@@ -1,0 +1,37 @@
+# PlexMigrate backend container.
+#
+# Runs the FastAPI server defined in server/app.py under uvicorn.
+# The engine code (services/) and the CLI driver (plexmigrate.py)
+# are copied in unchanged — the same image can be used to run the
+# CLI from inside the container if needed (docker compose exec
+# backend python plexmigrate.py ...).
+
+FROM python:3.11-slim
+
+# Disable .pyc and stdout buffering so logs surface in `docker logs`
+# in real time, and pip's progress bars don't fight the TTY.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# Install deps first so changes to source don't bust the layer cache.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Engine, CLI driver, server layer.
+COPY plexmigrate.py ./
+COPY services/ ./services/
+COPY server/ ./server/
+
+# Default mount points. These are also declared as named volumes in
+# docker-compose.yml so the data lives on the host.
+RUN mkdir -p /app/plex_exports /app/plex_logs /app/server_data
+ENV PLEXMIGRATE_DATA_DIR=/app/server_data
+
+EXPOSE 8000
+
+# uvicorn binds 0.0.0.0 so the nginx container can reach it on the
+# compose-managed bridge network. No --reload in production.
+CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,605 @@
+"""
+Multi-server registry for PlexMigrate v0.9.0.
+
+Replaces the single ``plex_url`` + ``plex_token`` fields that lived in
+``settings.json`` with a *list* of registered Plex servers. Each entry
+carries a user-given friendly name, the URL, the token, and cached
+status fields (last connection result, last contact time, last
+library catalogue) so the frontend can paint a server-list page
+without forcing every navigation to hit Plex.
+
+Persistence
+-----------
+The registry lives in ``$PLEXMIGRATE_DATA_DIR/servers.json`` (defaults
+to ``./server_data/servers.json`` — same volume mount as the rest of
+the persistence layer). Writes go through the same atomic-write
+helper that ``server/persistence.py`` uses, so a crash mid-save
+leaves either the old document intact or the new one fully written.
+
+Migration from v0.8.0
+---------------------
+v0.8.0 stored ``plex_url`` / ``plex_token`` in ``settings.json``.
+On first boot in v0.9.0 :func:`migrate_legacy_settings` checks for
+those keys and, if present, registers them as a server called
+``"Default"`` then clears them from ``settings.json``. The legacy
+fields are gone from the persistence default schema, so re-running
+migration on an already-migrated install is a no-op.
+
+Engine contract
+---------------
+This module **does not** modify the engine. It exposes
+:func:`connect_registered_server` which returns the same
+``(PlexServer, url, token, owner_name)`` tuple the engine has
+always accepted. The engine is unaware of the registry; it sees a
+single connection and a single token per call, exactly as in
+single-server mode.
+
+Threading note
+--------------
+Several PlexMigrate threads can read and write this file:
+- The request handler when the user adds / renames / deletes a server.
+- The "test connection" handler when the user clicks the refresh icon.
+- The job worker reading the registry to resolve a name at run start.
+
+A single module-level lock (:data:`_REG_LOCK`) serialises every
+read-modify-write cycle. Reads that don't mutate (e.g. ``list_servers``)
+also take the lock to ensure they see a consistent snapshot rather
+than a mid-write file.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from server.persistence import (
+    _atomic_write_json,
+    get_data_dir,
+    load_settings,
+    save_settings,
+)
+
+
+log = logging.getLogger("plexmigrate.server.registry")
+
+
+# ── File location ────────────────────────────────────────────────────────────
+
+def _registry_path() -> Path:
+    """Absolute path to ``servers.json`` inside the configured data dir."""
+    return get_data_dir() / "servers.json"
+
+
+# ── Cross-thread lock ────────────────────────────────────────────────────────
+
+# All public functions in this module that touch ``servers.json``
+# acquire this lock. Granularity is whole-file because the file is
+# small and access is infrequent — a finer lock would buy us nothing
+# and complicate the invariants.
+_REG_LOCK = threading.Lock()
+
+
+# ── Defaults ─────────────────────────────────────────────────────────────────
+
+# The shape of one server record. Anything missing from an on-disk
+# document is filled in from this dict on load so adding a new field
+# in a future release doesn't break an existing registry.
+_DEFAULT_SERVER: Dict[str, Any] = {
+    "id": "",
+    "name": "",
+    "url": "",
+    "token": "",
+    "last_status": "unknown",         # "ok" | "unreachable" | "auth_error" | "unknown"
+    "last_status_detail": "",         # Human-readable description of the last result.
+    "last_checked_at": 0.0,           # UNIX timestamp of last connection attempt.
+    "last_libraries": [],             # Cached library list ({name,type,key,count}).
+    "owner_name": "",                 # myPlexUsername at last successful connect.
+    # v0.9.1: response time in milliseconds for the last lightweight
+    # ping. ``None`` if no ping has succeeded yet. Used by the Servers
+    # tab live indicator and the JobForm server selector chips.
+    "last_response_ms": None,
+}
+
+
+# ── Name-safety helper ───────────────────────────────────────────────────────
+
+# Some server names (e.g. "Living Room / Plex") contain characters
+# that are not legal in filenames on Windows or that would break
+# log-directory globs. ``safe_server_name`` produces a filename-safe
+# slug while preserving readability — used to prefix log dirs and
+# export filenames so outputs from different servers never collide.
+def safe_server_name(name: str) -> str:
+    """
+    Turn a free-form friendly name into a filename-safe slug.
+
+    Examples:
+        "My Home Plex"     -> "My-Home-Plex"
+        "Plex (NAS) #1"    -> "Plex-NAS-1"
+        "café / régal"     -> "cafe-regal"
+    """
+    if not name:
+        return "server"
+    # ASCII-fold so non-ASCII names don't trip filesystem encoding
+    # surprises across host platforms. ``encode('ascii', 'ignore')``
+    # silently drops accents; that's fine for filename use.
+    folded = name.encode("ascii", "ignore").decode("ascii")
+    # Replace any run of non-alphanumeric chars with a single hyphen.
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", folded).strip("-")
+    return slug or "server"
+
+
+# ── Load / Save ──────────────────────────────────────────────────────────────
+
+def _load_raw() -> List[Dict[str, Any]]:
+    """
+    Read the on-disk registry. Missing or malformed file = empty list.
+    Returned list is *not* a deep copy — callers that mutate must
+    re-save the result through :func:`_save_raw`.
+    """
+    import json
+    path = _registry_path()
+    if not path.exists():
+        return []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        log.exception("servers.json unreadable; treating as empty")
+        return []
+    if not isinstance(data, list):
+        return []
+    # Backfill missing fields from the default schema so old documents
+    # don't break newer code that expects keys added in later versions.
+    out: List[Dict[str, Any]] = []
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+        merged = dict(_DEFAULT_SERVER)
+        merged.update(raw)
+        out.append(merged)
+    return out
+
+
+def _save_raw(rows: List[Dict[str, Any]]) -> None:
+    """Atomically replace ``servers.json``."""
+    _atomic_write_json(_registry_path(), rows)
+
+
+# ── Public read API ─────────────────────────────────────────────────────────
+
+def list_servers(*, include_tokens: bool = False) -> List[Dict[str, Any]]:
+    """
+    Return every registered server.
+
+    ``include_tokens`` defaults to False so callers that send the
+    list over the network can do so without exposing tokens. When the
+    job runner needs the actual token to connect, it passes True.
+    """
+    with _REG_LOCK:
+        rows = _load_raw()
+    if include_tokens:
+        return rows
+    redacted: List[Dict[str, Any]] = []
+    for row in rows:
+        copy = dict(row)
+        copy["has_token"] = bool(copy.get("token"))
+        copy.pop("token", None)
+        redacted.append(copy)
+    return redacted
+
+
+def get_server_by_name(name: str, *, include_token: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Look up one server by its friendly name (case-sensitive, exact match).
+
+    Returns ``None`` if no server is registered with that name. The
+    case-sensitive contract matches how schedules and CLI flags pass
+    server names around — "Plex1" and "plex1" are different servers.
+    """
+    with _REG_LOCK:
+        rows = _load_raw()
+    for row in rows:
+        if row.get("name") == name:
+            if not include_token:
+                row = {k: v for k, v in row.items() if k != "token"}
+            return row
+    return None
+
+
+def get_server_by_id(server_id: str, *, include_token: bool = True) -> Optional[Dict[str, Any]]:
+    """
+    Look up one server by its server-generated UUID id.
+
+    ID-based lookup is what the frontend uses (because the friendly
+    name can change). The CLI uses name-based lookup because typing a
+    UUID at a shell prompt is hostile to the user.
+    """
+    with _REG_LOCK:
+        rows = _load_raw()
+    for row in rows:
+        if row.get("id") == server_id:
+            if not include_token:
+                row = {k: v for k, v in row.items() if k != "token"}
+            return row
+    return None
+
+
+# ── Public write API ────────────────────────────────────────────────────────
+
+def add_server(name: str, url: str, token: str) -> Dict[str, Any]:
+    """
+    Register a new server. Friendly name must be unique (case-sensitive).
+    Raises ValueError if the name is already taken or any required
+    field is empty.
+    """
+    if not name or not name.strip():
+        raise ValueError("Server name must not be empty.")
+    if not url or not url.strip():
+        raise ValueError("Server URL must not be empty.")
+    if not token or not token.strip():
+        raise ValueError("Server token must not be empty.")
+    with _REG_LOCK:
+        rows = _load_raw()
+        if any(r.get("name") == name for r in rows):
+            raise ValueError(f"A server named {name!r} is already registered.")
+        new_row = dict(_DEFAULT_SERVER)
+        new_row.update({
+            "id": str(uuid.uuid4()),
+            "name": name.strip(),
+            "url": url.strip().rstrip("/"),
+            "token": token.strip(),
+            "last_status": "unknown",
+            "last_checked_at": 0.0,
+        })
+        rows.append(new_row)
+        _save_raw(rows)
+        return new_row
+
+
+def update_server(server_id: str, *, name: Optional[str] = None, url: Optional[str] = None,
+                  token: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Rename or re-credential an existing server. Any field set to
+    ``None`` is left unchanged. The friendly name remains unique across
+    the registry — a rename that collides with another entry raises
+    ``ValueError``. Tokens passed empty-string mean "keep current" so
+    the frontend can submit a form without re-entering the token.
+    """
+    with _REG_LOCK:
+        rows = _load_raw()
+        target: Optional[Dict[str, Any]] = None
+        for row in rows:
+            if row.get("id") == server_id:
+                target = row
+                break
+        if target is None:
+            raise ValueError(f"No server with id {server_id!r}")
+        if name is not None and name.strip() and name != target.get("name"):
+            if any(r.get("name") == name and r is not target for r in rows):
+                raise ValueError(f"A server named {name!r} already exists.")
+            target["name"] = name.strip()
+        if url is not None and url.strip():
+            target["url"] = url.strip().rstrip("/")
+        if token is not None and token != "":
+            target["token"] = token
+        _save_raw(rows)
+        return target
+
+
+def remove_server(server_id: str) -> bool:
+    """
+    Delete one server entry. Returns True if a row was actually
+    removed, False if no server had that id.
+
+    **Never** touches exports or logs the server produced — those
+    live under host bind mounts and are out of this module's scope.
+    """
+    with _REG_LOCK:
+        rows = _load_raw()
+        kept = [r for r in rows if r.get("id") != server_id]
+        if len(kept) == len(rows):
+            return False
+        _save_raw(kept)
+        return True
+
+
+def remove_server_by_name(name: str) -> bool:
+    """Convenience wrapper for the CLI ``--remove-server NAME`` path."""
+    with _REG_LOCK:
+        rows = _load_raw()
+        kept = [r for r in rows if r.get("name") != name]
+        if len(kept) == len(rows):
+            return False
+        _save_raw(kept)
+        return True
+
+
+# ── Engine integration ──────────────────────────────────────────────────────
+
+def connect_registered_server(name_or_id: str, logger: logging.Logger
+                              ) -> Tuple[Any, Dict[str, Any]]:
+    """
+    Resolve a server identifier and connect to Plex.
+
+    The identifier is tried first as a friendly name, then as a UUID
+    id, so the same function works for both CLI input ("Plex1") and
+    REST handlers that pass the id from the URL.
+
+    Returns ``(PlexServer, server_row)``. The caller is responsible
+    for passing ``server_row['url']`` and ``server_row['token']`` to
+    any engine call that needs them. Updates the server row's
+    ``last_status`` / ``last_checked_at`` / ``owner_name`` fields and
+    persists them before returning, so the registry's status column
+    is always up to date after a connection attempt.
+
+    Raises:
+        ValueError if no server with that name/id is registered.
+        ConnectionError if Plex is unreachable or the token is bad.
+    """
+    # Import locally so this module stays usable in environments
+    # where plexapi/requests aren't installed (e.g. unit tests).
+    from services.auth import connect_to_server
+
+    row = get_server_by_name(name_or_id) or get_server_by_id(name_or_id)
+    if row is None:
+        raise ValueError(f"No registered server named or ided {name_or_id!r}")
+
+    server = connect_to_server(row["url"], row["token"], logger)
+    now = time.time()
+    if server is None:
+        _record_status(row["id"], status="unreachable",
+                       detail=f"connect_to_server returned None for {row['url']}",
+                       checked_at=now)
+        raise ConnectionError(
+            f"Cannot connect to registered server {row['name']!r} at {row['url']}. "
+            f"Check the URL and token under the Servers tab."
+        )
+
+    owner = getattr(server, "myPlexUsername", None) or "Plex Owner"
+    _record_status(row["id"], status="ok", detail="", checked_at=now, owner=owner)
+    # Refresh our local copy so the caller sees the new fields.
+    row["last_status"] = "ok"
+    row["last_checked_at"] = now
+    row["owner_name"] = owner
+    return server, row
+
+
+def test_connection(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
+    """
+    Probe a registered server's connection without running any engine
+    logic. Used by the "Test" button in the Servers tab and at
+    startup to populate the status indicators.
+
+    Always returns the (now-updated) server row. Never raises — a
+    failure is recorded into the row instead so the frontend can
+    render a useful tooltip.
+    """
+    from services.auth import connect_to_server
+
+    row = get_server_by_id(server_id)
+    if row is None:
+        raise ValueError(f"No server with id {server_id!r}")
+    now = time.time()
+    try:
+        server = connect_to_server(row["url"], row["token"], logger)
+    except Exception as exc:
+        _record_status(server_id, status="unreachable",
+                       detail=f"{type(exc).__name__}: {exc}", checked_at=now)
+        return get_server_by_id(server_id, include_token=False) or row
+    if server is None:
+        _record_status(server_id, status="unreachable",
+                       detail="connect_to_server returned None", checked_at=now)
+        return get_server_by_id(server_id, include_token=False) or row
+    # Try a tiny live query so an "ok" status really means the token works.
+    try:
+        owner = getattr(server, "myPlexUsername", None) or "Plex Owner"
+        libs_raw = list(server.library.sections())
+        libs: List[Dict[str, Any]] = []
+        for sec in libs_raw:
+            try:
+                count = sec.totalSize
+            except Exception:
+                count = 0
+            libs.append({"name": sec.title, "type": sec.type, "key": sec.key, "count": count})
+        _record_status(server_id, status="ok", detail="", checked_at=now,
+                       owner=owner, libraries=libs)
+    except Exception as exc:
+        _record_status(server_id, status="auth_error",
+                       detail=f"{type(exc).__name__}: {exc}", checked_at=now)
+    return get_server_by_id(server_id, include_token=False) or row
+
+
+def refresh_libraries(server_id: str, logger: logging.Logger) -> List[Dict[str, Any]]:
+    """
+    Reload the cached library list for a server. Returns the new list.
+    Errors propagate so the frontend can show them.
+    """
+    row = test_connection(server_id, logger)
+    return row.get("last_libraries", []) or []
+
+
+# ── Lightweight ping (v0.9.1) ────────────────────────────────────────────────
+
+def ping_server(server_id: str, *, timeout: float = 3.0) -> Dict[str, Any]:
+    """
+    Probe a registered server's reachability without enumerating its
+    libraries — much cheaper than :func:`test_connection`. Used by the
+    UI's 30-second status refresh poll.
+
+    Issues one ``GET /identity?X-Plex-Token=...`` against the registered
+    URL. Plex's ``/identity`` endpoint returns a small XML document
+    with server metadata; if the server is reachable and the token is
+    accepted, we get a 200 response in single-digit milliseconds on a
+    LAN. Any non-200, any connection error, or any timeout means the
+    server is not reachable for our purposes.
+
+    The result is also written back into the row's status fields so
+    the cached value visible elsewhere stays current. Returns a dict
+    ``{"ok": bool, "response_ms": float, "status": str, "detail": str}``.
+
+    Never raises — a failure to reach Plex is the *expected* outcome
+    for at least some pings and the caller just wants the result.
+    """
+    # Import here so the module stays importable without ``requests``
+    # in environments that only use the CRUD bits.
+    import requests
+
+    row = get_server_by_id(server_id)
+    if row is None:
+        return {"ok": False, "response_ms": 0.0, "status": "unknown",
+                "detail": f"No server with id {server_id!r}"}
+
+    url = (row.get("url") or "").rstrip("/")
+    token = row.get("token") or ""
+    if not url or not token:
+        _record_status(server_id, status="unreachable",
+                       detail="URL or token missing on registry row",
+                       checked_at=time.time(), response_ms=0.0)
+        return {"ok": False, "response_ms": 0.0, "status": "unreachable",
+                "detail": "URL or token missing"}
+
+    started = time.perf_counter()
+    detail = ""
+    status = "unreachable"
+    ok = False
+    try:
+        resp = requests.get(
+            f"{url}/identity",
+            headers={"X-Plex-Token": token, "Accept": "application/xml"},
+            timeout=timeout,
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if resp.status_code == 200:
+            ok = True
+            status = "ok"
+        elif resp.status_code in (401, 403):
+            status = "auth_error"
+            detail = f"HTTP {resp.status_code}: token rejected"
+        else:
+            detail = f"HTTP {resp.status_code}"
+    except requests.exceptions.Timeout:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        detail = f"Timeout after {timeout:.1f}s"
+    except requests.exceptions.ConnectionError as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        detail = f"Connection error: {exc.__class__.__name__}"
+    except Exception as exc:  # pragma: no cover (defensive)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        detail = f"{type(exc).__name__}: {exc}"
+
+    _record_status(
+        server_id,
+        status=status,
+        detail=detail,
+        checked_at=time.time(),
+        response_ms=elapsed_ms,
+    )
+    return {
+        "ok": ok,
+        "response_ms": round(elapsed_ms, 1),
+        "status": status,
+        "detail": detail,
+    }
+
+
+def _record_status(server_id: str, *, status: str, detail: str, checked_at: float,
+                   owner: Optional[str] = None, libraries: Optional[List[Dict[str, Any]]] = None,
+                   response_ms: Optional[float] = None) -> None:
+    """
+    Internal: update status fields on one row and persist.
+
+    Called from :func:`connect_registered_server` (job run),
+    :func:`test_connection` (Test button), and :func:`ping_server`
+    (live status poll). Keeping the write path in one place ensures
+    the same lock discipline is applied no matter how the status was
+    learned.
+
+    ``response_ms`` is recorded on every call so the UI can show
+    "current latency" without needing a separate write path; callers
+    that don't measure latency (e.g. :func:`test_connection` which
+    measures library enumeration time, not raw ping) pass ``None``
+    to leave the previous value in place.
+    """
+    with _REG_LOCK:
+        rows = _load_raw()
+        for row in rows:
+            if row.get("id") == server_id:
+                row["last_status"] = status
+                row["last_status_detail"] = detail
+                row["last_checked_at"] = checked_at
+                if owner is not None:
+                    row["owner_name"] = owner
+                if libraries is not None:
+                    row["last_libraries"] = libraries
+                if response_ms is not None:
+                    row["last_response_ms"] = response_ms
+                break
+        _save_raw(rows)
+
+
+# ── Auto-migration from v0.8.0 ──────────────────────────────────────────────
+
+def migrate_legacy_settings(logger: logging.Logger) -> Optional[Dict[str, Any]]:
+    """
+    Move legacy ``plex_url`` / ``plex_token`` from ``settings.json``
+    into the registry as a server named "Default".
+
+    Idempotent: a fully-migrated install (no legacy fields, or legacy
+    fields empty) returns ``None`` and writes nothing. A partially
+    migrated install (registry already has entries but legacy fields
+    are still set) clears the legacy fields and returns ``None`` — we
+    don't double-register.
+
+    Returns the newly-created server row, or ``None`` if no migration
+    was needed.
+    """
+    settings = load_settings()
+    legacy_url = (settings.get("plex_url") or "").strip()
+    legacy_tok = (settings.get("plex_token") or "").strip()
+    # Idempotence: a fully-migrated install has both legacy fields empty
+    # (load_settings backfills missing keys as ""). We early-out here so
+    # the function performs zero work and writes zero bytes on every
+    # subsequent startup. If a future schema change adds new legacy
+    # fields, that path needs its own empty-check guard at this point.
+    if not legacy_url and not legacy_tok:
+        return None
+
+    # If the registry already has the legacy URL/token under any name,
+    # treat this as already-migrated and just clear the legacy fields.
+    existing = list_servers(include_tokens=True)
+    for row in existing:
+        if row.get("url") == legacy_url.rstrip("/") and row.get("token") == legacy_tok:
+            _clear_legacy_fields(settings)
+            return None
+
+    # If there's no registry at all, register the legacy as "Default".
+    # If there IS a registry already (user manually added servers) but
+    # neither URL nor token match, the legacy fields probably refer to
+    # a server the user no longer wants — clear them silently.
+    if existing:
+        _clear_legacy_fields(settings)
+        logger.info(
+            "Legacy plex_url/plex_token in settings.json ignored — "
+            "registry already contains %d server(s).", len(existing),
+        )
+        return None
+
+    # Heuristic default name: "Default" unless already taken (it
+    # can't be — registry is empty here).
+    new_row = add_server(name="Default", url=legacy_url, token=legacy_tok)
+    _clear_legacy_fields(settings)
+    logger.info("Migrated legacy plex_url/plex_token into registry as server 'Default'.")
+    return new_row
+
+
+def _clear_legacy_fields(settings: Dict[str, Any]) -> None:
+    """Strip the now-unused single-server fields out of ``settings.json``."""
+    patch = {"plex_url": "", "plex_token": ""}
+    # ``save_settings`` is a merge — passing the patch overwrites just
+    # those two keys without touching workers / output_dir / etc.
+    save_settings(patch)

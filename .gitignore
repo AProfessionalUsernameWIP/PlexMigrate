@@ -1,0 +1,61 @@
+# PlexMigrate .gitignore
+# What's allowed in the repo: source code, Dockerfiles, requirements,
+# the Makefile, and docs. Everything else listed below is either a
+# build artefact, a Python/Node cache, or runtime data that contains
+# user secrets (Plex tokens) or library contents.
+
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+.env
+
+# ── Node / frontend build ──────────────────────────────────────────
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+frontend/.vite/
+
+# ── User runtime data (NEVER commit) ───────────────────────────────
+# Contains your Plex token and registered server credentials.
+server_data/
+
+# Per-run logs and exports. May contain server URLs, library names,
+# file paths, and other library-shape information. Keep local.
+plex_logs/
+plex_exports/
+
+# Stray .plexbackup.json files in the repo root (e.g. test exports).
+/*.plexbackup.json
+*.tmp.plexbackup.json
+
+# ── IDE / OS ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+*.bak
+.DS_Store
+Thumbs.db
+.history/
+
+# ── Editor / file-manager duplicates ───────────────────────────────
+# Catches accidental copies like "README copy.md" (Finder) and
+# "README - Copy.md" (Windows Explorer) so they don't end up in git.
+* copy.*
+* copy *.*
+*-copy.*
+* - Copy.*
+* - Copy (*).*
+
+# ── Docker ─────────────────────────────────────────────────────────
+# docker-compose.yml itself IS tracked. These are local-only:
+docker-compose.override.yml
+.env.local

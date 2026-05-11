@@ -1,0 +1,59 @@
+# PlexMigrate v0.8.0 — docker compose orchestration.
+#
+# `docker compose up --build` brings up two services on a shared
+# bridge network:
+#
+#   * backend   — FastAPI / uvicorn process exposing /api and /ws
+#                 on port 8000. Holds the Plex token; never exposed
+#                 to the LAN by default (bound to 127.0.0.1).
+#   * frontend  — nginx serving the compiled React bundle on port
+#                 8080, proxying /api/* and /ws/* to the backend.
+#
+# Three host bind mounts let exports, logs, and the schedule store
+# outlive `docker compose down`:
+#   ./plex_exports  ↔  /app/plex_exports
+#   ./plex_logs     ↔  /app/plex_logs
+#   ./server_data   ↔  /app/server_data   (schedules.json + settings.json)
+#
+# host.docker.internal is added explicitly because the most common
+# deployment is "Plex on the same machine that runs docker", and
+# Linux Docker doesn't resolve that name by default.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: plexmigrate-backend
+    restart: unless-stopped
+    # Bind to localhost only — the backend holds a Plex token and
+    # has no auth layer of its own. Operators who want LAN access
+    # should put a reverse proxy with auth in front.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./plex_exports:/app/plex_exports
+      - ./plex_logs:/app/plex_logs
+      - ./server_data:/app/server_data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      PLEXMIGRATE_DATA_DIR: /app/server_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health',timeout=2).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: plexmigrate-frontend
+    restart: unless-stopped
+    # Open the web UI on http://localhost:8080
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - backend
