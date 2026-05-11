@@ -11,7 +11,7 @@
 // Reads only from props — no fetch logic here. The App owns the WS
 // subscription and pushes the snapshot down.
 
-import { useEffect, useMemo, useState } from 'react';
+import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import { ActivityEntry, CurrentItem, DashboardSnapshot, JobPayload, LibraryProgress, LogFile, SnapshotMessage, api } from '../api';
 import { LogTailer } from './LogTailer';
 
@@ -37,7 +37,6 @@ export function DashboardPanel({ snapshot, connState = 'connected' }: Props) {
   return (
     <>
       <JobHeader job={job} dash={dash} />
-      <DashboardLogTail job={job} />
       {dash ? (
         <>
           <RunCoverage dash={dash} />
@@ -47,6 +46,7 @@ export function DashboardPanel({ snapshot, connState = 'connected' }: Props) {
           <CurrentlyProcessing items={dash.current_items ?? []} />
           <LibraryList libs={dash.libraries} now={Date.now() / 1000} />
           <ActivityFeed entries={dash.activity} />
+          <DashboardLogTail job={job} />
         </>
       ) : (
         <div className="panel">
@@ -85,6 +85,7 @@ export function DashboardPanel({ snapshot, connState = 'connected' }: Props) {
           )}
         </div>
       )}
+      {!dash && job && <DashboardLogTail job={job} />}
     </>
   );
 }
@@ -133,7 +134,15 @@ function DashboardLogTail({ job }: { job: JobPayload | null }) {
     const load = () => {
       api.listLogFiles(runName)
         .then((fs) => { if (!cancelled) { setFiles(fs); setListError(null); } })
-        .catch((e) => { if (!cancelled) setListError(String(e)); });
+        .catch((e) => {
+          if (cancelled) return;
+          // The run directory is renamed (..._PASS / _FAIL) when the
+          // job finishes, so the original runName 404s at that moment.
+          // Swallow that specific case — the tail is about to freeze
+          // anyway and a banner error is just noise.
+          if (isRunGoneError(e)) { setListError(null); return; }
+          setListError(String(e));
+        });
     };
     load();
     // Stop refreshing once the job is done — the file set is final.
@@ -189,6 +198,7 @@ function DashboardLogTail({ job }: { job: JobPayload | null }) {
           </select>
         </div>
       </div>
+      <SectionHint>Tail of any log file in the current run directory — pick a file from the dropdown above.</SectionHint>
       {listError && <div className="banner error" style={{ marginBottom: 6 }}>{listError}</div>}
       {selected && files.some((f) => f.name === selected) ? (
         <LogTailer
@@ -326,6 +336,7 @@ function RunCoverage({ dash }: { dash: DashboardSnapshot }) {
   return (
     <div className="panel">
       <h2>Run Coverage</h2>
+      <SectionHint>How big this run is — the user count and the totals for each category of data being touched.</SectionHint>
       <div className="grid-4">
         <Stat label="Users (incl. owner)" value={dash.home_user_count ?? 0} />
         <Stat label="Watched items" value={dash.watch_count ?? 0} />
@@ -413,6 +424,7 @@ function RunStats({ dash }: { dash: DashboardSnapshot }) {
   return (
     <div className="panel">
       <h2>Run Stats</h2>
+      <SectionHint>Outcome counts as items move through the pipeline.</SectionHint>
       <div className="grid-4">
         <Stat label="Completed" value={dash.completed} variant="good" />
         <Stat label="Skipped"   value={dash.skipped} />
@@ -429,6 +441,7 @@ function MatchStats({ dash }: { dash: DashboardSnapshot }) {
   return (
     <div className="panel">
       <h2>Match Resolution</h2>
+      <SectionHint>How items are matched between source and destination.</SectionHint>
       <div className="grid-4">
         <Stat label="GUID"      value={dash.guid_hits} />
         <Stat label="Filepath"  value={dash.filepath_hits} />
@@ -455,6 +468,7 @@ function ThreadPool({ dash }: { dash: DashboardSnapshot }) {
   return (
     <div className="panel">
       <h2>Thread Pool</h2>
+      <SectionHint>Worker threads currently active, grouped by what they're doing.</SectionHint>
       <div className="kv" style={{ marginBottom: 8 }}>
         <div className="k">Active workers</div><div className="v">{activeWorkers}</div>
         <div className="k">Status</div><div className="v">{dash.paused ? 'PAUSED' : 'Running'}</div>
@@ -513,6 +527,7 @@ function LibraryList({ libs, now }: { libs: LibraryProgress[]; now: number }) {
   return (
     <div className="panel">
       <h2>Libraries</h2>
+      <SectionHint>Per-library progress with item counts, current phase, and an ETA.</SectionHint>
       {libs.length === 0 ? (
         <div className="empty">No libraries in this run.</div>
       ) : (
@@ -577,6 +592,7 @@ function ActivityFeed({ entries }: { entries: ActivityEntry[] }) {
   return (
     <div className="panel">
       <h2>Activity Feed</h2>
+      <SectionHint>The most recent pipeline events, newest at the top.</SectionHint>
       {ordered.length === 0 ? (
         <div className="empty">No events yet.</div>
       ) : (
@@ -627,6 +643,14 @@ const LABEL_FOR_ACTION: Record<string, string> = {
 
 // ── Tiny shared helpers ───────────────────────────────────────────────────────
 
+function SectionHint({ children }: { children: ReactNode }) {
+  return (
+    <div style={{ marginTop: -4, marginBottom: 10, fontSize: 12, color: 'var(--text-dim)' }}>
+      {children}
+    </div>
+  );
+}
+
 function Stat({ label, value, variant }: { label: string; value: number; variant?: 'good' | 'bad' | 'warn' }) {
   return (
     <div className={`stat ${variant ?? ''}`}>
@@ -634,6 +658,14 @@ function Stat({ label, value, variant }: { label: string; value: number; variant
       <div className="value">{value.toLocaleString()}</div>
     </div>
   );
+}
+
+// True when the API returned a 404 because the run directory has
+// been renamed at job end. Used to suppress a transient banner error
+// in both the file-list refresh and the LogTailer poll.
+export function isRunGoneError(e: unknown): boolean {
+  const s = String(e);
+  return s.includes('404') && /no such run/i.test(s);
 }
 
 function secondsToHMS(s: number): string {

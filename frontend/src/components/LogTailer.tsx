@@ -14,6 +14,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api, LogFileContent } from '../api';
+import { isRunGoneError } from './DashboardPanel';
 
 const TAIL_POLL_MS = 2000;
 
@@ -67,7 +68,14 @@ export function LogTailer({
           if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
         });
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        // Suppress the transient 404 when the run directory is
+        // renamed (..._PASS / _FAIL) at job end. The parent freezes
+        // the tail moments later, so surfacing it would just flash a
+        // banner the user can't act on.
+        if (isRunGoneError(e)) return;
+        setError(String(e));
+      });
   }, [runName, fileName]);
 
   // Poll loop — appends only the new bytes via ?since=offset.
@@ -81,6 +89,7 @@ export function LogTailer({
         setMeta(r);
         setLastPolledAt(Date.now());
       } catch (e) {
+        if (isRunGoneError(e)) { window.clearInterval(tick); return; }
         setError(String(e));
       }
     }, TAIL_POLL_MS);
