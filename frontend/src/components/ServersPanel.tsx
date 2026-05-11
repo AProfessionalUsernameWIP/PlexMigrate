@@ -16,7 +16,7 @@
 // above and the cached library catalogue panel below stay as-is.
 
 import { useEffect, useRef, useState } from 'react';
-import { api, LibraryDescriptor, PingResult, ServerView } from '../api';
+import { api, PingResult, ServerDeleteSummary, ServerView } from '../api';
 
 // Poll cadence for the live status indicator, in milliseconds.
 const PING_INTERVAL_MS = 30_000;
@@ -26,6 +26,10 @@ export function ServersPanel() {
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<ServerView | 'new' | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Last cascade summary from a successful delete. Rendered as a
+  // green toast banner at the top of the panel and dismissed by the
+  // operator (or by the next action).
+  const [cascadeToast, setCascadeToast] = useState<ServerDeleteSummary | null>(null);
 
   // Live ping state, keyed by server id. We keep this *separate* from
   // ``servers`` so a ping update can happen without re-rendering the
@@ -114,16 +118,32 @@ export function ServersPanel() {
   };
 
   const remove = async (s: ServerView) => {
-    // Confirmation prompt explicitly reminds the user that the
-    // registry entry is being removed, not any artefacts on disk.
-    if (!confirm(
-      `Remove server "${s.name}" from the registry?\n\n` +
-      `This removes the registry entry only. Any export files in ` +
-      `plex_exports/ or log directories in plex_logs/ that were ` +
-      `produced by this server are NOT deleted and stay on disk.`
-    )) return;
+    // v0.9.5: fetch the cascade preview first so the confirmation
+    // dialog can show concrete counts. If the preview call itself
+    // fails (e.g. server is mid-cascade by another request), fall
+    // back to the previous text-only prompt so the operator can
+    // still cancel the action safely.
+    let previewLine = '';
     try {
-      await api.deleteServer(s.id);
+      const preview = await api.previewServerCascade(s.id);
+      const parts = [
+        `${preview.schedules} schedule(s)`,
+        `${preview.exports} export file(s)`,
+        `${preview.log_dirs} log directory/ies`,
+      ];
+      previewLine = `Cascade will also delete:\n  • ${parts.join('\n  • ')}\n\n`;
+    } catch {
+      previewLine = 'Cascade will also delete every schedule, export, and log directory attributable to this server.\n\n';
+    }
+    if (!confirm(
+      `Delete server "${s.name}" and everything attributable to it?\n\n` +
+      previewLine +
+      'This cannot be undone.'
+    )) return;
+    setCascadeToast(null);
+    try {
+      const summary = await api.deleteServer(s.id);
+      setCascadeToast(summary);
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -133,6 +153,28 @@ export function ServersPanel() {
   return (
     <>
       {error && <div className="banner error">{error}</div>}
+
+      {cascadeToast && (
+        <div
+          className="banner good"
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}
+        >
+          <div>
+            <strong>Deleted {cascadeToast.name}.</strong>{' '}
+            Cleaned up {cascadeToast.schedules} schedule(s), {cascadeToast.exports} export file(s),
+            and {cascadeToast.log_dirs} log directory/ies.
+            {(cascadeToast.exports_failed > 0 || cascadeToast.log_dirs_failed > 0) && (
+              <div style={{ marginTop: 6, fontSize: 12 }}>
+                {cascadeToast.exports_failed + cascadeToast.log_dirs_failed} item(s) could not be removed:
+                <ul style={{ margin: '4px 0 0 18px' }}>
+                  {cascadeToast.errors.map((e, i) => <li key={i} className="mono">{e}</li>)}
+                </ul>
+              </div>
+            )}
+          </div>
+          <button onClick={() => setCascadeToast(null)} style={{ flexShrink: 0 }}>Dismiss</button>
+        </div>
+      )}
 
       <div className="banner info">
         <strong>Threading note:</strong> Every registered server adds API load when used.

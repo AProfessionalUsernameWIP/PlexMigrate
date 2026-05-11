@@ -69,14 +69,22 @@ export function SettingsPanel() {
 
       <div className="panel">
         <h2>Default Paths</h2>
+        <div className="banner info" style={{ fontSize: 12, marginBottom: 12 }}>
+          <strong>Docker note:</strong> these paths are inside the backend container, not on your host.
+          The defaults <code>./plex_exports</code> and <code>./plex_logs</code> are bind-mounted in
+          <code> docker-compose.yml</code> so they appear on the host too. To use an external drive or
+          a NAS (e.g. <code>Y:\plexbackups</code>), add a bind mount in <code>docker-compose.yml</code>
+          first — Windows host paths typed here will be rejected, because the Linux container has no
+          drive letters. See the commented examples at the bottom of <code>docker-compose.yml</code>.
+        </div>
         <label className="field">
           <span className="label">Output directory</span>
-          <span className="help">Where exports land by default. Job forms can override per-run.</span>
+          <span className="help">Where exports land by default. Job forms can override per-run. Must be a container-visible path (e.g. <code>./plex_exports</code> or <code>/app/nas_exports</code>).</span>
           <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} />
         </label>
         <label className="field">
           <span className="label">Log directory</span>
-          <span className="help">Where per-run log subdirectories are created. Job forms can override per-run.</span>
+          <span className="help">Where per-run log subdirectories are created. Job forms can override per-run. Same container-path constraint as above.</span>
           <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} />
         </label>
       </div>

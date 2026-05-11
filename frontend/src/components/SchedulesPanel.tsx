@@ -230,7 +230,7 @@ function ScheduleEditor(props: {
         </label>
         <label className="field">
           <span className="label">Output directory</span>
-          <span className="help">Where this schedule's <code>.plexbackup.json</code> files land. Blank = use Settings default.</span>
+          <span className="help">Where this schedule's <code>.plexbackup.json</code> files land. Blank = use Settings default. Must be a path inside the backend container — Windows host paths (e.g. <code>Y:\…</code>) are rejected; bind-mount external drives in <code>docker-compose.yml</code> first.</span>
           <input type="text" value={schedule.output_dir || ''} onChange={(e) => set('output_dir', e.target.value || null)} placeholder="./plex_exports" />
         </label>
       </div>

@@ -15,8 +15,9 @@ would make the page slow.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from server.persistence import load_settings
 
@@ -173,6 +174,73 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
     out["trigger"] = _extract_top_level_string(text, "trigger")
     out["schedule_name"] = _extract_top_level_string(text, "schedule_name")
     return out
+
+
+# ── Slug-scoped cascade helpers (v0.9.5) ─────────────────────────────────────
+
+def _slug_pattern(slug: str) -> "re.Pattern[str]":
+    """
+    Compile the exact-position regex that matches export filenames
+    produced by the server whose ``safe_server_name`` slug is ``slug``.
+
+    Exporter filename shape (services/exporter.py):
+
+        ``<library>_<slug>_<YYYYMMDD>_<HHMMSS>.plexbackup.json``
+
+    The slug always appears between an underscore and the run
+    timestamp, so the pattern anchors on ``_<slug>_<8 digits>_<6 digits>``
+    immediately preceding ``.plexbackup.json``. This avoids false
+    positives if the slug substring happens to appear inside a
+    library name (e.g. a library literally named "Jade-TV" with a
+    different server slug).
+
+    Pre-v0.9.0 backups carry no slug at all (``<library>_<ts>``);
+    those never match this pattern by design — they aren't
+    attributable to any specific registered server.
+    """
+    return re.compile(
+        r"_" + re.escape(slug) + r"_\d{8}_\d{6}\.plexbackup\.json$"
+    )
+
+
+def _iter_exports_for_slug(slug: str) -> List[Path]:
+    """Return every export file path attributable to ``slug``."""
+    settings = load_settings()
+    base = Path(settings.get("output_dir") or "./plex_exports")
+    if not base.exists():
+        return []
+    pat = _slug_pattern(slug)
+    out: List[Path] = []
+    for f in base.iterdir():
+        if not f.is_file() or not f.name.endswith(".plexbackup.json"):
+            continue
+        if pat.search(f.name):
+            out.append(f)
+    return out
+
+
+def count_exports_by_slug(slug: str) -> int:
+    """How many export files would a cascade delete of ``slug`` remove?"""
+    return len(_iter_exports_for_slug(slug))
+
+
+def delete_exports_by_slug(slug: str) -> Tuple[int, List[str]]:
+    """
+    Delete every export file matching ``slug``. Returns
+    ``(deleted_count, errors)`` where ``errors`` is a list of
+    human-readable strings — one per file we tried to delete and
+    couldn't. Best-effort: a failure on one file does not stop the
+    sweep.
+    """
+    deleted = 0
+    errors: List[str] = []
+    for p in _iter_exports_for_slug(slug):
+        try:
+            p.unlink()
+            deleted += 1
+        except OSError as e:
+            errors.append(f"{p.name}: {type(e).__name__}: {e}")
+    return deleted, errors
 
 
 def _extract_top_level_string(text: str, key: str) -> Optional[str]:

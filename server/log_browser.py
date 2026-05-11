@@ -20,8 +20,10 @@ a client cannot ``../../etc/passwd`` out of the sandbox.
 
 from __future__ import annotations
 
+import re
+import shutil
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from server.persistence import load_settings
 
@@ -104,6 +106,68 @@ def list_files(run_name: str) -> List[Dict[str, Any]]:
         files.append({"name": f.name, "size": st.st_size, "mtime": st.st_mtime})
     files.sort(key=lambda e: e["name"])
     return files
+
+
+# ── Slug-scoped cascade helpers (v0.9.5) ─────────────────────────────────────
+
+def _slug_dir_pattern(slug: str) -> "re.Pattern[str]":
+    """
+    Compile the exact regex that matches per-run log directory names
+    produced by the server whose ``safe_server_name`` slug is ``slug``.
+
+    Engine writes run dirs as ``run_<slug>_<YYYYMMDD>_<HHMMSS>``, then
+    finalises them with a ``_PASS`` or ``_FAIL`` suffix (see
+    services/exporter.py and services/importer.py). The pattern
+    anchors on the leading ``run_<slug>_`` and accepts an optional
+    finalisation suffix.
+    """
+    return re.compile(
+        r"^run_" + re.escape(slug) + r"_\d{8}_\d{6}(?:_PASS|_FAIL)?$"
+    )
+
+
+def _iter_log_dirs_for_slug(slug: str) -> List[Path]:
+    """Return every run directory attributable to ``slug``."""
+    settings = load_settings()
+    base = Path(settings.get("log_dir") or "./plex_logs")
+    if not base.exists():
+        return []
+    pat = _slug_dir_pattern(slug)
+    out: List[Path] = []
+    for child in base.iterdir():
+        if not child.is_dir():
+            continue
+        if pat.match(child.name):
+            out.append(child)
+    return out
+
+
+def count_log_dirs_by_slug(slug: str) -> int:
+    """How many run directories would a cascade delete of ``slug`` remove?"""
+    return len(_iter_log_dirs_for_slug(slug))
+
+
+def delete_log_dirs_by_slug(slug: str) -> Tuple[int, List[str]]:
+    """
+    Delete every run directory matching ``slug``. Returns
+    ``(deleted_count, errors)``. Best-effort — a single failed
+    rmtree does not stop the sweep.
+
+    ``shutil.rmtree`` is recursive; the engine writes file handles
+    into the run dir during a job, so a cascade attempted while a
+    job is in flight may legitimately fail on the live run dir.
+    That's fine — the error string surfaces in the cascade summary
+    and the operator can retry once the job finishes.
+    """
+    deleted = 0
+    errors: List[str] = []
+    for d in _iter_log_dirs_for_slug(slug):
+        try:
+            shutil.rmtree(d)
+            deleted += 1
+        except OSError as e:
+            errors.append(f"{d.name}: {type(e).__name__}: {e}")
+    return deleted, errors
 
 
 # ── Read ─────────────────────────────────────────────────────────────────────

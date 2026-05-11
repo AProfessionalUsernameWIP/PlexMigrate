@@ -26,6 +26,10 @@ frontend/.vite/
 # ── User runtime data (NEVER commit) ───────────────────────────────
 # Contains your Plex token and registered server credentials.
 server_data/
+# Explicit — already covered by server_data/ above, but called out
+# so a deployment that flattens the directory rule still keeps the
+# encryption key (server/secrets.py) private to the host volume.
+server_data/.keyfile
 
 # Per-run logs and exports. May contain server URLs, library names,
 # file paths, and other library-shape information. Keep local.

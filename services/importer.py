@@ -855,27 +855,32 @@ def import_backup_file(
     scan_cache: Dict[str, Any] = {}
     scan_lock = threading.Lock()
 
-    # Delegate the prefetch to _build_scan_cache so the cache ends up
-    # with the correct __ready__ / __building__ markers. The previous
-    # local implementation populated the dict in-place without those
-    # markers, which caused the first resolver thread to re-claim
-    # builder status and run the entire section scan a second time —
-    # and if the warmer itself raised (transient Plex error), every
-    # resolver thread would spin forever on the wait loop. Both
-    # symptoms now fixed: the shared coordinator handles markers,
-    # exceptions still flip __ready__ so waiters can exit gracefully,
-    # and a 5-minute hard ceiling in the wait loop prevents pathological
-    # hangs even if something upstream deadlocks.
-    def _warm_scan_cache():
-        try:
-            _build_scan_cache(section, scan_cache, scan_lock, logger)
-        except Exception as e:
-            logger.warning(
-                f"[scan_cache] Warm-up failed for '{section.title}': {e} — "
-                f"resolvers will fall back to fuzzy matching."
-            )
-
-    threading.Thread(target=_warm_scan_cache, daemon=True).start()
+    # v0.9.5: build the scan cache synchronously on this thread before
+    # launching the watch-history resolver pool. Workers only read
+    # from the cache during resolution — they never write — so the
+    # shared coordination machinery in _build_scan_cache (claim
+    # handshake, __building__ marker, spin-wait loop) is only
+    # exercised during this single up-front call. By the time the
+    # ThreadPoolExecutor inside import_watch_history fires up, every
+    # subsequent _build_scan_cache call sees __ready__ on the first
+    # lock-free dict read and returns immediately — no lock acquired,
+    # no spin-wait. The shared coordinator stays in resolver.py as a
+    # defensive fallback for any future call site that doesn't
+    # pre-build, but on this path it's a no-op.
+    #
+    # Trade-off: each library's watch-history phase now has a hard
+    # ``t_build`` lower bound (30-60 s on a big TV library) before
+    # the first resolver runs. For libraries with thousands of
+    # watched items the saving from removing the spin-wait dominates;
+    # for tiny libraries the build dominates. Net positive on real
+    # workloads.
+    try:
+        _build_scan_cache(section, scan_cache, scan_lock, logger)
+    except Exception as e:
+        logger.warning(
+            f"[scan_cache] Build failed for '{section.title}': {e} — "
+            f"resolvers will fall back to fuzzy matching."
+        )
 
     def _stopped() -> bool:
         return stop_event is not None and stop_event.is_set()
