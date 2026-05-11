@@ -225,12 +225,13 @@ class Scheduler:
                 }
                 if row.get("output_dir"):
                     params["output_dir"] = row["output_dir"]
+                # Tag the run so the resulting .plexbackup.json carries
+                # "Scheduled: <schedule name>" in its metadata — the
+                # Exports tab uses this to badge each row by origin.
+                params["_trigger"] = "schedule"
+                params["_schedule_name"] = str(row.get("name") or "")
                 if row.get("source_server_name"):
                     params["source_server_name"] = row["source_server_name"]
-                # P2-1: forward per-schedule strict_match override when set.
-                # None on the schedule row means "inherit settings.json".
-                if row.get("strict_match") is not None:
-                    params["strict_match"] = bool(row["strict_match"])
                 else:
                     log.warning(
                         "Schedule %r has no source_server_name set; rolling forward without firing. "
@@ -240,6 +241,10 @@ class Scheduler:
                     row["next_run_at"] = _compute_next(row, now=now_ts)
                     mutated = True
                     continue
+                # P2-1: forward per-schedule strict_match override when set.
+                # None on the schedule row means "inherit settings.json".
+                if row.get("strict_match") is not None:
+                    params["strict_match"] = bool(row["strict_match"])
                 rec = queue.submit_export(params)
                 row["last_job_id"] = rec.job_id
                 row["last_fired_at"] = now_ts

@@ -102,9 +102,92 @@ def export_watch_history(section, logger: logging.Logger, user: str = "Plex Owne
     return watched
 
 
-def build_playlist_cache(server: PlexServer, logger: logging.Logger) -> List[Tuple[Any, List]]:
+def _resolve_server_owner_ids(
+    admin_server: PlexServer,
+    home_users: List[Tuple[str, str, PlexServer]],
+    logger: logging.Logger,
+) -> Dict[int, int]:
     """
-    Fetch every playlist on a server and its items, once.
+    Map each user-bound ``PlexServer`` instance (by ``id()``) to that
+    user's *local server user-id* — the same number Plex puts in the
+    ``<Playlist userID="…">`` attribute.
+
+    Plex's local user-ids come from ``server.systemAccounts()`` (the
+    ``/accounts`` endpoint) and are distinct from Plex.tv account-ids.
+    The owner is typically ``SystemAccount.id == 1``; home users get
+    2, 3, 4… We match by ``SystemAccount.name`` against the home
+    user's title and against the admin's ``MyPlexAccount.username``
+    so a future migration to an account that wasn't id=1 still works.
+
+    Returns an empty dict if ``systemAccounts()`` is unavailable; the
+    caller treats a missing entry as "owner_id unknown" and walks
+    every playlist (the prior behaviour), so this is a soft-fail
+    optimisation rather than a hard requirement.
+    """
+    try:
+        sys_accts = admin_server.systemAccounts()
+    except Exception as e:
+        logger.debug(f"systemAccounts() unavailable: {e} — playlist owner filter disabled")
+        return {}
+
+    by_name: Dict[str, int] = {}
+    for a in sys_accts:
+        name = getattr(a, "name", None)
+        aid = getattr(a, "id", None)
+        if name and aid is not None:
+            by_name[str(name)] = int(aid)
+
+    out: Dict[int, int] = {}
+
+    # Owner: try MyPlexAccount username first, then fall back to the
+    # SystemAccount with the lowest id (Plex's owner is conventionally id=1).
+    try:
+        owner_name = admin_server.myPlexAccount().username
+    except Exception:
+        owner_name = None
+    owner_id = by_name.get(str(owner_name)) if owner_name else None
+    if owner_id is None and sys_accts:
+        owner_id = min((int(getattr(a, "id", 0)) for a in sys_accts if getattr(a, "id", None) is not None), default=None)
+    if owner_id is not None:
+        out[id(admin_server)] = owner_id
+
+    for (title, _, user_server) in home_users:
+        uid = by_name.get(str(title))
+        if uid is not None:
+            out[id(user_server)] = uid
+        else:
+            logger.debug(f"No SystemAccount match for home user '{title}' — will export all visible playlists")
+
+    return out
+
+
+def _playlist_owner_id(pl) -> Optional[int]:
+    """
+    Best-effort extraction of the local server user-id that owns ``pl``.
+
+    Plex's ``<Playlist userID="…">`` attribute maps to ``SystemAccount.id``
+    on the server (not the global Plex.tv account id). python-plexapi
+    has used both ``userID`` and ``ownerID`` over the years; we try the
+    historical name first and fall back. Returns ``None`` if neither is
+    present (e.g. on auto-generated server playlists) so callers can
+    treat that as "unknown — don't filter".
+    """
+    raw = getattr(pl, "userID", None)
+    if raw is None:
+        raw = getattr(pl, "ownerID", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_playlist_cache(
+    server: PlexServer,
+    logger: logging.Logger,
+    owner_id: Optional[int] = None,
+) -> List[Tuple[Any, List]]:
+    """
+    Fetch every playlist owned by ``owner_id`` on this server, once.
 
     Returns a list of ``(playlist_obj, items)`` tuples. Playlists whose
     ``pl.items()`` call errors (e.g. Plex 500s on auto-generated
@@ -112,10 +195,19 @@ def build_playlist_cache(server: PlexServer, logger: logging.Logger) -> List[Tup
     item list and a single summary INFO line — not per-playlist DEBUG
     spam.
 
-    Each backup run reuses this cache across libraries (and across home
-    users, one cache per user-token connection) so the N×M×P×items
-    blow-up in :func:`export_playlists` collapses to a single fetch per
-    server connection. See P1-1 in the code review.
+    Ownership filter (v0.9.5): when ``owner_id`` is supplied, playlists
+    whose owner does not match are skipped without fetching
+    ``pl.items()`` — Plex's server-wide ``/playlists`` response under a
+    user's token can include playlists *shared to* that user, and
+    walking them once per recipient was the dominant cost in mixed-
+    content exports. Now each playlist is fetched exactly once, by its
+    actual owner. Auto-generated playlists with no userID attribute
+    are still walked (we can't tell who owns them; better to over-fetch
+    than to silently drop them).
+
+    Each backup run reuses this cache across libraries so the
+    O(libraries × playlists × items) blow-up in :func:`export_playlists`
+    collapses to one fetch per (server, owner) pair.
 
     The per-playlist ``pl.items()`` call is the slow part (one network
     round-trip each) so we surface it on the dashboard's Currently
@@ -125,6 +217,7 @@ def build_playlist_cache(server: PlexServer, logger: logging.Logger) -> List[Tup
     """
     cache: List[Tuple[Any, List]] = []
     skipped_500 = 0
+    skipped_not_owned = 0
     try:
         all_playlists = server.playlists()
     except Exception as e:
@@ -138,6 +231,14 @@ def build_playlist_cache(server: PlexServer, logger: logging.Logger) -> List[Tup
             f"Warming playlist cache for '{server_label}' ({len(all_playlists)} playlists)…",
         )
     for pl in all_playlists:
+        if owner_id is not None:
+            pl_owner = _playlist_owner_id(pl)
+            # pl_owner is None for auto-generated playlists (no userID
+            # attribute). We let those through rather than guess.
+            if pl_owner is not None and pl_owner != owner_id:
+                skipped_not_owned += 1
+                continue
+
         pl_title = getattr(pl, "title", "?")
         try:
             with _current_item(server_label, "playlist", pl_title, phase="fetching"):
@@ -154,7 +255,40 @@ def build_playlist_cache(server: PlexServer, logger: logging.Logger) -> List[Tup
             f"Playlist enumeration: {skipped_500} playlist(s) returned errors on .items() "
             f"and were treated as empty. See DEBUG runtime log for per-playlist details."
         )
+    if skipped_not_owned:
+        logger.info(
+            f"[{server_label}] Skipped {skipped_not_owned} playlist(s) shared to this "
+            f"user — they will be exported once under their actual owner."
+        )
     return cache
+
+
+def _primary_section_for_playlist(items) -> Optional[str]:
+    """
+    Return the ``librarySectionID`` (as string) that holds the majority
+    of items in this playlist, or ``None`` if no item carries one.
+
+    Used by :func:`export_playlists` to assign each playlist to a single
+    "primary" library backup instead of duplicating it into every
+    library that has at least one item — see the v0.9.5 changelog note
+    on the mixed-content playlist fan-out.
+
+    Tie-breaking: ``max()`` picks the first-encountered max which gives
+    a stable but arbitrary winner. Stability matters only across runs
+    of the same dataset (so the same library always "owns" the
+    playlist), which is satisfied because the iteration order of
+    ``pl.items()`` is deterministic per Plex response.
+    """
+    counts: Dict[str, int] = {}
+    for i in items:
+        sec_id = getattr(i, "librarySectionID", None)
+        if sec_id is None:
+            continue
+        key = str(sec_id)
+        counts[key] = counts.get(key, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda k: counts[k])
 
 
 def export_playlists(
@@ -165,11 +299,17 @@ def export_playlists(
     playlist_cache: Optional[List[Tuple[Any, List]]] = None,
 ) -> List[Dict]:
     """
-    Fetches playlists that contain at least one item from the given library.
+    Fetches playlists whose *primary* library is this one.
 
-    Plex playlists are server-wide (not per-library), but we want to export
-    each library's playlists with that library's backup file. We filter by
-    checking whether any playlist item belongs to this library section.
+    Plex playlists are server-wide (not per-library) and can span
+    multiple libraries (e.g. a mixed movies+TV playlist). Pre-v0.9.5
+    we serialised the whole playlist into *every* library that had at
+    least one matching item — meaning an 800-item mixed playlist
+    landed in both the Movies and the TV backup files (1600 items
+    on disk, 1600 resolves on import). Each playlist is now serialised
+    into exactly one library: the section that holds the most items.
+    Cross-section items still restore correctly on import via Tier 1
+    GUID matching (``server.library.getByGuid`` is section-agnostic).
 
     Args:
         server (PlexServer): Active server connection (only used when
@@ -187,25 +327,34 @@ def export_playlists(
     """
     result = []
     label = lib_name or f"section:{section_key}"
+    section_key_s = str(section_key)
     try:
         if playlist_cache is None:
             playlist_cache = build_playlist_cache(server, logger)
 
         for pl, items in playlist_cache:
             try:
-                if any(
-                    str(getattr(i, "librarySectionID", "")) == str(section_key)
-                    for i in items
-                ):
-                    with _current_item(label, "playlist", pl.title, phase="exporting"):
-                        result.append(serialize_playlist(pl, prefetched_items=items))
-                    if state._dashboard:
-                        state._dashboard.inc_playlist()
-                    if state._media_logger:
-                        state._media_logger.debug(_fmt_media_line(
-                            "EXPORT", label, "playlist", pl.title,
-                            items=len(items),
-                        ))
+                primary = _primary_section_for_playlist(items)
+                # Skip playlists with no items carrying a librarySectionID
+                # — those are empty playlists or auto-generated entries
+                # whose pl.items() failed during cache warm-up. An empty
+                # playlist has no meaningful content to migrate and
+                # silently dropping it here avoids the alternative of
+                # duplicating its name into every selected library.
+                if primary is None:
+                    continue
+                if primary != section_key_s:
+                    continue
+
+                with _current_item(label, "playlist", pl.title, phase="exporting"):
+                    result.append(serialize_playlist(pl, prefetched_items=items))
+                if state._dashboard:
+                    state._dashboard.inc_playlist()
+                if state._media_logger:
+                    state._media_logger.debug(_fmt_media_line(
+                        "EXPORT", label, "playlist", pl.title,
+                        items=len(items),
+                    ))
             except Exception as e:
                 logger.debug(f"Skipping playlist '{pl.title}': {e}")
         logger.info(f"[{label}] Playlist export: {len(result)} playlist(s) found")
@@ -494,6 +643,12 @@ def export_library(
         "source_server_name": getattr(server, "friendlyName", "") or "",
         "source_server_url": state._plex_base_url or "",
         "source_server_machine_id": getattr(server, "machineIdentifier", "") or "",
+        # v0.9.5: how this run was triggered — "manual" for a GUI / API
+        # submission, "schedule" for a scheduler fire. ``schedule_name``
+        # is the schedule's display name when trigger == "schedule".
+        # Both empty strings on older / CLI runs that didn't set them.
+        "trigger": state._run_trigger or "",
+        "schedule_name": state._run_schedule_name or "",
         "items": results,
         "users": users_data,
         "stats": {
@@ -561,6 +716,17 @@ def run_export(
     home_users = get_home_users(server, base_url, logger)
     n_user_tasks = len(home_users)
 
+    # ── Map each user-bound server to its local server user-id ────────────
+    # v0.9.5: ``server.playlists()`` returns every playlist a token can
+    # *see* — which includes playlists shared TO the user, not just ones
+    # they own. The pre-existing per-server cache therefore walked the
+    # same big shared playlist once per recipient (admin + every home
+    # user it was shared with), and that fan-out was the dominant cost
+    # for mixed-content exports. We feed ``build_playlist_cache`` each
+    # user's *local* ``SystemAccount.id`` so it can drop shared copies
+    # — every playlist is then walked exactly once, by its actual owner.
+    server_owner_ids: Dict[int, int] = _resolve_server_owner_ids(server, home_users, logger)
+
     # ── Pre-fetch playlists once per server connection ─────────────────────
     # Without this cache, export_playlists fires server.playlists() once
     # per library *and* once per library per home user, each call also
@@ -575,7 +741,7 @@ def run_export(
         unique_servers.append(entry[2])
 
     def _warm(srv: PlexServer) -> Tuple[int, List[Tuple[Any, List]]]:
-        return id(srv), build_playlist_cache(srv, logger)
+        return id(srv), build_playlist_cache(srv, logger, owner_id=server_owner_ids.get(id(srv)))
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=max(1, min(len(unique_servers), 8))

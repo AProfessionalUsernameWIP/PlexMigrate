@@ -267,14 +267,32 @@ def _build_scan_cache(
                 scan_cache["__ready__"] = True
                 scan_cache.pop("__building__", None)
         except Exception:
+            # Critical: still flip __ready__ so any thread spinning on
+            # the wait loop below can exit. Without this, a single
+            # Plex error during the scan would leave every resolver
+            # thread spinning forever (the "30+ minute / continue
+            # run" symptom). We also tag __failed__ so callers can
+            # tell the cache is empty by failure rather than by
+            # design.
             with scan_lock:
+                scan_cache["__ready__"] = True
+                scan_cache["__failed__"] = True
                 scan_cache.pop("__building__", None)
             raise
     else:
-        # Another thread is building. Spin briefly until it publishes
-        # __ready__. Tight sleep cadence so a fast build doesn't add
-        # perceptible latency.
+        # Another thread is building. Wait until it publishes
+        # __ready__. A 5-minute ceiling makes this defensively
+        # bounded: the builder normally finishes in seconds; if
+        # something deadlocks upstream we'd rather degrade gracefully
+        # to a cache-miss + fuzzy fallback than block forever.
+        deadline = time.time() + 300
         while not scan_cache.get("__ready__"):
+            if time.time() > deadline:
+                logger.warning(
+                    f"[scan_cache] Builder for '{section.title}' did not "
+                    f"signal ready within 300s — proceeding without cache."
+                )
+                return
             time.sleep(0.05)
 
 
