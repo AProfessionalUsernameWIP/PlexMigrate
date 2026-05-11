@@ -186,6 +186,18 @@ export interface LogFileContent {
   next_offset: number;
 }
 
+export interface ServerTime {
+  // UNIX timestamp the backend produced this response at.
+  now: number;
+  // IANA zone name (e.g. "America/Los_Angeles") if $TZ is set on the
+  // backend; falls back to the OS abbreviation ("PDT") otherwise.
+  tz: string;
+  // Short abbreviation always populated when the OS knows it.
+  tz_abbrev: string;
+  // ISO-8601 wallclock in the backend's local zone.
+  iso: string;
+}
+
 export interface ExportFile {
   name: string;
   size: number;
@@ -196,6 +208,12 @@ export interface ExportFile {
   // backup. ``null`` for backups exported before this field was added.
   source_server?: string | null;
   source_server_url?: string | null;
+  // v0.9.5: how the run was initiated. "manual" for a GUI submission,
+  // "schedule" for a scheduler fire (``schedule_name`` carries the
+  // schedule's display name). ``null`` on backups exported before
+  // these fields existed.
+  trigger?: string | null;
+  schedule_name?: string | null;
 }
 
 // ── REST helpers ─────────────────────────────────────────────────────────────
@@ -289,9 +307,15 @@ export const api = {
       (since > 0 ? `?since=${since}` : ''),
     ),
 
+  // Server time / timezone — used by SchedulesPanel to label hour/
+  // minute fields with the zone they're interpreted in.
+  getServerTime: () => http<ServerTime>('/api/server-time'),
+
   // Exports
   listExports: () => http<ExportFile[]>('/api/exports'),
   exportDownloadUrl: (name: string) => `/api/exports/${encodeURIComponent(name)}`,
+  deleteExport: (name: string) =>
+    http<{ deleted: string }>(`/api/exports/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 };
 
 // ── WebSocket wrapper ────────────────────────────────────────────────────────

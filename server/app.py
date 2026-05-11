@@ -169,6 +169,29 @@ def _register_routes(app: FastAPI) -> None:
         """
         return {"ok": True, "api_version": SERVER_API_VERSION}
 
+    @app.get("/api/server-time")
+    def server_time() -> Dict[str, Any]:
+        """
+        Report the backend's wallclock + timezone so the UI can label
+        the schedule editor with the zone the hour/minute fields are
+        interpreted in. Without this the user has no signal that a
+        misconfigured container TZ (defaults to UTC) is offsetting
+        their schedules.
+        """
+        import datetime as _dt
+        import time as _time
+        now_local = _dt.datetime.now().astimezone()
+        # IANA name from $TZ when set (Docker path); fall back to the
+        # abbreviation if the host has no TZ env (rare for containers).
+        iana = os.environ.get("TZ") or ""
+        abbrev = _time.tzname[_time.localtime().tm_isdst] if _time.tzname else ""
+        return {
+            "now": _time.time(),
+            "tz": iana or abbrev,
+            "tz_abbrev": abbrev,
+            "iso": now_local.isoformat(timespec="seconds"),
+        }
+
     # ── Settings ─────────────────────────────────────────────────────
 
     @app.get("/api/settings")
@@ -381,7 +404,12 @@ def _register_routes(app: FastAPI) -> None:
         Enqueue an export job. Returns the JobRecord immediately;
         progress is reported live via the WebSocket.
         """
-        rec = get_queue().submit_export(body.model_dump(exclude_none=True))
+        params = body.model_dump(exclude_none=True)
+        # Tag the run as user-initiated so the export JSON (and the
+        # Exports tab in the GUI) can distinguish it from scheduler
+        # fires.
+        params["_trigger"] = "manual"
+        rec = get_queue().submit_export(params)
         return {"job_id": rec.job_id, "state": rec.state, "mode": rec.mode}
 
     @app.post("/api/job/import")
@@ -497,6 +525,22 @@ def _register_routes(app: FastAPI) -> None:
             media_type="application/json",
             filename=path.name,
         )
+
+    @app.delete("/api/exports/{file_name}")
+    def delete_export_file(file_name: str) -> Dict[str, str]:
+        """
+        Remove one ``.plexbackup.json`` from the configured output
+        directory. Returns ``{"deleted": "<name>"}`` on success; 404
+        if the file doesn't exist; 400 if the name fails containment
+        or the suffix check.
+        """
+        try:
+            export_browser.delete_export(file_name)
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"deleted": file_name}
 
     # ── WebSocket ────────────────────────────────────────────────────
 

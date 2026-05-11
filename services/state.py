@@ -73,6 +73,15 @@ _plex_token: Optional[str] = None         # auth token; set in main() for [S] UR
 _plex_owner_name: str = "Plex Owner"      # actual myPlexUsername; set after connect
 _live_instance: Optional[Any] = None      # active Live context; set in run_export/run_import
 
+# ── Run-trigger labels (v0.9.5) ──────────────────────────────────────────────
+# Filled by server/jobs.py at job start so services/exporter.py can stamp
+# the resulting .plexbackup.json with how the run was initiated. "manual"
+# for an API call from the GUI, "schedule" for the background scheduler,
+# "cli" / "" for direct invocations. Schedule fires also fill
+# _run_schedule_name with the schedule's display name.
+_run_trigger: str = ""
+_run_schedule_name: str = ""
+
 # ── Small-Terminal Fallback Progress State ────────────────────────────────────
 # Used when the terminal is < 80×22 (Rich Progress bars instead of dashboard).
 _live_progress: Optional[Progress] = None
@@ -302,3 +311,8 @@ def reset_run_state() -> None:
         _lib_failures.clear()
         _failure_categories.clear()
     _lib_task_ids.clear()
+    # Clear the run-trigger labels so a manual run after a scheduled
+    # one doesn't inherit the scheduler's "schedule" tag.
+    global _run_trigger, _run_schedule_name
+    _run_trigger = ""
+    _run_schedule_name = ""

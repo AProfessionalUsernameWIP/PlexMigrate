@@ -70,6 +70,12 @@ def list_exports() -> List[Dict[str, Any]]:
             # an em-dash.
             "source_server": meta.get("source_server_name"),
             "source_server_url": meta.get("source_server_url"),
+            # v0.9.5: how this backup was initiated — "manual" or
+            # "schedule" — with the schedule name when applicable.
+            # Both ``null`` on backups produced before this field
+            # existed; the UI renders those as "—".
+            "trigger": meta.get("trigger"),
+            "schedule_name": meta.get("schedule_name"),
         })
     items.sort(key=lambda e: e["mtime"], reverse=True)
     return items
@@ -86,6 +92,28 @@ def export_path(file_name: str) -> Path:
     if not p.is_file():
         raise FileNotFoundError(f"No such export: {file_name}")
     return p
+
+
+def delete_export(file_name: str) -> None:
+    """
+    Delete one export file from the configured output directory.
+
+    Goes through :func:`_resolve_within` so a crafted ``file_name``
+    (``../etc/passwd`` etc.) can't escape the export root. Raises
+    :class:`FileNotFoundError` if the target doesn't exist and
+    :class:`ValueError` on containment failure — the route layer
+    maps those to 404 / 400 respectively. The ``.plexbackup.json``
+    suffix is enforced here too so this endpoint can't be repurposed
+    to wipe arbitrary files that happen to land in the export dir.
+    """
+    if not file_name.endswith(".plexbackup.json"):
+        raise ValueError(f"Refusing to delete non-backup file: {file_name!r}")
+    settings = load_settings()
+    base = Path(settings.get("output_dir") or "./plex_exports")
+    p = _resolve_within(base, file_name)
+    if not p.is_file():
+        raise FileNotFoundError(f"No such export: {file_name}")
+    p.unlink()
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -110,6 +138,8 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
         "exported_at": None,
         "source_server_name": None,
         "source_server_url": None,
+        "trigger": None,
+        "schedule_name": None,
     }
     try:
         with open(path, "rb") as fh:
@@ -125,6 +155,8 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
             out["exported_at"] = data.get("exported_at")
             out["source_server_name"] = data.get("source_server_name")
             out["source_server_url"] = data.get("source_server_url")
+            out["trigger"] = data.get("trigger")
+            out["schedule_name"] = data.get("schedule_name")
             return out
     except json.JSONDecodeError:
         pass
@@ -138,6 +170,8 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
     out["exported_at"] = _extract_top_level_string(text, "exported_at")
     out["source_server_name"] = _extract_top_level_string(text, "source_server_name")
     out["source_server_url"] = _extract_top_level_string(text, "source_server_url")
+    out["trigger"] = _extract_top_level_string(text, "trigger")
+    out["schedule_name"] = _extract_top_level_string(text, "schedule_name")
     return out
 
 

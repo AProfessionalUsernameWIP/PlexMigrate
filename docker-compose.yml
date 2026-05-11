@@ -39,6 +39,11 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       PLEXMIGRATE_DATA_DIR: /app/server_data
+      # Container timezone — used by the schedule engine so the hour/
+      # minute fields in the UI mean wallclock time in your zone, not
+      # UTC. Change this to your IANA zone if you're not on Pacific
+      # (full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
+      TZ: America/Los_Angeles
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health',timeout=2).status==200 else 1)"]
       interval: 30s

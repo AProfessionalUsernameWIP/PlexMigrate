@@ -45,10 +45,8 @@ from services.logging_ops import (
     write_unresolved_log,
 )
 from services.resolver import (
+    _build_scan_cache,
     _category_for_failure,
-    _normalize_path_parts,
-    _safe_file_path,
-    _section_leaf_items,
     resolve_item,
 )
 
@@ -857,22 +855,25 @@ def import_backup_file(
     scan_cache: Dict[str, Any] = {}
     scan_lock = threading.Lock()
 
+    # Delegate the prefetch to _build_scan_cache so the cache ends up
+    # with the correct __ready__ / __building__ markers. The previous
+    # local implementation populated the dict in-place without those
+    # markers, which caused the first resolver thread to re-claim
+    # builder status and run the entire section scan a second time —
+    # and if the warmer itself raised (transient Plex error), every
+    # resolver thread would spin forever on the wait loop. Both
+    # symptoms now fixed: the shared coordinator handles markers,
+    # exceptions still flip __ready__ so waiters can exit gracefully,
+    # and a 5-minute hard ceiling in the wait loop prevents pathological
+    # hangs even if something upstream deadlocks.
     def _warm_scan_cache():
-        with scan_lock:
-            if not scan_cache:
-                logger.debug(f"[scan_cache] Prefetching filepath + suffix index for '{section.title}'")
-                _sfx: Dict[str, List] = {}
-                for _item in _section_leaf_items(section):
-                    _path = _safe_file_path(_item)
-                    if _path:
-                        scan_cache[_path] = _item
-                        _parts = _normalize_path_parts(_path)
-                        for _n in (3, 2):
-                            if len(_parts) >= _n:
-                                _k = "/".join(_parts[-_n:])
-                                _sfx.setdefault(_k, []).append(_item)
-                if scan_cache:
-                    scan_cache["__suffix_index__"] = _sfx
+        try:
+            _build_scan_cache(section, scan_cache, scan_lock, logger)
+        except Exception as e:
+            logger.warning(
+                f"[scan_cache] Warm-up failed for '{section.title}': {e} — "
+                f"resolvers will fall back to fuzzy matching."
+            )
 
     threading.Thread(target=_warm_scan_cache, daemon=True).start()
 

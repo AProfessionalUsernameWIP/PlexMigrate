@@ -11,12 +11,34 @@ import { api, ExportFile } from '../api';
 export function ExportsPanel() {
   const [items, setItems] = useState<ExportFile[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Tracks which row is mid-delete so we can disable its buttons and
+  // show a "Deleting…" label without freezing the whole table.
+  const [deleting, setDeleting] = useState<string | null>(null);
 
   const refresh = async () => {
-    try { setItems(await api.listExports()); }
+    try { setItems(await api.listExports()); setError(null); }
     catch (e) { setError(String(e)); }
   };
   useEffect(() => { refresh(); }, []);
+
+  const removeOne = async (name: string, sizeBytes: number) => {
+    const sizeLabel = formatBytes(sizeBytes);
+    if (!confirm(`Delete ${name} (${sizeLabel})? This cannot be undone.`)) return;
+    setDeleting(name);
+    setError(null);
+    try {
+      await api.deleteExport(name);
+      // Optimistic: drop the row locally so the table reflects the
+      // change immediately, then re-fetch the list to stay in sync
+      // with the directory (catches any concurrent additions).
+      setItems((prev) => prev.filter((f) => f.name !== name));
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setDeleting(null);
+    }
+  };
 
   return (
     <>
@@ -35,6 +57,7 @@ export function ExportsPanel() {
               <tr>
                 <th>Source Server</th>
                 <th>Library</th>
+                <th>Initiated By</th>
                 <th>Filename</th>
                 <th>Exported At</th>
                 <th>Size</th>
@@ -53,14 +76,24 @@ export function ExportsPanel() {
                     {f.source_server || <span style={{ color: 'var(--text-dim)' }}>—</span>}
                   </td>
                   <td>{f.library || <em>unknown</em>}</td>
+                  <td><TriggerBadge trigger={f.trigger} scheduleName={f.schedule_name} /></td>
                   <td className="mono">{f.name}</td>
                   <td className="mono">{f.exported_at || '—'}</td>
                   <td className="num">{formatBytes(f.size)}</td>
                   <td>{new Date(f.mtime * 1000).toLocaleString()}</td>
                   <td>
-                    <a href={api.exportDownloadUrl(f.name)} download>
-                      <button>Download</button>
-                    </a>
+                    <div className="row-buttons">
+                      <a href={api.exportDownloadUrl(f.name)} download>
+                        <button disabled={deleting === f.name}>Download</button>
+                      </a>
+                      <button
+                        className="danger"
+                        disabled={deleting === f.name}
+                        onClick={() => removeOne(f.name, f.size)}
+                      >
+                        {deleting === f.name ? 'Deleting…' : 'Delete'}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -70,6 +103,30 @@ export function ExportsPanel() {
       </div>
     </>
   );
+}
+
+function TriggerBadge({
+  trigger,
+  scheduleName,
+}: {
+  trigger?: string | null;
+  scheduleName?: string | null;
+}) {
+  // Older backups (exported before v0.9.5) don't carry the trigger
+  // field at all. Render an em-dash so the column doesn't look broken.
+  if (!trigger) {
+    return <span style={{ color: 'var(--text-dim)' }}>—</span>;
+  }
+  if (trigger === 'schedule') {
+    const label = scheduleName ? `Scheduled · ${scheduleName}` : 'Scheduled';
+    return <span className="tag phase" title={label}>{label}</span>;
+  }
+  if (trigger === 'manual') {
+    return <span className="tag started">Manual</span>;
+  }
+  // Forward-compat: unknown trigger string still renders so we don't
+  // silently hide the value (helps when adding new triggers later).
+  return <span className="tag">{trigger}</span>;
 }
 
 function formatBytes(n: number): string {

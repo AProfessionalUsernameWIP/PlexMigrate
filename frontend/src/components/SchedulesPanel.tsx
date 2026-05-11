@@ -7,7 +7,7 @@
 // is wired correctly.
 
 import { useEffect, useState } from 'react';
-import { api, LibraryDescriptor, Schedule, ServerView } from '../api';
+import { api, LibraryDescriptor, Schedule, ServerTime, ServerView } from '../api';
 
 export function SchedulesPanel() {
   const [items, setItems] = useState<Schedule[]>([]);
@@ -15,20 +15,32 @@ export function SchedulesPanel() {
   const [libraries, setLibraries] = useState<LibraryDescriptor[]>([]);
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [serverTime, setServerTime] = useState<ServerTime | null>(null);
 
   const refresh = async () => {
     try {
-      const [s, srv] = await Promise.all([
+      const [s, srv, st] = await Promise.all([
         api.listSchedules(),
         api.listServers().catch(() => [] as ServerView[]),
+        api.getServerTime().catch(() => null as ServerTime | null),
       ]);
       setItems(s);
       setServers(srv);
+      setServerTime(st);
     } catch (e) {
       setError(String(e));
     }
   };
   useEffect(() => { refresh(); }, []);
+
+  // Re-fetch the server clock every 30 s so the displayed wallclock
+  // doesn't drift while the panel is open.
+  useEffect(() => {
+    const tick = window.setInterval(() => {
+      api.getServerTime().then(setServerTime).catch(() => { /* keep prior */ });
+    }, 30_000);
+    return () => window.clearInterval(tick);
+  }, []);
 
   // Whenever the editor opens we (re)fetch the source server's library
   // catalogue so the picker shows the right list.
@@ -141,6 +153,7 @@ export function SchedulesPanel() {
           schedule={editing}
           servers={servers}
           libraries={libraries}
+          serverTime={serverTime}
           onChange={setEditing}
           onSave={saveEdit}
           onCancel={cancelEdit}
@@ -156,11 +169,12 @@ function ScheduleEditor(props: {
   schedule: Schedule;
   servers: ServerView[];
   libraries: LibraryDescriptor[];
+  serverTime: ServerTime | null;
   onChange: (s: Schedule) => void;
   onSave: () => void;
   onCancel: () => void;
 }) {
-  const { schedule, servers, libraries, onChange, onSave, onCancel } = props;
+  const { schedule, servers, libraries, serverTime, onChange, onSave, onCancel } = props;
   const set = <K extends keyof Schedule>(k: K, v: Schedule[K]) => onChange({ ...schedule, [k]: v });
 
   const toggleLib = (name: string) => {
@@ -221,6 +235,32 @@ function ScheduleEditor(props: {
         </label>
       </div>
 
+      {serverTime && (
+        <div
+          className="banner"
+          style={{
+            background: 'var(--panel-alt, #1b2233)',
+            border: '1px solid var(--border, #2a3146)',
+            padding: '8px 10px',
+            borderRadius: 6,
+            marginBottom: 10,
+            fontSize: 12,
+            color: 'var(--text-dim)',
+          }}
+        >
+          Schedule times are interpreted in the <strong>backend's</strong> timezone:{' '}
+          <strong style={{ color: 'var(--text)' }}>
+            {formatServerWallclock(serverTime)}
+          </strong>{' '}
+          <span>({serverTime.tz}{serverTime.tz_abbrev && serverTime.tz_abbrev !== serverTime.tz ? ` · ${serverTime.tz_abbrev}` : ''})</span>.
+          {serverTime.tz === 'UTC' && (
+            <span style={{ display: 'block', marginTop: 4, color: 'var(--warn, #d39e3c)' }}>
+              Heads up: the backend is on UTC. Set the <code>TZ</code> env var on the backend container (e.g. <code>America/Los_Angeles</code>) so this matches your local clock.
+            </span>
+          )}
+        </div>
+      )}
+
       <div className="grid-2">
         {schedule.frequency !== 'hourly' && (
           <label className="field">
@@ -269,4 +309,12 @@ function pad2(n: number) { return n < 10 ? `0${n}` : String(n); }
 function formatTs(ts: number) {
   const d = new Date(ts * 1000);
   return d.toLocaleString();
+}
+
+// Extract HH:MM from a backend ISO-with-offset string so we render the
+// server's wallclock, not the browser's. Server sends e.g.
+// "2026-05-11T14:32:11-07:00"; we want "14:32".
+function formatServerWallclock(st: ServerTime): string {
+  const m = st.iso.match(/T(\d{2}):(\d{2})/);
+  return m ? `${m[1]}:${m[2]}` : st.iso;
 }

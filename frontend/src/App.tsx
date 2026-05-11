@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   dashboardSocket,
   SnapshotMessage,
+  ServerTime,
   api,
 } from './api';
 import { DashboardPanel } from './components/DashboardPanel';
@@ -41,6 +42,14 @@ export function App() {
   const [snapshot, setSnapshot] = useState<SnapshotMessage | null>(null);
   const [conn, setConn] = useState<ConnState>('connecting');
   const [tab, setTab] = useState<Tab>('dashboard');
+  // Server-side clock surfaced in the topbar. We fetch the timezone +
+  // an initial wallclock from /api/server-time, then tick locally using
+  // a skew offset (server_now - browser_now). One periodic re-fetch
+  // every 5 min keeps DST transitions and host clock drift in line
+  // without polling once per second.
+  const [serverTime, setServerTime] = useState<ServerTime | null>(null);
+  const [, setClockTick] = useState(0);
+  const clockSkewRef = useRef<number>(0);
   // Keep the last seen "running"/"stopping" snapshot around for a
   // brief grace period after the job finishes so the user can read
   // the final totals before the panel goes blank.
@@ -69,6 +78,26 @@ export function App() {
     }, 1000);
     return () => {
       unsubscribe();
+      window.clearInterval(tick);
+    };
+  }, []);
+
+  // Server-clock lifecycle: one initial fetch + a 5-minute refresh,
+  // plus a 1 Hz local tick so the rendered HH:MM:SS advances smoothly.
+  useEffect(() => {
+    const load = () => {
+      api.getServerTime()
+        .then((st) => {
+          setServerTime(st);
+          clockSkewRef.current = st.now * 1000 - Date.now();
+        })
+        .catch(() => { /* keep prior value; render falls back to '—' */ });
+    };
+    load();
+    const refresh = window.setInterval(load, 5 * 60 * 1000);
+    const tick = window.setInterval(() => setClockTick((x) => x + 1), 1000);
+    return () => {
+      window.clearInterval(refresh);
       window.clearInterval(tick);
     };
   }, []);
@@ -127,13 +156,46 @@ export function App() {
   const dotClass = conn === 'connected' ? 'green' : conn === 'connecting' ? 'amber' : 'red';
   const connLabel = conn === 'connected' ? 'Live' : conn === 'connecting' ? 'Connecting…' : 'Disconnected';
 
+  // Format the topbar clock in the *server's* timezone. We feed the
+  // skew-corrected wallclock into Intl.DateTimeFormat with the IANA
+  // zone the backend reported. If the backend only returned a short
+  // abbreviation (no $TZ set), Intl will reject it — fall back to the
+  // browser's local zone so the topbar still renders.
+  const clockLabel = (() => {
+    if (!serverTime) return null;
+    const d = new Date(Date.now() + clockSkewRef.current);
+    const fmtOpts: Intl.DateTimeFormatOptions = {
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    };
+    try {
+      return new Intl.DateTimeFormat(undefined, { ...fmtOpts, timeZone: serverTime.tz }).format(d);
+    } catch {
+      return new Intl.DateTimeFormat(undefined, fmtOpts).format(d);
+    }
+  })();
+  const clockTzLabel = serverTime?.tz_abbrev || serverTime?.tz || '';
+
   return (
     <div className="app">
       <header className="topbar">
         <div className="brand">PlexMigrate</div>
-        <div className="conn">
-          <span className={`dot ${dotClass}`} />
-          {connLabel}
+        <div className="conn" style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          {clockLabel && (
+            <span
+              className="mono"
+              title={serverTime ? `Server time (${serverTime.tz})` : ''}
+              style={{ color: 'var(--text-dim)', fontSize: 13 }}
+            >
+              {clockLabel}
+              {clockTzLabel && (
+                <span style={{ marginLeft: 6, opacity: 0.75 }}>{clockTzLabel}</span>
+              )}
+            </span>
+          )}
+          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            <span className={`dot ${dotClass}`} />
+            {connLabel}
+          </span>
         </div>
       </header>
 

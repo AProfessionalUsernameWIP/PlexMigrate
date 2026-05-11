@@ -304,6 +304,12 @@ class JobQueue:
         state._plex_base_url = url
         state._plex_token = token
         state._plex_owner_name = owner
+        # Run-trigger labels: stamped into the export JSON so the
+        # Exports tab can show how each backup was initiated. Defaults
+        # to "manual" when the API call carries no explicit marker
+        # (covers any future caller that forgets to set it).
+        state._run_trigger = str(settings.get("_trigger") or "manual")
+        state._run_schedule_name = str(settings.get("_schedule_name") or "")
 
         # Resolve the library *names* sent by the client to the
         # python-plexapi LibrarySection objects ``run_export`` expects.
