@@ -172,7 +172,7 @@ function DashboardLogTail({ job }: { job: JobPayload | null }) {
     return (
       <div className="panel">
         <h2>Live Log</h2>
-        <div className="empty">Log file not yet available — initialising…</div>
+        <div className="empty">Log file not yet available initialising…</div>
       </div>
     );
   }
@@ -198,7 +198,7 @@ function DashboardLogTail({ job }: { job: JobPayload | null }) {
           </select>
         </div>
       </div>
-      <SectionHint>Tail of any log file in the current run directory — pick a file from the dropdown above.</SectionHint>
+      <SectionHint>Tail of any log file in the current run directory, pick a file from the dropdown above.</SectionHint>
       {listError && <div className="banner error" style={{ marginBottom: 6 }}>{listError}</div>}
       {selected && files.some((f) => f.name === selected) ? (
         <LogTailer
@@ -336,7 +336,7 @@ function RunCoverage({ dash }: { dash: DashboardSnapshot }) {
   return (
     <div className="panel">
       <h2>Run Coverage</h2>
-      <SectionHint>How big this run is — the user count and the totals for each category of data being touched.</SectionHint>
+      <SectionHint>How big this run is the user count and the totals for each category of data being touched.</SectionHint>
       <div className="grid-4">
         <Stat label="Users (incl. owner)" value={dash.home_user_count ?? 0} />
         <Stat label="Watched items" value={dash.watch_count ?? 0} />
