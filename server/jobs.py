@@ -32,7 +32,6 @@ import logging
 import queue
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -50,9 +49,13 @@ from server.direct_transfer import run_direct_transfer
 from server.persistence import load_settings
 from server.server_registry import (
     connect_registered_server,
+    decrypt_server_token,
     get_server_by_name,
     safe_server_name,
 )
+
+
+log = logging.getLogger("plexmigrate.server.jobs")
 
 
 # ── Job state model ──────────────────────────────────────────────────────────
@@ -255,9 +258,16 @@ class JobQueue:
             except Exception as exc:
                 rec.state = STATE_FAILED
                 rec.error = f"{type(exc).__name__}: {exc}"
-                # Include traceback in server logs for debugging;
-                # don't surface the raw traceback to the frontend.
-                traceback.print_exc()
+                # v0.9.5: route the traceback through the standard
+                # logging framework so the X-Plex-Token scrubber
+                # (installed on every handler) can redact any
+                # token-bearing URLs before they hit disk or stdout.
+                # The previous ``traceback.print_exc()`` wrote
+                # straight to stderr and bypassed the scrubber.
+                log.error(
+                    "Job worker caught unhandled exception",
+                    exc_info=True,
+                )
             finally:
                 rec.finished_at = time.time()
                 self._record_history(rec)
@@ -460,8 +470,17 @@ class JobQueue:
         combined_slug = f"{src_slug}-to-{dst_slug}"
         _set_run_timestamp(combined_slug)
 
+        # Decrypt source + destination tokens once, at the point of
+        # use. The plaintexts live in local variables ``src_token`` /
+        # ``dst_token`` for the duration of this run; settings["plex_token"]
+        # holds the dest plaintext only because the engine's direct-HTTP
+        # helpers read it from ``state._plex_token`` (documented residual
+        # exposure — see services/state.py).
+        src_token = decrypt_server_token(src_row)
+        dst_token = decrypt_server_token(dst_row)
+
         settings["plex_url"] = dst_row["url"]
-        settings["plex_token"] = dst_row["token"]
+        settings["plex_token"] = dst_token
         settings["source_url"] = src_row["url"]
         settings["resolved_server_slug"] = combined_slug
         rec.params = {
@@ -485,11 +504,11 @@ class JobQueue:
         run_direct_transfer(
             source_server=src_server,
             source_url=src_row["url"],
-            source_token=src_row["token"],
+            source_token=src_token,
             source_owner=src_row.get("owner_name") or "Plex Owner",
             dest_server=dst_server,
             dest_url=dst_row["url"],
-            dest_token=dst_row["token"],
+            dest_token=dst_token,
             dest_owner=dst_row.get("owner_name") or "Plex Owner",
             library_names=list(settings.get("libraries") or []),
             logger=logger,
@@ -600,8 +619,13 @@ def _resolve_source_connection(
         state._dashboard.push_activity(
             "started", "—", f"Connected to '{name}' as {fresh.get('owner_name') or '?'}",
         )
+    # ``fresh["token"]`` is ciphertext (servers.json is encrypted at
+    # rest). Decrypt here so the caller — which assigns the result
+    # to ``state._plex_token`` for use by direct-HTTP helpers
+    # (/:/scrobble, /:/rate, etc.) — gets plaintext.
+    plain_token = decrypt_server_token(fresh)
     return (
-        server, fresh["url"], fresh["token"],
+        server, fresh["url"], plain_token,
         fresh.get("owner_name") or "Plex Owner",
         safe_server_name(fresh["name"]),
     )

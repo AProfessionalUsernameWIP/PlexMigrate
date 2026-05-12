@@ -465,12 +465,24 @@ def _handle_registry_commands(args: argparse.Namespace) -> bool:
         return True
 
     if args.remove_server:
-        if server_registry.remove_server_by_name(args.remove_server):
-            console.print(f"[green]Removed {args.remove_server!r} from the registry.[/green]")
-            console.print("[dim]Export files and log directories on disk were not touched.[/dim]")
-        else:
+        summary = server_registry.remove_server_by_name(args.remove_server)
+        if summary is None:
             console.print(f"[red]No server named {args.remove_server!r} in the registry.[/red]")
             sys.exit(2)
+        # v0.9.5: remove is now a cascading delete — drops the registry
+        # row, schedules referencing the server, and any
+        # ``.plexbackup.json`` / ``run_<slug>_*`` artefacts attributable
+        # to it. Report the counts so the operator sees what happened.
+        console.print(f"[green]Removed {args.remove_server!r} from the registry.[/green]")
+        console.print(
+            f"[dim]Cascade: {summary['schedules']} schedule(s), "
+            f"{summary['exports']} export file(s), "
+            f"{summary['log_dirs']} log directory/ies deleted.[/dim]"
+        )
+        if summary.get("errors"):
+            console.print("[yellow]Some items could not be removed:[/yellow]")
+            for err in summary["errors"]:
+                console.print(f"  [dim]{err}[/dim]")
         return True
 
     if args.rename_server:
