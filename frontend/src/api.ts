@@ -195,6 +195,35 @@ export interface ServerIn {
   token?: string;
 }
 
+// v0.9.5: returned by ``DELETE /api/servers/{id}`` after a cascading
+// remove. Lets the UI render a "Deleted Jade.TV (2 schedules, 47
+// exports, 12 log dirs cleaned up)" toast instead of a blank success.
+// Best-effort: a non-empty ``errors`` array lists per-file failures
+// that did not block the rest of the sweep.
+export interface ServerDeleteSummary {
+  deleted: boolean;
+  id: string;
+  name: string;
+  slug: string;
+  schedules: number;
+  exports: number;
+  exports_failed: number;
+  log_dirs: number;
+  log_dirs_failed: number;
+  errors: string[];
+}
+
+// Returned by ``GET /api/servers/{id}/cascade-preview``. Same fields
+// as the post-delete summary minus the failure counts.
+export interface ServerCascadePreview {
+  id: string;
+  name: string;
+  slug: string;
+  schedules: number;
+  exports: number;
+  log_dirs: number;
+}
+
 export interface Schedule {
   id?: string;
   name: string;
@@ -303,7 +332,9 @@ export const api = {
       body: JSON.stringify(body),
     }),
   deleteServer: (id: string) =>
-    http<{ deleted: string }>(`/api/servers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    http<ServerDeleteSummary>(`/api/servers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  previewServerCascade: (id: string) =>
+    http<ServerCascadePreview>(`/api/servers/${encodeURIComponent(id)}/cascade-preview`),
   testServer: (id: string) =>
     http<ServerView>(`/api/servers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
   pingServer: (id: string) =>

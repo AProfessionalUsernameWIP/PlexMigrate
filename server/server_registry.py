@@ -59,13 +59,26 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from server.persistence import (
     _atomic_write_json,
+    delete_schedules_by_server_name,
     get_data_dir,
     load_settings,
     save_settings,
 )
+from server.secrets import decrypt_str, encrypt_str
 
 
 log = logging.getLogger("plexmigrate.server.registry")
+
+
+class ServerCredentialError(Exception):
+    """
+    Raised when a server's stored token can't be decrypted.
+
+    The message is user-actionable — it names the server and tells
+    the operator exactly what to do — because this exception flows
+    all the way out to HTTP error responses and dashboard activity
+    feed entries.
+    """
 
 
 # ── File location ────────────────────────────────────────────────────────────
@@ -103,6 +116,11 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # ping. ``None`` if no ping has succeeded yet. Used by the Servers
     # tab live indicator and the JobForm server selector chips.
     "last_response_ms": None,
+
+    # v0.9.5: marker indicating ``token`` is a Fernet ciphertext string.
+    # Rows missing this marker (or with it set to False) are treated as
+    # legacy plaintext on the next ``_load_raw`` and migrated in place.
+    "_encrypted": False,
     # v0.9.6 Feature 3: operator-chosen friendly names for users on
     # this server. Keys: raw Plex identifier — owner's email for the
     # owner, managed user's username for managed users. Values: a
@@ -113,8 +131,6 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # — engine logic, logs, and backup files always use the raw
     # identifier.
     "user_display_names": {},
-}
-
 
 # ── Name-safety helper ───────────────────────────────────────────────────────
 
@@ -150,6 +166,12 @@ def _load_raw() -> List[Dict[str, Any]]:
     Read the on-disk registry. Missing or malformed file = empty list.
     Returned list is *not* a deep copy — callers that mutate must
     re-save the result through :func:`_save_raw`.
+
+    Migrates legacy plaintext tokens on first read (v0.9.5): any row
+    without ``_encrypted: True`` is treated as plaintext, its ``token``
+    is encrypted in place, the marker is set, and the file is
+    rewritten atomically. Caller must already hold :data:`_REG_LOCK`
+    so the rewrite is safe to issue here.
     """
     import json
     path = _registry_path()
@@ -172,12 +194,90 @@ def _load_raw() -> List[Dict[str, Any]]:
         merged = dict(_DEFAULT_SERVER)
         merged.update(raw)
         out.append(merged)
+
+    # Migrate any rows still carrying a plaintext token. Done under
+    # the caller's existing _REG_LOCK acquisition so concurrent reads
+    # serialise naturally; the worst-case race writes identical
+    # (semantically equivalent — Fernet uses a fresh IV each time)
+    # ciphertexts back. ``os.replace`` keeps the write atomic.
+    if _migrate_unencrypted_tokens_in_place(out):
+        _save_raw(out)
+
     return out
+
+
+def _migrate_unencrypted_tokens_in_place(rows: List[Dict[str, Any]]) -> bool:
+    """
+    For every row missing ``_encrypted: True``, treat the ``token``
+    field as plaintext and replace it with a Fernet ciphertext. Sets
+    the marker. Returns True if at least one row was migrated so the
+    caller knows to persist the rewrite.
+
+    Empty tokens are migrated too (marker flipped to True, ciphertext
+    stays empty) so the file converges on a uniform shape and we don't
+    re-attempt migration on every load.
+    """
+    migrated = 0
+    for row in rows:
+        if row.get("_encrypted") is True:
+            continue
+        plain = row.get("token") or ""
+        row["token"] = encrypt_str(plain) if plain else ""
+        row["_encrypted"] = True
+        migrated += 1
+    if migrated:
+        log.info(
+            "servers.json: migrated %d plaintext token(s) to encrypted storage.",
+            migrated,
+        )
+    return migrated > 0
 
 
 def _save_raw(rows: List[Dict[str, Any]]) -> None:
     """Atomically replace ``servers.json``."""
     _atomic_write_json(_registry_path(), rows)
+
+
+def decrypt_server_token(row: Dict[str, Any]) -> str:
+    """
+    Return the plaintext token for a registry row.
+
+    The token is kept ciphertext on disk and inside :func:`_load_raw`
+    output; callers that need to hand a plaintext token to plexapi or
+    to a direct HTTP write call use this helper inline at the point
+    of use. The decrypted string lives only in the local variable
+    returned here — it is never stored on the row or cached.
+
+    Raises:
+        ServerCredentialError — when the row's ciphertext can't be
+        decrypted. The message names the server and tells the operator
+        to re-enter credentials in the Servers tab. Callers should
+        let this exception propagate to the request handler / job
+        worker, which will translate it to a clean 400/500 or
+        dashboard error.
+    """
+    # Lazy import so a regression test that monkey-patches Fernet
+    # doesn't have to load this module's import chain.
+    from cryptography.fernet import InvalidToken
+
+    cipher = row.get("token") or ""
+    if not cipher:
+        return ""
+    # Legacy rows (pre-v0.9.5) that somehow reached a decrypt site
+    # without going through _load_raw's migration: treat token as
+    # plaintext. Reach this branch only if a row was hand-edited or
+    # came from a code path that bypasses _load_raw — defensive.
+    if not row.get("_encrypted"):
+        return cipher
+    try:
+        return decrypt_str(cipher)
+    except InvalidToken as exc:
+        name = row.get("name") or row.get("id") or "?"
+        raise ServerCredentialError(
+            f"Server token for {name!r} is unreadable — the encryption "
+            f"key has changed. Please re-enter this server's credentials "
+            f"in the Servers tab."
+        ) from exc
 
 
 # ── Public read API ─────────────────────────────────────────────────────────
@@ -199,6 +299,9 @@ def list_servers(*, include_tokens: bool = False) -> List[Dict[str, Any]]:
         copy = dict(row)
         copy["has_token"] = bool(copy.get("token"))
         copy.pop("token", None)
+        # The ``_encrypted`` marker is an internal storage detail; the
+        # frontend has no need for it.
+        copy.pop("_encrypted", None)
         redacted.append(copy)
     return redacted
 
@@ -216,7 +319,7 @@ def get_server_by_name(name: str, *, include_token: bool = True) -> Optional[Dic
     for row in rows:
         if row.get("name") == name:
             if not include_token:
-                row = {k: v for k, v in row.items() if k != "token"}
+                row = {k: v for k, v in row.items() if k not in ("token", "_encrypted")}
             return row
     return None
 
@@ -234,7 +337,7 @@ def get_server_by_id(server_id: str, *, include_token: bool = True) -> Optional[
     for row in rows:
         if row.get("id") == server_id:
             if not include_token:
-                row = {k: v for k, v in row.items() if k != "token"}
+                row = {k: v for k, v in row.items() if k not in ("token", "_encrypted")}
             return row
     return None
 
@@ -262,7 +365,9 @@ def add_server(name: str, url: str, token: str) -> Dict[str, Any]:
             "id": str(uuid.uuid4()),
             "name": name.strip(),
             "url": url.strip().rstrip("/"),
-            "token": token.strip(),
+            # Encrypt before storing — plaintext never reaches disk.
+            "token": encrypt_str(token.strip()),
+            "_encrypted": True,
             "last_status": "unknown",
             "last_checked_at": 0.0,
         })
@@ -296,37 +401,152 @@ def update_server(server_id: str, *, name: Optional[str] = None, url: Optional[s
         if url is not None and url.strip():
             target["url"] = url.strip().rstrip("/")
         if token is not None and token != "":
-            target["token"] = token
+            # New token from the UI / API — encrypt before storing.
+            # Empty string means "keep the existing (already-encrypted)
+            # value", which we honour by leaving target['token']
+            # untouched.
+            target["token"] = encrypt_str(token)
+            target["_encrypted"] = True
         _save_raw(rows)
         return target
 
 
-def remove_server(server_id: str) -> bool:
+def cascade_preview(server_id: str) -> Optional[Dict[str, Any]]:
     """
-    Delete one server entry. Returns True if a row was actually
-    removed, False if no server had that id.
+    Count what a cascading remove of ``server_id`` would delete,
+    without modifying anything. Returns ``None`` if no server with
+    that id is registered.
 
-    **Never** touches exports or logs the server produced — those
-    live under host bind mounts and are out of this module's scope.
+    Used by the Servers tab to populate the confirmation dialog
+    before the operator clicks Delete — so the prompt can read
+    *"Jade.TV has 2 schedule(s), 47 export file(s), 12 log directory/ies"*
+    instead of the previous blanket warning.
     """
+    # Local imports to keep the dependency direction registry → log/export
+    # one-way; these modules already import from persistence/secrets.
+    from server import export_browser, log_browser
+    from server.persistence import load_schedules
+
+    row = get_server_by_id(server_id, include_token=False)
+    if row is None:
+        return None
+
+    name = row.get("name") or ""
+    slug = safe_server_name(name)
+    schedules = load_schedules()
+    schedule_count = sum(
+        1 for s in schedules if s.get("source_server_name") == name
+    )
+    return {
+        "id": server_id,
+        "name": name,
+        "slug": slug,
+        "schedules": schedule_count,
+        "exports": export_browser.count_exports_by_slug(slug),
+        "log_dirs": log_browser.count_log_dirs_by_slug(slug),
+    }
+
+
+def remove_server(server_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Cascading delete (v0.9.5): drops the registry row and every other
+    artefact attributable to the named server — schedules referencing
+    it, ``.plexbackup.json`` files produced by it, and per-run log
+    directories under its slug.
+
+    Order is deliberate:
+
+      1. Schedules first — atomic write to ``schedules.json``.
+      2. Registry row — atomic write to ``servers.json``.
+      3. Files last (exports + log dirs) — best-effort; a permission
+         error on one file is recorded in the summary but doesn't
+         block the rest of the sweep.
+
+    Rationale: if the backend crashes between (2) and (3) the data
+    stores are still consistent — the row is gone, and orphan files
+    on disk can be cleaned up later. Doing it in reverse would risk
+    a live registry row pointing at deleted exports.
+
+    Returns ``None`` if no server with ``server_id`` is registered,
+    otherwise a summary dict ``{deleted: bool, schedules, exports,
+    exports_failed, log_dirs, log_dirs_failed, errors}``. The bool
+    ``deleted`` is True when the registry row itself was removed.
+    """
+    from server import export_browser, log_browser
+
+    # We need the server's NAME (for schedule match) and SLUG (for
+    # file match) before deleting the row. Pull them under the lock
+    # together with the row-removal so a concurrent rename can't
+    # land between the lookup and the delete.
     with _REG_LOCK:
         rows = _load_raw()
+        target: Optional[Dict[str, Any]] = None
+        for row in rows:
+            if row.get("id") == server_id:
+                target = row
+                break
+        if target is None:
+            return None
+        name = target.get("name") or ""
+        slug = safe_server_name(name)
+
+        # (1) Schedules — separate lock inside delete_schedules_by_server_name
+        #     so this is safe to call while holding _REG_LOCK.
+        schedules_removed = delete_schedules_by_server_name(name)
+
+        # (2) Registry row.
         kept = [r for r in rows if r.get("id") != server_id]
-        if len(kept) == len(rows):
-            return False
         _save_raw(kept)
-        return True
+
+    # (3) Filesystem sweep — outside the registry lock to avoid holding
+    #     it across slow disk I/O. By this point the registry and
+    #     schedules are already consistent, so a concurrent reader
+    #     sees the server as gone even while the file deletion runs.
+    exports_deleted, export_errors = export_browser.delete_exports_by_slug(slug)
+    logs_deleted, log_errors = log_browser.delete_log_dirs_by_slug(slug)
+
+    errors = export_errors + log_errors
+    return {
+        "deleted": True,
+        "id": server_id,
+        "name": name,
+        "slug": slug,
+        "schedules": schedules_removed,
+        "exports": exports_deleted,
+        "exports_failed": len(export_errors),
+        "log_dirs": logs_deleted,
+        "log_dirs_failed": len(log_errors),
+        "errors": errors,
+    }
 
 
-def remove_server_by_name(name: str) -> bool:
-    """Convenience wrapper for the CLI ``--remove-server NAME`` path."""
+def remove_server_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """
+    CLI convenience wrapper around :func:`remove_server` that takes a
+    friendly name instead of a UUID. Returns the same cascade summary.
+    """
+    row = get_server_by_name(name, include_token=False)
+    if row is None:
+        return None
+    return remove_server(row["id"])
+
+
+# ── Startup helpers (v0.9.5) ────────────────────────────────────────────────
+
+def ensure_encrypted_at_rest() -> int:
+    """
+    Force any plaintext rows in ``servers.json`` to be encrypted now,
+    rather than waiting for the next lazy ``_load_raw`` call from a
+    request handler. Called from the FastAPI startup hook so by the
+    time uvicorn binds the port every row on disk is ciphertext.
+
+    Returns the row count after migration. The migration itself runs
+    as a side effect of ``_load_raw``; this wrapper exists so the
+    intent is explicit at the call site.
+    """
     with _REG_LOCK:
         rows = _load_raw()
-        kept = [r for r in rows if r.get("name") != name]
-        if len(kept) == len(rows):
-            return False
-        _save_raw(kept)
-        return True
+    return len(rows)
 
 
 # ── Users (v0.9.6 Feature 3) ────────────────────────────────────────────────
@@ -512,7 +732,17 @@ def connect_registered_server(name_or_id: str, logger: logging.Logger
     if row is None:
         raise ValueError(f"No registered server named or ided {name_or_id!r}")
 
-    server = connect_to_server(row["url"], row["token"], logger)
+    # Decrypt the token only at the moment we hand it to plexapi.
+    # The plaintext lives in a local variable for the duration of
+    # this call; nothing on ``row`` is mutated.
+    try:
+        plain_token = decrypt_server_token(row)
+    except ServerCredentialError as exc:
+        _record_status(row["id"], status="auth_error",
+                       detail=str(exc), checked_at=time.time())
+        raise ConnectionError(str(exc)) from exc
+
+    server = connect_to_server(row["url"], plain_token, logger)
     now = time.time()
     if server is None:
         _record_status(row["id"], status="unreachable",
@@ -549,7 +779,13 @@ def test_connection(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
         raise ValueError(f"No server with id {server_id!r}")
     now = time.time()
     try:
-        server = connect_to_server(row["url"], row["token"], logger)
+        plain_token = decrypt_server_token(row)
+    except ServerCredentialError as exc:
+        _record_status(server_id, status="auth_error",
+                       detail=str(exc), checked_at=now)
+        return get_server_by_id(server_id, include_token=False) or row
+    try:
+        server = connect_to_server(row["url"], plain_token, logger)
     except Exception as exc:
         _record_status(server_id, status="unreachable",
                        detail=f"{type(exc).__name__}: {exc}", checked_at=now)
@@ -618,13 +854,19 @@ def ping_server(server_id: str, *, timeout: float = 3.0) -> Dict[str, Any]:
                 "detail": f"No server with id {server_id!r}"}
 
     url = (row.get("url") or "").rstrip("/")
-    token = row.get("token") or ""
-    if not url or not token:
+    if not url or not (row.get("token") or ""):
         _record_status(server_id, status="unreachable",
                        detail="URL or token missing on registry row",
                        checked_at=time.time(), response_ms=0.0)
         return {"ok": False, "response_ms": 0.0, "status": "unreachable",
                 "detail": "URL or token missing"}
+    try:
+        token = decrypt_server_token(row)
+    except ServerCredentialError as exc:
+        _record_status(server_id, status="auth_error",
+                       detail=str(exc), checked_at=time.time(), response_ms=0.0)
+        return {"ok": False, "response_ms": 0.0, "status": "auth_error",
+                "detail": str(exc)}
 
     started = time.perf_counter()
     detail = ""
@@ -734,9 +976,18 @@ def migrate_legacy_settings(logger: logging.Logger) -> Optional[Dict[str, Any]]:
 
     # If the registry already has the legacy URL/token under any name,
     # treat this as already-migrated and just clear the legacy fields.
+    # Tokens in the registry are encrypted; decrypt for the compare.
+    # A row whose token is unreadable can't match plaintext anyway, so
+    # we just skip it.
     existing = list_servers(include_tokens=True)
     for row in existing:
-        if row.get("url") == legacy_url.rstrip("/") and row.get("token") == legacy_tok:
+        if row.get("url") != legacy_url.rstrip("/"):
+            continue
+        try:
+            row_plain = decrypt_server_token(row)
+        except ServerCredentialError:
+            continue
+        if row_plain == legacy_tok:
             _clear_legacy_fields(settings)
             return None
 

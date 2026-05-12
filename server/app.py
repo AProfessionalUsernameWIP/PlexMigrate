@@ -121,12 +121,35 @@ def _register_lifecycle(app: FastAPI) -> None:
 
     @app.on_event("startup")
     async def _startup() -> None:
+        # v0.9.5: install the X-Plex-Token scrubber on every existing
+        # log handler BEFORE any token-touching code runs. Catches
+        # uvicorn's access/error loggers (which can record request
+        # URLs containing the token as a query param) plus anything
+        # the legacy-migration path logs below.
+        try:
+            from server.log_scrubber import install_on_all_handlers
+            install_on_all_handlers()
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("Log scrubber install failed; continuing.")
+
         # v0.9.0: migrate any legacy plex_url/plex_token in settings.json
         # into the registry as a server called "Default". Idempotent.
         try:
             server_registry.migrate_legacy_settings(log)
         except Exception:  # pragma: no cover (defensive)
             log.exception("Legacy settings migration failed; continuing.")
+
+        # v0.9.5: force-migrate any plaintext rows in servers.json so
+        # the file on disk is fully encrypted before uvicorn binds the
+        # port. Without this the encryption pass would only run when
+        # the first /api/servers request landed — leaving a brief
+        # window where someone inspecting the volume could see
+        # plaintext.
+        try:
+            count = server_registry.ensure_encrypted_at_rest()
+            log.info("Registry at-rest encryption verified for %d row(s).", count)
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("Registry encryption ensure step failed; continuing.")
 
         get_scheduler().start()
         await get_manager().start()
@@ -210,6 +233,16 @@ def _register_routes(app: FastAPI) -> None:
         Returns the redacted updated document.
         """
         patch = {k: v for k, v in body.model_dump().items() if v is not None}
+        # v0.9.5: refuse Windows host paths early so the operator gets
+        # an actionable error in the Settings tab instead of a silent
+        # write into the container's ephemeral filesystem.
+        try:
+            if "output_dir" in patch:
+                persistence.validate_container_path(patch["output_dir"], "Output directory")
+            if "log_dir" in patch:
+                persistence.validate_container_path(patch["log_dir"], "Log directory")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         merged = persistence.save_settings(patch)
         return persistence.redact_settings(merged)
 
@@ -269,16 +302,36 @@ def _register_routes(app: FastAPI) -> None:
         server_registry.test_connection(server_id, log)
         return server_registry.get_server_by_id(server_id, include_token=False) or row
 
+    @app.get("/api/servers/{server_id}/cascade-preview")
+    def preview_server_cascade(server_id: str) -> Dict[str, Any]:
+        """
+        Count what a cascading delete of this server would remove
+        without actually deleting anything. Used by the Servers tab
+        to populate the confirmation dialog with concrete numbers.
+        """
+        preview = server_registry.cascade_preview(server_id)
+        if preview is None:
+            raise HTTPException(status_code=404, detail=f"No server with id {server_id!r}")
+        return preview
+
     @app.delete("/api/servers/{server_id}")
     def delete_one_server(server_id: str) -> Dict[str, Any]:
         """
-        Remove a registered server. Export files and log directories
-        on disk are **never** touched — this is a registry-only delete.
+        Remove a registered server *and cascade-delete* everything
+        attributable to it (v0.9.5):
+
+          * Schedules whose ``source_server_name`` matches.
+          * ``plex_exports/*_<slug>_<ts>.plexbackup.json`` files.
+          * ``plex_logs/run_<slug>_*`` directories.
+
+        Returns a summary dict with per-category counts and a list of
+        per-file errors that the cascade encountered. Best-effort —
+        a failure on one file does not stop the rest of the sweep.
         """
-        ok = server_registry.remove_server(server_id)
-        if not ok:
+        summary = server_registry.remove_server(server_id)
+        if summary is None:
             raise HTTPException(status_code=404, detail=f"No server with id {server_id!r}")
-        return {"deleted": server_id}
+        return summary
 
     @app.post("/api/servers/{server_id}/test")
     def test_one_server(server_id: str) -> Dict[str, Any]:
@@ -445,6 +498,14 @@ def _register_routes(app: FastAPI) -> None:
         progress is reported live via the WebSocket.
         """
         params = body.model_dump(exclude_none=True)
+        # v0.9.5: reject Windows host paths early so a misconfigured
+        # ad-hoc export per-run output_dir doesn't silently land
+        # inside the container's ephemeral filesystem.
+        try:
+            if "output_dir" in params:
+                persistence.validate_container_path(params["output_dir"], "Output directory")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         # Tag the run as user-initiated so the export JSON (and the
         # Exports tab in the GUI) can distinguish it from scheduler
         # fires.
@@ -495,6 +556,14 @@ def _register_routes(app: FastAPI) -> None:
         """
         doc = body.model_dump()
         doc.pop("id", None)
+        # v0.9.5: per-schedule output_dir overrides settings; reject a
+        # Windows host path here too so a misconfigured schedule
+        # doesn't fire silently into the container's ephemeral fs.
+        try:
+            if doc.get("output_dir"):
+                persistence.validate_container_path(doc["output_dir"], "Schedule output directory")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         ensure_next_run_at(doc)
         return persistence.upsert_schedule(doc)
 
@@ -506,6 +575,11 @@ def _register_routes(app: FastAPI) -> None:
         """
         doc = body.model_dump()
         doc["id"] = schedule_id
+        try:
+            if doc.get("output_dir"):
+                persistence.validate_container_path(doc["output_dir"], "Schedule output directory")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         ensure_next_run_at(doc)
         return persistence.upsert_schedule(doc)
 

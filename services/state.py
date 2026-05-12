@@ -69,7 +69,19 @@ _console_handler: Optional[logging.Handler] = None
 _media_logger: Optional[logging.Logger] = None
 _run_log_dir: Optional[Path] = None       # per-run subdirectory; set by setup_logging()
 _plex_base_url: Optional[str] = None      # server URL; set in main() for [S] key
-_plex_token: Optional[str] = None         # auth token; set in main() for [S] URL
+# Plaintext Plex auth token for the duration of one job.
+#
+# v0.9.5 — encryption at rest (server/secrets.py) covers the token on
+# disk (servers.json and the legacy settings.json). It does NOT cover
+# this module-level alias: python-plexapi's PlexServer instance
+# necessarily holds the decrypted token in memory to sign every HTTP
+# request, and several direct-HTTP helpers (/:/scrobble, /:/rate,
+# /:/progress) read this variable rather than the PlexServer object.
+# Cleared at the end of every run by reset_run_state(). Accepted
+# residual exposure: encryption at rest protects against host-disk /
+# volume / backup theft; it does not protect against a compromised
+# running process that can read another process's memory.
+_plex_token: Optional[str] = None
 _plex_owner_name: str = "Plex Owner"      # actual myPlexUsername; set after connect
 # v0.9.6: owner's Plex.tv email — the canonical "identifier" the
 # dashboard uses for the run-owner phases of current_user. Distinct

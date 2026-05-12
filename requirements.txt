@@ -4,6 +4,11 @@
 plexapi>=4.15
 rich>=13.0
 requests>=2.31
+# v0.9.5: Fernet symmetric encryption for stored Plex tokens
+# (server_data/servers.json, legacy settings.json). Used by
+# server/secrets.py — required for both the CLI (--add-server)
+# and the FastAPI server.
+cryptography>=41.0
 
 # Server deps (only required when running the FastAPI server / Docker mode).
 # Pinned to broad-but-compatible ranges so the CLI install path still works

@@ -35,6 +35,28 @@ services:
       - ./plex_exports:/app/plex_exports
       - ./plex_logs:/app/plex_logs
       - ./server_data:/app/server_data
+      # ── Optional: external / NAS backup destination ─────────────
+      # The backend is a Linux container — it CANNOT see Windows host
+      # paths like Y:\plexbackups directly. To send exports to an
+      # external drive or a NAS mapped to a Windows drive letter:
+      #
+      #   1. Uncomment one of the example lines below and edit the
+      #      host side (left of the colon). Use FORWARD SLASHES even
+      #      on Windows; Docker translates them.
+      #   2. Run `docker compose up -d` to recreate the container.
+      #   3. In the GUI, set Settings → Output directory to the
+      #      CONTAINER-side path (right of the colon, e.g.
+      #      `/app/nas_exports`).
+      #
+      # The Settings tab rejects Windows-style paths at submit, so
+      # entering `Y:\plexbackups` directly returns an error pointing
+      # back to this file.
+      #
+      # Examples:
+      #   - Y:/plexbackups:/app/nas_exports          # mapped drive
+      #   - //nas-host/share/plexbackups:/app/nas_exports  # UNC
+      #   - /mnt/nas/plexbackups:/app/nas_exports    # WSL2-mounted
+      # - <host-path>:/app/nas_exports
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:

@@ -143,6 +143,20 @@ def setup_logging(log_dir: str, verbose: bool) -> logging.Logger:
 
         sys.excepthook = _excepthook
 
+    # v0.9.5: install the X-Plex-Token scrubber on every handler that
+    # currently exists, including the ones we just attached above and
+    # any uvicorn / root handlers from server mode. Re-running on
+    # every setup_logging call is fine — install_on_handler is
+    # idempotent (it checks for an existing filter first).
+    try:
+        from server.log_scrubber import install_on_all_handlers
+        install_on_all_handlers()
+    except Exception:
+        # The scrubber is defence-in-depth; a missing module here
+        # (CLI-only checkout, partial install) should not stop the
+        # logger from being usable.
+        pass
+
     return logger
 
 
