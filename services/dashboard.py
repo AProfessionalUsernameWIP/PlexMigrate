@@ -7,6 +7,7 @@ used by both the export and import pipelines.
 """
 
 import contextlib
+import contextvars
 import logging
 import os
 import subprocess
@@ -17,7 +18,7 @@ import webbrowser
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from rich.live import Live
 from rich.panel import Panel
@@ -55,6 +56,76 @@ class LibraryProgress:
     status: str = "queued"   # queued | active | done | error
     phase: str = ""
     start_time: float = 0.0
+
+
+@dataclass
+class RateLimitEntry:
+    """
+    One 429 / 503 event recorded in the rate-limit feed (v0.9.6).
+
+    Distinct from :class:`ActivityEntry` so a burst of throttle events
+    doesn't push useful engine events out of the activity feed (the
+    feed caps at 8 entries). The Network panel renders this stream
+    next to the cumulative 2C status block.
+    """
+    timestamp: str
+    library: str
+    status_code: int
+    retry_after_seconds: Optional[float]
+    detail: str = ""
+
+
+# ── HTTP attribution ContextVar (v0.9.6) ─────────────────────────────────────
+# Set by ``submit_with_context`` (and the per-library task entry in
+# importer/exporter) to tag every outbound Plex API call with the
+# library it's working on. Read by the requests response hook in
+# services/auth.py to build per-library status / latency histograms.
+#
+# Why a ContextVar instead of a threading.local: ``concurrent.futures``'s
+# ``ThreadPoolExecutor`` does not propagate threading.local across
+# worker submissions, so per-library attribution would be lost in the
+# inner resolve / scrobble / rate worker pools. ContextVar copies
+# correctly via ``contextvars.copy_context().run(...)``, which
+# ``submit_with_context`` does for us.
+#
+# Empty-string default means "no library context" — the hook
+# attributes those calls to the ``__all__`` cumulative bucket only.
+_http_lib_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "plexmigrate_http_library",
+    default="",
+)
+
+
+def submit_with_context(executor, fn: Callable, *args, **kwargs):
+    """
+    Drop-in replacement for ``executor.submit(fn, *args, **kwargs)``
+    that copies the calling context into the worker thread so any
+    ContextVar set on the submitter (notably :data:`_http_lib_var`)
+    is visible inside ``fn``.
+
+    Cost is a single ``copy_context()`` per submission — microseconds —
+    and it's the cleanest way to make per-library HTTP attribution
+    survive the engine's nested ThreadPoolExecutor pattern.
+    """
+    ctx = contextvars.copy_context()
+    return executor.submit(ctx.run, fn, *args, **kwargs)
+
+
+@contextlib.contextmanager
+def library_http_context(library: str):
+    """
+    Set :data:`_http_lib_var` to ``library`` for the duration of the
+    ``with`` block, then restore the prior value on exit. Used by the
+    library-level task entry points (``import_backup_file``,
+    ``export_library``) to seed the context so every HTTP call inside
+    — including those issued from nested worker pools — gets
+    attributed to the right library.
+    """
+    token = _http_lib_var.set(library)
+    try:
+        yield
+    finally:
+        _http_lib_var.reset(token)
 
 
 @dataclass
@@ -121,6 +192,56 @@ class DashboardState:
         # Keyed by threading.get_ident() so updates from worker threads
         # don't collide. The dashboard renders one row per active worker.
         self.current_items: Dict[int, CurrentItem] = {}
+        # ── Header context (v0.9.6) ──────────────────────────────────
+        # current_user holds the raw identifier (owner email or managed
+        # username) of whichever user the engine is processing right
+        # now. None when the run has no per-user phase scope (e.g.
+        # CLI-only library exports without home users) or no run is
+        # active. The frontend resolves this through
+        # user_display_names before rendering. The backend always
+        # writes the raw identifier — log files, success records, and
+        # all engine logic consult the raw value.
+        self.current_user: Optional[str] = None
+        # ── Display-name map (v0.9.6) ────────────────────────────────
+        # Copied at job start from the active server's registry row
+        # so the frontend can substitute friendly display names for
+        # raw identifiers without a separate REST call per WS tick.
+        # Keys: owner email or managed username. Values: operator-
+        # chosen display string. Empty dict on runs with no map set.
+        self.user_display_names: Dict[str, str] = {}
+        # ── HTTP telemetry (v0.9.6, Feature 2) ───────────────────────
+        # Populated by the requests response hook installed on every
+        # session. All updates go through _record_http_response under
+        # _lock to keep snapshot() consistent.
+        #
+        # _http_status_counts outer key is the library name OR the
+        # "__all__" sentinel for cumulative totals; inner key is the
+        # integer HTTP status code. The double-key shape lets the
+        # frontend toggle between "this library only" and "whole run"
+        # with one structure.
+        self._http_status_counts: Dict[str, Dict[int, int]] = {}
+        # Rolling window of recent responses. Each tuple is
+        # (timestamp_seconds, elapsed_ms, library, status_code).
+        # v0.9.7 Item 1: time-based eviction. The deque holds exactly
+        # the last 60 seconds of entries (popped from the left by
+        # record_http_response as new entries arrive past the
+        # window). A hard ceiling of 100 000 entries is the safety
+        # net against pathological traffic rates that would otherwise
+        # let the deque grow unbounded; at sustained 1000 req/s that
+        # ceiling kicks in at minute one and keeps memory bounded.
+        # The previous fixed maxlen=500 caused the original "graph
+        # only shows data on the right edge" bug at high rates
+        # because old entries got evicted before reaching the left
+        # side of the 60-second window.
+        self._http_recent: Deque[Tuple[float, float, str, int]] = deque(maxlen=100_000)
+        # 2C: rate-limit counters and a separate event feed.
+        # _rate_limit_events maxes at 50; the Network panel renders
+        # the most recent N. Kept apart from `activity` (8 entries)
+        # so a 429 burst doesn't push engine events out of view.
+        self._http_rate_limit_count: int = 0
+        self._http_retry_count: int = 0
+        self._http_backoff_active: bool = False
+        self._rate_limit_events: Deque[RateLimitEntry] = deque(maxlen=50)
         self._pause_event = threading.Event()
         self._pause_event.set()
         self.paused = False
@@ -151,6 +272,36 @@ class DashboardState:
             if name in self.libraries:
                 lib = self.libraries[name]
                 lib.completed = min(lib.completed + n, lib.total)
+
+    def set_library_total(
+        self, name: str, total: int, completed: Optional[int] = None,
+    ) -> None:
+        """
+        Reset a library's progress accounting mid-run (v0.9.7 Item 6).
+
+        Direct-transfer needs to widen the per-library bar from the
+        placeholder ``total=8`` (4 export phases + 4 import phases) to
+        the real item count once the source-side gather has produced
+        the payload. Without this, every per-item ``_advance_lib``
+        call inside ``import_backup_file`` saturates the bar after
+        the first handful of items and the top-level ETA stops
+        counting down (it climbs alongside elapsed time instead,
+        which is the bug Item 6 fixes).
+
+        ``completed`` is optional; when supplied it's clamped to the
+        new total so a smaller-than-current new total doesn't leave
+        completed > total. ``None`` leaves completed where it is
+        (still clamped to the new total).
+        """
+        with self._lock:
+            if name not in self.libraries:
+                return
+            lib = self.libraries[name]
+            lib.total = max(1, int(total))
+            if completed is not None:
+                lib.completed = min(max(0, int(completed)), lib.total)
+            else:
+                lib.completed = min(lib.completed, lib.total)
 
     def finish_library(self, name: str, error: bool = False) -> None:
         with self._lock:
@@ -249,6 +400,102 @@ class DashboardState:
         with self._lock:
             self.current_items.pop(threading.get_ident(), None)
 
+    # ── Header context (v0.9.6) ──────────────────────────────────────
+
+    def set_current_user(self, user: Optional[str]) -> None:
+        """
+        Update the header's current-user field. ``None`` hides the
+        field in the GUI; any string (owner email or managed
+        username) shows up after frontend display-name resolution.
+        """
+        with self._lock:
+            self.current_user = user
+
+    def set_user_display_names(self, mapping: Dict[str, str]) -> None:
+        """
+        Replace the cached display-name map. Called once at job start
+        with the active server's user_display_names dict so the
+        frontend can resolve current_user without a per-tick REST hit.
+        """
+        with self._lock:
+            self.user_display_names = dict(mapping) if mapping else {}
+
+    # ── HTTP telemetry (v0.9.6, Feature 2) ───────────────────────────
+
+    def record_http_response(
+        self,
+        library: str,
+        status_code: int,
+        elapsed_ms: float,
+        retry_after_seconds: Optional[float] = None,
+    ) -> None:
+        """
+        One response observed by the session response hook.
+
+        ``library`` should be ``"__all__"`` (empty context) or the
+        actual library name the calling worker was working on (set
+        via :data:`_http_lib_var`). Both the per-library counter and
+        the cumulative ``"__all__"`` counter are bumped — the
+        frontend toggle simply picks which to render.
+
+        429 events also append to the dedicated rate-limit feed and
+        increment the cumulative counter.
+        """
+        ts = time.time()
+        # Default any falsy library to the cumulative bucket so the
+        # frontend's toggle never sees an empty-string key.
+        lib_key = library or "__all__"
+
+        with self._lock:
+            # Per-library + cumulative counter pair.
+            for key in (lib_key, "__all__"):
+                bucket = self._http_status_counts.setdefault(key, {})
+                bucket[status_code] = bucket.get(status_code, 0) + 1
+            # Raw data for the 60-second rolling latency / rate graph.
+            # v0.9.7 Item 1: time-based eviction. Pop entries older
+            # than 60 seconds off the left so the deque always covers
+            # exactly the latest window — old entries from any prior
+            # high-traffic burst no longer evict events we need to
+            # plot on the left side of the chart.
+            cutoff = ts - 60.0
+            while self._http_recent and self._http_recent[0][0] < cutoff:
+                self._http_recent.popleft()
+            self._http_recent.append((ts, float(elapsed_ms), lib_key, int(status_code)))
+            # 429 surfaces as a rate-limit event in its own feed.
+            if status_code == 429:
+                self._http_rate_limit_count += 1
+                self._rate_limit_events.append(RateLimitEntry(
+                    timestamp=datetime.now().strftime("%H:%M:%S"),
+                    library=lib_key if lib_key != "__all__" else "—",
+                    status_code=status_code,
+                    retry_after_seconds=retry_after_seconds,
+                    detail="",
+                ))
+
+    def inc_http_retry(self, n: int = 1) -> None:
+        """Bump the cumulative retry counter (one increment per urllib3 retry)."""
+        with self._lock:
+            self._http_retry_count += int(n)
+
+    def set_http_backoff(self, active: bool) -> None:
+        """Set the 'currently sleeping for Retry-After' indicator."""
+        with self._lock:
+            self._http_backoff_active = bool(active)
+
+    def reset_http_telemetry(self) -> None:
+        """
+        Wipe all HTTP-telemetry accumulators. Called by
+        :func:`services.state.reset_run_state` at job start so a new
+        run doesn't inherit the previous run's bars and graphs.
+        """
+        with self._lock:
+            self._http_status_counts.clear()
+            self._http_recent.clear()
+            self._http_rate_limit_count = 0
+            self._http_retry_count = 0
+            self._http_backoff_active = False
+            self._rate_limit_events.clear()
+
     def push_activity(self, action_type: str, library: str, title: str) -> None:
         with self._lock:
             self.activity.append(ActivityEntry(
@@ -334,7 +581,98 @@ class DashboardState:
                 "start_time": self.start_time,
                 "log_dir": self.log_dir,
                 "now": now,
+                # ── Header context (v0.9.6) ──────────────────────────
+                "current_user": self.current_user,
+                "user_display_names": dict(self.user_display_names),
+                # ── HTTP telemetry (v0.9.6, Feature 2) ───────────────
+                # Cumulative + per-library status code histograms.
+                # JSON keys are stringified to keep the on-wire shape
+                # consistent (Python int keys would otherwise survive
+                # but the frontend Record<string, ...> typing expects
+                # strings).
+                "http_status_counts": {
+                    lib: {str(code): n for code, n in codes.items()}
+                    for lib, codes in self._http_status_counts.items()
+                },
+                # Last-60-seconds rate + average latency, bucketed per
+                # second and per library. Built inside the lock so the
+                # numbers don't tear under concurrent record_http_response
+                # calls. The frontend filters by library based on the
+                # 2A/2B toggle.
+                "http_latency_series": _aggregate_http_series(
+                    self._http_recent, now, window_seconds=60,
+                ),
+                "http_rate_limits": {
+                    "count": self._http_rate_limit_count,
+                    "retries": self._http_retry_count,
+                    "backing_off": self._http_backoff_active,
+                },
+                "rate_limit_events": [
+                    {
+                        "timestamp": e.timestamp,
+                        "library": e.library,
+                        "status_code": e.status_code,
+                        "retry_after_seconds": e.retry_after_seconds,
+                        "detail": e.detail,
+                    }
+                    for e in self._rate_limit_events
+                ],
             }
+
+
+# ── HTTP telemetry aggregation (v0.9.6) ──────────────────────────────────────
+
+def _aggregate_http_series(
+    recent: "Deque[Tuple[float, float, str, int]]",
+    now: float,
+    *,
+    window_seconds: int = 60,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Collapse the rolling 500-entry response deque into the wire shape
+    the Network panel renders: per-library buckets, one per second
+    over the last ``window_seconds``, each bucket carrying
+    ``{t, rps, avg_ms}``.
+
+    Keeps the WS payload small (60 buckets × ~K libraries instead of
+    500 raw events) and predictable in size regardless of traffic
+    volume. Always returns the cumulative ``"__all__"`` series so the
+    frontend can render the default cumulative view without a library
+    selection.
+    """
+    cutoff = now - window_seconds
+    # buckets[lib][second_index] = (count, total_elapsed_ms)
+    buckets: Dict[str, Dict[int, Tuple[int, float]]] = {"__all__": {}}
+    for ts, elapsed_ms, lib_key, _status in recent:
+        if ts < cutoff:
+            continue
+        sec_idx = int(ts - cutoff)  # 0..window_seconds-1
+        for key in (lib_key, "__all__"):
+            lib_bucket = buckets.setdefault(key, {})
+            cur_count, cur_total = lib_bucket.get(sec_idx, (0, 0.0))
+            lib_bucket[sec_idx] = (cur_count + 1, cur_total + elapsed_ms)
+
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for lib, sec_map in buckets.items():
+        series: List[Dict[str, Any]] = []
+        for sec_idx in range(window_seconds):
+            count, total_ms = sec_map.get(sec_idx, (0, 0.0))
+            # v0.9.7 Item 1: empty buckets emit ``avg_ms = None`` so
+            # the frontend's ``spanGaps: true`` line chart draws a
+            # gap instead of dropping to the x-axis. RPS stays at 0.0
+            # for empty buckets — zero traffic is meaningful data,
+            # not a gap.
+            avg_ms: Optional[float] = (total_ms / count) if count else None
+            series.append({
+                # Absolute UNIX timestamp of the bucket centre so the
+                # frontend can scroll smoothly without needing to know
+                # the server clock skew.
+                "t": cutoff + sec_idx,
+                "rps": float(count),
+                "avg_ms": avg_ms,
+            })
+        out[lib] = series
+    return out
 
 
 # ── Thread Category Context Manager ──────────────────────────────────────────

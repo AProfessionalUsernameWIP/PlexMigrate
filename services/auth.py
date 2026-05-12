@@ -32,19 +32,112 @@ def _make_retry_adapter(pool_maxsize: int = 10) -> HTTPAdapter:
     retry behaviour. Extracting the construction here means the policy is defined
     once and applied to both sessions.
 
+    v0.9.6: 429 is now in ``status_forcelist`` with
+    ``respect_retry_after_header=True``, and the total budget is bumped
+    from 2 to 4 so the engine absorbs Plex throttling rather than
+    surfacing 429s to callers. ``connect`` and ``read`` budgets are
+    unchanged.
+
     Args:
         pool_maxsize (int): Max simultaneous open connections in the pool.
     """
     retry = Retry(
-        total=2,
+        total=4,
         connect=2,
         read=1,
         backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504],
+        status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "PUT"]),
+        respect_retry_after_header=True,
         raise_on_status=False,
     )
     return HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=pool_maxsize)
+
+
+def _http_response_hook(response, *args, **kwargs):
+    """
+    Per-response hook installed on every Plex session (v0.9.6 Feature 2).
+
+    Records status code + latency into ``state._dashboard`` so the
+    Network panel can render the histogram, the rolling rate / latency
+    graph, and the rate-limit feed. Best-effort: any error inside the
+    hook is swallowed so a telemetry hiccup never breaks a real HTTP
+    call.
+
+    The library attribution comes from
+    :data:`services.dashboard._http_lib_var` — a ContextVar that the
+    per-library task entry sets and ``submit_with_context`` propagates
+    into nested worker threads.
+    """
+    try:
+        # Lazy import keeps this module importable even on a host
+        # without the dashboard module loaded (CLI-only checkouts).
+        from services.dashboard import _http_lib_var
+
+        # Lookup library context; default to empty string → "__all__"
+        # bucket in record_http_response.
+        try:
+            library = _http_lib_var.get()
+        except Exception:
+            library = ""
+
+        # ``response.elapsed`` is a timedelta; convert to ms.
+        try:
+            elapsed_ms = response.elapsed.total_seconds() * 1000.0
+        except Exception:
+            elapsed_ms = 0.0
+
+        # Read Retry-After when the server is throttling us. Plex
+        # sometimes returns it as a delta-seconds integer and sometimes
+        # omits it; the dashboard tolerates None.
+        retry_after: Optional[float] = None
+        if response.status_code == 429:
+            ra_raw = response.headers.get("Retry-After")
+            if ra_raw:
+                try:
+                    retry_after = float(ra_raw)
+                except (TypeError, ValueError):
+                    retry_after = None
+
+        # urllib3 stuffs the retry-attempt history on response.raw —
+        # one entry per retry actually performed. Count them once per
+        # final response so the cumulative retry counter reflects work
+        # that's already done, not pending retries.
+        try:
+            history = getattr(response.raw, "retries", None)
+            history_list = getattr(history, "history", None)
+            if history_list:
+                state._dashboard.inc_http_retry(len(history_list))
+        except Exception:
+            pass
+
+        if state._dashboard is not None:
+            state._dashboard.record_http_response(
+                library=library,
+                status_code=int(response.status_code),
+                elapsed_ms=elapsed_ms,
+                retry_after_seconds=retry_after,
+            )
+    except Exception:
+        # Telemetry must never break the response path.
+        pass
+
+
+def _install_response_hook(session: requests.Session) -> None:
+    """
+    Attach :func:`_http_response_hook` to ``session.hooks["response"]``
+    if it isn't already present. Idempotent so re-mounting an adapter
+    later (e.g. plexapi's session getting a fresh adapter) doesn't
+    register the hook twice.
+    """
+    existing = session.hooks.setdefault("response", [])
+    # ``hooks["response"]`` accepts either a single callable or a list;
+    # normalise to a list so we can dedupe.
+    if not isinstance(existing, list):
+        existing = [existing] if existing else []
+        session.hooks["response"] = existing
+    if _http_response_hook not in existing:
+        existing.append(_http_response_hook)
 
 
 def _make_session() -> requests.Session:
@@ -59,6 +152,7 @@ def _make_session() -> requests.Session:
     adapter = _make_retry_adapter()
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    _install_response_hook(session)
     return session
 
 
@@ -127,6 +221,12 @@ def connect_to_server(url: str, token: str, logger: logging.Logger) -> Optional[
             adapter = _make_retry_adapter(pool_maxsize=min(state.MAX_WORKERS, 16))
             server._session.mount("http://", adapter)
             server._session.mount("https://", adapter)
+            # v0.9.6: every Plex API call plexapi makes flows through
+            # this session — section.search, getByGuid, playlists,
+            # systemAccounts, etc. Installing the telemetry hook here
+            # captures the bulk of the engine's HTTP traffic so the
+            # Network panel doesn't miss it.
+            _install_response_hook(server._session)
 
         logger.info(
             f"Connected to Plex server: {server.friendlyName} (version {server.version})"

@@ -116,12 +116,21 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # ping. ``None`` if no ping has succeeded yet. Used by the Servers
     # tab live indicator and the JobForm server selector chips.
     "last_response_ms": None,
+
     # v0.9.5: marker indicating ``token`` is a Fernet ciphertext string.
     # Rows missing this marker (or with it set to False) are treated as
     # legacy plaintext on the next ``_load_raw`` and migrated in place.
     "_encrypted": False,
-}
-
+    # v0.9.6 Feature 3: operator-chosen friendly names for users on
+    # this server. Keys: raw Plex identifier — owner's email for the
+    # owner, managed user's username for managed users. Values: a
+    # free-form display string. Empty dict on rows that have never
+    # had a custom display name assigned. The frontend reads this map
+    # to substitute friendly names in the dashboard header, activity
+    # feed, and direct-transfer user selector. Purely a rendering aid
+    # — engine logic, logs, and backup files always use the raw
+    # identifier.
+    "user_display_names": {},
 
 # ── Name-safety helper ───────────────────────────────────────────────────────
 
@@ -538,6 +547,159 @@ def ensure_encrypted_at_rest() -> int:
     with _REG_LOCK:
         rows = _load_raw()
     return len(rows)
+
+
+# ── Users (v0.9.6 Feature 3) ────────────────────────────────────────────────
+
+def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
+    """
+    Return the list of users associated with one registered server.
+
+    Owner row uses the Plex.tv email as the identifier — the same
+    string the dashboard's ``current_user`` resolves through
+    ``user_display_names``. Managed users come from
+    ``server.systemAccounts()`` and use the local server username.
+
+    Best-effort:
+      * If ``systemAccounts()`` fails (local-admin token, permission
+        error), the response still includes the owner row plus an
+        empty managed list and a non-null ``error`` string so the
+        frontend can render "No managed users found" with a tooltip
+        rather than an error state.
+      * Connection failures bubble up as ``ConnectionError`` so the
+        route layer can return a clean 502.
+
+    Returns:
+        ``{"users": [...], "error": <str|null>}``. Each user dict
+        carries ``{kind: "owner"|"managed", plex_id, raw_name,
+        display_name}``. ``display_name`` is the operator's choice
+        from the row's ``user_display_names`` map if one exists;
+        otherwise an empty string and the UI falls back to ``raw_name``.
+
+    Raises:
+        ValueError if no server with ``server_id`` is registered.
+        ConnectionError if Plex is unreachable.
+    """
+    from services.auth import connect_to_server
+
+    row = get_server_by_id(server_id)
+    if row is None:
+        raise ValueError(f"No server with id {server_id!r}")
+
+    token = row.get("token") or ""
+    if not token:
+        raise ConnectionError(
+            f"Server {row.get('name') or server_id!r} has no stored token. "
+            f"Re-enter credentials under the Servers tab."
+        )
+
+    server = connect_to_server(row["url"], token, logger)
+    if server is None:
+        raise ConnectionError(
+            f"Could not connect to {row.get('name') or server_id!r}. "
+            f"Check the URL and token under the Servers tab."
+        )
+
+    display_names: Dict[str, str] = dict(row.get("user_display_names") or {})
+    users: List[Dict[str, Any]] = []
+
+    # Owner: email from ``myPlexAccount``. Captured separately because
+    # the SystemAccount entry for the owner uses the *username*, not
+    # the email — and the dashboard's ``current_user`` keys on email
+    # for the owner role.
+    owner_email = ""
+    owner_username = ""
+    try:
+        account = server.myPlexAccount()
+        owner_email = (getattr(account, "email", "") or "").strip()
+        owner_username = (getattr(account, "username", "") or "").strip()
+    except Exception as e:
+        logger.debug(f"myPlexAccount unavailable for {row.get('name')!r}: {e}")
+
+    if owner_email:
+        users.append({
+            "kind": "owner",
+            "plex_id": owner_email,
+            "raw_name": owner_email,
+            "display_name": display_names.get(owner_email, ""),
+        })
+
+    # Managed users — read systemAccounts(); skip the entry whose
+    # ``name`` matches the owner's username (that's the owner himself
+    # appearing in the local accounts list, already represented above).
+    sys_error: Optional[str] = None
+    try:
+        sys_accts = server.systemAccounts() or []
+    except Exception as e:
+        sys_accts = []
+        sys_error = f"systemAccounts() unavailable: {e}"
+        logger.debug(sys_error)
+
+    for acct in sys_accts:
+        name = (getattr(acct, "name", "") or "").strip()
+        if not name:
+            continue
+        # v0.9.7 Item 7: harden owner detection. The original check
+        # matched SystemAccount.name against the Plex.tv username
+        # from myPlexAccount, but those identifiers can legitimately
+        # differ (server stores "Plex Owner" or a handle while
+        # Plex.tv stores an email). Without the id==1 fallback the
+        # owner can show up twice — once as kind="owner" (from
+        # myPlexAccount.email) and once as kind="managed" (from
+        # the SystemAccounts row that didn't match). SystemAccount
+        # id 1 is Plex's conventional server-owner local id.
+        try:
+            local_id = int(getattr(acct, "id", 0) or 0)
+        except (TypeError, ValueError):
+            local_id = 0
+        if local_id == 1:
+            continue
+        if owner_username and name == owner_username:
+            continue
+        users.append({
+            "kind": "managed",
+            "plex_id": name,
+            "raw_name": name,
+            "display_name": display_names.get(name, ""),
+        })
+
+    return {"users": users, "error": sys_error}
+
+
+def set_user_display_name(
+    server_id: str, plex_id: str, display_name: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Set / clear one entry in a server's ``user_display_names`` map.
+
+    An empty / whitespace-only ``display_name`` removes the entry
+    instead of storing an empty value — that way the frontend's
+    fallback ("show raw_name when no display name set") works without
+    extra logic.
+
+    Returns the redacted server row after the write, or ``None`` if
+    no server with ``server_id`` exists. Raises ``ValueError`` if
+    ``plex_id`` is empty (a client bug or malformed request).
+    """
+    plex_id = (plex_id or "").strip()
+    if not plex_id:
+        raise ValueError("plex_id must not be empty.")
+    cleaned = (display_name or "").strip()
+
+    with _REG_LOCK:
+        rows = _load_raw()
+        target = next((r for r in rows if r.get("id") == server_id), None)
+        if target is None:
+            return None
+        names = dict(target.get("user_display_names") or {})
+        if cleaned:
+            names[plex_id] = cleaned
+        else:
+            names.pop(plex_id, None)
+        target["user_display_names"] = names
+        _save_raw(rows)
+
+    return get_server_by_id(server_id, include_token=False)
 
 
 # ── Engine integration ──────────────────────────────────────────────────────

@@ -55,7 +55,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from plexapi.server import PlexServer
 
@@ -107,6 +107,9 @@ def run_direct_transfer(
     strict_match: bool,
     stop_event: Optional[threading.Event] = None,
     output_dir: Optional[str] = None,
+    source_home_users: Optional[List[Tuple[str, str, PlexServer]]] = None,
+    dest_home_users: Optional[List[Tuple[str, str, PlexServer]]] = None,
+    user_filter: Optional[List[str]] = None,
 ) -> None:
     """
     Drive an end-to-end direct transfer.
@@ -166,12 +169,77 @@ def run_direct_transfer(
         state._dashboard = DashboardState(log_dir=log_dir)
     else:
         state._dashboard.log_dir = log_dir
-    # Direct transfer is owner-only — per-user data doesn't survive a
-    # cross-server move because Home tokens are server-specific (see
-    # the "users": {} block written by _transfer_one_library). Report
-    # one user (the source owner) so the dashboard's coverage row
-    # doesn't read "0 users" during a real run.
-    state._dashboard.set_user_count(1)
+
+    # ── v0.9.6 Feature 4 / v0.9.7 Item 7: per-user data + owner ──────
+    # Compute the effective per-user roster. Pre-Feature 4 direct
+    # transfer was owner-only; we now propagate managed-user data when
+    # the same managed username exists on both source and destination,
+    # AND the owner is a first-class filter target (v0.9.7) — when
+    # the operator unchecks the owner the engine skips the entire
+    # library-level ``payload["items"]`` block (watch_history,
+    # playlists, library-level collections, ratings) for that run.
+    #
+    # Inputs:
+    #   - source_home_users : (uname, src_token, src_user_server) tuples
+    #   - dest_home_users   : (uname, dst_token, dst_user_server) tuples
+    #   - user_filter       : operator's checked-list of raw Plex
+    #                         identifiers. None = include every
+    #                         transferable user including the owner;
+    #                         explicit list = only the ones named.
+    #                         Empty list = no users — the run is a no-op.
+    src_users_by_name: Dict[str, Tuple[str, str, PlexServer]] = {
+        u[0]: u for u in (source_home_users or [])
+    }
+    dst_users_by_name: Dict[str, Tuple[str, str, PlexServer]] = {
+        u[0]: u for u in (dest_home_users or [])
+    }
+    transferable: Set[str] = set(src_users_by_name) & set(dst_users_by_name)
+    if user_filter is None:
+        included: Set[str] = set(transferable)
+    else:
+        requested = set(user_filter)
+        included = requested & transferable
+        missing = requested - transferable
+        if missing:
+            logger.warning(
+                "user_filter requested user(s) %s not present on both servers; skipped.",
+                sorted(missing),
+            )
+
+    # v0.9.7 Item 7: owner inclusion is independent of the managed
+    # intersection because the owner is implicit (always exists on
+    # both sides). Owner is included unless user_filter is supplied
+    # AND the source owner's email is absent from it.
+    source_owner_email = (state._plex_owner_email or "").strip()
+    if user_filter is None:
+        owner_included = True
+    else:
+        owner_included = bool(source_owner_email) and source_owner_email in set(user_filter)
+
+    # Build the ordered, filtered home_users lists each side will see.
+    effective_src_home = [src_users_by_name[n] for n in sorted(included)]
+    effective_dst_home = [dst_users_by_name[n] for n in sorted(included)]
+
+    # v0.9.7 Item 7: actionable run-log line when the owner is
+    # unchecked, so the operator sees exactly what they're skipping.
+    # Verbatim from the spec.
+    if not owner_included:
+        logger.info(
+            "[user-filter] Owner excluded — library-level collections "
+            "will not transfer this run. Personal collections for "
+            "included users will transfer normally.",
+        )
+
+    # One INFO line at transfer start so the operator can audit what
+    # went where straight from the run log.
+    logger.info(
+        "Direct transfer per-user scope: owner always included; "
+        "%d managed user(s) included: %s",
+        len(included),
+        sorted(included) if included else "none",
+    )
+
+    state._dashboard.set_user_count(1 + len(included))
     for lib_name in library_names:
         # Each library does 4 gather phases + N resolution phases.
         # We use a coarse total of 8 (4 gather + 4 import) so the bar
@@ -222,6 +290,9 @@ def run_direct_transfer(
                     remap=remap,
                     strict_match=strict_match,
                     stop_event=stop_event,
+                    source_home_users=effective_src_home,
+                    dest_home_users=effective_dst_home,
+                    owner_included=owner_included,
                 )
             except DirectTransferUnavailable as exc:
                 logger.warning(
@@ -246,6 +317,9 @@ def run_direct_transfer(
                     strict_match=strict_match,
                     output_dir=resolved_output_dir,
                     stop_event=stop_event,
+                    source_home_users=effective_src_home,
+                    dest_home_users=effective_dst_home,
+                    owner_included=owner_included,
                 )
             except Exception as exc:
                 # Any unexpected exception in the direct path: log and
@@ -274,6 +348,9 @@ def run_direct_transfer(
                     strict_match=strict_match,
                     output_dir=resolved_output_dir,
                     stop_event=stop_event,
+                    source_home_users=effective_src_home,
+                    dest_home_users=effective_dst_home,
+                    owner_included=owner_included,
                 )
             state._dashboard.finish_library(lib_name)
     finally:
@@ -281,6 +358,128 @@ def run_direct_transfer(
         # broadcaster gets one more snapshot with the final counters.
         # The job worker clears it after a small grace period.
         pass
+
+
+# ── Import-total estimator (v0.9.7 Item 6) ───────────────────────────────────
+
+def _compute_import_total(
+    payload: Dict[str, Any],
+    *,
+    home_user_names: Set[str],
+) -> int:
+    """
+    Estimate the per-item / per-row work the import side will do for
+    one library's payload.
+
+    Mirrors :func:`services.importer.run_import`'s own ``_peek_metadata``
+    arithmetic so direct-transfer's progress bar fills the same way a
+    standalone import would. Returns 0 on a fully-empty payload; the
+    caller adds the export-phase constant (4) on top.
+
+    Only counts users that exist on the destination side
+    (``home_user_names``) — users on the source but missing on the
+    destination produce no work on the import path. ``_import_user``
+    already short-circuits for them, so including their items would
+    inflate the total and prevent the bar from reaching 100%.
+    """
+    items = payload.get("items", {}) or {}
+    total = 0
+    total += len(items.get("watch_history", []) or [])
+    total += sum(len(pl.get("items", []) or []) for pl in (items.get("playlists", []) or []))
+    total += len(items.get("playlists", []) or [])
+    total += sum(len(c.get("items", []) or []) for c in (items.get("collections", []) or []))
+    total += len(items.get("collections", []) or [])
+    total += len(items.get("ratings", []) or [])
+
+    users_block = payload.get("users", {}) or {}
+    for uname, udata in users_block.items():
+        if uname not in home_user_names:
+            continue
+        total += len(udata.get("watch_history", []) or [])
+        total += sum(len(pl.get("items", []) or []) for pl in (udata.get("playlists", []) or []))
+        total += len(udata.get("playlists", []) or [])
+        total += len(udata.get("ratings", []) or [])
+        # v0.9.7 Item 9 adds per-user collections; size them too so
+        # the bar reflects the work. Older payloads without the key
+        # short-circuit to 0 via the get() default.
+        total += sum(len(c.get("items", []) or []) for c in (udata.get("collections", []) or []))
+        total += len(udata.get("collections", []) or [])
+    return total
+
+
+# ── Per-user gather (v0.9.6 Feature 4) ───────────────────────────────────────
+
+def _gather_users_data(
+    lib_name: str,
+    source_home_users: List[Tuple[str, str, PlexServer]],
+    owner_coll_keys: Set[Any],
+    logger: logging.Logger,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Build the ``payload["users"]`` dict for one library by reading each
+    source-side managed user's watch history, ratings, playlists, and
+    personal collections (v0.9.7 Item 9).
+
+    Shared by the in-memory direct path and the chained-fallback path
+    so both produce identical per-user payloads. Best-effort: a user
+    whose library section can't be resolved (no visibility, deleted)
+    is logged and skipped rather than aborting the whole transfer.
+    Empty input list returns an empty dict.
+
+    ``owner_coll_keys`` is the rating-key set of the owner-side
+    library collections — used to subtract library-level collections
+    from each user's set so only genuinely-personal collections land
+    in the per-user payload.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    if not source_home_users:
+        return out
+    for (uname, _user_token, user_server) in source_home_users:
+        try:
+            user_section = next(
+                (s for s in user_server.library.sections() if s.title == lib_name),
+                None,
+            )
+            if user_section is None:
+                logger.info(
+                    "Direct transfer: library %r not visible to source user %r — "
+                    "their data for this library is skipped.",
+                    lib_name, uname,
+                )
+                continue
+            u_watch = export_watch_history(user_section, logger, user=uname)
+            u_ratings = export_ratings(user_section, logger, user=uname)
+            u_playlists = export_playlists(
+                user_server, user_section.key, logger, lib_name=lib_name,
+            )
+            # v0.9.7 Item 9: personal collections, dedupe-by-rating-key
+            # against the owner's library-level set. ``user_section``
+            # is bound to this user's token; ``section.collections()``
+            # returns library + personal for this user, so the subtract
+            # leaves only personal collections.
+            u_collections_all = export_collections(user_section, logger)
+            u_collections = [
+                c for c in u_collections_all
+                if c.get("rating_key") not in owner_coll_keys
+            ]
+            out[uname] = {
+                "watch_history": u_watch,
+                "ratings": u_ratings,
+                "playlists": u_playlists,
+                "collections": u_collections,
+            }
+            logger.info(
+                "Direct transfer: gathered source user %r — %d watched, "
+                "%d rated, %d playlist(s), %d personal collection(s) for %r.",
+                uname, len(u_watch), len(u_ratings), len(u_playlists),
+                len(u_collections), lib_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "Direct transfer: could not gather data for source user %r in %r: %s",
+                uname, lib_name, e,
+            )
+    return out
 
 
 # ── Per-library worker ───────────────────────────────────────────────────────
@@ -299,6 +498,9 @@ def _transfer_one_library(
     remap: Optional[Tuple[str, str]],
     strict_match: bool,
     stop_event: Optional[threading.Event] = None,
+    source_home_users: Optional[List[Tuple[str, str, PlexServer]]] = None,
+    dest_home_users: Optional[List[Tuple[str, str, PlexServer]]] = None,
+    owner_included: bool = True,
 ) -> None:
     """
     Transfer a single library source→dest. See :func:`run_direct_transfer`
@@ -323,31 +525,66 @@ def _transfer_one_library(
     # exporter functions to label each item.
     saved_owner = state._plex_owner_name
     state._plex_owner_name = source_owner
+    # v0.9.7 Item 7: gate the owner-side gather on the operator's
+    # filter choice. When the owner is unchecked we still advance the
+    # phase counter (the per-library dashboard total reserves 4 ticks
+    # for the export side) but skip the four export_* calls — the
+    # library-level items[] block lands empty and the import side's
+    # owner-scoped path becomes a no-op.
     try:
-        watch_history = export_watch_history(src_section, logger, user=source_owner)
-        state._dashboard.advance_library(lib_name, 1)
-        state._dashboard.set_library_phase(lib_name, "Reading playlists…")
+        if owner_included:
+            watch_history = export_watch_history(src_section, logger, user=source_owner)
+            state._dashboard.advance_library(lib_name, 1)
+            state._dashboard.set_library_phase(lib_name, "Reading playlists…")
 
-        playlists = export_playlists(source_server, src_section.key, logger, lib_name=lib_name)
-        state._dashboard.advance_library(lib_name, 1)
-        state._dashboard.set_library_phase(lib_name, "Reading collections…")
+            playlists = export_playlists(source_server, src_section.key, logger, lib_name=lib_name)
+            state._dashboard.advance_library(lib_name, 1)
+            state._dashboard.set_library_phase(lib_name, "Reading collections…")
 
-        collections = export_collections(src_section, logger)
-        state._dashboard.advance_library(lib_name, 1)
-        state._dashboard.set_library_phase(lib_name, "Reading ratings…")
+            collections = export_collections(src_section, logger)
+            state._dashboard.advance_library(lib_name, 1)
+            state._dashboard.set_library_phase(lib_name, "Reading ratings…")
 
-        ratings = export_ratings(src_section, logger, user=source_owner)
-        state._dashboard.advance_library(lib_name, 1)
+            ratings = export_ratings(src_section, logger, user=source_owner)
+            state._dashboard.advance_library(lib_name, 1)
+        else:
+            # Owner skipped — empty library-level block, four phases
+            # advanced together so the bar still reflects the four
+            # owner phases as "done."
+            watch_history = []
+            playlists = []
+            collections = []
+            ratings = []
+            state._dashboard.advance_library(lib_name, 4)
+            state._dashboard.set_library_phase(lib_name, "Owner skipped (user-filter)")
+            state._dashboard.push_activity(
+                "phase", lib_name,
+                "Owner data block skipped — user-filter excluded owner",
+            )
     finally:
         state._plex_owner_name = saved_owner
+
+    # ── Per-user gather (v0.9.6 Feature 4, v0.9.7 Item 9) ────────────
+    # Each transferable managed user reads their data on the source
+    # via their own token-bound PlexServer connection. The data lands
+    # in payload["users"][username] in the on-disk schema's shape so
+    # import_backup_file's existing per-user import loop can replay
+    # it under the matching destination user's token.
+    #
+    # v0.9.7 Item 9: per-user collections need the owner's collection
+    # rating-key set so library-level collections (visible to every
+    # user via section.collections()) don't get double-counted into
+    # every user's payload.
+    owner_coll_keys_inmem: Set[Any] = {
+        c.get("rating_key") for c in collections if c.get("rating_key") is not None
+    }
+    users_data = _gather_users_data(
+        lib_name, source_home_users or [], owner_coll_keys_inmem, logger,
+    )
 
     # ── Build the dict in the on-disk schema's shape ─────────────────
     # ``import_backup_file`` reads ``library``, ``items.{watch_history,
     # playlists, collections, ratings}``, and ``users`` (per-user data).
-    # We never carry per-user data over a direct transfer — Plex Home
-    # user tokens are server-specific, so the user data is intentionally
-    # source-server-scoped and would not survive a cross-server move
-    # without explicit re-credentialing. That stays a future feature.
     payload: Dict[str, Any] = {
         "library": lib_name,
         "exported_at": datetime.now().isoformat(),
@@ -358,17 +595,36 @@ def _transfer_one_library(
             "collections": collections,
             "ratings": ratings,
         },
-        "users": {},
+        "users": users_data,
         "stats": {
             "total_watched": len(watch_history),
             "total_playlists": len(playlists),
             "total_collections": len(collections),
             "total_rated": len(ratings),
-            "total_home_users": 0,
+            "total_home_users": len(users_data),
         },
     }
 
     # ── Phase 2: merge into the destination ──────────────────────────
+    # v0.9.7 Item 6: widen the library's progress total from the
+    # placeholder 8 to the real per-item count BEFORE handing off to
+    # ``import_backup_file``. Each per-item ``_advance_lib`` call
+    # inside the import path now contributes to a meaningful bar
+    # instead of saturating at 8 after the first few items — which
+    # was the root cause of the top-level ETA climbing rather than
+    # counting down during the import phase.
+    #
+    # Total = 4 (export phases already completed, counted above) +
+    # one tick per per-item or per-row operation the import side
+    # will perform. This mirrors ``run_import``'s own per-backup-file
+    # total computation in services/importer.py.
+    import_total = _compute_import_total(payload, home_user_names={u[0] for u in (dest_home_users or [])})
+    state._dashboard.set_library_total(
+        lib_name,
+        total=4 + import_total,
+        completed=4,  # the four export phases are done
+    )
+
     state._dashboard.set_library_phase(lib_name, "Writing to destination…")
     # ``import_backup_file`` expects the dest connection's URL + token
     # in the module-level state (for /:/scrobble, /:/rate, /:/progress
@@ -389,7 +645,7 @@ def _transfer_one_library(
         import_backup_file(
             dest_server, synthetic_path, dest_token, dest_url,
             logger, log_dir, remap, strict_match,
-            home_users=None,
+            home_users=dest_home_users,
             existing_playlists=all_playlists,
             sections_by_name=sections_by_name,
             preloaded_data=payload,
@@ -399,7 +655,10 @@ def _transfer_one_library(
         state._plex_base_url = prev_url
         state._plex_token = prev_tok
 
-    state._dashboard.advance_library(lib_name, 4)  # phases 5-8 (import side)
+    # v0.9.7 Item 6: no longer post-advance(4); the per-item advances
+    # inside ``import_backup_file`` already filled the bar up to the
+    # recomputed total. Anything else is a no-op via ``min(... ,
+    # lib.total)`` clamping in advance_library.
     state._dashboard.push_activity("done", lib_name, "Direct transfer complete")
 
 
@@ -420,6 +679,9 @@ def _chained_fallback_library(
     strict_match: bool,
     output_dir: str,
     stop_event: Optional[threading.Event] = None,
+    source_home_users: Optional[List[Tuple[str, str, PlexServer]]] = None,
+    dest_home_users: Optional[List[Tuple[str, str, PlexServer]]] = None,
+    owner_included: bool = True,
 ) -> None:
     """
     Fallback path used by :func:`run_direct_transfer` when the
@@ -448,15 +710,40 @@ def _chained_fallback_library(
     state._dashboard.set_library_phase(lib_name, "Chained: gathering from source…")
 
     # ── Phase 1: gather from source into a dict (same as direct) ──────
+    # v0.9.7 Item 7: gate the owner-side gather on the operator's
+    # filter choice, identical to the in-memory path.
     saved_owner = state._plex_owner_name
     state._plex_owner_name = source_owner
     try:
-        watch_history = export_watch_history(src_section, logger, user=source_owner)
-        playlists = export_playlists(source_server, src_section.key, logger, lib_name=lib_name)
-        collections = export_collections(src_section, logger)
-        ratings = export_ratings(src_section, logger, user=source_owner)
+        if owner_included:
+            watch_history = export_watch_history(src_section, logger, user=source_owner)
+            playlists = export_playlists(source_server, src_section.key, logger, lib_name=lib_name)
+            collections = export_collections(src_section, logger)
+            ratings = export_ratings(src_section, logger, user=source_owner)
+        else:
+            watch_history = []
+            playlists = []
+            collections = []
+            ratings = []
+            state._dashboard.push_activity(
+                "phase", lib_name,
+                "Owner data block skipped — user-filter excluded owner",
+            )
     finally:
         state._plex_owner_name = saved_owner
+
+    # Per-user gather mirrors the in-memory path so the chained
+    # fallback produces an equivalent .plexbackup.json — the
+    # operator's filter choice is honoured no matter which route
+    # the engine ends up taking for this library. Same owner-set
+    # dedupe so library-level collections don't surface in every
+    # user's personal block.
+    owner_coll_keys_chained: Set[Any] = {
+        c.get("rating_key") for c in collections if c.get("rating_key") is not None
+    }
+    users_data = _gather_users_data(
+        lib_name, source_home_users or [], owner_coll_keys_chained, logger,
+    )
 
     payload: Dict[str, Any] = {
         "library": lib_name,
@@ -468,13 +755,13 @@ def _chained_fallback_library(
             "collections": collections,
             "ratings": ratings,
         },
-        "users": {},
+        "users": users_data,
         "stats": {
             "total_watched": len(watch_history),
             "total_playlists": len(playlists),
             "total_collections": len(collections),
             "total_rated": len(ratings),
-            "total_home_users": 0,
+            "total_home_users": len(users_data),
         },
     }
 
@@ -494,6 +781,15 @@ def _chained_fallback_library(
     )
 
     # ── Phase 3: import that file into the destination ────────────────
+    # v0.9.7 Item 6: same per-item total recompute as the in-memory
+    # path so the chained fallback's progress bar behaves identically.
+    import_total = _compute_import_total(payload, home_user_names={u[0] for u in (dest_home_users or [])})
+    state._dashboard.set_library_total(
+        lib_name,
+        total=4 + import_total,
+        completed=4,
+    )
+
     state._dashboard.set_library_phase(lib_name, "Chained: importing into destination…")
     prev_url, prev_tok = state._plex_base_url, state._plex_token
     state._plex_base_url = dest_url
@@ -505,7 +801,7 @@ def _chained_fallback_library(
         import_backup_file(
             dest_server, str(tmp_path), dest_token, dest_url,
             logger, log_dir, remap, strict_match,
-            home_users=None,
+            home_users=dest_home_users,
             existing_playlists=all_playlists,
             sections_by_name=sections_by_name,
             preloaded_data=payload,

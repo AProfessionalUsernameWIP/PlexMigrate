@@ -320,6 +320,13 @@ def serialize_collection(collection) -> Dict:
 
     return {
         "name": collection.title,
+        # v0.9.7 Item 9: rating_key surfaces so callers can dedupe by
+        # identity — direct-transfer's per-user gather subtracts the
+        # owner's collection set from each user's set so library-level
+        # collections (visible to all users) don't get double-counted.
+        # ``rating_key`` is server-local but stable within one
+        # connection, which is exactly the scope we need it in.
+        "rating_key": getattr(collection, "ratingKey", None),
         "sort_order": getattr(collection, "collectionSort", 0),
         "has_custom_poster": bool(getattr(collection, "thumb", None)),
         "items": items,

@@ -296,6 +296,23 @@ table.list td.num  { text-align: right; font-family: var(--mono); }
 .tag.done     { color: var(--color-done);     }
 .tag.error    { color: var(--color-error);    background:#3a1414; }
 .tag.started  { color: var(--color-started);  }
+/* v0.9.6 Feature 2C: rate-limit feed entries get their own amber
+   visual identity so a 429 burst is unmistakable. Distinct from
+   ``error`` (red) and ``unresolved`` (red background) — rate limiting
+   is not a failure, just back-pressure from Plex. */
+.tag.rate_limit { color:#ffb74d; background:#3a2a14; }
+
+/* v0.9.7 Item 8: log keyword filter — highlight matched substrings
+   inside filtered log lines. Tinted amber so the highlight is
+   visible against the standard dark log background without
+   masking the surrounding text. Inherits the line's font and
+   colour so the rest of the line stays legible. */
+mark.log-match {
+  background: rgba(255, 215, 0, 0.32);
+  color: inherit;
+  padding: 0 1px;
+  border-radius: 2px;
+}
 
 .thread-pill {
   display: inline-block;

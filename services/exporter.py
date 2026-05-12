@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from plexapi.server import PlexServer
 from rich.live import Live
@@ -27,9 +27,11 @@ from services.dashboard import (
     _build_dashboard,
     _check_terminal_size,
     _current_item,
+    _http_lib_var,
     _keyboard_thread,
     _make_progress,
     _thread_category,
+    submit_with_context,
 )
 from services.logging_ops import _fmt_media_line
 from services.resolver import (
@@ -509,9 +511,22 @@ def export_library(
     """
     lib_name = section.title
     logger.info(f"Exporting library: {lib_name}")
+    # v0.9.6 Feature 2: tag every Plex API call this library makes
+    # with the library name so the Network panel can attribute traffic
+    # per-library. Set on the task-local context (each export_library
+    # call runs in its own copied context via submit_with_context from
+    # run_export, so the var is library-scoped).
+    _http_lib_var.set(lib_name)
     if state._dashboard:
         state._dashboard.push_activity("started", lib_name, "Export started")
         state._dashboard.set_library_phase(lib_name, "Exporting…")
+        # v0.9.6 Feature 1: attribute owner-phase work to the owner
+        # email. gather_user temporarily overrides this while its
+        # block runs.
+        # v0.9.7 Item 4: gated — standard exports never narrow the
+        # run to one user, so the header field stays null.
+        if state._current_user_visible:
+            state._dashboard.set_current_user(state._plex_owner_email or None)
 
     results: Dict[str, List] = {
         "watch_history": [],
@@ -560,7 +575,16 @@ def export_library(
         _advance()
 
     def gather_user(username: str, user_server: PlexServer):
-        """Thread task: fetch one home user's Play Count, playlists, and ratings."""
+        """Thread task: fetch one home user's Play Count, playlists, ratings, and personal collections."""
+        # v0.9.6 Feature 1: surface this user in the dashboard header
+        # while their block runs. Restored on exit so a sibling
+        # gather_user that completes after this one doesn't show this
+        # username instead of its own.
+        # v0.9.7 Item 4: gated. Standard exports always run with this
+        # off; the field stays null for the whole run.
+        prev_user = state._dashboard.current_user if state._dashboard else None
+        if state._dashboard and state._current_user_visible:
+            state._dashboard.set_current_user(username)
         try:
             user_section = next(
                 (s for s in user_server.library.sections() if s.title == lib_name),
@@ -579,24 +603,47 @@ def export_library(
                     user_server, user_section.key, logger,
                     lib_name=lib_name, playlist_cache=user_cache,
                 )
+                # v0.9.7 Item 9: per-user personal collections. On a
+                # Plex Pass server each user can have their own
+                # collections that are NOT visible to other users.
+                # ``user_section.collections()`` returns those PLUS
+                # library-level collections (visible to everyone), so
+                # we subtract the owner's collection rating-key set
+                # to isolate the genuinely-personal ones. The owner's
+                # collection set was computed once in the owner-side
+                # gather block and captured in ``owner_coll_keys``.
+                u_collections_all = export_collections(user_section, logger)
+                u_collections = [
+                    c for c in u_collections_all
+                    if c.get("rating_key") not in owner_coll_keys
+                ]
             users_data[username] = {
                 "watch_history": u_watch,
                 "ratings": u_ratings,
                 "playlists": u_playlists,
+                "collections": u_collections,
             }
             logger.info(
                 f"Home user '{username}' — {lib_name}: "
                 f"{len(u_watch)} watched, {len(u_ratings)} rated, "
-                f"{len(u_playlists)} playlist(s)"
+                f"{len(u_playlists)} playlist(s), "
+                f"{len(u_collections)} personal collection(s)"
             )
         except Exception as e:
             logger.warning(f"Could not export data for home user '{username}': {e}")
         finally:
+            if state._dashboard and state._current_user_visible:
+                state._dashboard.set_current_user(prev_user)
             _advance()
 
     users_data: Dict[str, Dict] = {}
+    # v0.9.7 Item 9: the per-user gather subtracts the owner's
+    # collection rating-keys to isolate personal collections. Built
+    # after the owner-side gather pool finishes (below) so the set
+    # is guaranteed populated before any gather_user runs. Captured
+    # in this closure so gather_user can read it without arg-threading.
+    owner_coll_keys: Set[Any] = set()
     n_user_tasks = len(home_users or [])
-    n_total_tasks = 4 + n_user_tasks
 
     # If stop was requested before this library even started, exit
     # before opening the pool so the user's click takes effect at the
@@ -607,29 +654,50 @@ def export_library(
             state._dashboard.finish_library(lib_name, error=False)
         return ""
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, n_total_tasks)) as pool:
-        futures = [
-            pool.submit(gather_watch),
-            pool.submit(gather_playlists),
-            pool.submit(gather_collections),
-            pool.submit(gather_ratings),
+    # v0.9.7 Item 9: TWO-PHASE gather (Q1 confirmed).
+    # Phase 1 — owner-side: watch / playlists / collections / ratings
+    #   run in parallel. Library-level data lives in ``results``.
+    # Phase 2 — per-user: each managed user reads their own data via
+    #   their token-bound server connection. Per-user personal
+    #   collections need the owner's collection set computed from
+    #   Phase 1's output, so Phase 2 can't start until Phase 1 ends.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        owner_futures = [
+            submit_with_context(pool, gather_watch),
+            submit_with_context(pool, gather_playlists),
+            submit_with_context(pool, gather_collections),
+            submit_with_context(pool, gather_ratings),
         ]
-        # Home-user gather threads check stop_event before launching so
-        # a stop signalled mid-library at least prevents the (often very
-        # slow) per-user playlist scans from starting.
-        for username, _, user_server in (home_users or []):
-            if stop_event is not None and stop_event.is_set():
-                logger.info(
-                    f"Stop requested — skipping home user '{username}' "
-                    f"for library '{lib_name}'."
-                )
-                continue
-            futures.append(pool.submit(gather_user, username, user_server))
-
-        for f in concurrent.futures.as_completed(futures):
+        for f in concurrent.futures.as_completed(owner_futures):
             exc = f.exception()
             if exc:
-                logger.error(f"Error in gather thread for {lib_name}: {exc}")
+                logger.error(f"Error in owner gather thread for {lib_name}: {exc}")
+
+    # Phase 1 done — owner_coll_keys is now safe to populate from the
+    # owner's collections result.
+    owner_coll_keys = {
+        c.get("rating_key")
+        for c in (results.get("collections") or [])
+        if c.get("rating_key") is not None
+    }
+
+    # Phase 2 — per-user gathers, only if any users exist for this run.
+    if n_user_tasks > 0:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, n_user_tasks)) as pool:
+            futures = []
+            for username, _, user_server in (home_users or []):
+                if stop_event is not None and stop_event.is_set():
+                    logger.info(
+                        f"Stop requested — skipping home user '{username}' "
+                        f"for library '{lib_name}'."
+                    )
+                    continue
+                futures.append(submit_with_context(pool, gather_user, username, user_server))
+
+            for f in concurrent.futures.as_completed(futures):
+                exc = f.exception()
+                if exc:
+                    logger.error(f"Error in gather thread for {lib_name}: {exc}")
 
     # Embed source-server identity so the Exports browser can label
     # each file with the server that produced it. Reads from state
@@ -782,7 +850,8 @@ def run_export(
         with Live(state._live_progress, console=console, refresh_per_second=8):
             with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
                 futures = {
-                    pool.submit(
+                    submit_with_context(
+                        pool,
                         export_library, server, sec, output_dir, logger, home_users, playlist_caches,
                         stop_event,
                     ): sec.title
@@ -861,7 +930,8 @@ def run_export(
             )
             with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
                 futures_map = {
-                    pool.submit(
+                    submit_with_context(
+                        pool,
                         export_library, server, sec, output_dir, logger, home_users, playlist_caches,
                         stop_event,
                     ): sec.title

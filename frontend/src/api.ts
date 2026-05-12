@@ -45,6 +45,29 @@ export interface DashboardSnapshot {
   start_time: number;
   log_dir: string;
   now: number;
+  // v0.9.6 Feature 1: raw identifier of the user whose data is being
+  // processed right now (owner email or managed username). Null when
+  // the run has no per-user phase active. Frontend resolves through
+  // ``user_display_names`` before rendering.
+  current_user?: string | null;
+  // v0.9.6 Feature 3: source server's display-name map, copied at
+  // run start. Keys: raw Plex identifier. Values: operator-chosen
+  // display name. Empty / missing = render raw identifiers as-is.
+  user_display_names?: Record<string, string>;
+  // v0.9.6 Feature 2: HTTP telemetry — status code histogram and
+  // 60-second rolling rate / latency series, partitioned by library
+  // name with a ``__all__`` cumulative bucket. Optional for
+  // forward-compat with an older backend.
+  http_status_counts?: Record<string, Record<string, number>>;
+  http_latency_series?: Record<string, Array<{ t: number; rps: number; avg_ms: number | null }>>;
+  http_rate_limits?: { count: number; retries: number; backing_off: boolean };
+  rate_limit_events?: Array<{
+    timestamp: string;
+    library: string;
+    status_code: number;
+    retry_after_seconds: number | null;
+    detail: string;
+  }>;
 }
 
 export interface CurrentItem {
@@ -131,6 +154,31 @@ export interface ServerView {
   // Latency of the last lightweight ping in milliseconds. ``null``
   // if no ping has ever been recorded for this server.
   last_response_ms: number | null;
+  // v0.9.6 Feature 3: operator-chosen friendly names for users on
+  // this server. Keys: raw Plex identifier (owner email or managed
+  // username). Empty / missing = no custom names assigned. The
+  // Servers tab uses this to populate the inline owner-display-name
+  // input and to render display names alongside managed users.
+  user_display_names?: Record<string, string>;
+}
+
+// v0.9.6 Feature 3: one row in the per-server Users panel.
+// ``raw_name`` is the canonical identifier (email for owner, username
+// for managed). ``display_name`` is the operator's chosen friendly
+// name from the server's ``user_display_names`` map, or empty if none.
+export interface ServerUser {
+  kind: 'owner' | 'managed';
+  plex_id: string;
+  raw_name: string;
+  display_name: string;
+}
+
+export interface ServerUsersResponse {
+  users: ServerUser[];
+  // Non-null when ``systemAccounts()`` failed but the owner row is
+  // still present — UI renders "No managed users found" plus a
+  // tooltip with the underlying reason.
+  error: string | null;
 }
 
 // Response shape of POST /api/servers/{id}/ping (v0.9.1).
@@ -293,6 +341,17 @@ export const api = {
     http<PingResult>(`/api/servers/${encodeURIComponent(id)}/ping`, { method: 'POST' }),
   listServerLibraries: (id: string) =>
     http<LibraryDescriptor[]>(`/api/servers/${encodeURIComponent(id)}/libraries`),
+  // v0.9.6 Feature 3: list users on a server (owner + managed). Live
+  // call to systemAccounts() — one round-trip per visit, no caching.
+  listServerUsers: (id: string) =>
+    http<ServerUsersResponse>(`/api/servers/${encodeURIComponent(id)}/users`),
+  // Set or clear one entry in a server's user_display_names map.
+  // Empty display_name clears the mapping (UI falls back to raw id).
+  setUserDisplayName: (id: string, plex_id: string, display_name: string) =>
+    http<ServerView>(`/api/servers/${encodeURIComponent(id)}/user-display-name`, {
+      method: 'PATCH',
+      body: JSON.stringify({ plex_id, display_name }),
+    }),
 
   // Legacy single-server library listing — kept for one release.
   listLibraries: () => http<LibraryDescriptor[]>('/api/libraries'),
