@@ -301,14 +301,31 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!res.ok) {
+    // v0.9.7 fix: a Response body is a one-shot stream. The previous
+    // version called ``res.json()`` first and fell back to ``res.text()``
+    // in the catch — but ``res.json()`` consumes the stream even when
+    // it throws (e.g. on an HTML / plain-text error body), so the
+    // ``res.text()`` fallback then failed with "body stream already
+    // read". Read raw text once, then try to parse as JSON to extract
+    // ``detail``; either way the original text is available for the
+    // error message.
     let detail = '';
     try {
-      const body = await res.json();
-      detail = body?.detail || JSON.stringify(body);
+      const raw = await res.text();
+      if (raw) {
+        try {
+          const body = JSON.parse(raw);
+          detail = (body && typeof body === 'object' && body.detail) || raw;
+        } catch {
+          detail = raw;
+        }
+      }
     } catch {
-      detail = await res.text();
+      // Body couldn't even be read as text. Leave detail empty —
+      // the status code + statusText below still tell the user
+      // something useful.
     }
-    throw new Error(`${res.status} ${res.statusText}: ${detail}`);
+    throw new Error(`${res.status} ${res.statusText}${detail ? `: ${detail}` : ''}`);
   }
   if (res.status === 204) return undefined as unknown as T;
   return (await res.json()) as T;

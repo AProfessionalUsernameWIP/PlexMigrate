@@ -131,6 +131,8 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # — engine logic, logs, and backup files always use the raw
     # identifier.
     "user_display_names": {},
+}
+
 
 # ── Name-safety helper ───────────────────────────────────────────────────────
 
@@ -586,14 +588,28 @@ def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
     if row is None:
         raise ValueError(f"No server with id {server_id!r}")
 
-    token = row.get("token") or ""
-    if not token:
+    if not (row.get("token") or ""):
         raise ConnectionError(
             f"Server {row.get('name') or server_id!r} has no stored token. "
             f"Re-enter credentials under the Servers tab."
         )
 
-    server = connect_to_server(row["url"], token, logger)
+    # v0.9.7 fix: tokens on disk are Fernet ciphertexts (encryption at
+    # rest, see server/secrets.py). The pre-fix code passed the raw
+    # row["token"] straight to ``connect_to_server`` — Plex received
+    # ciphertext as the auth token and rejected it, surfacing as a
+    # 502 in the Servers tab's Users panel. Decrypting at the point
+    # of use brings this consumer in line with every other
+    # token-touching path (connect_registered_server, test_connection,
+    # ping_server, _run_direct).
+    try:
+        plain_token = decrypt_server_token(row)
+    except ServerCredentialError as exc:
+        # Keyfile lost or token corrupted — actionable message all the
+        # way to the operator.
+        raise ConnectionError(str(exc)) from exc
+
+    server = connect_to_server(row["url"], plain_token, logger)
     if server is None:
         raise ConnectionError(
             f"Could not connect to {row.get('name') or server_id!r}. "
