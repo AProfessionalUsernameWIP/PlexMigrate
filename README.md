@@ -1,5 +1,5 @@
 # PlexMigrate -WIP
-**Version 0.9.2**
+**Version 0.9.7**
 A tool that moves your Plex watch history, listening history, playlists, collections, and star ratings between Plex servers, without losing any data. 
 
 > **In a hurry?** See [QUICKSTART.md](QUICKSTART.md) for the 5-minute version. This README is the long reference.
