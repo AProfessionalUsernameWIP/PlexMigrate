@@ -1,5 +1,5 @@
 # PlexMigrate -WIP
-**Version 0.9.2**
+**Version 0.9.7**
 A tool that moves your Plex watch history, listening history, playlists, collections, and star ratings between Plex servers, without losing any data. 
 
 > **In a hurry?** See [QUICKSTART.md](QUICKSTART.md) for the 5-minute version. This README is the long reference.
@@ -12,6 +12,12 @@ There are two ways to run it. Pick whichever fits how you work:
 **New in v0.9.0: multi-server support.** PlexMigrate now manages a registry of multiple Plex servers and lets you target each one by friendly name. A new direct server-to-server transfer mode moves data from one registered server straight into another, without writing an intermediate `.plexbackup.json` to disk. Jump to [Multi-Server Support](#multi-server-support).
 
 New in v0.9.1: Every operation now requires explicit server selection no silent defaults. The Run Job form shows a live reachability dot and ping latency next to each server, refreshed every 30 seconds, and lower panels stay greyed out until a selection is made. Direct transfers automatically fall back to a chained export-then-import if the in-memory path fails for any reason; the activity feed announces it when it happens.
+
+**New in v0.9.5 — security and reliability.** Plex tokens are now encrypted at rest using Fernet symmetric encryption, with a 256-bit key auto-generated on first boot and stored in `server_data/.keyfile`. Mixed-content playlists no longer cause 30+ minute hangs — the scan-cache lock was holding worker threads and we fixed it, and shared playlists are now walked once by their actual owner instead of once per recipient. The schedule engine got a fix for fires that silently rolled forward without running, a configurable `TZ` env var so wall-clock times in the UI match your zone, and a server-clock display in the topbar so the operator always knows what time the container thinks it is. Server removal is now a cascade — it cleans up matching schedules, backup files, and run log directories with a confirmation dialog showing the counts up front. The Settings tab rejects Windows host paths (`Y:\…`) with an actionable error instead of silently writing them into the container's ephemeral filesystem.
+
+**New in v0.9.6 — four feature blocks.** The dashboard run header now shows the libraries queued, which library is currently being processed, and (when scoped) which user. A new Network Activity panel charts every Plex HTTP response by status code, plots a 60-second rolling requests-per-second + average-latency graph, and keeps its own amber-tinted rate-limit feed so 429s don't push useful events out of the activity stream. The Servers tab gained a per-server Users panel showing owner + managed users, with inline-editable owner display names that propagate everywhere a user appears in the UI. Direct transfers now offer a per-user selection — pick which managed users (and optionally the owner) carry their data over to the destination, with the intersection of both servers' user lists computed on the fly.
+
+**New in v0.9.7 — refinements and data fidelity.** The network charts now propagate data across the full 60-second window even under high traffic, the Y-axis only grows (never collapses on quiet periods), and elapsed time freezes at the final duration when a job ends instead of climbing through the post-finish retain window. The Thread Pool panel now populates during imports too — it was blank for every import path including direct-transfer-import because of an oversight that had been there since v0.5.0. Plex Pass personal collections are now correctly captured per-user and restored per-user; pre-v0.9.7 they were silently dropped from every export. The Logs tab gained a case-insensitive keyword filter with match highlighting, and the import file picker shows readable short-form labels like `Movies — Jade.TV (2026-05-11 10:32)` instead of bare filenames.
 
 
 ---
@@ -76,12 +82,13 @@ Once both containers are healthy, open <http://localhost:8080> in your browser. 
 
 ### What the web UI gives you
 
-* **Dashboard tab**: the live, browser-side version of the terminal dashboard. Thread pool counts broken down by category, run stats (completed / skipped / failed / unresolved), match resolution stats (GUID / filepath / suffix / fuzzy), per-library progress bars with ETA, and the colour-coded activity feed. Updates over a WebSocket at the same 4 Hz cadence as the terminal panel.
-* **Run Job tab**: each CLI flag has a clearly labelled form control. Pick export or import, select libraries (or backup files), set worker count, toggle verbose and strict match, fill in path remap if needed, then submit. Jobs run one at a time. Subsequent submissions queue.
-* **Schedules tab**: create, edit, enable / disable, and delete recurring export schedules. Schedules persist across container restarts and fire on a server-side background thread. Frequency: hourly, daily, or weekly, at a wall-clock time you choose.
-* **Logs tab**: a three-pane browser over `plex_logs/`. Click a run directory, click a file, read the contents in the browser. Files larger than 4 MB show the tail.
-* **Exports tab**: every `.plexbackup.json` in your output directory, with library, export timestamp, size, and a download button.
-* **Settings tab**: Plex URL, Plex token (write-only, never echoed back to the browser), and the default values for every per-run option.
+* **Dashboard tab**: the live, browser-side version of the terminal dashboard. The header now also shows the libraries queued for this run, which library is being processed right now, and (when a direct transfer is scoped to specific users) which user the engine is on. Below that you get the thread pool counts, run stats, match resolution stats, per-library progress bars with ETA, the colour-coded activity feed, and a new Network Activity panel that charts HTTP status codes, requests-per-second, and average latency over the last 60 seconds. Elapsed and ETA freeze at the final values when a job ends so you can see what the actual run duration was. Updates over a WebSocket at 4 Hz, same cadence as the terminal panel.
+* **Run Job tab**: each CLI flag has a clearly labelled form control. Pick export, import, or direct server-to-server transfer; select libraries (or backup files), set worker count, toggle verbose and strict match, fill in path remap if needed, then submit. Direct mode adds a Users section with checkboxes for the owner and every managed user that exists on both servers — uncheck anyone you don't want to migrate. Jobs run one at a time; subsequent submissions queue.
+* **Servers tab**: register, edit, test, and remove Plex servers by friendly name. The Server Users block under each row lists the owner and every Plex Home managed user; click the owner's display name to edit it inline (the chosen name propagates to the dashboard header, the activity feed, and the direct-transfer user selector). Removing a server is a cascade — schedules referencing it, backup files produced by it, and per-run log directories under its slug all get deleted with a confirmation dialog showing the counts.
+* **Schedules tab**: create, edit, enable / disable, and delete recurring export schedules. Schedules fire in the container's configured timezone (set the `TZ` env var in `docker-compose.yml`), and the topbar shows a live server-time clock so you always know what time the schedule engine sees. Frequency: hourly, daily, or weekly, at a wall-clock time you choose.
+* **Logs tab**: a three-pane browser over `plex_logs/`. Click a run directory, click a file, read the contents in the browser. The viewer has a case-insensitive keyword filter — type any substring and matching lines stay visible with the match highlighted, everything else hides. Files larger than 4 MB show the tail.
+* **Exports tab**: every `.plexbackup.json` in your output directory, with library, source server, export timestamp, size, an "Initiated by" badge (Manual or Scheduled · `<schedule name>`), a download button, and a Delete button per row.
+* **Settings tab**: Plex URL, Plex token (write-only, never echoed back to the browser), and the default values for every per-run option. Output and log paths must be container-visible — Windows host paths like `Y:\plexbackups` are rejected with a message explaining how to bind-mount external drives in `docker-compose.yml`.
 
 ### Stop / restart / inspect
 
@@ -101,15 +108,18 @@ Three host directories are bind-mounted into the backend container so all data o
 |---|---|---|
 | `./plex_exports/` | `/app/plex_exports/` | `.plexbackup.json` files |
 | `./plex_logs/` | `/app/plex_logs/` | Per-run log directories (same format as CLI mode) |
-| `./server_data/` | `/app/server_data/` | `settings.json` + `schedules.json` |
+| `./server_data/` | `/app/server_data/` | `settings.json`, `schedules.json`, `servers.json`, and the binary `.keyfile` used for token encryption (v0.9.5+) |
 
-You can inspect and edit everything in the table from the host. The JSON files use 2-space indent and are easy to diff.
+You can inspect and edit everything in the table from the host. The JSON files use 2-space indent and are easy to diff. The `.keyfile` is 32 raw bytes — don't open it in a text editor, don't commit it to source control (`.gitignore` already excludes it), and don't delete it unless you're prepared to re-enter every registered server's token.
 
 ### Security notes
 
-* The backend has **no built-in authentication**. It holds your Plex token and trusts whoever can reach `localhost:8000` / `localhost:8080`. Both ports bind to `127.0.0.1` by default, so a fresh `make docker` is reachable only from the host that ran it.
+* The backend has **no built-in authentication**. It holds your Plex tokens and trusts whoever can reach `localhost:8000` / `localhost:8080`. Both ports bind to `127.0.0.1` by default, so a fresh `make docker` is reachable only from the host that ran it.
 * If you want LAN access, put a reverse proxy with authentication (Caddy, Authelia, etc.) in front of the frontend container. Do not change the port binding to `0.0.0.0` without adding auth.
-* PlexMigrate stores the Plex token at rest in `./server_data/settings.json` in plaintext. Protect that directory the same way you protect any other server credentials file.
+* **Tokens are encrypted at rest as of v0.9.5.** A 256-bit Fernet key is generated on first boot and stored at `server_data/.keyfile` (raw bytes, mode `0o600`). Every Plex token in `servers.json` and the legacy `settings.json` is encrypted with that key; on disk you'll see `gAAAAAB…` ciphertexts rather than the raw tokens, and each row carries an `"_encrypted": true` marker. If the keyfile is deleted or replaced, existing encrypted tokens become unrecoverable — the operator gets an actionable "re-enter credentials" message in the UI rather than a crash. Decryption happens only at the point a token is handed to plexapi; the plaintext never lands in any log line, API response, or backup file.
+* A log-scrubber filter strips `X-Plex-Token=<value>` from every record written through Python's logging framework, so plexapi exceptions whose message includes a token-bearing URL don't leak it into `runtime.log`, `errors.log`, or Docker's stdout. The job worker's traceback path was rerouted from `traceback.print_exc()` (which bypassed handlers) through `logger.error(..., exc_info=True)` so the scrubber catches it too.
+* The Settings and Servers API endpoints return `""` (or `has_token: true/false`) for the token field, never the value itself. The Pydantic models reject Windows host paths in `output_dir` / `log_dir` so a misconfigured run can't silently write into the container's ephemeral filesystem.
+* Protect `server_data/` the same way you protect any other server credentials directory.
 
 ---
 
@@ -195,6 +205,10 @@ When you start a direct server-to-server transfer, PlexMigrate first tries the i
 4. If anything in step 2 fails, the file stays on disk, clearly marked with the `.tmp` infix, so you can re-import it manually after fixing the underlying issue.
 
 The dashboard activity feed announces the fallback (`Direct path unavailable — falling back to chained.`) so you know the operation has changed paths. The end result for your data is the same either way.
+
+### Per-user transfer scope (v0.9.6+)
+
+When you pick **Direct Transfer** in the Run Job form, after both servers are chosen a new **Users** section appears. It shows three groups computed live from each server's `/accounts` data: users present on both servers (with checkboxes, default-checked), users present only on the source (greyed out, "Not on destination server"), and an informational footer explaining how to invite missing users. The owner appears in the list alongside managed users — uncheck them and the run skips the entire library-level data block (watch history, playlists, library-level collections, ratings) with a clear log line. Personal collections (Plex Pass feature) ride with each included user's block automatically; pre-v0.9.7 these were silently dropped from every export, now they're correctly captured and restored per-user.
 
 ### Filename and log directory conventions
 
