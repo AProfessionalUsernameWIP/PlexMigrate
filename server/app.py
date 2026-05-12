@@ -51,6 +51,7 @@ from server.models import (
     ScheduleIn,
     ServerIn,
     SettingsIn,
+    UserDisplayNameIn,
 )
 from server.schedules import ensure_next_run_at, get_scheduler, list_schedules
 from server.ws import build_snapshot, get_manager
@@ -320,6 +321,45 @@ def _register_routes(app: FastAPI) -> None:
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
         return libs
+
+    @app.get("/api/servers/{server_id}/users")
+    def list_server_users(server_id: str) -> Dict[str, Any]:
+        """
+        Return the user list for one server (v0.9.6 Feature 3).
+
+        Owner + every managed user surfaces here, each carrying the
+        operator's chosen display name from the server's
+        ``user_display_names`` map (or empty if none). 404 if the
+        server is unregistered; 502 if Plex is unreachable. A
+        successful response with a non-null ``error`` field means
+        ``systemAccounts()`` failed but the owner row is still
+        present — the UI renders "No managed users found".
+        """
+        try:
+            return server_registry.get_server_users(server_id, log)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except ConnectionError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    @app.patch("/api/servers/{server_id}/user-display-name")
+    def patch_user_display_name(
+        server_id: str, body: UserDisplayNameIn,
+    ) -> Dict[str, Any]:
+        """
+        Set or clear one entry in a server's ``user_display_names``
+        map (v0.9.6 Feature 3). An empty ``display_name`` clears the
+        mapping. Returns the updated server row (with token redacted).
+        """
+        try:
+            updated = server_registry.set_user_display_name(
+                server_id, body.plex_id, body.display_name,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"No server with id {server_id!r}")
+        return updated
 
     # ── Libraries (legacy single-server alias, deprecated) ────────────
     # Kept for v0.8.x clients that still hit this endpoint. Resolves

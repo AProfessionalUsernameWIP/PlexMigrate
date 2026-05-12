@@ -304,6 +304,7 @@ class JobQueue:
         state._plex_base_url = url
         state._plex_token = token
         state._plex_owner_name = owner
+        _populate_run_user_context(server, source_name=settings.get("source_server_name"))
         # Run-trigger labels: stamped into the export JSON so the
         # Exports tab can show how each backup was initiated. Defaults
         # to "manual" when the API call carries no explicit marker
@@ -372,6 +373,10 @@ class JobQueue:
         state._plex_base_url = url
         state._plex_token = token
         state._plex_owner_name = owner
+        # Imports run against the destination server — pull its
+        # display-name map so the dashboard's current_user attribution
+        # uses the right side's friendly names.
+        _populate_run_user_context(server, source_name=settings.get("dest_server_name") or settings.get("source_server_name"))
 
         # Verify each requested input file exists before kicking off
         # the engine — fail fast with a useful message rather than
@@ -473,6 +478,11 @@ class JobQueue:
         state.MAX_WORKERS = int(settings["workers"])
         state.SCROBBLE_WORKERS = int(settings["scrobble_workers"])
         state._session = _make_session()
+        # Direct transfer attributes per-user work to the SOURCE side
+        # (users are read from there). The destination's display names
+        # are not relevant here — users on the destination match by
+        # raw identifier, not friendly name.
+        _populate_run_user_context(src_server, source_name=src_name)
 
         remap: Optional[Tuple[str, str]] = None
         if settings.get("remap_old") and settings.get("remap_new"):
@@ -481,6 +491,47 @@ class JobQueue:
         # Hand the keyboard-stub stop event over so /api/job/stop
         # propagates into the orchestrator.
         stop_event = runtime_patches._active_stop_event
+
+        # v0.9.6 Feature 4: resolve per-user tokens on both sides so
+        # direct transfer can carry managed-user data. Each home_users
+        # tuple is (username, token, PlexServer-bound-to-that-side).
+        # Failures (account.users() unavailable on local-admin tokens
+        # or transient network errors) degrade gracefully to an empty
+        # list, which collapses back to pre-v0.9.6 owner-only
+        # behaviour. The dashboard activity feed gets a phase line
+        # from inside ``get_home_users`` so the slow per-user auth
+        # burst is visible.
+        from services.auth import get_home_users
+        try:
+            src_home_users = get_home_users(src_server, src_row["url"], logger)
+        except Exception as e:
+            logger.warning("Could not enumerate source home users: %s", e)
+            src_home_users = []
+        try:
+            dst_home_users = get_home_users(dst_server, dst_row["url"], logger)
+        except Exception as e:
+            logger.warning("Could not enumerate destination home users: %s", e)
+            dst_home_users = []
+
+        # ``user_filter`` arrives as either None (include every
+        # transferable user) or a list of managed usernames. The model
+        # constraint already rejects malformed inputs at the API layer.
+        raw_filter = settings.get("user_filter")
+        user_filter: Optional[List[str]]
+        if raw_filter is None:
+            user_filter = None
+        elif isinstance(raw_filter, list):
+            user_filter = [str(u) for u in raw_filter]
+        else:
+            user_filter = None
+
+        # v0.9.7 Item 4: only show the dashboard's ``current_user``
+        # row when this run is *deliberately* scoped to a specific
+        # subset of users — i.e. direct transfer with a non-empty
+        # filter. Standard export / import / unscoped direct transfer
+        # leaves the row hidden so the header doesn't lock onto one
+        # user for minutes at a time.
+        state._current_user_visible = bool(user_filter)
 
         run_direct_transfer(
             source_server=src_server,
@@ -499,6 +550,10 @@ class JobQueue:
             stop_event=stop_event,
             # v0.9.1: where chained-fallback temp files (if any) land.
             output_dir=settings.get("output_dir") or None,
+            # v0.9.6 Feature 4: managed-user roster + filter.
+            source_home_users=src_home_users,
+            dest_home_users=dst_home_users,
+            user_filter=user_filter,
         )
 
         _close_logger(logger, run_log_dir)
@@ -605,6 +660,49 @@ def _resolve_source_connection(
         fresh.get("owner_name") or "Plex Owner",
         safe_server_name(fresh["name"]),
     )
+
+
+def _populate_run_user_context(
+    server: Any,
+    source_name: Optional[str] = None,
+) -> None:
+    """
+    Populate the run-scoped user context the dashboard reads from
+    (v0.9.6 Feature 1 + 3).
+
+    - ``state._plex_owner_email`` is set to the connected account's
+      Plex.tv email so the per-library "owner phase" can attribute
+      ``current_user`` to the owner identifier the
+      ``user_display_names`` map is keyed by.
+    - When ``source_name`` matches a registry row, its cached
+      ``user_display_names`` dict is copied into the live
+      :class:`services.dashboard.DashboardState` once at run start
+      so the frontend can substitute display names without a
+      per-tick REST hit. The map is otherwise rebuilt by the next
+      ``Servers`` tab visit.
+
+    Both operations are best-effort — failures here must not block
+    the actual run.
+    """
+    try:
+        email = getattr(server.myPlexAccount(), "email", None) or ""
+        state._plex_owner_email = str(email)
+    except Exception:
+        # myPlexAccount() requires a Plex.tv-linked token. Local-admin
+        # tokens raise; treat the owner as having no public identifier.
+        state._plex_owner_email = ""
+
+    # Carry the cached display-name map into the dashboard so the WS
+    # snapshot can ship it to the frontend.
+    if state._dashboard is not None and source_name:
+        try:
+            row = get_server_by_name(source_name, include_token=False)
+            if row is not None:
+                state._dashboard.set_user_display_names(
+                    row.get("user_display_names") or {}
+                )
+        except Exception:
+            pass
 
 
 def _set_run_timestamp(slug: str) -> None:

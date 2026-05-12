@@ -32,8 +32,12 @@ from services.dashboard import (
     _build_dashboard,
     _check_terminal_size,
     _current_item,
+    _http_lib_var,
     _keyboard_thread,
     _make_progress,
+    _thread_category,
+    library_http_context,
+    submit_with_context,
 )
 from services.logging_ops import (
     _fmt_media_line,
@@ -168,8 +172,20 @@ def import_watch_history(
     logger.info(f"Importing Play Count for {lib_name}: {total} items")
 
     scrobble_sem = threading.Semaphore(state.SCROBBLE_WORKERS)
+    # v0.9.7 Item 5: register every worker thread under the right
+    # category so the dashboard's Thread Pool panel shows live
+    # counts during imports. Music sections use ``play_count``;
+    # everything else uses ``watched`` — same mapping the exporter
+    # uses in gather_watch. Pre-v0.9.7 the import side never called
+    # _thread_category, leaving the panel blank for every import
+    # path including direct-transfer-import.
+    worker_category = "play_count" if section.type == "artist" else "watched"
 
     def process(stored: Dict) -> None:
+        with _thread_category(worker_category):
+            _process_one_watch_item(stored)
+
+    def _process_one_watch_item(stored: Dict) -> None:
         # Surface this item on the dashboard's "Currently Processing"
         # panel. Phase advances from "resolving" → "scrobbling" so the
         # user can tell which workers are doing GUID/filepath lookups
@@ -308,7 +324,7 @@ def import_watch_history(
                 state._dashboard.clear_current_item()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
-        futures = {pool.submit(process, item): item for item in watch_items}
+        futures = {submit_with_context(pool, process, item): item for item in watch_items}
         for f in concurrent.futures.as_completed(futures):
             _advance_lib(lib_name)
             exc = f.exception()
@@ -367,15 +383,18 @@ def import_playlists(
     resolved_by_pl: Dict[int, List[Tuple[Any, int]]] = {}
 
     def _resolve_one(pl_idx: int, stored: Dict) -> Tuple[int, Optional[Any], int]:
-        item = resolve_item(
-            server, section, stored, logger, remap, strict_match,
-            scan_cache, scan_lock,
-        )[0]
-        return pl_idx, item, stored.get("position", 0)
+        # v0.9.7 Item 5: register worker under "playlists" so the
+        # Thread Pool panel shows live counts during playlist resolve.
+        with _thread_category("playlists"):
+            item = resolve_item(
+                server, section, stored, logger, remap, strict_match,
+                scan_cache, scan_lock,
+            )[0]
+            return pl_idx, item, stored.get("position", 0)
 
     if resolve_tasks:
         with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
-            futs = [pool.submit(_resolve_one, pl_idx, stored)
+            futs = [submit_with_context(pool, _resolve_one, pl_idx, stored)
                     for pl_idx, stored in resolve_tasks]
             for fut in concurrent.futures.as_completed(futs):
                 _advance_lib(lib_name)
@@ -532,15 +551,17 @@ def import_collections(
     resolved_by_coll: Dict[int, List[Any]] = {}
 
     def _resolve_member(coll_idx: int, stored: Dict) -> Tuple[int, Optional[Any]]:
-        item = resolve_item(
-            server, section, stored, logger, remap, strict_match,
-            scan_cache, scan_lock,
-        )[0]
-        return coll_idx, item
+        # v0.9.7 Item 5: thread category for the Thread Pool panel.
+        with _thread_category("collections"):
+            item = resolve_item(
+                server, section, stored, logger, remap, strict_match,
+                scan_cache, scan_lock,
+            )[0]
+            return coll_idx, item
 
     if resolve_tasks:
         with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
-            futs = [pool.submit(_resolve_member, coll_idx, stored)
+            futs = [submit_with_context(pool, _resolve_member, coll_idx, stored)
                     for coll_idx, stored in resolve_tasks]
             for fut in concurrent.futures.as_completed(futs):
                 _advance_lib(lib_name)
@@ -668,6 +689,10 @@ def import_ratings(
     logger.info(f"Importing ratings for {lib_name}: {total} items")
 
     def process(stored: Dict) -> None:
+        with _thread_category("ratings"):
+            _process_one_rating(stored)
+
+    def _process_one_rating(stored: Dict) -> None:
         if state._dashboard:
             state._dashboard.set_current_item(
                 lib_name, stored.get("type", "?"), stored.get("title", ""),
@@ -765,7 +790,7 @@ def import_ratings(
                 state._dashboard.clear_current_item()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
-        futs = {pool.submit(process, stored): stored for stored in ratings}
+        futs = {submit_with_context(pool, process, stored): stored for stored in ratings}
         for fut in concurrent.futures.as_completed(futs):
             _advance_lib(lib_name)
             if fut.exception():
@@ -822,6 +847,23 @@ def import_backup_file(
 
     lib_name = data.get("library", "Unknown")
     logger.info(f"Importing from {backup_path} → library: {lib_name}")
+
+    # v0.9.6 Feature 2: tag every Plex API call this library makes with
+    # the library name so the Network panel can attribute traffic
+    # per-library. Set on the task-local context (the import_backup_file
+    # call is itself dispatched via submit_with_context from run_import,
+    # so each library task has its own context — no leakage across
+    # libraries).
+    _http_lib_var.set(lib_name)
+    # v0.9.6 Feature 1: the per-library work the OWNER does (admin's
+    # watch history, playlists, etc) is attributed to the owner's
+    # email. Per-user blocks inside the loop below override this
+    # temporarily and restore it on exit.
+    # v0.9.7 Item 4: gate on ``state._current_user_visible`` so the
+    # field stays null during standard imports and unscoped direct
+    # transfers. Set only when the user explicitly narrowed the run.
+    if state._dashboard and state._current_user_visible:
+        state._dashboard.set_current_user(state._plex_owner_email or None)
 
     task_id = state._lib_task_ids.get(lib_name)
 
@@ -953,25 +995,62 @@ def import_backup_file(
             f"library '{lib_name}': "
             f"{len(user_data.get('watch_history', []))} watch history, "
             f"{len(user_data.get('playlists', []))} playlist(s), "
+            f"{len(user_data.get('collections', []))} personal collection(s), "
             f"{len(user_data.get('ratings', []))} rating(s)"
         )
 
-        import_watch_history(
-            user_server, user_section, user_data.get("watch_history", []),
-            user_token, base_url, logger, log_dir, remap, strict_match,
-            scan_cache, scan_lock, user=username,
-        )
-        import_playlists(
-            user_server, user_section, user_data.get("playlists", []),
-            logger, log_dir, remap, strict_match,
-            scan_cache, scan_lock,
-            existing_playlists=None,
-        )
-        import_ratings(
-            user_server, user_section, user_data.get("ratings", []),
-            user_token, base_url, logger, remap, strict_match,
-            scan_cache, scan_lock, user=username,
-        )
+        # v0.9.6 Feature 1: tag the header with this user for the
+        # duration of their block. Restored to the owner's identifier
+        # (or None) on exit so subsequent libraries' owner phases
+        # don't show this user.
+        # v0.9.7 Item 4: gated by ``_current_user_visible``. When
+        # False the header field stays null for the whole run.
+        prev_user = state._dashboard.current_user if state._dashboard else None
+        if state._dashboard and state._current_user_visible:
+            state._dashboard.set_current_user(username)
+        # v0.9.7 Item 5: register this orchestrator thread under
+        # "home_user" so the Thread Pool panel shows live counts
+        # during the per-user phase. Inner pools spawned by the
+        # import_* primitives still register under their own
+        # categories (watched / playlists / collections / ratings).
+        thread_ctx = _thread_category("home_user")
+        thread_ctx.__enter__()
+        try:
+            import_watch_history(
+                user_server, user_section, user_data.get("watch_history", []),
+                user_token, base_url, logger, log_dir, remap, strict_match,
+                scan_cache, scan_lock, user=username,
+            )
+            import_playlists(
+                user_server, user_section, user_data.get("playlists", []),
+                logger, log_dir, remap, strict_match,
+                scan_cache, scan_lock,
+                existing_playlists=None,
+            )
+            # v0.9.7 Item 9: restore this user's personal collections
+            # (Plex Pass feature — collections that live in their
+            # profile, not at the library level). Older backups
+            # without the field map to an empty list via .get's
+            # default, making this a no-op for pre-v0.9.7 exports.
+            import_collections(
+                user_server, user_section, user_data.get("collections", []),
+                logger, log_dir, remap, strict_match,
+                scan_cache, scan_lock,
+            )
+            import_ratings(
+                user_server, user_section, user_data.get("ratings", []),
+                user_token, base_url, logger, remap, strict_match,
+                scan_cache, scan_lock, user=username,
+            )
+        finally:
+            # Restore the prior current_user (owner email or None) so
+            # the next user's block has a clean starting point. Safe
+            # to run even when gating is off — the prior value was
+            # also null in that case, so this is a no-op.
+            if state._dashboard and state._current_user_visible:
+                state._dashboard.set_current_user(prev_user)
+            # v0.9.7 Item 5: unregister the "home_user" thread tag.
+            thread_ctx.__exit__(None, None, None)
         return "imported"
 
     if users_data:
@@ -980,7 +1059,7 @@ def import_backup_file(
         n_user_workers = min(4, len(users_data))
         with concurrent.futures.ThreadPoolExecutor(max_workers=n_user_workers) as user_pool:
             futs = {
-                user_pool.submit(_import_user, uname, udata): uname
+                submit_with_context(user_pool, _import_user, uname, udata): uname
                 for uname, udata in users_data.items()
             }
             for fut in concurrent.futures.as_completed(futs):
@@ -1138,7 +1217,8 @@ def run_import(
             if stop_event.is_set():
                 logger.info(f"Stop requested — not submitting '{lib_names[bf]}'.")
                 continue
-            fut = lib_pool.submit(
+            fut = submit_with_context(
+                lib_pool,
                 import_backup_file,
                 server, bf, token, base_url, logger, log_dir, remap, strict_match,
                 home_users, all_playlists, sections_by_name, None,  # preloaded_data=None: load on demand

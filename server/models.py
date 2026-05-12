@@ -240,6 +240,21 @@ class DirectTransferIn(BaseModel):
     remap_old: Optional[str] = None
     remap_new: Optional[str] = None
     strict_match: Optional[bool] = None
+    # v0.9.6 Feature 4: limit per-user data transfer to this list of
+    # raw Plex identifiers (managed-user usernames). ``None`` / absent
+    # = all users included (the existing v0.9.5 behaviour). Empty list
+    # = exclude every managed user; only the owner's data transfers.
+    # Matching is by raw identifier, not display name — display names
+    # are a pure rendering aid (Feature 3). The filter applies wholesale
+    # to each managed user's block (watch history + playlists +
+    # collections + ratings together). The owner's data always
+    # transfers regardless of this list.
+    user_filter: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "List of managed-user identifiers to include. None = include all."
+        ),
+    )
 
 
 class ServerIn(BaseModel):
@@ -257,6 +272,22 @@ class ServerIn(BaseModel):
         default="",
         description="Plex auth token. Empty on update = keep existing.",
     )
+
+
+# ── User display-name editing (v0.9.6 Feature 3) ─────────────────────────────
+
+class UserDisplayNameIn(BaseModel):
+    """
+    Body of ``PATCH /api/servers/{id}/user-display-name``.
+
+    ``plex_id`` is the raw Plex identifier — owner email for the owner
+    row, managed-user username for managed rows. ``display_name`` is
+    the operator's chosen friendly name. An empty string clears the
+    mapping (the UI then falls back to showing the raw identifier).
+    """
+
+    plex_id: str = Field(description="Raw Plex identifier — owner email or managed username.")
+    display_name: str = Field(default="", description="Friendly name; empty clears.")
 
 
 class JobStatusOut(BaseModel):

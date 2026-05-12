@@ -14,6 +14,7 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react';
 import { ActivityEntry, CurrentItem, DashboardSnapshot, JobPayload, LibraryProgress, LogFile, SnapshotMessage, api } from '../api';
 import { LogTailer } from './LogTailer';
+import { NetworkPanel } from './NetworkPanel';
 
 interface Props {
   snapshot: SnapshotMessage | null;
@@ -45,6 +46,11 @@ export function DashboardPanel({ snapshot, connState = 'connected' }: Props) {
           <ThreadPool dash={dash} />
           <CurrentlyProcessing items={dash.current_items ?? []} />
           <LibraryList libs={dash.libraries} now={Date.now() / 1000} />
+          <NetworkPanel
+            snapshot={dash}
+            queuedLibraries={extractQueuedLibraries(job)}
+            jobId={job?.job_id ?? null}
+          />
           <ActivityFeed entries={dash.activity} />
           <DashboardLogTail job={job} />
         </>
@@ -219,7 +225,24 @@ function DashboardLogTail({ job }: { job: JobPayload | null }) {
 // ── Job header ────────────────────────────────────────────────────────────────
 
 function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardSnapshot | null }) {
-  const elapsed = dash ? secondsToHMS(Date.now() / 1000 - dash.start_time) : '—';
+  // v0.9.7: detect "run is over" so elapsed freezes at the final
+  // duration instead of climbing while the post-finish snapshot is
+  // retained on-screen, and ETA returns to '—' (extrapolating a
+  // remaining time after the run finished is meaningless).
+  const runIsOver = !!job && (
+    job.state === 'completed' ||
+    job.state === 'failed' ||
+    job.state === 'cancelled'
+  );
+  // ``nowSec`` is the time-reference both elapsed and ETA use. When
+  // the run is over and ``finished_at`` is known, freeze it to that
+  // value so the displayed elapsed equals the actual run duration.
+  // While the run is in flight (running / stopping / queued), use
+  // the live wallclock.
+  const nowSec = runIsOver && job?.finished_at
+    ? job.finished_at
+    : Date.now() / 1000;
+  const elapsed = dash ? secondsToHMS(nowSec - dash.start_time) : '—';
   // v0.9.2 fix for "Current Job shows 0/N and no ETA" bugs.
   // Both totalCount and completedCount now read from
   // ``dash.libraries[].{total,completed}`` — the exact same fields
@@ -235,17 +258,36 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardSnaps
   const totalCount = dash ? dash.libraries.reduce((acc, l) => acc + l.total, 0) : 0;
   const completedCount = dash ? dash.libraries.reduce((acc, l) => acc + l.completed, 0) : 0;
   const pct = totalCount > 0 ? completedCount / totalCount : 0;
-  // Global ETA: extrapolate from current rate.
-  const eta = dash && pct > 0.02 && pct < 1
-    ? secondsToHMS(((Date.now() / 1000 - dash.start_time) / pct) * (1 - pct))
+  // Global ETA: extrapolate from current rate. v0.9.7: also return
+  // '—' when the run is over — ETA after completion is meaningless
+  // and was previously continuing to climb alongside elapsed during
+  // the 30-second post-finish retain window.
+  const eta = !runIsOver && dash && pct > 0.02 && pct < 1
+    ? secondsToHMS(((nowSec - dash.start_time) / pct) * (1 - pct))
     : '—';
 
   // Pull multi-server names out of the job params dict the server
   // populates per /api/job request. We render them as a "Plex1 →
   // Plex2" badge so the user always knows where data is flowing.
-  const params = (job?.params ?? {}) as Record<string, string | undefined>;
-  const sourceServer = params['source_server_name'];
-  const destServer = params['dest_server_name'];
+  const params = (job?.params ?? {}) as Record<string, unknown>;
+  const sourceServer = typeof params['source_server_name'] === 'string' ? params['source_server_name'] : undefined;
+  const destServer = typeof params['dest_server_name'] === 'string' ? params['dest_server_name'] : undefined;
+
+  // v0.9.6 Feature 1 — header context.
+  const queuedLibs = extractQueuedLibraries(job);
+  // Active libraries are derived from the dashboard's per-library
+  // statuses (Q1 of the design pass: no separate ``current_library``
+  // field — multiple libraries can be active at once under
+  // ``lib_pool`` concurrency, and the libraries[] array already
+  // models that).
+  const activeLibs = dash ? dash.libraries.filter((l) => l.status === 'active').map((l) => l.name) : [];
+  // Current user is the raw identifier from the engine. The display
+  // name lookup is purely a rendering concern — backend logs and
+  // engine logic always use the raw identifier.
+  const rawCurrentUser = dash?.current_user ?? null;
+  const currentUserDisplay = rawCurrentUser
+    ? (dash?.user_display_names?.[rawCurrentUser] || rawCurrentUser)
+    : null;
 
   const onStop = async () => {
     try { await api.stopJob(); } catch { /* surface elsewhere */ }
@@ -296,6 +338,31 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardSnaps
             <div className="k">Elapsed</div><div className="v">{elapsed}</div>
             <div className="k">Estimated remaining</div><div className="v">{eta}</div>
             <div className="k">Progress</div><div className="v">{completedCount.toLocaleString()} / {totalCount.toLocaleString()} items ({(pct * 100).toFixed(1)}%)</div>
+            {/* v0.9.6 Feature 1: queued libraries (from job params),
+                currently-active libraries (derived from per-library
+                status), and current user (raw id resolved through
+                the cached display-name map). Each row is hidden
+                entirely when it has nothing to show. */}
+            {queuedLibs.length > 0 && (<>
+              <div className="k">Libraries queued</div>
+              <div className="v">
+                {queuedLibs.map((lib) => (
+                  <span key={lib} className="tag phase" style={{ marginRight: 4 }}>{lib}</span>
+                ))}
+              </div>
+            </>)}
+            {activeLibs.length > 0 && (<>
+              <div className="k">Currently processing</div>
+              <div className="v">
+                {activeLibs.map((lib) => (
+                  <span key={lib} className="tag started" style={{ marginRight: 4 }}>{lib}</span>
+                ))}
+              </div>
+            </>)}
+            {currentUserDisplay && (<>
+              <div className="k">Current user</div>
+              <div className="v" title={rawCurrentUser || ''}>{currentUserDisplay}</div>
+            </>)}
             {job?.run_log_dir && (<>
               <div className="k">Run log directory</div><div className="v">{job.run_log_dir}</div>
             </>)}
@@ -536,7 +603,12 @@ function LibraryList({ libs, now }: { libs: LibraryProgress[]; now: number }) {
             <tr>
               <th style={{ width: '20%' }}>Library</th>
               <th style={{ width: '40%' }}>Progress</th>
-              <th style={{ width: '12%' }}>Items</th>
+              {/* v0.9.7 Item 3: right-align header to match the
+                  ``.num`` cell underneath. Without this the Items
+                  header was left-aligned while the cell was
+                  right-aligned, visually offsetting the value
+                  across the column. */}
+              <th style={{ width: '12%', textAlign: 'right' }}>Items</th>
               <th style={{ width: '18%' }}>Phase</th>
               <th style={{ width: '10%' }}>ETA</th>
             </tr>
@@ -642,6 +714,20 @@ const LABEL_FOR_ACTION: Record<string, string> = {
 };
 
 // ── Tiny shared helpers ───────────────────────────────────────────────────────
+
+// v0.9.6 Feature 1: pull the libraries-queued list straight from the
+// job params. The backend already broadcasts ``job.params.libraries``
+// for every job mode (export, import, direct), so no new WS field is
+// needed. ``import`` mode submits ``input_files`` instead — no
+// per-library names available from the form. An empty list also
+// covers the legitimate "all libraries on the server" shorthand the
+// engine accepts.
+export function extractQueuedLibraries(job: JobPayload | null): string[] {
+  if (!job) return [];
+  const raw = (job.params as Record<string, unknown>)?.libraries;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((v): v is string => typeof v === 'string');
+}
 
 function SectionHint({ children }: { children: ReactNode }) {
   return (

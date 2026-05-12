@@ -14,7 +14,7 @@
 // — those live in the registry the user manages from the Servers tab.
 
 import { useEffect, useRef, useState } from 'react';
-import { api, ExportFile, LibraryDescriptor, PingResult, ServerView, SnapshotMessage } from '../api';
+import { api, ExportFile, LibraryDescriptor, PingResult, ServerUser, ServerView, SnapshotMessage } from '../api';
 
 // v0.9.1: live status indicator polling cadence for the server pickers.
 const PING_INTERVAL_MS = 30_000;
@@ -62,6 +62,21 @@ export function JobFormPanel({ snapshot }: Props) {
   const [overwritePlaylists, setOverwritePlaylists] = useState(false);
   const [remapOld, setRemapOld] = useState('');
   const [remapNew, setRemapNew] = useState('');
+
+  // v0.9.6 Feature 4: per-side managed-user lists for direct transfer.
+  // Loaded in parallel as soon as both source + destination are
+  // chosen. ``null`` = not loaded yet for that side; an array (even
+  // empty) means the fetch completed. ``sourceUsers === null ||
+  // destUsers === null`` gates the Users section's rendering so it
+  // doesn't flash an empty intersection during the fetch window.
+  const [sourceUsers, setSourceUsers] = useState<ServerUser[] | null>(null);
+  const [destUsers, setDestUsers] = useState<ServerUser[] | null>(null);
+  const [usersError, setUsersError] = useState<string | null>(null);
+  // Operator's set of included managed-user identifiers. Auto-initialised
+  // to the full transferable intersection (all checked by default) and
+  // then mutated by per-row checkbox toggles. Reset whenever either
+  // server selection changes.
+  const [includedUsers, setIncludedUsers] = useState<Set<string>>(new Set());
 
   // Submission state.
   const [submitting, setSubmitting] = useState(false);
@@ -142,6 +157,56 @@ export function JobFormPanel({ snapshot }: Props) {
     api.listExports().then(setExports).catch(() => setExports([]));
   }, [mode]);
 
+  // v0.9.6 Feature 4: load users from BOTH servers in direct mode so
+  // the form can compute the transferable intersection. Reset state
+  // on every selection change so we never show a stale list. The
+  // includedUsers default ("all checked") is set once after the
+  // fetch resolves so the operator only needs to *un*check to
+  // exclude — matching the spec.
+  useEffect(() => {
+    setSourceUsers(null);
+    setDestUsers(null);
+    setIncludedUsers(new Set());
+    setUsersError(null);
+    if (mode !== 'direct') return;
+    if (!sourceServerName || !destServerName) return;
+    if (sourceServerName === destServerName) return;
+    const src = servers.find((s) => s.name === sourceServerName);
+    const dst = servers.find((s) => s.name === destServerName);
+    if (!src || !dst) return;
+    let cancelled = false;
+    Promise.allSettled([
+      api.listServerUsers(src.id),
+      api.listServerUsers(dst.id),
+    ]).then(([sres, dres]) => {
+      if (cancelled) return;
+      const srcOk = sres.status === 'fulfilled';
+      const dstOk = dres.status === 'fulfilled';
+      const srcList = srcOk ? sres.value.users : [];
+      const dstList = dstOk ? dres.value.users : [];
+      setSourceUsers(srcList);
+      setDestUsers(dstList);
+      // v0.9.7 Item 7: the owner is now a selectable user, default-
+      // checked, alongside managed users. Compute the transferable
+      // intersection by raw identifier across BOTH kinds so the
+      // owner appears in the included set unless the operator
+      // unchecks them. When unchecked, the backend's run_direct_transfer
+      // gates the entire payload["items"] block (library-level
+      // watch_history / playlists / collections / ratings) on
+      // whether the owner identifier is in user_filter.
+      const dstIds = new Set(dstList.map((u) => u.plex_id));
+      const intersection = srcList
+        .filter((u) => dstIds.has(u.plex_id))
+        .map((u) => u.plex_id);
+      setIncludedUsers(new Set(intersection));
+      const errors: string[] = [];
+      if (!srcOk) errors.push(`source: ${String((sres as PromiseRejectedResult).reason)}`);
+      if (!dstOk) errors.push(`destination: ${String((dres as PromiseRejectedResult).reason)}`);
+      if (errors.length) setUsersError(errors.join(' · '));
+    });
+    return () => { cancelled = true; };
+  }, [mode, sourceServerName, destServerName, servers]);
+
   const jobRunning = !!snapshot?.job && snapshot.job.state === 'running';
 
   // ── Submit handler ────────────────────────────────────────────────
@@ -198,6 +263,20 @@ export function JobFormPanel({ snapshot }: Props) {
         if (remapOld && remapNew) {
           payload.remap_old = remapOld;
           payload.remap_new = remapNew;
+        }
+        // v0.9.6 Feature 4 / v0.9.7 Item 7: send ``user_filter``
+        // whenever the Users section rendered AND at least one
+        // transferable entry exists (owner OR managed). If both
+        // servers report no users we omit the field so the
+        // backend's "None = include all" default applies. Owner is
+        // included in the intersection check now — unchecking the
+        // owner is how the operator skips library-level data.
+        if (sourceUsers !== null && destUsers !== null) {
+          const dstIds = new Set(destUsers.map((u) => u.plex_id));
+          const hasIntersection = sourceUsers.some((u) => dstIds.has(u.plex_id));
+          if (hasIntersection) {
+            payload.user_filter = Array.from(includedUsers);
+          }
         }
         const r = await api.submitDirect(payload);
         setSubmitOk(`Direct transfer ${r.job_id} queued.`);
@@ -384,6 +463,34 @@ export function JobFormPanel({ snapshot }: Props) {
         </div>
       )}
 
+      {mode === 'direct' && sourceUsers !== null && destUsers !== null && (
+        <DirectUsersPanel
+          sourceUsers={sourceUsers}
+          destUsers={destUsers}
+          included={includedUsers}
+          onToggle={(plex_id) => {
+            setIncludedUsers((prev) => {
+              const next = new Set(prev);
+              if (next.has(plex_id)) next.delete(plex_id);
+              else next.add(plex_id);
+              return next;
+            });
+          }}
+          onAll={() => {
+            // v0.9.7 Item 7: include both owner and managed in the
+            // intersection — owner is selectable too.
+            const dstIds = new Set(destUsers.map((u) => u.plex_id));
+            setIncludedUsers(new Set(
+              sourceUsers
+                .filter((u) => dstIds.has(u.plex_id))
+                .map((u) => u.plex_id),
+            ));
+          }}
+          onNone={() => setIncludedUsers(new Set())}
+          loadError={usersError}
+        />
+      )}
+
       {mode === 'import' && (
         <div className="panel">
           <h2>Backup Files</h2>
@@ -396,7 +503,11 @@ export function JobFormPanel({ snapshot }: Props) {
             ) : exports.map((f) => (
               <label key={f.name} className="switch">
                 <input type="checkbox" checked={selectedFiles.has(f.name)} onChange={() => toggleFile(f.name)} />
-                <span>{f.library ?? f.name}</span>
+                {/* v0.9.7 follow-up: short-form label combining library
+                    name + source server when both are known. The
+                    full filename (long and machine-y) drops to the
+                    help row so the picker stays scannable. */}
+                <span>{formatImportLabel(f)}</span>
                 <span className="help">{f.name}</span>
               </label>
             ))}
@@ -520,6 +631,41 @@ function serversReady(mode: Mode, src: string, dst: string): boolean {
   return !!src && !!dst && src !== dst;
 }
 
+/**
+ * v0.9.7 follow-up: build a readable short-form label for an export
+ * file in the import picker. Prefers ``{library} — {source_server}
+ * (short date)`` when both library and source_server are populated;
+ * falls back to whatever's available without the dashes / parens so
+ * older backups (no source_server, no exported_at) still render
+ * cleanly. The full filename stays in the ``help`` row underneath
+ * so operators can still copy-paste it when needed.
+ */
+function formatImportLabel(f: ExportFile): string {
+  const lib = (f.library ?? '').trim();
+  const srv = (f.source_server ?? '').trim();
+  // Date source priority: ``exported_at`` (ISO from metadata) if
+  // present, else ``mtime`` (filesystem). The "short date" is just
+  // YYYY-MM-DD HH:MM — locale rendering would vary between hosts;
+  // a stable ISO-ish format is easier to scan in the picker.
+  let when = '';
+  const rawTs = f.exported_at || (f.mtime ? new Date(f.mtime * 1000).toISOString() : '');
+  if (rawTs) {
+    const d = new Date(rawTs);
+    if (!isNaN(d.getTime())) {
+      const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+      when = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+             `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+  }
+  // Compose parts conditionally so missing fields don't leave
+  // stray separators in the output.
+  const head = lib || f.name;
+  const parts: string[] = [head];
+  if (srv) parts.push(`— ${srv}`);
+  if (when) parts.push(`(${when})`);
+  return parts.join(' ');
+}
+
 // ── Sub-component: server picker (v0.9.1) ───────────────────────────────────
 //
 // Each option appears as a clickable card with a status dot, friendly
@@ -590,6 +736,134 @@ function ServerPicker(props: {
           </button>
         );
       })}
+    </div>
+  );
+}
+
+// ── Sub-component: direct-transfer user intersection (v0.9.6 Feature 4) ─────
+//
+// Three groups computed by raw identifier match:
+//   - Transferable : on both source AND destination → checkboxes,
+//                    default checked. Operator can uncheck to exclude.
+//   - Source only  : on source, missing on destination → grayed out
+//                    with a "Not on destination server" note.
+//   - Destination  : the spec's informational footer about inviting
+//                    users via the Servers tab. No button / action.
+//
+// Owner rows are never rendered here — owner data always transfers,
+// independent of this filter. If neither source nor destination has
+// any managed users at all, the parent component still mounts this
+// panel because it serves as a confirmation that there's nothing
+// per-user to filter; we render a single "No managed users on
+// either side" line to make that explicit.
+
+function DirectUsersPanel(props: {
+  sourceUsers: ServerUser[];
+  destUsers: ServerUser[];
+  included: Set<string>;
+  onToggle: (plex_id: string) => void;
+  onAll: () => void;
+  onNone: () => void;
+  loadError: string | null;
+}) {
+  const { sourceUsers, destUsers, included, onToggle, onAll, onNone, loadError } = props;
+  // v0.9.7 Item 7: the owner is selectable alongside managed users.
+  // Intersection is by raw identifier across both kinds; unchecking
+  // the owner narrows the transfer so library-level data
+  // (collections + the four owner-scoped blocks) is skipped.
+  const dstIds = new Set(destUsers.map((u) => u.plex_id));
+  const transferable = sourceUsers.filter((u) => dstIds.has(u.plex_id));
+  const sourceOnly = sourceUsers.filter((u) => !dstIds.has(u.plex_id));
+
+  const allEmpty = sourceUsers.length === 0 && destUsers.length === 0;
+
+  return (
+    <div className="panel">
+      <h2>Users</h2>
+      <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+        Pick which managed users' watch history, playlists, collections, and ratings travel
+        with this direct transfer. The server owner's data always transfers regardless of
+        what's checked here.
+      </span>
+      {loadError && (
+        <div className="banner error" style={{ fontSize: 12, marginBottom: 8 }}>
+          Could not fully load user lists: {loadError}
+        </div>
+      )}
+      {allEmpty ? (
+        <div className="empty" style={{ fontSize: 12 }}>
+          No managed users on either server — the owner's data will transfer alone.
+        </div>
+      ) : (
+        <>
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+              <strong style={{ fontSize: 13 }}>Transferable ({transferable.length})</strong>
+              <div className="row-buttons">
+                <button onClick={onAll} disabled={transferable.length === 0}>All</button>
+                <button onClick={onNone} disabled={transferable.length === 0}>None</button>
+              </div>
+            </div>
+            {transferable.length === 0 ? (
+              <div className="empty" style={{ fontSize: 12 }}>
+                No users available on both servers.
+              </div>
+            ) : (
+              <div className="checkbox-grid">
+                {transferable.map((u) => (
+                  <label key={u.plex_id} className="switch">
+                    <input
+                      type="checkbox"
+                      checked={included.has(u.plex_id)}
+                      onChange={() => onToggle(u.plex_id)}
+                    />
+                    <span>
+                      {/* v0.9.7 follow-up: prefer the operator's
+                          chosen display name (set on the Servers tab)
+                          over the raw identifier. Owner's raw_name
+                          is the Plex.tv email and gets noisy in this
+                          list; falling back to it only when no
+                          display name exists keeps the UI readable. */}
+                      <strong>{u.display_name || u.raw_name}</strong>{' '}
+                      {/* v0.9.7 Item 7: Owner / Managed badge so it's
+                          clear the owner is a selectable target with
+                          a different scope than managed users. */}
+                      <span
+                        className={`tag ${u.kind === 'owner' ? 'started' : 'phase'}`}
+                        style={{ fontSize: 10, marginLeft: 4 }}
+                      >
+                        {u.kind === 'owner' ? 'Owner' : 'Managed'}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+          {sourceOnly.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <strong style={{ fontSize: 13 }}>Source only ({sourceOnly.length})</strong>
+              <div className="checkbox-grid" style={{ opacity: 0.55 }}>
+                {sourceOnly.map((u) => (
+                  <label key={u.plex_id} className="switch" title="Not on destination server">
+                    <input type="checkbox" checked={false} disabled />
+                    <span>
+                      {/* v0.9.7 follow-up: prefer display_name same as the transferable list. */}
+                      <strong>{u.display_name || u.raw_name}</strong>{' '}
+                      <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+                        — Not on destination server
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+          <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-dim)' }}>
+            Users not on the destination can be invited via the Servers tab.
+          </div>
+        </>
+      )}
     </div>
   );
 }

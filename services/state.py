@@ -71,6 +71,22 @@ _run_log_dir: Optional[Path] = None       # per-run subdirectory; set by setup_l
 _plex_base_url: Optional[str] = None      # server URL; set in main() for [S] key
 _plex_token: Optional[str] = None         # auth token; set in main() for [S] URL
 _plex_owner_name: str = "Plex Owner"      # actual myPlexUsername; set after connect
+# v0.9.6: owner's Plex.tv email — the canonical "identifier" the
+# dashboard uses for the run-owner phases of current_user. Distinct
+# from _plex_owner_name (which is the myPlexUsername / handle) because
+# the user_display_names map is keyed by email for owners and by
+# username for managed users (single dict, two kinds of keys).
+_plex_owner_email: str = ""
+# v0.9.7 Item 4: gate for the dashboard's ``current_user`` field.
+# True only during a direct-transfer run with a non-empty
+# ``user_filter`` (i.e. the operator explicitly narrowed the run to
+# specific users). In every other case — standard export, standard
+# import, direct transfer with no filter — the four ``set_current_user``
+# call sites in importer/exporter become no-ops and the field stays
+# null so the dashboard header doesn't render it. Cleared at the
+# start of every run by ``reset_run_state``; flipped True by
+# ``server.jobs._run_direct`` after it resolves the filter.
+_current_user_visible: bool = False
 _live_instance: Optional[Any] = None      # active Live context; set in run_export/run_import
 
 # ── Run-trigger labels (v0.9.5) ──────────────────────────────────────────────
@@ -313,6 +329,22 @@ def reset_run_state() -> None:
     _lib_task_ids.clear()
     # Clear the run-trigger labels so a manual run after a scheduled
     # one doesn't inherit the scheduler's "schedule" tag.
-    global _run_trigger, _run_schedule_name
+    global _run_trigger, _run_schedule_name, _plex_owner_email
     _run_trigger = ""
     _run_schedule_name = ""
+    # v0.9.6: owner email is re-populated at the next job start.
+    _plex_owner_email = ""
+    # v0.9.7 Item 4: ``current_user`` visibility opts in per-run. The
+    # next ``_run_direct`` call sets this True iff a user filter is
+    # active; standard export / import always leaves it False.
+    global _current_user_visible
+    _current_user_visible = False
+    # v0.9.6: wipe HTTP telemetry on the dashboard. The dashboard
+    # instance is owned by the next-run setup; if one is already
+    # attached (server mode reuses placeholders) clear its state too.
+    if _dashboard is not None:
+        try:
+            _dashboard.reset_http_telemetry()
+        except Exception:
+            # Defensive: a malformed dashboard shouldn't block reset.
+            pass

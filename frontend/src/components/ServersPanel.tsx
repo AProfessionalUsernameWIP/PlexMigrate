@@ -16,7 +16,7 @@
 // above and the cached library catalogue panel below stay as-is.
 
 import { useEffect, useRef, useState } from 'react';
-import { api, LibraryDescriptor, PingResult, ServerView } from '../api';
+import { api, LibraryDescriptor, PingResult, ServerUser, ServerUsersResponse, ServerView } from '../api';
 
 // Poll cadence for the live status indicator, in milliseconds.
 const PING_INTERVAL_MS = 30_000;
@@ -33,6 +33,14 @@ export function ServersPanel() {
   // dict directly). Each value is the most recent PingResult or
   // ``undefined`` if no ping has come back yet for that id.
   const [pings, setPings] = useState<Record<string, PingResult>>({});
+
+  // v0.9.6 Feature 3: per-server user lists fetched on tab visit.
+  // Keyed by server id. ``undefined`` = not yet fetched / refetching;
+  // resolved values may carry a non-null ``error`` when systemAccounts
+  // failed but the owner row is still there. The ``error`` shape with
+  // a single ``message`` field flags total fetch failures (connect
+  // refused / 502) so the panel can render a recoverable inline error.
+  const [users, setUsers] = useState<Record<string, ServerUsersResponse | { error: string }>>({});
 
   // Track the polling timer so we can clear it on unmount.
   const pollTimerRef = useRef<number | null>(null);
@@ -100,6 +108,41 @@ export function ServersPanel() {
     // the list changes; using server.id values as the dep would also
     // work but ``servers`` is simpler and equally correct.
   }, [servers]);
+
+  // v0.9.6 Feature 3: fetch per-server user lists in parallel whenever
+  // the server list changes. No caching — the user list on a Plex
+  // server can change at any time (add/remove managed users), so a
+  // stale cache would mislead. One round-trip per registered server
+  // per Servers tab visit is acceptable; if performance becomes a
+  // concern with many servers, add a short TTL later.
+  useEffect(() => {
+    if (servers.length === 0) {
+      setUsers({});
+      return;
+    }
+    let cancelled = false;
+    const tasks = servers.map(async (s) => {
+      try {
+        const res = await api.listServerUsers(s.id);
+        if (!cancelled) {
+          setUsers((prev) => ({ ...prev, [s.id]: res }));
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setUsers((prev) => ({ ...prev, [s.id]: { error: String(e) } }));
+        }
+      }
+    });
+    Promise.allSettled(tasks);
+    return () => { cancelled = true; };
+  }, [servers]);
+
+  // Replace one row in the cached server list with the response the
+  // PATCH endpoint returned. Cheaper than refresh() because it skips
+  // the full list reload + re-ping cycle.
+  const applyServerPatch = (patched: ServerView) => {
+    setServers((prev) => prev.map((s) => (s.id === patched.id ? patched : s)));
+  };
 
   const test = async (id: string) => {
     setBusyId(id);
@@ -241,7 +284,189 @@ export function ServersPanel() {
           </div>
         </div>
       )}
+
+      {servers.length > 0 && (
+        <div className="panel">
+          <h2>Server Users</h2>
+          <p style={{ color: 'var(--text-dim)', fontSize: 12, marginTop: 0 }}>
+            Owner + Plex Home managed users on each registered server. Edit the owner's
+            display name inline — that name propagates to the dashboard run header, the
+            activity feed, and the direct-transfer user selector. Managed users' display
+            names are not editable in this version.
+          </p>
+          <div className="row">
+            {servers.map((s) => (
+              <UsersForServer
+                key={s.id}
+                server={s}
+                payload={users[s.id]}
+                onPatched={applyServerPatch}
+              />
+            ))}
+          </div>
+        </div>
+      )}
     </>
+  );
+}
+
+// ── Sub-component: per-server user list ──────────────────────────────────────
+
+function UsersForServer({
+  server,
+  payload,
+  onPatched,
+}: {
+  server: ServerView;
+  payload?: ServerUsersResponse | { error: string };
+  onPatched: (next: ServerView) => void;
+}) {
+  // The owner row's "edit display name" input is local UI state.
+  // Stored separately so each server's editor opens / closes
+  // independently.
+  const [editingOwner, setEditingOwner] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  if (!payload) {
+    return (
+      <div className="col" style={{ minWidth: 280 }}>
+        <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{server.name}</h3>
+        <div className="empty" style={{ fontSize: 12 }}>Loading users…</div>
+      </div>
+    );
+  }
+  if ('error' in payload && !('users' in payload)) {
+    // Total fetch failure (e.g. 502 — server unreachable).
+    return (
+      <div className="col" style={{ minWidth: 280 }}>
+        <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{server.name}</h3>
+        <div className="banner error" style={{ fontSize: 12 }}>{payload.error}</div>
+      </div>
+    );
+  }
+
+  const resp = payload as ServerUsersResponse;
+  const owner = resp.users.find((u) => u.kind === 'owner') || null;
+  const managed = resp.users.filter((u) => u.kind === 'managed');
+
+  const startOwnerEdit = () => {
+    if (!owner) return;
+    setDraft(owner.display_name || '');
+    setEditingOwner(true);
+    setSaveError(null);
+  };
+
+  const cancelOwnerEdit = () => {
+    setEditingOwner(false);
+    setDraft('');
+    setSaveError(null);
+  };
+
+  const commitOwnerEdit = async () => {
+    if (!owner) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const updated = await api.setUserDisplayName(server.id, owner.plex_id, draft);
+      onPatched(updated);
+      setEditingOwner(false);
+    } catch (e) {
+      setSaveError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onOwnerKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      void commitOwnerEdit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancelOwnerEdit();
+    }
+  };
+
+  return (
+    <div className="col" style={{ minWidth: 280 }}>
+      <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{server.name}</h3>
+      {/* Owner row with inline-editable display name. */}
+      {owner ? (
+        <div style={{ marginBottom: 10, padding: '6px 8px', background: 'var(--panel-alt, #1b2233)', borderRadius: 4 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+            <span className="tag started" style={{ fontSize: 10 }}>Owner</span>
+            <span className="mono" style={{ color: 'var(--text-dim)', wordBreak: 'break-all' }}>
+              {owner.raw_name}
+            </span>
+          </div>
+          <div style={{ marginTop: 4 }}>
+            {editingOwner ? (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input
+                  type="text"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={onOwnerKeyDown}
+                  autoFocus
+                  placeholder="Display name (Enter to save, Esc to cancel)"
+                  style={{ flex: 1 }}
+                  disabled={saving}
+                />
+                <button onClick={commitOwnerEdit} disabled={saving} className="primary" style={{ padding: '2px 8px' }}>
+                  {saving ? '…' : 'Save'}
+                </button>
+                <button onClick={cancelOwnerEdit} disabled={saving} style={{ padding: '2px 8px' }}>
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div
+                style={{ cursor: 'pointer', fontSize: 13 }}
+                title="Click to edit display name"
+                onClick={startOwnerEdit}
+              >
+                {owner.display_name ? (
+                  <strong>{owner.display_name}</strong>
+                ) : (
+                  <span style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>Click to set a display name…</span>
+                )}
+              </div>
+            )}
+            {saveError && (
+              <div className="banner error" style={{ fontSize: 12, marginTop: 4 }}>{saveError}</div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="empty" style={{ fontSize: 12 }}>Owner unavailable — check the server's token.</div>
+      )}
+
+      {/* Managed users — read-only in this version. */}
+      <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 4 }}>Managed users</div>
+      {managed.length === 0 ? (
+        <div className="empty" style={{ fontSize: 12 }} title={resp.error ?? ''}>
+          {resp.error ? 'No managed users found.' : 'No managed users on this server.'}
+        </div>
+      ) : (
+        <ul style={{ paddingLeft: 18, margin: 0 }}>
+          {managed.map((u) => (
+            <li key={u.plex_id} style={{ fontSize: 13 }}>
+              {u.display_name ? (
+                <>
+                  <strong>{u.display_name}</strong>{' '}
+                  <span style={{ color: 'var(--text-dim)' }}>({u.raw_name})</span>
+                </>
+              ) : (
+                <span>{u.raw_name}</span>
+              )}
+              <span className="tag phase" style={{ fontSize: 10, marginLeft: 6 }}>Managed</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
