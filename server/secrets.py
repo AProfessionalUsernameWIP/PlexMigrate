@@ -3,7 +3,7 @@ Symmetric encryption for sensitive values stored on disk.
 
 This module guards the Plex auth tokens written into
 ``server_data/servers.json`` and the legacy ``settings.json`` so a
-host-disk leak (backup theft, misconfigured bind mount, sloppy CI
+host-disk leak (export theft, misconfigured bind mount, sloppy CI
 artefact upload) does not expose the tokens to anyone with read
 access to the data volume.
 
@@ -12,18 +12,18 @@ Key management
 A single 256-bit symmetric key is generated on first boot using
 ``secrets.token_bytes(32)`` and written to ``server_data/.keyfile``
 with ``O_EXCL | O_CREAT | O_WRONLY`` so two processes racing on first
-boot don't clobber each other — exactly one creator wins; the loser
+boot don't clobber each other - exactly one creator wins; the loser
 sees ``EEXIST`` and re-reads. Subsequent boots read the existing
 keyfile.
 
 If the keyfile is missing on a host that previously had encrypted
 data (volume wiped, file manually deleted), :func:`_load_or_create_key`
 emits a prominent WARNING and regenerates. Existing ciphertext is
-unrecoverable in that case — by design.
+unrecoverable in that case - by design.
 
 Encryption format
 -----------------
-Fernet (``cryptography>=41.0``) — authenticated symmetric encryption
+Fernet (``cryptography>=41.0``) - authenticated symmetric encryption
 that bundles ciphertext, HMAC, and IV into one URL-safe base64
 string. Tampered or wrong-key ciphertext raises
 :class:`cryptography.fernet.InvalidToken`; callers should catch that
@@ -34,14 +34,14 @@ Threat model
 ------------
 Encryption at rest protects against:
 
-  * Host-disk theft or backup exfiltration.
+  * Host-disk theft or export exfiltration.
   * Bind-mount over-permissioning (another container reading
     ``server_data/`` on a shared host).
   * Container image leakage that included the data volume.
 
 It does NOT protect against:
 
-  * A compromised running process — once a job is running, the
+  * A compromised running process - once a job is running, the
     decrypted token is necessarily in memory (held by python-plexapi
     inside the ``PlexServer`` object). This is the accepted residual
     exposure documented at ``services.state._plex_token``.
@@ -63,11 +63,11 @@ log = logging.getLogger("plexmigrate.server.secrets")
 
 # The keyfile lives inside the bind-mounted data dir so it survives
 # container restarts but is deliberately co-located with the encrypted
-# JSON files. If the data volume is restored from a backup that
+# JSON files. If the data volume is restored from a export that
 # contains both, decryption keeps working transparently.
 _KEYFILE_NAME = ".keyfile"
 
-# Lazy singleton — the Fernet instance is constructed on first use so
+# Lazy singleton - the Fernet instance is constructed on first use so
 # this module is safe to import even when ``cryptography`` is somehow
 # absent. The ImportError surfaces only when an encrypt/decrypt is
 # actually attempted.
@@ -149,7 +149,7 @@ def _get_fernet() -> "object":
 def encrypt_str(plaintext: str) -> str:
     """
     Encrypt ``plaintext`` and return a Fernet token string suitable
-    for storage in JSON. Empty input yields empty output — an empty
+    for storage in JSON. Empty input yields empty output - an empty
     token slot stays empty rather than carrying a useless ciphertext.
     """
     if not plaintext:
@@ -164,7 +164,7 @@ def decrypt_str(ciphertext: str) -> str:
     yields empty output.
 
     Raises:
-        cryptography.fernet.InvalidToken — when the ciphertext is
+        cryptography.fernet.InvalidToken - when the ciphertext is
         malformed, tampered, or was encrypted under a different key.
         Callers should catch this and emit an actionable user-facing
         message rather than letting the raw exception reach the UI.

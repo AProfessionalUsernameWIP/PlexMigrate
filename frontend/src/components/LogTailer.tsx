@@ -3,8 +3,8 @@
 // Owns the offset tracking, sticky-bottom scroll behaviour, 2 s poll
 // loop, and the body buffer for one log file inside one run dir. Used
 // by:
-//   * LogsPanel — full-size, manual Reload button.
-//   * DashboardPanel — small height, embedded under the JobHeader so
+//   * LogsPanel - full-size, manual Reload button.
+//   * DashboardPanel - small height, embedded under the JobHeader so
 //     the user can watch the current run without switching tabs.
 //
 // Always polls when ``finished`` is false; freezes when true (typically
@@ -84,7 +84,7 @@ export function LogTailer({
       });
   }, [runName, fileName]);
 
-  // Poll loop — appends only the new bytes via ?since=offset.
+  // Poll loop - appends only the new bytes via ?since=offset.
   useEffect(() => {
     if (!liveTail || externalFreeze || !runName || !fileName) return;
     const tick = window.setInterval(async () => {
@@ -132,9 +132,9 @@ export function LogTailer({
   };
 
   const statusLabel = externalFreeze
-    ? 'Tail paused — run finished'
+    ? 'Tail paused - run finished'
     : liveTail
-      ? `Live · last polled ${lastPolledAt ? new Date(lastPolledAt).toLocaleTimeString() : '—'}`
+      ? `Live · last polled ${lastPolledAt ? new Date(lastPolledAt).toLocaleTimeString() : '-'}`
       : 'Paused';
 
   // v0.9.7 Item 8: when the filter is active, split the body once
@@ -176,7 +176,7 @@ export function LogTailer({
       {error && <div className="banner error" style={{ marginBottom: 6 }}>{error}</div>}
       {meta?.truncated && (
         <div style={{ color: 'var(--warn)', fontSize: 12, marginBottom: 6 }}>
-          Truncated — older bytes not shown; new lines still append as they arrive.
+          Truncated - older bytes not shown; new lines still append as they arrive.
         </div>
       )}
 
@@ -240,7 +240,7 @@ export function LogTailer({
 
 // Escape a string so it can be embedded in a RegExp literal without
 // interpreting special characters. The filter input is a plain
-// substring — operators don't expect regex semantics from typing
+// substring - operators don't expect regex semantics from typing
 // e.g. "(error)" into the box.
 function escapeForRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

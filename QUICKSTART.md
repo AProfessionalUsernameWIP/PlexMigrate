@@ -1,6 +1,6 @@
 # PlexMigrate
 A Docker tool to back up and restore your Plex user experience across servers. Preserves watch history, playlists, ratings, and collections via the Plex API no downtime, no database access. Web UI or CLI. Tested on Windows and Ubuntu migrations in both directions.
-# PlexMigrate — Quick Start
+# PlexMigrate - Quick Start
 
 Back up and restore your Plex watch history, playlists, ratings, and collections between servers. No downtime required. Your server stays live the entire time.
 
@@ -16,7 +16,7 @@ docker compose up --build
 
 Open **http://localhost:8080** in your browser, then go to the **Settings** tab and enter your Plex server URL and token.
 
-> You don't need to run this on the same machine as Plex. Any machine on the same network works — just point it at your Plex server's IP address.
+> You don't need to run this on the same machine as Plex. Any machine on the same network works - just point it at your Plex server's IP address.
 
 ### Docker Commands
 
@@ -46,19 +46,19 @@ pip install plexapi rich requests
 > pip install plexapi rich requests
 > ```
 
-**Export (back up your data):**
+**Snapshot (back up your data):**
 
 ```bash
-python plexmigrate.py --export --server http://localhost:32400
+python plexmigrate.py --snapshot --server http://localhost:32400
 ```
 
-**Import (restore your data):**
+**Restore (restore your data):**
 
 ```bash
-python plexmigrate.py --import --server http://localhost:32400 --input-file Movies_20260509_173300.plexbackup.json
+python plexmigrate.py --import --server http://localhost:32400 --input-file Movies_20260509_173300.plexexport.json
 ```
 
-**Interactive mode (no flags — the script walks you through it):**
+**Interactive mode (no flags - the script walks you through it):**
 
 ```bash
 python plexmigrate.py
@@ -70,12 +70,12 @@ python plexmigrate.py
 
 | Flag | What it does | Example |
 |---|---|---|
-| `--export` | Save data from this server | `--export` |
+| `--snapshot` | Save data from this server | `--snapshot` |
 | `--import` | Restore data to this server | `--import` |
 | `--token TOKEN` | Your Plex authentication token | `--token abc123xyz` |
 | `--server URL` | Plex server URL | `--server http://192.168.1.10:32400` |
-| `--output-dir PATH` | Where to save export files (default: `./plex_exports`) | `--output-dir /mnt/backup` |
-| `--input-file FILE` | `.plexbackup.json` file(s) to import | `--input-file Movies.plexbackup.json` |
+| `--output-dir PATH` | Where to save snapshot files (default: `./snapshots`) | `--output-dir /mnt/export` |
+| `--input-file FILE` | `.plexexport.json` file(s) to import | `--input-file Movies.plexexport.json` |
 | `--workers N` | Number of parallel worker threads | `--workers 8` |
 | `--libraries NAMES` | Libraries to process, skips the interactive prompt | `--libraries "Movies,TV Shows,Music"` |
 | `--verbose` | Extra debug output | `--verbose` |
@@ -91,6 +91,6 @@ python plexmigrate.py
 | `--list-servers` | List all registered servers | `--list-servers` |
 | `--test-server NAME` | Test connection to a registered server | `--test-server "Plex1"` |
 | `--remove-server NAME` | Remove a server from the registry | `--remove-server "Plex1"` |
-| `--source-server NAME` | Source server for export or direct transfer | `--source-server "Plex1"` |
+| `--source-server NAME` | Source server for snapshot or direct transfer | `--source-server "Plex1"` |
 | `--dest-server NAME` | Destination server for import or direct transfer | `--dest-server "Plex2"` |
 | `--direct` | Direct server-to-server transfer, no intermediate file | `--direct --source-server "Plex1" --dest-server "Plex2"` |

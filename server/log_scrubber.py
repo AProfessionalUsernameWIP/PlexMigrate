@@ -1,5 +1,7 @@
 """
-Log filter that scrubs ``X-Plex-Token=<value>`` out of log records.
+Log filter that scrubs credentials out of log records: the Plex token
+(``X-Plex-Token``), the plex.tv login token (``authToken``), the JWT
+(``access_token`` / ``?token=``), and Fernet ciphertext blobs.
 
 python-plexapi commonly raises exceptions whose ``__str__`` contains
 the full request URL, and Plex's URLs carry the auth token as a
@@ -8,11 +10,11 @@ captured by ``traceback.print_exc``), the token lands on disk in
 ``runtime.log``, ``errors.log``, the Docker container's stdout, and
 anywhere else the configured handlers route to.
 
-This filter is installed on every logging handler — engine,
+This filter is installed on every logging handler - engine,
 ``plexmigrate.server.*``, ``uvicorn``, ``uvicorn.error``,
-``uvicorn.access``, and the root logger — so no matter which code
-path emits the token-bearing message, the final on-disk / on-screen
-form has ``X-Plex-Token=<redacted>`` instead of the real value.
+``uvicorn.access``, and the root logger - so no matter which code
+path emits the credential-bearing message, the final on-disk /
+on-screen form has ``<redacted>`` in place of the real value.
 
 It does NOT cover writes that bypass the logging framework. The job
 worker's ``traceback.print_exc()`` (which went to stderr direct) has
@@ -27,22 +29,41 @@ import re
 import traceback
 from typing import Iterable
 
-# Catches ``X-Plex-Token=ABC123`` (URL form) and ``X-Plex-Token: ABC123``
-# (header form). Stops at characters that can't appear in a Plex token:
-# ``&``, ``"``, ``'``, ``<``, ``>``, whitespace. The capture group
-# preserves the prefix verbatim so we can rebuild the line with the
-# original separator intact.
+# M7: catches the credential-bearing ``key=value`` / ``key: value``
+# forms for every secret that turns up in our logs - the Plex token
+# (``X-Plex-Token``), the plex.tv login token (``authToken``), the
+# JWT (``access_token`` and the bare ``?token=`` WebSocket form), and
+# any ``password`` field (covers ``db_admin_password`` and friends if
+# a request body ever reaches a log line). Longer keys are listed
+# before the bare ``token`` alternative so the alternation matches
+# them whole. The separator clause ``["']?\s*[=:]\s*["']?`` absorbs
+# the quoting in JSON / dict-repr forms (``"password": "value"``) as
+# well as the bare URL / header forms. The value stops at characters
+# that can't appear in any of these: ``&``, ``"``, ``'``, ``<``,
+# ``>``, whitespace. The capture group preserves the prefix verbatim
+# so we can rebuild the line with the original separator intact.
 _TOKEN_PATTERN = re.compile(
-    r"(X-Plex-Token\s*[=:]\s*)([^&\s\"'<>]+)",
+    r"((?:X-Plex-Token|authToken|access_token|password|token)[\"']?\s*[=:]\s*[\"']?)"
+    r"([^&\s\"'<>]+)",
     re.IGNORECASE,
 )
 
 _REDACTED_REPLACEMENT = r"\1<redacted>"
 
+# M7: Fernet ciphertext blobs (encrypted Plex / managed-user tokens at
+# rest) are base64url and always start with the version+timestamp
+# prefix ``gAAAAA``. They have no ``key=`` lead-in, so they need their
+# own pattern. The ``{24,}`` floor is well below a real Fernet token's
+# length but high enough to avoid matching incidental text.
+_FERNET_PATTERN = re.compile(r"gAAAAA[A-Za-z0-9_\-=]{24,}")
+
+_FERNET_REPLACEMENT = "<redacted-fernet>"
+
 
 def scrub(text: str) -> str:
-    """Strip ``X-Plex-Token=<value>`` from ``text``."""
-    return _TOKEN_PATTERN.sub(_REDACTED_REPLACEMENT, text)
+    """Strip token ``key=value`` pairs and Fernet blobs from ``text``."""
+    text = _TOKEN_PATTERN.sub(_REDACTED_REPLACEMENT, text)
+    return _FERNET_PATTERN.sub(_FERNET_REPLACEMENT, text)
 
 
 class TokenScrubFilter(logging.Filter):
@@ -53,7 +74,7 @@ class TokenScrubFilter(logging.Filter):
     Filters run before formatters, so we mutate ``record.msg`` /
     ``record.args`` / ``record.exc_text`` here and the downstream
     formatter renders the redacted version. Subsequent filters on
-    the same record see the already-redacted state — idempotent.
+    the same record see the already-redacted state - idempotent.
 
     Never raises: a filter that throws would silently drop the
     record and the operator would lose the log entry entirely.
@@ -82,7 +103,7 @@ class TokenScrubFilter(logging.Filter):
                 record.exc_text = scrub("".join(exc_lines))
                 record.exc_info = None
         except Exception:
-            # A filter must not raise — fall through and let the
+            # A filter must not raise - fall through and let the
             # record through unmodified rather than dropping it.
             pass
         return True
@@ -117,7 +138,7 @@ def install_on_all_handlers() -> None:
     Install the scrubber on every handler currently attached to any
     logger Python knows about.
 
-    Idempotent — re-running adds nothing new. Safe to call multiple
+    Idempotent - re-running adds nothing new. Safe to call multiple
     times (FastAPI startup, ``setup_logging`` per job, etc.) so newly
     created handlers always pick up the filter.
     """

@@ -11,10 +11,10 @@ read raw keypresses for the [Q]uit / [V]erbose / [P]ause shortcuts.
 When the engine is invoked from inside the FastAPI server we always
 want:
 
-1. The full ``DashboardState`` path — that is the only path that
+1. The full ``DashboardState`` path - that is the only path that
    produces the per-thread, per-library, activity-feed state the
    browser needs to render.
-2. **No** real keyboard reader — there is no controlling TTY inside
+2. **No** real keyboard reader - there is no controlling TTY inside
    the container, and ``termios.tcgetattr`` on a non-TTY raises
    ``OSError`` that the engine's outer ``except`` would swallow
    silently. Instead we install a stub that blocks on the engine's
@@ -25,7 +25,7 @@ Both patches are *monkey patches at runtime*, not edits to the engine
 source. The engine files themselves remain byte-for-byte unchanged.
 
 This module is imported exactly once, from :mod:`server.app` at
-application startup. Importing it more than once is idempotent — the
+application startup. Importing it more than once is idempotent - the
 patch detects whether it has already been applied.
 """
 
@@ -36,8 +36,8 @@ import threading
 from typing import Any, Optional
 
 import services.dashboard as _dash
-import services.exporter as _exporter
-import services.importer as _importer
+import services.snapshotter as _snapshotter
+import services.restorer as _restorer
 import services.state as _state
 
 
@@ -73,7 +73,7 @@ def _server_keyboard_stub(log_dir: str, logger: logging.Logger, stop_event: thre
     Replacement for :func:`services.dashboard._keyboard_thread`.
 
     The original opens stdin in raw mode and reads keypresses. Inside
-    a container there is no controlling TTY — opening raw mode raises
+    a container there is no controlling TTY - opening raw mode raises
     ``OSError``. Instead we stash a reference to ``stop_event`` so the
     REST ``/api/job/stop`` endpoint can call ``signal_stop()`` and
     flip the same flag that the [Q] key flips in CLI mode. The engine
@@ -88,7 +88,7 @@ def _server_keyboard_stub(log_dir: str, logger: logging.Logger, stop_event: thre
     _active_stop_event = stop_event
     try:
         # Block here until either the engine signals stop_event itself
-        # (e.g. when all libraries finish and run_export returns) or
+        # (e.g. when all libraries finish and run_snapshot returns) or
         # signal_stop() flips it from the API side.
         stop_event.wait()
     finally:
@@ -113,11 +113,75 @@ def signal_stop() -> bool:
         return False
     try:
         logging.getLogger("plexmigrate").info(
-            "Stop requested — finishing current library and exiting."
+            "Stop requested - finishing current library and exiting."
         )
     except Exception:  # pragma: no cover (defensive)
         pass
     ev.set()
+    return True
+
+
+def signal_hard_stop() -> bool:
+    """
+    Force the running engine job to bail out as fast as it can (v0.12.1).
+
+    Soft :func:`signal_stop` is cooperative - the engine drains pending
+    futures and exits at the next library boundary, which can take
+    seconds or minutes depending on what's in flight. A "hard" stop is
+    for the case where that's too slow (long-running per-library
+    operations, a misbehaving destination server) and the operator just
+    wants the worker free *right now* even if some in-flight items end
+    up in the failure log.
+
+    What it actually does, in order:
+
+    1. **Set the soft stop_event** - same flag :func:`signal_stop`
+       flips, so any engine code that periodically checks
+       ``stop_event.is_set()`` sees it.
+    2. **Close the shared HTTP session** at
+       :data:`services.state._session` - every in-flight Plex request
+       running through it raises ``requests.exceptions.RequestException``
+       as the underlying connection pool tears down. The engine's
+       per-item ``try/except`` handlers catch those, record them as
+       failures, and the per-library loop exits via the stop_event
+       check.
+    3. **Wake any thread waiting on the stop_event** - no behaviour
+       change beyond ``set()`` since waits already react to that.
+
+    The actual cancellation of the JobRecord state (flipping to
+    CANCELLED, marking the job runner free for the next submission)
+    happens in :meth:`server.jobs.JobQueue.request_stop` with
+    ``hard=True``. This function only signals the engine; it does NOT
+    flip the JobRecord. Two-stage so the lock discipline in
+    ``server.jobs`` stays the single owner of JobRecord transitions.
+
+    Returns ``True`` if at least the soft signal was delivered.
+    """
+    import services.state as _state
+    ev = _active_stop_event
+    if ev is None:
+        return False
+    try:
+        logging.getLogger("plexmigrate").warning(
+            "Hard stop requested - tearing down HTTP session; in-flight "
+            "items will land in the failure log."
+        )
+    except Exception:  # pragma: no cover (defensive)
+        pass
+    # Step 1: cooperative flag for any engine loop already checking it.
+    ev.set()
+    # Step 2: yank the HTTP session out from under in-flight requests.
+    # ``requests.Session.close`` is documented to release pooled
+    # connections without raising on its own. Concurrent
+    # ``session.get(...)`` calls already in flight will fail because
+    # the urllib3 pool got torn down - engine code handles those at
+    # the per-item level so the job collapses rather than hanging.
+    try:
+        sess = _state._session
+        if sess is not None:
+            sess.close()
+    except Exception:  # pragma: no cover (defensive)
+        pass
     return True
 
 
@@ -127,17 +191,17 @@ def enable_headless_mode() -> None:
     """
     Apply the runtime patches. Safe to call multiple times.
 
-    Must be called *before* the engine's ``run_export`` or
-    ``run_import`` is invoked. :func:`server.app.create_app` calls it
+    Must be called *before* the engine's ``run_snapshot`` or
+    ``run_restore`` is invoked. :func:`server.app.create_app` calls it
     at module import time so the order is guaranteed.
 
     Why patch three modules instead of just ``services.dashboard``:
-    ``services/exporter.py`` and ``services/importer.py`` both do
+    ``services/snapshotter.py`` and ``services/restorer.py`` both do
     ``from services.dashboard import _check_terminal_size, _keyboard_thread``,
     which copies the function references into their own module
     namespaces at import time. Reassigning the attribute on
     ``services.dashboard`` alone would not reach those copies, so
-    ``run_export`` and ``run_import`` would still see the originals
+    ``run_snapshot`` and ``run_restore`` would still see the originals
     and fall into the CLI-only Rich Progress fallback path (which is
     not designed for non-TTY hosts). We rebind the same names in
     every importing module so the patch is total regardless of which
@@ -146,10 +210,10 @@ def enable_headless_mode() -> None:
     global _PATCHED
     if _PATCHED:
         return
-    for mod in (_dash, _exporter, _importer):
+    for mod in (_dash, _snapshotter, _restorer):
         mod._check_terminal_size = _always_full_dashboard
         mod._keyboard_thread = _server_keyboard_stub
-    # Tell setup_logging() to skip the sys.excepthook rebind — uvicorn
+    # Tell setup_logging() to skip the sys.excepthook rebind - uvicorn
     # owns that hook in server mode.
     _state.HEADLESS_MODE = True
     _PATCHED = True

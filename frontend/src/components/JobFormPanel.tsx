@@ -1,37 +1,80 @@
 // Job submission form (v0.9.0).
 //
 // Three modes:
-//   * Export  — pick source server, pick libraries, write JSON files.
-//   * Import  — pick destination server, pick existing backup files,
+//   * Snapshot   pick source server, pick libraries, write JSON files.
+//   * Restore   pick destination server, pick existing export files,
 //               merge into Plex.
-//   * Direct  — pick source AND destination servers side-by-side,
+//   * Direct   pick source AND destination servers side-by-side,
 //               pick libraries, transfer in memory without an
 //               intermediate file. Source and destination must
 //               be different.
 //
 // Every CLI flag from plexmigrate.py has a clearly labelled form
 // control. The form does not submit the Plex URL or token directly
-// — those live in the registry the user manages from the Servers tab.
+//  those live in the registry the user manages from the Servers tab.
 
 import { useEffect, useRef, useState } from 'react';
-import { api, ExportFile, LibraryDescriptor, PingResult, ServerUser, ServerView, SnapshotMessage } from '../api';
+import { api, ExportArchive, LibraryDescriptor, PingResult, ServerManagedUser, ServerUser, ServerView, DashboardFrame, Snapshot } from '../api';
 
 // v0.9.1: live status indicator polling cadence for the server pickers.
 const PING_INTERVAL_MS = 30_000;
 
-interface Props {
-  snapshot: SnapshotMessage | null;
+
+// PR-11 - the user picker reads from the local managed_users DB
+// instead of hitting the live Plex API on every job-form visit.
+// Shape adapter: DB rows carry ``username`` and ``kind`` directly;
+// the picker UI was originally built against the live API's
+// ``ServerUser`` shape with ``plex_id`` / ``raw_name``. Translating
+// here keeps the downstream render code unchanged.
+function dbUserToPickerUser(u: ServerManagedUser): ServerUser {
+  return {
+    kind: u.kind,
+    plex_id: u.username,
+    raw_name: u.username,
+    display_name: u.display_name || '',
+  };
 }
 
-type Mode = 'export' | 'import' | 'direct';
+// Fetch DB-backed users for one server with a one-shot cold-start
+// recovery: if the DB has no rows yet (the operator just installed
+// PR-11 without re-testing their existing servers), fire a single
+// sync and re-fetch. Failures swallow into an empty list - the
+// downstream effect surfaces a single combined error if multiple
+// servers fail.
+async function fetchPickerUsers(serverId: string): Promise<ServerUser[]> {
+  let res = await api.listServerManagedUsers(serverId);
+  if (res.users.length === 0) {
+    try {
+      await api.syncServerManagedUsers(serverId);
+      res = await api.listServerManagedUsers(serverId);
+    } catch {
+      // Sync 502'd (server unreachable or token rejected). Fall
+      // through with whatever the DB has, including the empty list -
+      // the picker shows "no users" and the operator can fix the
+      // server in the Servers tab.
+    }
+  }
+  return res.users.map(dbUserToPickerUser);
+}
+
+interface Props {
+  snapshot: DashboardFrame | null;
+}
+
+type Mode = 'snapshot' | 'restore' | 'direct';
 
 export function JobFormPanel({ snapshot }: Props) {
-  const [mode, setMode] = useState<Mode>('export');
+  const [mode, setMode] = useState<Mode>('snapshot');
 
   // Registry-aware server selection.
+  // v0.10.0  destinations are now a Set so direct-transfer and import
+  // jobs can target multiple servers in one job (fan-out). Membership
+  // is order-insensitive; the rendered picker is a multi-select grid.
+  // The source is still a single string  fan-out is one source many
+  // destinations, never the reverse.
   const [servers, setServers] = useState<ServerView[]>([]);
   const [sourceServerName, setSourceServerName] = useState<string>('');
-  const [destServerName, setDestServerName] = useState<string>('');
+  const [destServerNames, setDestServerNames] = useState<Set<string>>(new Set());
   const [serversError, setServersError] = useState<string | null>(null);
 
   // v0.9.1: live ping results keyed by server id. The selectors below
@@ -41,14 +84,21 @@ export function JobFormPanel({ snapshot }: Props) {
   const [pings, setPings] = useState<Record<string, PingResult>>({});
   const pollTimerRef = useRef<number | null>(null);
 
-  // Library picker (export + direct).
+  // Library picker (snapshot + direct).
   const [libraries, setLibraries] = useState<LibraryDescriptor[]>([]);
   const [selectedLibs, setSelectedLibs] = useState<Set<string>>(new Set());
   const [librariesError, setLibrariesError] = useState<string | null>(null);
 
-  // Backup file picker (import only).
-  const [exports, setExports] = useState<ExportFile[]>([]);
+  // Export file picker (import only).
+  const [snapshots, setExports] = useState<ExportArchive[]>([]);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
+  // Restore source toggle. Defaults to 'snapshot' (registered .db) since
+  // that's the post-PR-13 storage shape; legacy JSON archives still work
+  // via the 'file' option.
+  const [restoreSource, setRestoreSource] = useState<'snapshot' | 'file'>('snapshot');
+  const [registeredSnapshots, setRegisteredSnapshots] = useState<Snapshot[]>([]);
+  const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
+  const [snapshotsLoadError, setSnapshotsLoadError] = useState<string | null>(null);
 
   // Common engine flags.
   const [workers, setWorkers] = useState<string>('');
@@ -57,9 +107,62 @@ export function JobFormPanel({ snapshot }: Props) {
   const [outputDir, setOutputDir] = useState<string>('');
   const [logDir, setLogDir] = useState<string>('');
 
-  // Import-only flags.
+  // Restore-only flags.
   const [strictMatch, setStrictMatch] = useState(true);
   const [overwritePlaylists, setOverwritePlaylists] = useState(false);
+  const [fastCollectionDetection, setFastCollectionDetection] = useState(false);
+  const [skipPlaylistPrebuild, setSkipPlaylistPrebuild] = useState(false);
+  // PR-3 / Phase D - four-flag data-type filter. Replaces the two old
+  // skip_* checkboxes (skip_collections / skip_playlists). Applies to
+  // every job mode (snapshot / import / direct) so the operator can
+  // pick exactly which data types to migrate.
+  const [includeWatchHistory, setIncludeWatchHistory] = useState(true);
+  const [includeRatings, setIncludeRatings] = useState(true);
+  const [includePlaylists, setIncludePlaylists] = useState(true);
+  const [includeCollections, setIncludeCollections] = useState(true);
+  // Snapshot-only: render a .plexexport.json sidecar at the end of the
+  // run so the first Exports-tab download is instant. Off by default
+  // (extra wall-clock cost); operators opt in per job.
+  const [prebuildJsonSidecar, setPrebuildJsonSidecar] = useState(false);
+  const atLeastOneType =
+    includeWatchHistory || includeRatings || includePlaylists || includeCollections;
+
+  // Snapshot-aware gating for the include_* toggles. When the operator
+  // picks "From registered snapshot" in import mode AND a row is
+  // selected, gate the include_* toggles by what the run *actually
+  // gathered* (``captured_types``), not by what's in the cumulative
+  // .db (``row_counts``).
+  //
+  // ``row_counts`` reflects the state of media.db at capture time,
+  // which accumulates across runs - a playlists-only run still
+  // surfaces non-zero ``watch_events`` from a previous capture for
+  // the same server. ``captured_types`` is the explicit subset of
+  // {watch_history, ratings, playlists, collections} this run
+  // touched, matching the operator's mental model.
+  //
+  // Fallback: rows captured before ``captured_types`` was added to
+  // the registry schema have ``captured_types === null``. For those
+  // we walk back to the row_counts heuristic so the UI stays useful
+  // for legacy entries.
+  const _selectedSnapshot =
+    mode === 'restore' && restoreSource === 'snapshot' && selectedSnapshotId
+      ? registeredSnapshots.find((s) => s.id === selectedSnapshotId)
+      : undefined;
+  const gatingFromSnapshot = !!_selectedSnapshot;
+  const _capturedTypes = _selectedSnapshot?.captured_types ?? null;
+  const _rc = _selectedSnapshot?.row_counts || {};
+  // Strict preference for captured_types when present; fall back to
+  // row_counts otherwise.
+  const _hasType = (type: string, rcKey: keyof typeof _rc): boolean => {
+    if (!gatingFromSnapshot) return true;
+    if (_capturedTypes !== null) return _capturedTypes.includes(type);
+    return (_rc[rcKey] ?? 0) > 0;
+  };
+  const snapshotHasWatchHistory = _hasType('watch_history', 'watch_events');
+  const snapshotHasRatings      = _hasType('ratings', 'ratings');
+  const snapshotHasPlaylists    = _hasType('playlists', 'playlists');
+  const snapshotHasCollections  = _hasType('collections', 'collections');
+
   const [remapOld, setRemapOld] = useState('');
   const [remapNew, setRemapNew] = useState('');
 
@@ -83,10 +186,20 @@ export function JobFormPanel({ snapshot }: Props) {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitOk, setSubmitOk] = useState<string | null>(null);
 
+  // v0.13 form-layout refactor: the Run-Job form is now grouped into
+  // three sections - Mode & Servers (always visible) → Scope (always
+  // visible) → Advanced options (collapsed by default). The Scope
+  // card holds the controls that answer "what data moves" (libraries,
+  // data types, users, export files for import). The Advanced card
+  // holds everything else (engine tuning, retry behaviour, path
+  // remap, output / log dirs). 90%+ of operators never touch the
+  // Advanced section so collapsing it keeps the form scannable.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
   // Load registered servers on mount.
   // v0.9.1 change: do NOT pre-select source/destination. The previous
   // code auto-selected the first registered server, which is exactly
-  // the failure mode the user reported — operations silently used a
+  // the failure mode the user reported  operations silently used a
   // server the user never picked. The new flow forces the user to
   // make a deliberate selection (and the gated lower panels make this
   // visible).
@@ -117,7 +230,7 @@ export function JobFormPanel({ snapshot }: Props) {
           const result = await api.pingServer(s.id);
           setPings((prev) => ({ ...prev, [s.id]: result }));
         } catch {
-          // Drop silently — the next tick retries.
+          // Drop silently  the next tick retries.
         }
       });
       await Promise.allSettled(tasks);
@@ -139,7 +252,7 @@ export function JobFormPanel({ snapshot }: Props) {
   // live re-probe; the cached result on the registry row is the same
   // value but might be stale if the server was added a long time ago.
   useEffect(() => {
-    if (mode === 'import') return;
+    if (mode === 'restore') return;
     const srv = servers.find((s) => s.name === sourceServerName);
     if (!srv) {
       setLibraries([]);
@@ -151,61 +264,171 @@ export function JobFormPanel({ snapshot }: Props) {
       .catch((e) => setLibrariesError(String(e)));
   }, [sourceServerName, mode, servers]);
 
-  // Load existing export files when import mode is active.
+  // Load existing snapshot files when import mode is active.
+  // PR-13: the registry-backed listSnapshots() shape isn't compatible
+  // with the JSON-file-picker UI here (snapshots are now ``.db``
+  // files; the operator can't ingest them directly through this
+  // picker until the importer learns to read DB snapshots). For now
+  // the picker lists the legacy ``.plexexport.json`` archives moved
+  // to ``snapshots/legacy/`` by the PR-13 migration - those remain
+  // ingestible by the existing JSON-based importer.
   useEffect(() => {
-    if (mode !== 'import') return;
-    api.listExports().then(setExports).catch(() => setExports([]));
+    if (mode !== 'restore') return;
+    api.listLegacySnapshots().then(setExports).catch(() => setExports([]));
+    // Registered snapshots from snapshots.db - the primary import
+    // source post-PR-13. The importer reads JSON; the route handler
+    // for /api/job/import-from-snapshot materialises the sidecar
+    // before forwarding, so the engine path stays unchanged.
+    setSnapshotsLoadError(null);
+    api.listSnapshots()
+      .then((r) => setRegisteredSnapshots(r.snapshots))
+      .catch((e) => {
+        setRegisteredSnapshots([]);
+        setSnapshotsLoadError(String(e));
+      });
   }, [mode]);
+
+  // Snapshot defaults from Settings. Loaded once on mount; the
+  // per-server overrides map is cached so subsequent source-server
+  // picks don't re-hit /api/settings.
+  const [perServerSnapshotDefaults, setPerServerSnapshotDefaults] = useState<
+    Record<string, Record<string, boolean | undefined>>
+  >({});
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        if (s.prebuild_json_sidecar_default === true) {
+          setPrebuildJsonSidecar(true);
+        }
+        const raw = (s as unknown as Record<string, unknown>).snapshot_defaults_per_server;
+        if (raw && typeof raw === 'object') {
+          setPerServerSnapshotDefaults(raw as Record<string, Record<string, boolean | undefined>>);
+        }
+      })
+      .catch(() => { /* defaults stay at built-in */ });
+  }, []);
+
+  // When the operator picks a different source server, layer in any
+  // per-server overrides that exist for it. Non-destructive: fields
+  // the operator already changed stay changed unless the new server
+  // has an explicit override for them. Resolution order documented
+  // in dbschema.md - this implements step (2) for ad-hoc jobs.
+  useEffect(() => {
+    if (mode !== 'snapshot' && mode !== 'direct') return;
+    if (!sourceServerName) return;
+    const srv = servers.find((s) => s.name === sourceServerName);
+    if (!srv) return;
+    const o = perServerSnapshotDefaults[srv.id];
+    if (!o) return;
+    if (typeof o.prebuild_json_sidecar === 'boolean') setPrebuildJsonSidecar(o.prebuild_json_sidecar);
+    if (typeof o.include_watch_history === 'boolean') setIncludeWatchHistory(o.include_watch_history);
+    if (typeof o.include_ratings === 'boolean') setIncludeRatings(o.include_ratings);
+    if (typeof o.include_playlists === 'boolean') setIncludePlaylists(o.include_playlists);
+    if (typeof o.include_collections === 'boolean') setIncludeCollections(o.include_collections);
+    if (typeof o.skip_playlist_prebuild === 'boolean') setSkipPlaylistPrebuild(o.skip_playlist_prebuild);
+    if (typeof o.fast_collection_detection === 'boolean') setFastCollectionDetection(o.fast_collection_detection);
+  }, [sourceServerName, perServerSnapshotDefaults, servers, mode]);
+
+  // When the operator picks a snapshot as the import source (or
+  // switches between snapshots), reseed the four include_* toggles
+  // so "checked == this type was actually captured by the run".
+  // Prefers ``captured_types`` (authoritative) and falls back to
+  // ``row_counts`` for legacy rows that pre-date that column.
+  useEffect(() => {
+    if (mode !== 'restore') return;
+    if (restoreSource !== 'snapshot') return;
+    if (!selectedSnapshotId) return;
+    const snap = registeredSnapshots.find((s) => s.id === selectedSnapshotId);
+    if (!snap) return;
+    if (snap.captured_types !== null) {
+      const types = snap.captured_types;
+      setIncludeWatchHistory(types.includes('watch_history'));
+      setIncludeRatings(types.includes('ratings'));
+      setIncludePlaylists(types.includes('playlists'));
+      setIncludeCollections(types.includes('collections'));
+    } else {
+      const rc = snap.row_counts || {};
+      setIncludeWatchHistory((rc.watch_events ?? 0) > 0);
+      setIncludeRatings((rc.ratings ?? 0) > 0);
+      setIncludePlaylists((rc.playlists ?? 0) > 0);
+      setIncludeCollections((rc.collections ?? 0) > 0);
+    }
+  }, [selectedSnapshotId, registeredSnapshots, mode, restoreSource]);
 
   // v0.9.6 Feature 4: load users from BOTH servers in direct mode so
   // the form can compute the transferable intersection. Reset state
   // on every selection change so we never show a stale list. The
   // includedUsers default ("all checked") is set once after the
   // fetch resolves so the operator only needs to *un*check to
-  // exclude — matching the spec.
+  // exclude  matching the spec.
+  // v0.10.0  destinations are a set, so the per-user transferable
+  // intersection now spans the source plus *every* selected
+  // destination. A managed user must exist on every side to be
+  // included; missing on any one destination drops them from the
+  // default-checked set. The owner is treated the same way.
+  // ``destServerNames`` is included in the dep list as a stable
+  // string (sorted, joined) so React only re-runs the effect on
+  // actual membership changes, not on every render.
+  const destNamesKey = Array.from(destServerNames).sort().join('|');
   useEffect(() => {
     setSourceUsers(null);
     setDestUsers(null);
     setIncludedUsers(new Set());
     setUsersError(null);
     if (mode !== 'direct') return;
-    if (!sourceServerName || !destServerName) return;
-    if (sourceServerName === destServerName) return;
+    if (!sourceServerName || destServerNames.size === 0) return;
+    if (destServerNames.has(sourceServerName)) return;
     const src = servers.find((s) => s.name === sourceServerName);
-    const dst = servers.find((s) => s.name === destServerName);
-    if (!src || !dst) return;
+    const dsts = Array.from(destServerNames)
+      .map((n) => servers.find((s) => s.name === n))
+      .filter((s): s is ServerView => !!s);
+    if (!src || dsts.length === 0) return;
     let cancelled = false;
+    // PR-11 - the user picker reads from the local managed_users DB
+    // (no live Plex round-trip during job setup). ``fetchPickerUsers``
+    // handles the cold-DB case by firing a one-shot sync and re-
+    // fetching, so a server whose table was never warmed paints the
+    // picker without forcing the operator to visit User Management
+    // first.
     Promise.allSettled([
-      api.listServerUsers(src.id),
-      api.listServerUsers(dst.id),
-    ]).then(([sres, dres]) => {
+      fetchPickerUsers(src.id),
+      ...dsts.map((d) => fetchPickerUsers(d.id)),
+    ]).then((results) => {
       if (cancelled) return;
+      const sres = results[0];
+      const dResults = results.slice(1);
       const srcOk = sres.status === 'fulfilled';
-      const dstOk = dres.status === 'fulfilled';
-      const srcList = srcOk ? sres.value.users : [];
-      const dstList = dstOk ? dres.value.users : [];
+      const srcList = srcOk && sres.status === 'fulfilled' ? sres.value : [];
+      // For multi-destination, the "destUsers" surface shown in the
+      // UI's "on destination" column is the *intersection* across
+      // destinations  that's the set of users a fan-out can actually
+      // carry to every target. The Sets approach makes that easy.
+      const perDestLists: ServerUser[][] = dResults.map((r) =>
+        r.status === 'fulfilled' ? r.value : []
+      );
+      let destIntersection: ServerUser[] = perDestLists[0] ?? [];
+      for (let i = 1; i < perDestLists.length; i += 1) {
+        const ids = new Set(perDestLists[i].map((u) => u.plex_id));
+        destIntersection = destIntersection.filter((u) => ids.has(u.plex_id));
+      }
       setSourceUsers(srcList);
-      setDestUsers(dstList);
-      // v0.9.7 Item 7: the owner is now a selectable user, default-
-      // checked, alongside managed users. Compute the transferable
-      // intersection by raw identifier across BOTH kinds so the
-      // owner appears in the included set unless the operator
-      // unchecks them. When unchecked, the backend's run_direct_transfer
-      // gates the entire payload["items"] block (library-level
-      // watch_history / playlists / collections / ratings) on
-      // whether the owner identifier is in user_filter.
-      const dstIds = new Set(dstList.map((u) => u.plex_id));
+      setDestUsers(destIntersection);
+      const dstIds = new Set(destIntersection.map((u) => u.plex_id));
       const intersection = srcList
         .filter((u) => dstIds.has(u.plex_id))
         .map((u) => u.plex_id);
       setIncludedUsers(new Set(intersection));
       const errors: string[] = [];
       if (!srcOk) errors.push(`source: ${String((sres as PromiseRejectedResult).reason)}`);
-      if (!dstOk) errors.push(`destination: ${String((dres as PromiseRejectedResult).reason)}`);
+      dResults.forEach((r, i) => {
+        if (r.status !== 'fulfilled') {
+          errors.push(`${dsts[i].name}: ${String((r as PromiseRejectedResult).reason)}`);
+        }
+      });
       if (errors.length) setUsersError(errors.join(' · '));
     });
     return () => { cancelled = true; };
-  }, [mode, sourceServerName, destServerName, servers]);
+  }, [mode, sourceServerName, destNamesKey, servers]);
 
   const jobRunning = !!snapshot?.job && snapshot.job.state === 'running';
 
@@ -215,7 +438,7 @@ export function JobFormPanel({ snapshot }: Props) {
     setSubmitOk(null);
     setSubmitting(true);
     try {
-      if (mode === 'export') {
+      if (mode === 'snapshot') {
         if (!sourceServerName) throw new Error('Pick a source server first.');
         const payload: Record<string, unknown> = {
           source_server_name: sourceServerName,
@@ -226,13 +449,24 @@ export function JobFormPanel({ snapshot }: Props) {
         if (scrobbleWorkers) payload.scrobble_workers = Number(scrobbleWorkers);
         if (logDir) payload.log_dir = logDir;
         payload.verbose = verbose;
-        const r = await api.submitExport(payload);
-        setSubmitOk(`Export job ${r.job_id} queued.`);
-      } else if (mode === 'import') {
-        if (!destServerName) throw new Error('Pick a destination server first.');
+        if (fastCollectionDetection) payload.fast_collection_detection = true;
+        if (skipPlaylistPrebuild) payload.skip_playlist_prebuild = true;
+        // PR-3 / Phase D - four-flag data-type filter. Always sent so
+        // the server has an explicit value rather than relying on a
+        // model default. Defaults are all true so this is a no-op
+        // when the operator hasn't unchecked anything.
+        payload.include_watch_history = includeWatchHistory;
+        payload.include_ratings = includeRatings;
+        payload.include_playlists = includePlaylists;
+        payload.include_collections = includeCollections;
+        payload.prebuild_json_sidecar = prebuildJsonSidecar;
+        const r = await api.submitSnapshot(payload);
+        setSubmitOk(`Snapshot job ${r.job_id} queued.`);
+      } else if (mode === 'restore') {
+        if (destServerNames.size === 0) throw new Error('Pick at least one destination server first.');
+        const destList = Array.from(destServerNames);
         const payload: Record<string, unknown> = {
-          dest_server_name: destServerName,
-          input_files: Array.from(selectedFiles),
+          dest_server_names: destList,
           strict_match: strictMatch,
           overwrite_playlists: overwritePlaylists,
         };
@@ -244,15 +478,37 @@ export function JobFormPanel({ snapshot }: Props) {
           payload.remap_old = remapOld;
           payload.remap_new = remapNew;
         }
-        const r = await api.submitImport(payload);
-        setSubmitOk(`Import job ${r.job_id} queued.`);
+        payload.include_watch_history = includeWatchHistory;
+        payload.include_ratings = includeRatings;
+        payload.include_playlists = includePlaylists;
+        payload.include_collections = includeCollections;
+
+        let r;
+        if (restoreSource === 'snapshot') {
+          if (!selectedSnapshotId) throw new Error('Pick a registered snapshot first.');
+          payload.snapshot_id = selectedSnapshotId;
+          r = await api.submitRestoreFromSnapshot(payload);
+        } else {
+          if (selectedFiles.size === 0) throw new Error('Pick at least one export file.');
+          payload.input_files = Array.from(selectedFiles);
+          r = await api.submitRestore(payload);
+        }
+        setSubmitOk(
+          destList.length > 1
+            ? `Fan-out import ${r.job_id} queued - ${destList.length} destinations.`
+            : `Restore job ${r.job_id} queued.`,
+        );
       } else {
         // direct
-        if (!sourceServerName || !destServerName) throw new Error('Pick a source and destination server.');
-        if (sourceServerName === destServerName) throw new Error('Source and destination must be different.');
+        if (!sourceServerName) throw new Error('Pick a source server.');
+        if (destServerNames.size === 0) throw new Error('Pick at least one destination server.');
+        if (destServerNames.has(sourceServerName)) {
+          throw new Error('Source and destination must be different.');
+        }
+        const destList = Array.from(destServerNames);
         const payload: Record<string, unknown> = {
           source_server_name: sourceServerName,
-          dest_server_name: destServerName,
+          dest_server_names: destList,
           libraries: Array.from(selectedLibs),
           strict_match: strictMatch,
         };
@@ -260,16 +516,22 @@ export function JobFormPanel({ snapshot }: Props) {
         if (scrobbleWorkers) payload.scrobble_workers = Number(scrobbleWorkers);
         if (logDir) payload.log_dir = logDir;
         payload.verbose = verbose;
+        if (fastCollectionDetection) payload.fast_collection_detection = true;
         if (remapOld && remapNew) {
           payload.remap_old = remapOld;
           payload.remap_new = remapNew;
         }
+        // PR-3 / Phase D - four-flag data-type filter on direct too.
+        payload.include_watch_history = includeWatchHistory;
+        payload.include_ratings = includeRatings;
+        payload.include_playlists = includePlaylists;
+        payload.include_collections = includeCollections;
         // v0.9.6 Feature 4 / v0.9.7 Item 7: send ``user_filter``
         // whenever the Users section rendered AND at least one
         // transferable entry exists (owner OR managed). If both
         // servers report no users we omit the field so the
         // backend's "None = include all" default applies. Owner is
-        // included in the intersection check now — unchecking the
+        // included in the intersection check now  unchecking the
         // owner is how the operator skips library-level data.
         if (sourceUsers !== null && destUsers !== null) {
           const dstIds = new Set(destUsers.map((u) => u.plex_id));
@@ -279,7 +541,11 @@ export function JobFormPanel({ snapshot }: Props) {
           }
         }
         const r = await api.submitDirect(payload);
-        setSubmitOk(`Direct transfer ${r.job_id} queued.`);
+        setSubmitOk(
+          destList.length > 1
+            ? `Fan-out transfer ${r.job_id} queued - 1 source → ${destList.length} destinations.`
+            : `Direct transfer ${r.job_id} queued.`,
+        );
       }
     } catch (e) {
       setSubmitError(String(e));
@@ -331,7 +597,7 @@ export function JobFormPanel({ snapshot }: Props) {
             and gate everything below. The selectors are side-by-side
             with status indicators next to each option; unreachable
             servers still appear but are visually marked as offline.
-            For export-only jobs the destination selector is hidden
+            For snapshot-only jobs the destination selector is hidden
             and replaced with a note pointing at the output directory.
 
             All sections below this panel are wrapped in a fieldset
@@ -342,24 +608,24 @@ export function JobFormPanel({ snapshot }: Props) {
         <label className="field">
           <span className="label">Operation</span>
           <span className="help">
-            <strong>Export</strong> writes JSON files. <strong>Import</strong> reads JSON files into Plex.
+            <strong>Snapshot</strong> writes JSON files. <strong>Restore</strong> reads JSON files into Plex.
             <strong> Direct transfer</strong> reads from one Plex and writes straight to another with no
             intermediate file (with automatic chained fallback if the direct path is unavailable).
           </span>
           <select value={mode} onChange={(e) => setMode(e.target.value as Mode)}>
-            <option value="export">Export — save data from a Plex server</option>
-            <option value="import">Import — restore data to a Plex server</option>
-            <option value="direct">Direct transfer — read from one server, write to another</option>
+            <option value="snapshot">Snapshot - save data from a Plex server</option>
+            <option value="restore">Restore - restore data to a Plex server</option>
+            <option value="direct">Direct transfer - read from one server, write to another</option>
           </select>
         </label>
 
         <div className="grid-2">
           {/* ── Source selector (left) ──────────────────────────── */}
-          {mode === 'import' ? (
+          {mode === 'restore' ? (
             <div className="field">
               <span className="label">Source Server</span>
               <span className="help">
-                Not applicable for import — the source is the backup file(s) you pick below.
+                Not applicable for import - the source is the export file(s) you pick below.
               </span>
             </div>
           ) : (
@@ -370,48 +636,64 @@ export function JobFormPanel({ snapshot }: Props) {
               </span>
               <ServerPicker
                 value={sourceServerName}
-                onChange={setSourceServerName}
+                onChange={(name) => setSourceServerName(name)}
                 servers={servers}
                 pings={pings}
-                excludeName={mode === 'direct' ? destServerName : undefined}
+                excludeNames={mode === 'direct' ? destServerNames : undefined}
               />
             </div>
           )}
 
           {/* ── Destination selector (right) ─────────────────────── */}
-          {mode === 'export' ? (
+          {mode === 'snapshot' ? (
             <div className="field">
               <span className="label">Destination Server</span>
               <span className="help">
-                Not applicable for export — the export will be saved to the configured output directory
+                Not applicable for snapshot - the snapshot will be saved to the configured output directory
                 (see <strong>Settings</strong> or override below).
               </span>
             </div>
           ) : (
             <div className="field">
-              <span className="label">Destination Server</span>
+              <span className="label">
+                Destination Server{destServerNames.size > 1 ? 's (Fan-out)' : 's'}
+              </span>
               <span className="help">
-                The Plex server this operation will write into. Additive merge rules apply — nothing on the
-                destination is ever deleted or reduced.
+                {/* v0.10.0: multi-select destinations enable fan-out  one source → many
+                    destinations in a single job. Pick one for the classic single-destination
+                    flow; pick two or more to fan-out (each destination runs sequentially
+                    in this release, with its own dashboard card). */}
+                The Plex server(s) this operation will write into. Additive merge rules apply
+                - nothing on a destination is ever deleted or reduced. Select two or more to
+                fan-out: one job that writes into every destination.
               </span>
               <ServerPicker
-                value={destServerName}
-                onChange={setDestServerName}
+                multi
+                values={destServerNames}
+                onMultiChange={setDestServerNames}
                 servers={servers}
                 pings={pings}
-                excludeName={mode === 'direct' ? sourceServerName : undefined}
+                excludeNames={mode === 'direct' && sourceServerName
+                  ? new Set([sourceServerName])
+                  : undefined}
               />
+              {destServerNames.size > 1 && (
+                <div className="banner info" style={{ marginTop: 8 }}>
+                  Fan-out enabled - this job will write to <strong>{destServerNames.size}</strong> destinations in parallel.
+                  Each destination has its own dashboard card, run-log directory, and error tracking.
+                </div>
+              )}
             </div>
           )}
         </div>
 
         {/* Selection-state indicator helps the user understand why the
             lower panels are disabled when they're disabled.            */}
-        {!serversReady(mode, sourceServerName, destServerName) && (
+        {!serversReady(mode, sourceServerName, destServerNames) && (
           <div className="banner info" style={{ marginTop: 8 }}>
-            {mode === 'export' && 'Pick a Source Server to continue.'}
-            {mode === 'import' && 'Pick a Destination Server to continue.'}
-            {mode === 'direct' && 'Pick both a Source Server and a Destination Server to continue.'}
+            {mode === 'snapshot' && 'Pick a Source Server to continue.'}
+            {mode === 'restore' && 'Pick at least one Destination Server to continue.'}
+            {mode === 'direct' && 'Pick a Source Server and at least one Destination Server to continue.'}
           </div>
         )}
       </div>
@@ -421,15 +703,30 @@ export function JobFormPanel({ snapshot }: Props) {
            control inside it without otherwise changing the layout. */}
       <fieldset
         className="job-form-gate"
-        disabled={!serversReady(mode, sourceServerName, destServerName)}
+        disabled={!serversReady(mode, sourceServerName, destServerNames)}
         style={{
           border: 'none', padding: 0, margin: 0, minWidth: 0,
-          opacity: serversReady(mode, sourceServerName, destServerName) ? 1 : 0.5,
-          pointerEvents: serversReady(mode, sourceServerName, destServerName) ? 'auto' : 'none',
+          opacity: serversReady(mode, sourceServerName, destServerNames) ? 1 : 0.5,
+          pointerEvents: serversReady(mode, sourceServerName, destServerNames) ? 'auto' : 'none',
         }}
       >
+      {/* ── Scope section header ─────────────────────────────────────
+            v0.13 form-layout refactor: every control under here answers
+            "what data moves through this job" - libraries, data types,
+            users, or (in import mode) which export files to read. They
+            are visually grouped under one header so the operator can
+            see the scope of the run at a glance without scanning for
+            the relevant controls scattered between engine knobs. */}
+      <div className="section-header">
+        <h2 style={{ marginBottom: 4 }}>Scope - what to migrate</h2>
+        <span className="help" style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+          Pick libraries, data types, and (for direct transfer) which managed users move.
+          Defaults are everything checked.
+        </span>
+      </div>
+
       {/* ── Library / file picker ──────────────────────────────────── */}
-      {(mode === 'export' || mode === 'direct') && (
+      {(mode === 'snapshot' || mode === 'direct') && (
         <div className="panel">
           <h2>Libraries</h2>
           {librariesError ? (
@@ -437,14 +734,14 @@ export function JobFormPanel({ snapshot }: Props) {
           ) : (
             <>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                <span className="label">Libraries to {mode === 'export' ? 'export' : 'transfer'}</span>
+                <span className="label">Libraries to {mode === 'snapshot' ? 'snapshot' : 'transfer'}</span>
                 <div className="row-buttons">
                   <button onClick={selectAllLibs}>All</button>
                   <button onClick={clearLibs}>None</button>
                 </div>
               </div>
               <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 6 }}>
-                Empty selection = {mode === 'export' ? 'every library on the source' : 'every library present on both servers'}.
+                Empty selection = {mode === 'snapshot' ? 'every library on the source' : 'every library present on both servers'}.
                 Mirrors <code>--libraries "Movies,TV Shows,Music"</code>.
               </span>
               <div className="checkbox-grid">
@@ -478,7 +775,7 @@ export function JobFormPanel({ snapshot }: Props) {
           }}
           onAll={() => {
             // v0.9.7 Item 7: include both owner and managed in the
-            // intersection — owner is selectable too.
+            // intersection  owner is selectable too.
             const dstIds = new Set(destUsers.map((u) => u.plex_id));
             setIncludedUsers(new Set(
               sourceUsers
@@ -491,124 +788,327 @@ export function JobFormPanel({ snapshot }: Props) {
         />
       )}
 
-      {mode === 'import' && (
+      {mode === 'restore' && (
         <div className="panel">
-          <h2>Backup Files</h2>
-          <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 6 }}>
-            Mirrors <code>--input-file</code>. Lists every <code>.plexbackup.json</code> in the output directory.
-          </span>
-          <div className="checkbox-grid">
-            {exports.length === 0 ? (
-              <div className="empty">No export files found. Run an export first.</div>
-            ) : exports.map((f) => (
-              <label key={f.name} className="switch">
-                <input type="checkbox" checked={selectedFiles.has(f.name)} onChange={() => toggleFile(f.name)} />
-                {/* v0.9.7 follow-up: short-form label combining library
-                    name + source server when both are known. The
-                    full filename (long and machine-y) drops to the
-                    help row so the picker stays scannable. */}
-                <span>{formatImportLabel(f)}</span>
-                <span className="help">{f.name}</span>
-              </label>
-            ))}
+          <h2>Restore source</h2>
+          <div className="row-buttons" style={{ marginBottom: 12 }}>
+            <button
+              type="button"
+              className={restoreSource === 'snapshot' ? 'primary' : ''}
+              onClick={() => setRestoreSource('snapshot')}
+            >
+              From registered snapshot
+            </button>
+            <button
+              type="button"
+              className={restoreSource === 'file' ? 'primary' : ''}
+              onClick={() => setRestoreSource('file')}
+            >
+              From JSON archive
+            </button>
           </div>
+
+          {restoreSource === 'snapshot' ? (
+            <>
+              <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 6 }}>
+                Reads directly from a snapshot registered in <code>snapshots.db</code>.
+                The server materialises a JSON sidecar from the snapshot's <code>.db</code> on first use and caches it.
+                {destServerNames.size > 0 && ' Rows are ranked by how many of their captured libraries overlap with the chosen destination(s).'}
+              </span>
+              {snapshotsLoadError && (
+                <div className="banner error" style={{ marginBottom: 8 }}>
+                  Could not load snapshots: {snapshotsLoadError}
+                </div>
+              )}
+              {registeredSnapshots.length === 0 ? (
+                <div className="empty">
+                  No snapshots registered yet. Run a snapshot job first, or switch to <em>From JSON archive</em>.
+                </div>
+              ) : (
+                <SnapshotPicker
+                  rows={registeredSnapshots}
+                  selectedId={selectedSnapshotId}
+                  onSelect={setSelectedSnapshotId}
+                  destLibraries={destLibraryNames(servers, destServerNames)}
+                />
+              )}
+            </>
+          ) : (
+            <>
+              <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 6 }}>
+                Restore from a <code>.plexexport.json</code> file on disk. Use this when
+                you don't have the snapshot <code>.db</code> registered locally - either
+                a JSON copy you downloaded from another install (the
+                <strong> Exports</strong> tab's Download button produces these), or an
+                archive from before the <code>.db</code>-based capture pipeline. Files
+                listed here come from the server's <code>snapshots/legacy/</code>
+                directory; drop a JSON in there to make it pickable.
+              </span>
+              <div className="checkbox-grid">
+                {snapshots.length === 0 ? (
+                  <div className="empty">
+                    No JSON archives found in <code>snapshots/legacy/</code>. Drop a
+                    <code> .plexexport.json</code> file in that directory and refresh.
+                  </div>
+                ) : snapshots.map((f) => (
+                  <label key={f.name} className="switch">
+                    <input type="checkbox" checked={selectedFiles.has(f.name)} onChange={() => toggleFile(f.name)} />
+                    <span>{formatRestoreLabel(f)}</span>
+                    <span className="help">{f.name}</span>
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       )}
 
-      {/* ── Output / Path remap ──────────────────────────────────── */}
-      {mode === 'export' && (
-        <div className="panel">
-          <h2>Output Location</h2>
-          <label className="field">
-            <span className="label">Output directory</span>
-            <span className="help">Where the <code>.plexbackup.json</code> files will be written. Mirrors <code>--output-dir</code>. Leave blank to use the default from Settings.</span>
-            <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} placeholder="./plex_exports" />
-          </label>
-        </div>
-      )}
+      {/* ── Data to migrate (Scope card 2/2) ─────────────────────────
+            v0.13 form-layout refactor: promoted out of the
+            "Resolution & Performance" panel into its own card at the
+            top of the form. This is a *scope* decision, not engine
+            tuning, and the operator should see it next to the
+            Libraries / Users controls.
 
-      {(mode === 'import' || mode === 'direct') && (
-        <div className="panel">
-          <h2>Path Remap (cross-platform migrations)</h2>
-          <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
-            Only needed when the media root path on the destination server differs from the stored path
-            (e.g. exporting from Windows <code>C:\Media</code>, importing on Linux <code>/mnt/plex</code>).
-            Suffix matching handles most cases automatically. Mirrors <code>--remap-path OLD NEW</code>.
-          </span>
-          <div className="grid-2">
-            <label className="field">
-              <span className="label">Old root prefix</span>
-              <input type="text" value={remapOld} onChange={(e) => setRemapOld(e.target.value)} placeholder="C:\Media\" />
-            </label>
-            <label className="field">
-              <span className="label">New root prefix</span>
-              <input type="text" value={remapNew} onChange={(e) => setRemapNew(e.target.value)} placeholder="/mnt/plex/" />
-            </label>
-          </div>
-        </div>
-      )}
-
-      {/* ── Performance + behaviour ──────────────────────────────────── */}
+            Snapshot-aware gating: when the operator picks a registered
+            snapshot in import mode, the four toggles below are gated
+            by the snapshot's row_counts. Types that aren't in the
+            snapshot are disabled (greyed) and forced off; types that
+            are present are checked by default but can still be
+            unchecked. */}
       <div className="panel">
-        <h2>Resolution &amp; Performance</h2>
-        {mode === 'direct' && (
-          <div className="banner info">
-            Direct transfers hit two Plex servers simultaneously. Start with about <strong>half</strong> the default worker count
-            and watch the Failed counter on the dashboard — if it climbs, lower workers further.
+        <h2>Data to migrate</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+          Pick which data types this job moves. Defaults are everything checked.
+          Unchecking a type skips both the source gather and the destination merge for that type.
+          {gatingFromSnapshot && (
+            <>
+              {' '}<strong>Filtered to the contents of the selected snapshot</strong> -
+              greyed-out types are not present in this snapshot's <code>.db</code>.
+            </>
+          )}
+        </span>
+        <label className="switch" style={!snapshotHasWatchHistory ? { opacity: 0.5 } : undefined}>
+          <input
+            type="checkbox"
+            checked={includeWatchHistory && snapshotHasWatchHistory}
+            disabled={!snapshotHasWatchHistory}
+            onChange={(e) => setIncludeWatchHistory(e.target.checked)}
+          />
+          <span>Watch history{!snapshotHasWatchHistory && gatingFromSnapshot && <em style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 6 }}>(not in snapshot)</em>}</span>
+        </label>
+        <label className="switch" style={!snapshotHasRatings ? { opacity: 0.5 } : undefined}>
+          <input
+            type="checkbox"
+            checked={includeRatings && snapshotHasRatings}
+            disabled={!snapshotHasRatings}
+            onChange={(e) => setIncludeRatings(e.target.checked)}
+          />
+          <span>Ratings{!snapshotHasRatings && gatingFromSnapshot && <em style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 6 }}>(not in snapshot)</em>}</span>
+        </label>
+        <label className="switch" style={!snapshotHasPlaylists ? { opacity: 0.5 } : undefined}>
+          <input
+            type="checkbox"
+            checked={includePlaylists && snapshotHasPlaylists}
+            disabled={!snapshotHasPlaylists}
+            onChange={(e) => setIncludePlaylists(e.target.checked)}
+          />
+          <span>Playlists{!snapshotHasPlaylists && gatingFromSnapshot && <em style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 6 }}>(not in snapshot)</em>}</span>
+        </label>
+        <label className="switch" style={!snapshotHasCollections ? { opacity: 0.5 } : undefined}>
+          <input
+            type="checkbox"
+            checked={includeCollections && snapshotHasCollections}
+            disabled={!snapshotHasCollections}
+            onChange={(e) => setIncludeCollections(e.target.checked)}
+          />
+          <span>Collections{!snapshotHasCollections && gatingFromSnapshot && <em style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 6 }}>(not in snapshot)</em>}</span>
+        </label>
+        {!atLeastOneType && (
+          <div className="banner error" style={{ marginTop: 8 }}>
+            At least one data type must be selected - otherwise the job has nothing to do.
           </div>
-        )}
-        <div className="grid-2">
-          <label className="field">
-            <span className="label">Worker threads</span>
-            <span className="help">How many threads run in parallel. Mirrors <code>--workers</code>. Blank = use default from Settings.</span>
-            <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(e.target.value)} placeholder="(default)" />
-          </label>
-          <label className="field">
-            <span className="label">Scrobble workers</span>
-            <span className="help">Max simultaneous view-count writes during import or direct transfer. Mirrors <code>--scrobble-workers</code>.</span>
-            <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(e.target.value)} placeholder="(default)" />
-          </label>
-        </div>
-        {(mode === 'import' || mode === 'direct') && (
-          <>
-            <label className="switch">
-              <input type="checkbox" checked={strictMatch} onChange={(e) => setStrictMatch(e.target.checked)} />
-              <span>Strict match</span>
-              <span className="help">Require exactly one fuzzy title match (default). Unchecking is equivalent to <code>--no-strict-match</code>.</span>
-            </label>
-            {mode === 'import' && (
-              <label className="switch">
-                <input type="checkbox" checked={overwritePlaylists} onChange={(e) => setOverwritePlaylists(e.target.checked)} />
-                <span>Overwrite playlists</span>
-                <span className="help">Mirrors <code>--overwrite-playlists</code>. No-op for backward compat — all imports are additive since v0.2.0.</span>
-              </label>
-            )}
-          </>
         )}
       </div>
 
-      {/* ── Logging ──────────────────────────────────────────────── */}
+      {/* ── Advanced options (collapsible) ───────────────────────────
+            v0.13 form-layout refactor: every knob below is engine
+            tuning, retry behaviour, path remapping, output paths, or
+            logging - things the average operator never touches. The
+            section starts collapsed; clicking the header toggles it.
+            The single header replaces what used to be three or four
+            separate panels (Output Location, Path Remap, Resolution
+            & Performance, Logging). */}
       <div className="panel">
-        <h2>Logging</h2>
-        <label className="switch">
-          <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.target.checked)} />
-          <span>Verbose logging</span>
-          <span className="help">DEBUG-level output. Mirrors <code>--verbose</code>.</span>
-        </label>
-        <label className="field">
-          <span className="label">Log directory</span>
-          <span className="help">Where per-run log subdirectories are created (each is prefixed with the server name). Mirrors <code>--log-dir</code>. Blank = use default from Settings.</span>
-          <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} placeholder="./plex_logs" />
-        </label>
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen((o) => !o)}
+          aria-expanded={advancedOpen}
+          style={{
+            background: 'none', border: 'none', padding: 0,
+            font: 'inherit', color: 'inherit', cursor: 'pointer',
+            width: '100%', textAlign: 'left',
+            display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          <span style={{ fontSize: 14, color: 'var(--text-dim)' }}>
+            {advancedOpen ? '▾' : '▸'}
+          </span>
+          <h2 style={{ margin: 0 }}>Advanced options</h2>
+        </button>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
+          Performance tuning, path remapping, output / log directories. Defaults are right for most operators -
+          start here only if a run misbehaves or you need cross-platform path translation.
+        </span>
+
+        {advancedOpen && (
+          <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {/* ── Output location (snapshot only) ──────────────────── */}
+            {mode === 'snapshot' && (
+              <div>
+                <h3 style={{ marginTop: 0 }}>Output location</h3>
+                <label className="field">
+                  <span className="label">Output directory</span>
+                  <span className="help">Where the <code>.plexexport.json</code> files will be written. Mirrors <code>--output-dir</code>. Leave blank to use the default from Settings.</span>
+                  <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} placeholder="./snapshots" />
+                </label>
+              </div>
+            )}
+
+            {/* ── Path remap (import/direct) ─────────────────────── */}
+            {(mode === 'restore' || mode === 'direct') && (
+              <div>
+                <h3 style={{ marginTop: 0 }}>Path remap (cross-platform migrations)</h3>
+                <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+                  Only needed when the media root path on the destination server differs from the stored path
+                  (e.g. exporting from Windows <code>C:\Media</code>, importing on Linux <code>/mnt/plex</code>).
+                  Suffix matching handles most cases automatically. Mirrors <code>--remap-path OLD NEW</code>.
+                </span>
+                <div className="grid-2">
+                  <label className="field">
+                    <span className="label">Old root prefix</span>
+                    <input type="text" value={remapOld} onChange={(e) => setRemapOld(e.target.value)} placeholder="C:\Media\" />
+                  </label>
+                  <label className="field">
+                    <span className="label">New root prefix</span>
+                    <input type="text" value={remapNew} onChange={(e) => setRemapNew(e.target.value)} placeholder="/mnt/plex/" />
+                  </label>
+                </div>
+              </div>
+            )}
+
+            {/* ── Resolution & performance ───────────────────────── */}
+            <div>
+              <h3 style={{ marginTop: 0 }}>Resolution &amp; performance</h3>
+              {mode === 'direct' && (
+                <div className="banner info">
+                  Direct transfers hit two Plex servers simultaneously. Start with about <strong>half</strong> the default worker count
+                  and watch the Failed counter on the dashboard - if it climbs, lower workers further.
+                </div>
+              )}
+              <div className="grid-2">
+                <label className="field">
+                  <span className="label">Worker threads</span>
+                  <span className="help">How many threads run in parallel. Mirrors <code>--workers</code>. Blank = use default from Settings.</span>
+                  <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(e.target.value)} placeholder="(default)" />
+                </label>
+                <label className="field">
+                  <span className="label">Scrobble workers</span>
+                  <span className="help">Max simultaneous view-count writes during import or direct transfer. Mirrors <code>--scrobble-workers</code>.</span>
+                  <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(e.target.value)} placeholder="(default)" />
+                </label>
+              </div>
+              {(mode === 'restore' || mode === 'direct') && (
+                <>
+                  <label className="switch">
+                    <input type="checkbox" checked={strictMatch} onChange={(e) => setStrictMatch(e.target.checked)} />
+                    <span>Strict match</span>
+                    <span className="help">Require exactly one fuzzy title match (default). Unchecking is equivalent to <code>--no-strict-match</code>.</span>
+                  </label>
+                  {mode === 'restore' && (
+                    <label className="switch">
+                      <input type="checkbox" checked={overwritePlaylists} onChange={(e) => setOverwritePlaylists(e.target.checked)} />
+                      <span>Overwrite playlists</span>
+                      <span className="help">Mirrors <code>--overwrite-playlists</code>. No-op for backward compat - all imports are additive since v0.2.0.</span>
+                    </label>
+                  )}
+                </>
+              )}
+              {(mode === 'snapshot' || mode === 'direct') && (
+                <>
+                  <label className="switch">
+                    <input type="checkbox" checked={skipPlaylistPrebuild} onChange={(e) => setSkipPlaylistPrebuild(e.target.checked)} />
+                    <span>Skip playlist pre-building</span>
+                    <span className="help">
+                      Skip the parallel upfront fetch that loads all playlists and their items
+                      before snapshot starts. Playlists still snapshot correctly - the data is fetched
+                      lazily the first time each server needs it, and the result is shared so each
+                      server is still only fetched once per run. Use this to eliminate the
+                      "Warming playlist cache" stall at job start without losing any playlist data.
+                    </span>
+                  </label>
+                  <label className="switch">
+                    <input type="checkbox" checked={fastCollectionDetection} onChange={(e) => setFastCollectionDetection(e.target.checked)} />
+                    <span>Fast collection detection</span>
+                    <span className="help">
+                      Use Plex's <code>librarySectionUserID</code> attribute to distinguish
+                      library-wide from personal collections without a set lookup. Measurably
+                      faster on large libraries (300+ collections, 10+ users). Requires
+                      Plex Media Server ≥ 1.32. On older servers the engine falls back to
+                      the standard rating-key method automatically - safe to enable.
+                    </span>
+                  </label>
+                </>
+              )}
+              {mode === 'snapshot' && (
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={prebuildJsonSidecar}
+                    onChange={(e) => setPrebuildJsonSidecar(e.target.checked)}
+                  />
+                  <span>Save JSON copy after snapshot</span>
+                  <span className="help">
+                    Writes a <code>.plexexport.json</code> file next to the snapshot
+                    <code>.db</code> at the end of the run. Useful when you want a
+                    portable text-format archive ready to download immediately. Off
+                    by default - the JSON is otherwise rendered on first
+                    <strong> Download</strong> click in the Exports tab and cached
+                    from that point on. Adds wall-clock time to the run.
+                  </span>
+                </label>
+              )}
+            </div>
+
+            {/* ── Logging ─────────────────────────────────────────── */}
+            <div>
+              <h3 style={{ marginTop: 0 }}>Logging</h3>
+              <label className="switch">
+                <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.target.checked)} />
+                <span>Verbose logging</span>
+                <span className="help">DEBUG-level output. Mirrors <code>--verbose</code>.</span>
+              </label>
+              <label className="field">
+                <span className="label">Log directory</span>
+                <span className="help">Where per-run log subdirectories are created (each is prefixed with the server name). Mirrors <code>--log-dir</code>. Blank = use default from Settings.</span>
+                <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} placeholder="./plex_logs" />
+              </label>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="panel">
         <div className="row-buttons">
-          <button className="primary" disabled={submitting || servers.length === 0} onClick={submit}>
+          <button
+            className="primary"
+            disabled={submitting || servers.length === 0 || !atLeastOneType}
+            onClick={submit}
+          >
             {submitting ? 'Submitting…' :
               mode === 'direct' ? 'Submit Direct Transfer' :
-              mode === 'export' ? 'Submit Export Job' :
-              'Submit Import Job'}
+              mode === 'snapshot' ? 'Submit Snapshot Job' :
+              'Submit Restore Job'}
           </button>
         </div>
       </div>
@@ -621,34 +1121,37 @@ export function JobFormPanel({ snapshot }: Props) {
 
 /**
  * Per-mode rule for whether the lower panels are interactive.
- * Export needs a source server. Import needs a destination. Direct
+ * Snapshot needs a source server. Restore needs a destination. Direct
  * needs both, and they must be different. Mirrors the same logic
  * applied on the backend in :func:`server.jobs.JobQueue._run_*`.
  */
-function serversReady(mode: Mode, src: string, dst: string): boolean {
-  if (mode === 'export') return !!src;
-  if (mode === 'import') return !!dst;
-  return !!src && !!dst && src !== dst;
+function serversReady(mode: Mode, src: string, dsts: Set<string>): boolean {
+  if (mode === 'snapshot') return !!src;
+  if (mode === 'restore') return dsts.size >= 1;
+  // direct: source picked, at least one destination picked, source not
+  // also in the destination set (the ServerPicker disables that option
+  // visually but a stale ``destServerNames`` could still carry it).
+  return !!src && dsts.size >= 1 && !dsts.has(src);
 }
 
 /**
  * v0.9.7 follow-up: build a readable short-form label for an export
- * file in the import picker. Prefers ``{library} — {source_server}
+ * file in the import picker. Prefers ``{library}  {source_server}
  * (short date)`` when both library and source_server are populated;
  * falls back to whatever's available without the dashes / parens so
- * older backups (no source_server, no exported_at) still render
+ * older exports (no source_server, no captured_at) still render
  * cleanly. The full filename stays in the ``help`` row underneath
  * so operators can still copy-paste it when needed.
  */
-function formatImportLabel(f: ExportFile): string {
+function formatRestoreLabel(f: ExportArchive): string {
   const lib = (f.library ?? '').trim();
   const srv = (f.source_server ?? '').trim();
-  // Date source priority: ``exported_at`` (ISO from metadata) if
+  // Date source priority: ``captured_at`` (ISO from metadata) if
   // present, else ``mtime`` (filesystem). The "short date" is just
-  // YYYY-MM-DD HH:MM — locale rendering would vary between hosts;
+  // YYYY-MM-DD HH:MM  locale rendering would vary between hosts;
   // a stable ISO-ish format is easier to scan in the picker.
   let when = '';
-  const rawTs = f.exported_at || (f.mtime ? new Date(f.mtime * 1000).toISOString() : '');
+  const rawTs = f.captured_at || (f.mtime ? new Date(f.mtime * 1000).toISOString() : '');
   if (rawTs) {
     const d = new Date(rawTs);
     if (!isNaN(d.getTime())) {
@@ -661,9 +1164,121 @@ function formatImportLabel(f: ExportFile): string {
   // stray separators in the output.
   const head = lib || f.name;
   const parts: string[] = [head];
-  if (srv) parts.push(`— ${srv}`);
+  if (srv) parts.push(`- ${srv}`);
   if (when) parts.push(`(${when})`);
   return parts.join(' ');
+}
+
+/**
+ * Union of every library name the selected destination(s) report.
+ * Used by the snapshot picker to score / rank rows by overlap with
+ * what the destination(s) actually have. Returns an empty set when
+ * no destination is picked yet - callers should treat that as
+ * "filter inactive, show everything".
+ */
+function destLibraryNames(servers: ServerView[], destNames: Set<string>): Set<string> {
+  const out = new Set<string>();
+  if (destNames.size === 0) return out;
+  for (const s of servers) {
+    if (!destNames.has(s.name)) continue;
+    for (const lib of s.last_libraries || []) {
+      const n = (lib.name || '').trim();
+      if (n) out.add(n);
+    }
+  }
+  return out;
+}
+
+// ── Sub-component: registered-snapshot picker (PR-13 follow-up) ─────────────
+//
+// Lists rows from snapshots.db, newest first. When a destination is
+// picked, each row carries an overlap chip showing how many of its
+// captured libraries also exist on the destination - rows with zero
+// overlap are not hidden (the operator may have a reason to import
+// anyway) but are visually dimmed and ranked last.
+
+function SnapshotPicker({
+  rows,
+  selectedId,
+  onSelect,
+  destLibraries,
+}: {
+  rows: Snapshot[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  destLibraries: Set<string>;
+}) {
+  const filterActive = destLibraries.size > 0;
+  // Compute overlap once per row + sort: compatible (overlap > 0) first,
+  // then by captured_at desc. When the filter isn't active, fall back
+  // to pure captured_at desc.
+  const enriched = rows
+    .map((r) => {
+      const libs = r.libraries || [];
+      let overlap = 0;
+      for (const lib of libs) {
+        if (destLibraries.has(lib)) overlap += 1;
+      }
+      return { row: r, overlap, total: libs.length };
+    })
+    .sort((a, b) => {
+      if (filterActive && (a.overlap > 0) !== (b.overlap > 0)) {
+        return a.overlap > 0 ? -1 : 1;
+      }
+      return (b.row.captured_at || 0) - (a.row.captured_at || 0);
+    });
+
+  return (
+    <div style={{ maxHeight: 360, overflowY: 'auto' }}>
+      <table className="list" style={{ width: '100%' }}>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Snapshot</th>
+            <th>Server</th>
+            <th>Captured</th>
+            <th>Libraries</th>
+            {filterActive && <th>Compat</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {enriched.map(({ row, overlap, total }) => {
+            const dim = filterActive && overlap === 0;
+            return (
+              <tr
+                key={row.id}
+                onClick={() => onSelect(row.id)}
+                style={{
+                  cursor: 'pointer',
+                  opacity: dim ? 0.55 : 1,
+                  background: row.id === selectedId ? 'var(--bg-panel)' : undefined,
+                }}
+              >
+                <td>
+                  <input
+                    type="radio"
+                    checked={row.id === selectedId}
+                    onChange={() => onSelect(row.id)}
+                  />
+                </td>
+                <td className="mono">{row.snapshot_name}</td>
+                <td>{row.server_name}</td>
+                <td>{row.captured_at ? new Date(row.captured_at * 1000).toLocaleString() : '-'}</td>
+                <td>{total}</td>
+                {filterActive && (
+                  <td>
+                    <span className={`tag ${overlap > 0 ? 'done' : 'error'}`} style={{ fontSize: 11 }}>
+                      {overlap}/{total}
+                    </span>
+                  </td>
+                )}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 // ── Sub-component: server picker (v0.9.1) ───────────────────────────────────
@@ -679,14 +1294,35 @@ function formatImportLabel(f: ExportFile): string {
 // by the v0.9.1 spec ("live connection status indicator next to each
 // option").
 
-function ServerPicker(props: {
+// v0.10.0: ServerPicker now supports both single-select (the source
+// selector, the snapshot-mode destination) and multi-select (the
+// import/direct destination, for fan-out). Mode is chosen by the
+// caller: pass ``value`` + ``onChange`` for single, ``values`` +
+// ``onMultiChange`` + ``multi`` for multi. The card layout / status
+// indicators are identical between the two modes; only the toggle
+// behaviour and selection state differ.
+type ServerPickerSingle = {
+  multi?: false;
   value: string;
   onChange: (name: string) => void;
+  values?: undefined;
+  onMultiChange?: undefined;
+};
+type ServerPickerMulti = {
+  multi: true;
+  values: Set<string>;
+  onMultiChange: (next: Set<string>) => void;
+  value?: undefined;
+  onChange?: undefined;
+};
+type ServerPickerProps = (ServerPickerSingle | ServerPickerMulti) & {
   servers: ServerView[];
   pings: Record<string, PingResult>;
-  excludeName?: string;
-}) {
-  const { value, onChange, servers, pings, excludeName } = props;
+  excludeNames?: Set<string>;
+};
+
+function ServerPicker(props: ServerPickerProps) {
+  const { servers, pings, excludeNames } = props;
   if (servers.length === 0) {
     return (
       <div className="empty" style={{ marginTop: 4 }}>
@@ -694,21 +1330,32 @@ function ServerPicker(props: {
       </div>
     );
   }
+  const isSelected = (name: string): boolean => {
+    if (props.multi) return props.values.has(name);
+    return props.value === name;
+  };
+  const handleClick = (name: string): void => {
+    if (props.multi) {
+      const next = new Set(props.values);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      props.onMultiChange(next);
+      return;
+    }
+    props.onChange(name);
+  };
   return (
     <div className="server-picker">
       {servers.map((s) => {
         const ping = pings[s.id];
-        // Effective status: live ping result if we have one, else
-        // the cached value from the registry.
         const status = ping?.status ?? s.last_status;
         const ms = ping?.response_ms ?? s.last_response_ms ?? null;
         const isReachable = status === 'ok';
-        const isExcluded = excludeName === s.name;
-        const isSelected = value === s.name;
+        const isExcluded = !!excludeNames?.has(s.name);
+        const selected = isSelected(s.name);
         const dotClass = status === 'ok' ? 'green'
           : status === 'auth_error' || status === 'unreachable' ? 'red'
           : 'amber';
-        // Compose the metadata string shown on the right of the card.
         const metaText = isExcluded
           ? '(picked as opposite)'
           : status === 'ok' && ms !== null
@@ -722,10 +1369,11 @@ function ServerPicker(props: {
           <button
             type="button"
             key={s.id}
-            className={`server-card${isSelected ? ' selected' : ''}${isReachable ? '' : ' offline'}`}
+            className={`server-card${selected ? ' selected' : ''}${isReachable ? '' : ' offline'}`}
             disabled={isExcluded}
-            onClick={() => onChange(s.name)}
+            onClick={() => handleClick(s.name)}
             title={ping?.detail ?? s.last_status_detail ?? ''}
+            aria-pressed={selected}
           >
             <span className={`dot ${dotClass}`} />
             <span className="server-card-body">
@@ -750,7 +1398,7 @@ function ServerPicker(props: {
 //   - Destination  : the spec's informational footer about inviting
 //                    users via the Servers tab. No button / action.
 //
-// Owner rows are never rendered here — owner data always transfers,
+// Owner rows are never rendered here  owner data always transfers,
 // independent of this filter. If neither source nor destination has
 // any managed users at all, the parent component still mounts this
 // panel because it serves as a confirmation that there's nothing
@@ -792,7 +1440,7 @@ function DirectUsersPanel(props: {
       )}
       {allEmpty ? (
         <div className="empty" style={{ fontSize: 12 }}>
-          No managed users on either server — the owner's data will transfer alone.
+          No managed users on either server  the owner's data will transfer alone.
         </div>
       ) : (
         <>
@@ -851,7 +1499,7 @@ function DirectUsersPanel(props: {
                       {/* v0.9.7 follow-up: prefer display_name same as the transferable list. */}
                       <strong>{u.display_name || u.raw_name}</strong>{' '}
                       <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-                        — Not on destination server
+                        - Not on destination server
                       </span>
                     </span>
                   </label>

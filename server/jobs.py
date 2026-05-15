@@ -17,13 +17,13 @@ running job winds down cleanly.
 Design notes
 ------------
 * The worker thread is started lazily on first submission rather than
-  at module import — that keeps unit tests from leaking a thread.
+  at module import - that keeps unit tests from leaking a thread.
 * The :class:`JobRecord` exposed via the REST endpoint is a plain
   dataclass copied out of the live state under lock, so the consumer
   never sees a torn read.
 * Each job calls the same orchestration functions the CLI uses
-  (:func:`services.exporter.run_export`, :func:`services.importer.run_import`).
-  No engine logic is duplicated here — this file is a *driver*.
+  (:func:`services.snapshotter.run_snapshot`, :func:`services.restorer.run_restore`).
+  No engine logic is duplicated here - this file is a *driver*.
 """
 
 from __future__ import annotations
@@ -40,12 +40,18 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import services.state as state
 from services.auth import _make_session
-from services.exporter import run_export
-from services.importer import run_import
+from services.snapshotter import run_snapshot
+from services.restorer import run_restore
 from services.logging_ops import setup_logging
 
 from server import runtime_patches
 from server.direct_transfer import run_direct_transfer
+from server.fan_out import (
+    FanOutResult,
+    clear_active_result as _clear_fan_out_active,
+    run_fan_out_direct,
+    run_fan_out_restore,
+)
 from server.persistence import load_settings
 from server.server_registry import (
     connect_registered_server,
@@ -67,7 +73,7 @@ STATE_QUEUED = "queued"
 STATE_RUNNING = "running"
 # "stopping" is the intermediate state between the user clicking Stop and
 # the engine actually returning. The job stays in this state until the
-# current library finishes; see services.exporter.run_export's stop
+# current library finishes; see services.snapshotter.run_snapshot's stop
 # semantics. Surfaces to the frontend so the Stop button can re-label
 # itself "Stopping…" and disable, giving the user immediate feedback.
 STATE_STOPPING = "stopping"
@@ -85,7 +91,7 @@ class JobRecord:
     """
 
     job_id: str
-    mode: str                                 # "export" or "import"
+    mode: str                                 # "snapshot" or "restore"
     params: Dict[str, Any]
     state: str = STATE_QUEUED
     queued_at: float = field(default_factory=time.time)
@@ -93,6 +99,13 @@ class JobRecord:
     finished_at: Optional[float] = None
     error: Optional[str] = None
     run_log_dir: Optional[str] = None
+    # Run summary captured at completion. Currently carries
+    # ``tier_counts`` for direct-transfer jobs (and any other run
+    # whose resolver fires). Populated in the worker loop's finally
+    # block from the active dashboard state. None for jobs that
+    # never started or that completed before the summary capture
+    # landed in the codebase.
+    summary: Optional[Dict[str, Any]] = None
 
 
 _HISTORY_MAX = 50
@@ -104,14 +117,14 @@ class JobQueue:
     """
     The single-writer queue. Public surface:
 
-    * :meth:`submit_export` / :meth:`submit_import` — enqueue a job
+    * :meth:`submit_snapshot` / :meth:`submit_restore` - enqueue a job
       and return its ``JobRecord`` immediately. The actual engine run
       happens on the worker thread.
-    * :meth:`current` — the currently running or most recently finished
+    * :meth:`current` - the currently running or most recently finished
       job (used by both the REST status endpoint and the WebSocket
       snapshot builder).
-    * :meth:`history` — the in-memory job history.
-    * :meth:`request_stop` — flip the engine's stop flag so a running
+    * :meth:`history` - the in-memory job history.
+    * :meth:`request_stop` - flip the engine's stop flag so a running
       job winds down at the next worker checkpoint.
     """
 
@@ -130,6 +143,12 @@ class JobQueue:
         # consistent multi-field reads.
         self._current: Optional[JobRecord] = None
         self._history: List[JobRecord] = []
+        # PR-8: queued jobs awaiting the worker. Kept alongside the
+        # internal queue.Queue so the WS broadcaster can list them
+        # without poking the queue's private deque. Mutated only
+        # under ``_lock``: append on submit, pop on _worker_loop
+        # pulling the next record.
+        self._pending: List[JobRecord] = []
         self._lock = threading.Lock()
 
         # The worker thread is started lazily on first submit().
@@ -138,11 +157,11 @@ class JobQueue:
 
     # ── Public submission API ────────────────────────────────────────
 
-    def submit_export(self, params: Dict[str, Any]) -> JobRecord:
-        return self._submit("export", params)
+    def submit_snapshot(self, params: Dict[str, Any]) -> JobRecord:
+        return self._submit("snapshot", params)
 
-    def submit_import(self, params: Dict[str, Any]) -> JobRecord:
-        return self._submit("import", params)
+    def submit_restore(self, params: Dict[str, Any]) -> JobRecord:
+        return self._submit("restore", params)
 
     def submit_direct(self, params: Dict[str, Any]) -> JobRecord:
         """
@@ -154,6 +173,12 @@ class JobQueue:
 
     def _submit(self, mode: str, params: Dict[str, Any]) -> JobRecord:
         rec = JobRecord(job_id=str(uuid.uuid4()), mode=mode, params=dict(params))
+        # PR-8: track the rec on the public pending list before queuing
+        # it. The order is important - list-then-queue ensures the WS
+        # broadcaster never sees the worker pulling a rec that isn't
+        # yet on the pending list.
+        with self._lock:
+            self._pending.append(rec)
         self._inbox.put(rec)
         self._ensure_worker()
         return rec
@@ -168,49 +193,127 @@ class JobQueue:
         with self._lock:
             return list(self._history)
 
+    def pending(self) -> List[JobRecord]:
+        """
+        Snapshot of every queued JobRecord that hasn't started yet. PR-8.
+
+        Excludes the currently-running record; combine with
+        :meth:`current` to get the full active+queued list for the
+        Dashboard tab's multi-job sub-tab strip.
+        """
+        with self._lock:
+            return list(self._pending)
+
+    def active_and_queued(self) -> List[JobRecord]:
+        """
+        Convenience snapshot used by the WS broadcaster (PR-8). The
+        running job (if any) comes first, followed by every queued
+        record in FIFO order. Empty list when the worker is idle and
+        nothing is queued - the WS payload then omits the sub-tab strip.
+        """
+        with self._lock:
+            out: List[JobRecord] = []
+            if self._current is not None and self._current.state in (
+                STATE_QUEUED, STATE_RUNNING, STATE_STOPPING,
+            ):
+                out.append(self._current)
+            out.extend(self._pending)
+            return out
+
     def busy(self) -> bool:
         with self._lock:
             return self._current is not None and self._current.state == STATE_RUNNING
 
-    def request_stop(self) -> bool:
+    def request_stop(self, *, hard: bool = False) -> bool:
         """
-        Ask the running job to wind down. Returns False if no job is
-        running (in which case the caller should respond 409).
+        Stop the active job AND clear every queued job.
 
-        Flips the live JobRecord into STATE_STOPPING *before* the
-        engine's stop_event so the next WS snapshot the frontend reads
-        already reflects the user's click. The actual state transition
-        to COMPLETED / CANCELLED happens when the worker loop's
-        finally-block runs, which can be seconds-to-minutes later
-        depending on what's in flight.
+        Both Stop (soft) and Hard Stop clear the pending queue: each
+        queued job is marked CANCELLED and moved to history, and the
+        worker loop skips any inbox record whose state is already
+        CANCELLED when it pulls it. The soft/hard distinction only
+        governs how the *running* job is stopped:
+
+        Soft (``hard=False``, default): flips the running JobRecord to
+        STATE_STOPPING and sets the engine's stop_event. The engine's
+        gather loops check it at item-level checkpoints, so the run
+        halts promptly rather than at the next library boundary. The
+        worker loop then ends the job as CANCELLED.
+
+        Hard (``hard=True``): same flip, plus tears down the shared HTTP
+        session so every in-flight Plex request fails immediately and
+        the run collapses within seconds. Items in flight land in the
+        per-library failure log; the job still ends CANCELLED.
+
+        Returns True if anything was stopped or cleared, False only
+        when there was no running job and nothing queued.
         """
-        if not self.busy():
-            return False
         with self._lock:
-            if self._current is not None and self._current.state == STATE_RUNNING:
+            # ── Clear the queue ──────────────────────────────────────
+            # Mark every pending job CANCELLED and move it to history.
+            # The records are still sitting in ``_inbox``; we do NOT
+            # drain the Queue here (that would race the worker's
+            # ``_inbox.get()``). Instead the worker loop skips any rec
+            # whose state is already CANCELLED when it pulls one.
+            now = time.time()
+            cleared = len(self._pending)
+            for prec in self._pending:
+                prec.state = STATE_CANCELLED
+                prec.finished_at = now
+                self._history.append(prec)
+            self._pending.clear()
+
+            # ── Stop the running job ─────────────────────────────────
+            # M8: the check-and-transition is atomic under the lock so
+            # we never fire the engine signal for a job that finished
+            # in a gap. ``transitioned`` is True only when *this* call
+            # actually moved a RUNNING job to STOPPING.
+            transitioned = (
+                self._current is not None
+                and self._current.state == STATE_RUNNING
+            )
+            if transitioned:
                 self._current.state = STATE_STOPPING
-        return runtime_patches.signal_stop()
+                if hard:
+                    # Annotate so the WS payload + history surface the
+                    # hard-stop cause distinctly from a clean Stop.
+                    self._current.error = (
+                        "Hard stop requested - HTTP session was torn down; "
+                        "in-flight items recorded as failures."
+                    )
+        # Fire the engine-level signal outside the lock.
+        if transitioned:
+            if hard:
+                runtime_patches.signal_hard_stop()
+            else:
+                runtime_patches.signal_stop()
+        return transitioned or cleared > 0
 
     # ── Worker thread ────────────────────────────────────────────────
 
     def _ensure_worker(self) -> None:
         # Start exactly one worker thread for the life of the process.
-        if self._worker_started:
-            return
-        self._worker_started = True
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="plexmigrate-job-worker",
-            daemon=True,
-        )
-        self._worker.start()
+        # The check-and-set runs under ``self._lock`` - without it, two
+        # callers racing through ``_ensure_worker`` could both see
+        # ``_worker_started`` False and each start a worker, defeating
+        # the single-writer invariant the whole queue depends on.
+        with self._lock:
+            if self._worker_started:
+                return
+            self._worker_started = True
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="plexmigrate-job-worker",
+                daemon=True,
+            )
+            self._worker.start()
 
     def _worker_loop(self) -> None:
         """
         Pull jobs off the inbox one at a time and run them.
 
         Any exception raised by the engine is caught here so the
-        worker thread itself never dies — a single bad job should
+        worker thread itself never dies - a single bad job should
         not block the rest of the queue.
         """
         # Imported lazily so importing this module without the engine
@@ -220,14 +323,49 @@ class JobQueue:
         while True:
             rec = self._inbox.get()
             with self._lock:
+                # Stop P1: a job cancelled while it was still queued
+                # (request_stop cleared the queue) is still sitting in
+                # the inbox - request_stop marked it CANCELLED and
+                # moved it to history already, so just drop it without
+                # running. ``_pending.remove`` is best-effort: the
+                # clear() in request_stop already emptied the list.
+                if rec.state == STATE_CANCELLED:
+                    try:
+                        self._pending.remove(rec)
+                    except ValueError:
+                        pass
+                    continue
+                # PR-8: pop this record from the pending list now that
+                # it has been claimed. We match by identity (``is``) so
+                # there's never any ambiguity even if two queued jobs
+                # have identical params.
+                try:
+                    self._pending.remove(rec)
+                except ValueError:  # pragma: no cover (defensive)
+                    # Should not happen - _submit appends before
+                    # putting on the queue - but never let a missing
+                    # pending entry block the worker loop.
+                    pass
                 self._current = rec
                 rec.state = STATE_RUNNING
                 rec.started_at = time.time()
 
+            # ── Pre-flight: clear any leftover fan-out registry ──────
+            # If the previous job was a fan-out, ``server.fan_out``'s
+            # ``_active_result`` may still be set (it clears on its
+            # own 8 s grace timer for the post-completion display).
+            # Wiping it immediately at the start of THIS job so the WS
+            # payload returns to ``fan_out: null`` even if THIS job is
+            # a single-destination run that lands inside the grace.
+            try:
+                _clear_fan_out_active()
+            except Exception:  # pragma: no cover (defensive)
+                pass
+
             # ── Pre-flight DashboardState ─────────────────────────────
             # The engine's slow start-up (Plex connect → home-user auth
             # → playlist cache warm) can take 10–60 s on a large server
-            # before run_export / run_import construct their own
+            # before run_snapshot / run_restore construct their own
             # DashboardState. Without a placeholder, the WS payload
             # broadcasts ``dashboard: null`` during that window and the
             # browser shows "No job is running" misleadingly. We create
@@ -236,40 +374,110 @@ class JobQueue:
             # replacing it) once pre-flight finishes.
             try:
                 state._dashboard = DashboardState(log_dir="")
-                state._dashboard.push_activity(
-                    "started", "—",
+                state.get_dashboard().push_activity(
+                    "started", "-",
                     f"{rec.mode.upper()} job initialising…",
                 )
             except Exception:  # pragma: no cover (defensive)
                 pass
 
             try:
-                if rec.mode == "export":
-                    self._run_export(rec)
-                elif rec.mode == "import":
-                    self._run_import(rec)
+                if rec.mode == "snapshot":
+                    self._run_snapshot(rec)
+                elif rec.mode == "restore":
+                    self._run_restore(rec)
                 elif rec.mode == "direct":
                     self._run_direct(rec)
                 else:
                     raise ValueError(f"Unknown job mode {rec.mode!r}")
-                rec.state = STATE_COMPLETED
+                # Stop P2: if request_stop flipped this job to STOPPING
+                # (soft Stop), the engine returned because the
+                # stop_event was set at an item-level checkpoint - that
+                # is a CANCELLED job, not a COMPLETED one.
+                rec.state = (
+                    STATE_CANCELLED if rec.state == STATE_STOPPING
+                    else STATE_COMPLETED
+                )
             except _JobCancelled:
                 rec.state = STATE_CANCELLED
             except Exception as exc:
-                rec.state = STATE_FAILED
-                rec.error = f"{type(exc).__name__}: {exc}"
-                # v0.9.5: route the traceback through the standard
-                # logging framework so the X-Plex-Token scrubber
-                # (installed on every handler) can redact any
-                # token-bearing URLs before they hit disk or stdout.
-                # The previous ``traceback.print_exc()`` wrote
-                # straight to stderr and bypassed the scrubber.
-                log.error(
-                    "Job worker caught unhandled exception",
-                    exc_info=True,
-                )
+                # Stop P2: a hard stop tears down the HTTP session, so
+                # the engine usually exits via an exception. If a stop
+                # was requested (state is STOPPING), that's a CANCELLED
+                # job - not a FAILED one.
+                if rec.state == STATE_STOPPING:
+                    rec.state = STATE_CANCELLED
+                else:
+                    rec.state = STATE_FAILED
+                    rec.error = f"{type(exc).__name__}: {exc}"
+                    # v0.9.5: route the traceback through the standard
+                    # logging framework so the X-Plex-Token scrubber
+                    # (installed on every handler) can redact any
+                    # token-bearing URLs before they hit disk or stdout.
+                    # The previous ``traceback.print_exc()`` wrote
+                    # straight to stderr and bypassed the scrubber.
+                    log.error(
+                        "Job worker caught unhandled exception",
+                        exc_info=True,
+                    )
             finally:
                 rec.finished_at = time.time()
+                # Capture the run summary from whatever dashboard is
+                # still attached (single-job: state._dashboard;
+                # fan-out: each destination's dashboard contributes
+                # to its own subtab and the top-level summary stays
+                # None - the fan-out array is the surface there).
+                try:
+                    dash = state.get_dashboard()
+                    if dash is not None:
+                        rec.summary = {
+                            "tier_counts": dict(dash.tier_counts),
+                            # Rule 4: per-container restoration summary.
+                            # Both lists are present (possibly empty)
+                            # for every run so the frontend can branch
+                            # on length rather than truthiness.
+                            "container_summary": {
+                                "playlists": [
+                                    dict(p) for p in
+                                    dash.container_summary.get("playlists", [])
+                                ],
+                                "collections": [
+                                    dict(c) for c in
+                                    dash.container_summary.get("collections", [])
+                                ],
+                            },
+                            # Timing facts captured at completion. No
+                            # estimate fields - the discover-don't-
+                            # predict model has no pre-run baseline to
+                            # compare against. Just the wall-clock
+                            # facts the Job History view renders.
+                            "timing": {
+                                "started_at": rec.started_at,
+                                "finished_at": rec.finished_at,
+                                "actual_seconds": (
+                                    (rec.finished_at - rec.started_at)
+                                    if (rec.finished_at and rec.started_at)
+                                    else None
+                                ),
+                            },
+                        }
+                        # One-line run summary to the engine log so the
+                        # operator can see the wall-clock duration
+                        # without opening the Job History panel.
+                        if rec.started_at and rec.finished_at:
+                            log.info(
+                                "Run %s finished: %.0fs wall-clock "
+                                "(%d watched, %d rated, %d playlists, "
+                                "%d collections processed).",
+                                rec.job_id,
+                                max(0.0, rec.finished_at - rec.started_at),
+                                int(getattr(dash, "watch_count", 0) or 0),
+                                int(getattr(dash, "rating_count", 0) or 0),
+                                int(getattr(dash, "playlist_count", 0) or 0),
+                                int(getattr(dash, "collection_count", 0) or 0),
+                            )
+                except Exception:  # pragma: no cover (defensive)
+                    pass
                 self._record_history(rec)
 
     def _record_history(self, rec: JobRecord) -> None:
@@ -279,21 +487,21 @@ class JobQueue:
                 # Trim the oldest entries first.
                 del self._history[: len(self._history) - _HISTORY_MAX]
 
-    # ── Engine invocation: export ────────────────────────────────────
+    # ── Engine invocation: snapshot ────────────────────────────────────
 
-    def _run_export(self, rec: JobRecord) -> None:
+    def _run_snapshot(self, rec: JobRecord) -> None:
         """
-        Build a fresh logger + Plex connection, then call run_export().
+        Build a fresh logger + Plex connection, then call run_snapshot().
 
         Multi-server (v0.9.0): the connection is resolved from
         ``source_server_name`` against the registered server list.
         For backward compatibility with ad-hoc CLI calls, raw
         ``plex_url`` + ``plex_token`` in the params still work.
         ``state._run_timestamp`` is prefixed with the server's
-        filename-safe slug so log dirs and export filenames don't
+        filename-safe slug so log dirs and snapshot filenames don't
         collide between servers.
         """
-        settings = _merge_settings(rec.params, mode="export")
+        settings = _merge_settings(rec.params, mode="snapshot")
 
         # Resolve the connection. Either a registered server name
         # was supplied (preferred path) or a raw URL+token pair.
@@ -315,15 +523,51 @@ class JobQueue:
         state._plex_token = token
         state._plex_owner_name = owner
         _populate_run_user_context(server, source_name=settings.get("source_server_name"))
-        # Run-trigger labels: stamped into the export JSON so the
-        # Exports tab can show how each backup was initiated. Defaults
+        # Run-trigger labels: stamped into the snapshot JSON so the
+        # Snapshots tab can show how each export was initiated. Defaults
         # to "manual" when the API call carries no explicit marker
         # (covers any future caller that forgets to set it).
         state._run_trigger = str(settings.get("_trigger") or "manual")
         state._run_schedule_name = str(settings.get("_schedule_name") or "")
+        # PR-13 fix #3 - publish the registered server's id into
+        # state so the engine's per-library payload can ingest
+        # straight into media.db. ``_resolve_server_id`` walks
+        # server_registry to map ``source_server_name`` -> id; the
+        # snapshot job hard-fails below if no row matches (engine
+        # is media.db-primary now and refuses to run without a
+        # registered server).
+        snapshot_server_id = _resolve_server_id(settings.get("source_server_name"))
+        if not snapshot_server_id:
+            raise ValueError(
+                f"Snapshot requires a registered server. {settings.get('source_server_name')!r} "
+                "is not in the registry - register it under the Servers tab first."
+            )
+        state._snapshot_server_id = snapshot_server_id
+        # Defensive last-line guarantee: the post-job snapshot capture
+        # hits ``SELECT id FROM servers WHERE id = ?`` against media.db
+        # and raises if the row is missing. ``add_server`` /
+        # ``update_server`` + the startup backfill cover this on healthy
+        # installs; the upsert here also handles the case where the
+        # operator added a server to the registry between server-boot
+        # and the first snapshot for it.
+        try:
+            from server import media_db, server_registry
+            src_row = server_registry.get_server_by_id(snapshot_server_id, include_token=False) or {}
+            media_db.upsert_server_row(
+                server_id=snapshot_server_id,
+                name=src_row.get("name") or settings.get("source_server_name") or "",
+                url=src_row.get("url") or url,
+                service="plex",
+                machine_id=(src_row.get("machine_identifier") or None) or None,
+            )
+        except Exception:
+            logging.getLogger("plexmigrate.server.jobs").exception(
+                "Pre-snapshot media.db.servers upsert failed for %r; capture may fail.",
+                snapshot_server_id,
+            )
 
         # Resolve the library *names* sent by the client to the
-        # python-plexapi LibrarySection objects ``run_export`` expects.
+        # python-plexapi LibrarySection objects ``run_snapshot`` expects.
         all_sections = list(server.library.sections())
         wanted = set(settings["libraries"] or [])
         if wanted:
@@ -336,34 +580,108 @@ class JobQueue:
         else:
             selected = all_sections
 
-        # Hand off to the engine. ``run_export`` returns when every
+        # Hand off to the engine. ``run_snapshot`` returns when every
         # library is done (or stop_event is set, in which case it
         # finishes the in-flight ones and returns).
-        run_export(
+        run_snapshot(
             server,
             selected,
             settings["output_dir"],
             logger,
             run_log_dir,
             url,
+            skip_collections=bool(settings.get("skip_collections") or False),
+            fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
+            skip_playlists=bool(settings.get("skip_playlists") or False),
+            skip_playlist_prebuild=bool(settings.get("skip_playlist_prebuild") or False),
+            # PR-3 / Phase D - four-flag data-type filter forwarded from
+            # the request (or schedule). The Pydantic validator on
+            # SnapshotJobIn / ScheduleIn already mapped any legacy
+            # skip_* fields onto these include_* defaults.
+            include_watch_history=bool(settings.get("include_watch_history", True)),
+            include_ratings=bool(settings.get("include_ratings", True)),
+            include_playlists=bool(settings.get("include_playlists", True)),
+            include_collections=bool(settings.get("include_collections", True)),
         )
 
+        # Part B: the engine has returned (every library row reads
+        # "Done"), but the job is NOT done - close-logger, run-dir
+        # finalize, and the snapshot-DB capture below all still run
+        # before the worker loop flips the JobRecord to COMPLETED.
+        # Surface that as a run-level "Finalizing" phase so the
+        # dashboard doesn't look frozen at 100%.
+        _dash = state.get_dashboard()
+        if _dash is not None:
+            _dash.set_finalizing("closing run logs")
         _close_logger(logger, run_log_dir)
 
         # Mirror the CLI's PASS/FAIL log rename so per-run log
         # directories on disk stay consistent across CLI and server.
         _finalise_run_dir(run_log_dir)
 
+        # PR-13: capture the snapshot .db file + register it.
+        # This is the heaviest post-engine step (it writes the whole
+        # snapshot .db from the in-memory payloads) - the dominant
+        # cause of the "stuck at the end" feeling, so it gets its own
+        # finalize label.
+        if _dash is not None:
+            _dash.set_finalizing("writing snapshot to database")
+        # Best-effort wrapper: failure here doesn't fail the job (the
+        # engine already wrote rows to media.db; the operator's data
+        # is intact and re-runs are idempotent). We log AND stamp
+        # ``rec.error`` so the UI shows a banner alongside the
+        # otherwise-successful job state - silent capture failure is
+        # the original bug that left the Exports panel empty.
+        try:
+            _capture_snapshot_after_run(
+                rec=rec,
+                server_id=snapshot_server_id,
+                server_name=settings.get("source_server_name") or "",
+                output_dir=settings["output_dir"],
+                server_slug=server_slug,
+                libraries=[s.title for s in selected],
+            )
+        except Exception as exc:
+            msg = (
+                f"Snapshot artifact capture failed: {type(exc).__name__}: {exc}. "
+                "Engine data is in media.db; re-running is safe."
+            )
+            rec.error = msg
+            logging.getLogger("plexmigrate.server.jobs").exception(
+                "Snapshot capture failed for job %r; media.db rows are still intact.",
+                rec.job_id,
+            )
+            if state.get_dashboard():
+                try:
+                    state.get_dashboard().push_activity("error", "-", msg)
+                except Exception:
+                    pass
+
     # ── Engine invocation: import ────────────────────────────────────
 
-    def _run_import(self, rec: JobRecord) -> None:
-        settings = _merge_settings(rec.params, mode="import")
+    def _run_restore(self, rec: JobRecord) -> None:
+        """
+        File-mediated import. The destination is named by
+        ``dest_server_name`` (single) or ``dest_server_names`` (fan-out).
+        v0.10.0 dispatches to :func:`run_fan_out_restore` when more than
+        one destination is requested; the single-destination path below
+        is unchanged.
+        """
+        settings = _merge_settings(rec.params, mode="restore")
+
+        dest_names = _resolve_dest_names(settings)
+        if len(dest_names) > 1:
+            self._run_restore_fan_out(rec, settings, dest_names)
+            return
+
+        if dest_names:
+            settings["dest_server_name"] = dest_names[0]
 
         # Multi-server resolution. ``dest_server_name`` selects the
         # destination registered server; falls back to ad-hoc
         # url/token from the legacy CLI shape if not present.
         # We adapt the source/dest naming on the fly so the same helper
-        # is used for both export (source) and import (dest).
+        # is used for both snapshot (source) and import (dest).
         if settings.get("dest_server_name"):
             settings["source_server_name"] = settings["dest_server_name"]
         server, url, token, owner, server_slug = _resolve_source_connection(
@@ -383,24 +701,24 @@ class JobQueue:
         state._plex_base_url = url
         state._plex_token = token
         state._plex_owner_name = owner
-        # Imports run against the destination server — pull its
+        # Imports run against the destination server - pull its
         # display-name map so the dashboard's current_user attribution
         # uses the right side's friendly names.
         _populate_run_user_context(server, source_name=settings.get("dest_server_name") or settings.get("source_server_name"))
 
         # Verify each requested input file exists before kicking off
-        # the engine — fail fast with a useful message rather than
+        # the engine - fail fast with a useful message rather than
         # mid-run with a stack trace.
         #
         # The web frontend's Run-Job form sends bare filenames pulled
-        # from the export browser (e.g. "Movies_20260510.plexbackup.json")
+        # from the snapshot browser (e.g. "Movies_20260510.plexexport.json")
         # because the directory is implied by the configured output
         # directory. The CLI may send absolute paths. We try the value
         # as-is first, then fall back to joining it against the
         # configured output_dir, so both call shapes work without
         # the client having to know the engine's working directory
         # inside the container.
-        output_dir = settings.get("output_dir") or "./plex_exports"
+        output_dir = settings.get("output_dir") or "./snapshots"
         valid: List[str] = []
         missing: List[str] = []
         for f in settings["input_files"] or []:
@@ -413,15 +731,15 @@ class JobQueue:
                 valid.append(str(scoped))
                 continue
             missing.append(f)
-            logger.error(f"Backup file not found: {f} (also tried {scoped})")
+            logger.error(f"Export file not found: {f} (also tried {scoped})")
         if not valid:
-            raise ValueError(f"No valid backup files found. Missing: {missing}")
+            raise ValueError(f"No valid export files found. Missing: {missing}")
 
         remap: Optional[Tuple[str, str]] = None
         if settings.get("remap_old") and settings.get("remap_new"):
             remap = (settings["remap_old"], settings["remap_new"])
 
-        run_import(
+        run_restore(
             server,
             valid,
             settings["plex_token"],
@@ -430,8 +748,21 @@ class JobQueue:
             run_log_dir,
             remap,
             bool(settings["strict_match"]),
+            # PR-3 / Phase D - four-flag data-type filter forwarded from
+            # the request. The Pydantic validator already mapped any
+            # legacy skip_* fields onto these include_* defaults, so
+            # both shapes work without translation here.
+            include_playlists=bool(settings.get("include_playlists", True)),
+            include_watch_history=bool(settings.get("include_watch_history", True)),
+            include_ratings=bool(settings.get("include_ratings", True)),
+            include_collections=bool(settings.get("include_collections", True)),
         )
 
+        # Part B: run-level finalize phase so the dashboard doesn't
+        # look frozen at 100% during the post-engine close-out.
+        _dash = state.get_dashboard()
+        if _dash is not None:
+            _dash.set_finalizing("finalizing run")
         _close_logger(logger, run_log_dir)
         _finalise_run_dir(run_log_dir)
 
@@ -444,29 +775,52 @@ class JobQueue:
         lives in :mod:`server.direct_transfer`; this method just
         handles connection resolution, logger setup, and stop-flag
         threading.
+
+        Fan-out (v0.10.0): when ``dest_server_names`` carries more than
+        one name the call is forwarded to :func:`run_fan_out_direct`
+        and the single-destination resolution / engine call below is
+        skipped. ``len == 1`` keeps the existing single-destination
+        code path verbatim - the model validator collapses
+        ``dest_server_name`` + ``dest_server_names`` into a list of one
+        for older clients.
         """
         settings = _merge_settings(rec.params, mode="direct")
 
         src_name = settings.get("source_server_name")
-        dst_name = settings.get("dest_server_name")
+        dest_names = _resolve_dest_names(settings)
         if not src_name:
             raise ValueError("source_server_name is required for a direct transfer.")
-        if not dst_name:
-            raise ValueError("dest_server_name is required for a direct transfer.")
-        if src_name == dst_name:
-            raise ValueError("Source and destination must be different registered servers.")
+        if not dest_names:
+            raise ValueError(
+                "dest_server_name or dest_server_names is required for a direct transfer."
+            )
+        if any(src_name == d for d in dest_names):
+            raise ValueError(
+                "Source and destination must be different registered servers."
+            )
+        if len(set(dest_names)) != len(dest_names):
+            raise ValueError("Destinations must be unique.")
+
+        if len(dest_names) > 1:
+            self._run_direct_fan_out(rec, settings, src_name, dest_names)
+            return
+
+        # Single-destination path - keep ``dest_server_name`` populated
+        # for the resolution + log helpers downstream.
+        dst_name = dest_names[0]
+        settings["dest_server_name"] = dst_name
 
         # Resolve both connections up front so we fail fast if either
         # is unreachable, rather than half-way through library 1.
         boot_logger = logging.getLogger("plexmigrate")
-        if state._dashboard:
-            state._dashboard.push_activity(
-                "phase", "—", f"Connecting to source Plex '{src_name}'…",
+        if state.get_dashboard():
+            state.get_dashboard().push_activity(
+                "phase", "-", f"Connecting to source Plex '{src_name}'…",
             )
         src_server, src_row = connect_registered_server(src_name, boot_logger)
-        if state._dashboard:
-            state._dashboard.push_activity(
-                "phase", "—", f"Connecting to destination Plex '{dst_name}'…",
+        if state.get_dashboard():
+            state.get_dashboard().push_activity(
+                "phase", "-", f"Connecting to destination Plex '{dst_name}'…",
             )
         dst_server, dst_row = connect_registered_server(dst_name, boot_logger)
 
@@ -480,7 +834,7 @@ class JobQueue:
         # ``dst_token`` for the duration of this run; settings["plex_token"]
         # holds the dest plaintext only because the engine's direct-HTTP
         # helpers read it from ``state._plex_token`` (documented residual
-        # exposure — see services/state.py).
+        # exposure - see services/state.py).
         src_token = decrypt_server_token(src_row)
         dst_token = decrypt_server_token(dst_row)
 
@@ -499,7 +853,7 @@ class JobQueue:
         state._session = _make_session()
         # Direct transfer attributes per-user work to the SOURCE side
         # (users are read from there). The destination's display names
-        # are not relevant here — users on the destination match by
+        # are not relevant here - users on the destination match by
         # raw identifier, not friendly name.
         _populate_run_user_context(src_server, source_name=src_name)
 
@@ -546,8 +900,8 @@ class JobQueue:
 
         # v0.9.7 Item 4: only show the dashboard's ``current_user``
         # row when this run is *deliberately* scoped to a specific
-        # subset of users — i.e. direct transfer with a non-empty
-        # filter. Standard export / import / unscoped direct transfer
+        # subset of users - i.e. direct transfer with a non-empty
+        # filter. Standard snapshot / import / unscoped direct transfer
         # leaves the row hidden so the header doesn't lock onto one
         # user for minutes at a time.
         state._current_user_visible = bool(user_filter)
@@ -573,16 +927,215 @@ class JobQueue:
             source_home_users=src_home_users,
             dest_home_users=dst_home_users,
             user_filter=user_filter,
+            skip_collections=bool(settings.get("skip_collections") or False),
+            fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
+            skip_playlists=bool(settings.get("skip_playlists") or False),
+            # PR-3 / Phase D - four-flag data-type filter.
+            include_watch_history=bool(settings.get("include_watch_history", True)),
+            include_ratings=bool(settings.get("include_ratings", True)),
+            include_playlists=bool(settings.get("include_playlists", True)),
+            include_collections=bool(settings.get("include_collections", True)),
         )
 
+        # Part B: run-level finalize phase so the dashboard doesn't
+        # look frozen at 100% during the post-engine close-out.
+        _dash = state.get_dashboard()
+        if _dash is not None:
+            _dash.set_finalizing("finalizing run")
         _close_logger(logger, run_log_dir)
         _finalise_run_dir(run_log_dir)
 
+    # ── Fan-out dispatch (v0.10.0) ───────────────────────────────────
 
-# ── Helpers used by both export and import paths ──────────────────────────────
+    def _run_direct_fan_out(
+        self,
+        rec: JobRecord,
+        settings: Dict[str, Any],
+        src_name: str,
+        dest_names: List[str],
+    ) -> None:
+        """
+        Hand off a multi-destination direct transfer to
+        :func:`server.fan_out.run_fan_out_direct`.
+
+        The fan-out coordinator owns its own per-destination dashboards
+        and log dirs, so this method intentionally does *not* call
+        ``_build_logger`` / ``_set_run_timestamp`` / ``state._dashboard
+        =`` here - the placeholder DashboardState set in the worker
+        loop will be replaced per-destination inside the coordinator.
+
+        The record's ``run_log_dir`` is set to the parent log directory
+        root so the run-dir browser surface in the UI still resolves;
+        per-destination subdirectories live inside it.
+        """
+        # Strip the token from the recorded params before publishing.
+        rec.params = {k: v for k, v in settings.items() if k != "plex_token"}
+        rec.run_log_dir = settings.get("log_dir") or "./plex_logs"
+
+        # MAX_WORKERS / SCROBBLE_WORKERS are plain module globals shared
+        # by every destination (per-destination caps don't make sense -
+        # these bound the engine's internal thread pools). Set them on
+        # the worker-loop thread BEFORE spawning so each destination
+        # sees the freshly-requested values rather than whatever the
+        # prior job left behind.
+        state.MAX_WORKERS = int(settings.get("workers") or state.MAX_WORKERS)
+        state.SCROBBLE_WORKERS = int(
+            settings.get("scrobble_workers") or state.SCROBBLE_WORKERS
+        )
+        # Bug fix: the engine's restore_ratings path writes via
+        # ``state._session.put(...)``. Single-destination jobs init
+        # this in their own _run_* method, but the fan-out dispatch
+        # paths did not - so the first ratings write of a fan-out
+        # job hit ``NoneType.put`` whenever state._session hadn't
+        # been initialised by a prior job. Initialise here, before
+        # any destination worker runs.
+        state._session = _make_session()
+
+        raw_filter = settings.get("user_filter")
+        if raw_filter is None:
+            user_filter: Optional[List[str]] = None
+        elif isinstance(raw_filter, list):
+            user_filter = [str(u) for u in raw_filter]
+        else:
+            user_filter = None
+
+        remap: Optional[Tuple[str, str]] = None
+        if settings.get("remap_old") and settings.get("remap_new"):
+            remap = (settings["remap_old"], settings["remap_new"])
+
+        stop_event = runtime_patches._active_stop_event
+
+        result: FanOutResult = run_fan_out_direct(
+            source_name=src_name,
+            dest_names=list(dest_names),
+            libraries=list(settings.get("libraries") or []),
+            user_filter=user_filter,
+            remap=remap,
+            strict_match=bool(settings.get("strict_match", True)),
+            output_dir=settings.get("output_dir") or None,
+            workers=int(settings.get("workers") or state.MAX_WORKERS),
+            scrobble_workers=int(
+                settings.get("scrobble_workers") or state.SCROBBLE_WORKERS
+            ),
+            verbose=bool(settings.get("verbose") or False),
+            log_dir_root=settings.get("log_dir") or "./plex_logs",
+            stop_event=stop_event,
+            run_trigger=str(settings.get("_trigger") or "manual"),
+            schedule_name=str(settings.get("_schedule_name") or ""),
+            skip_collections=bool(settings.get("skip_collections") or False),
+            fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
+            skip_playlists=bool(settings.get("skip_playlists") or False),
+            # PR-3 / Phase D - four-flag data-type filter (fan-out direct).
+            include_watch_history=bool(settings.get("include_watch_history", True)),
+            include_ratings=bool(settings.get("include_ratings", True)),
+            include_playlists=bool(settings.get("include_playlists", True)),
+            include_collections=bool(settings.get("include_collections", True)),
+        )
+        _apply_fan_out_result(rec, result)
+
+    def _run_restore_fan_out(
+        self,
+        rec: JobRecord,
+        settings: Dict[str, Any],
+        dest_names: List[str],
+    ) -> None:
+        """
+        Hand off a multi-destination import to
+        :func:`server.fan_out.run_fan_out_restore`. The single-server
+        connect+resolve dance is repeated per-destination inside the
+        coordinator, so this dispatcher just normalises params.
+        """
+        rec.params = {k: v for k, v in settings.items() if k != "plex_token"}
+        rec.run_log_dir = settings.get("log_dir") or "./plex_logs"
+
+        # MAX_WORKERS / SCROBBLE_WORKERS - see note in
+        # ``_run_direct_fan_out`` above. Same rationale, same fix.
+        state.MAX_WORKERS = int(settings.get("workers") or state.MAX_WORKERS)
+        state.SCROBBLE_WORKERS = int(
+            settings.get("scrobble_workers") or state.SCROBBLE_WORKERS
+        )
+        # Same NoneType.put fix as _run_direct_fan_out - restore_ratings
+        # writes via ``state._session.put(...)`` and the fan-out import
+        # path was not initialising it before destinations spawned.
+        state._session = _make_session()
+
+        remap: Optional[Tuple[str, str]] = None
+        if settings.get("remap_old") and settings.get("remap_new"):
+            remap = (settings["remap_old"], settings["remap_new"])
+
+        stop_event = runtime_patches._active_stop_event
+
+        result: FanOutResult = run_fan_out_restore(
+            dest_names=list(dest_names),
+            input_files=list(settings.get("input_files") or []),
+            remap=remap,
+            strict_match=bool(settings.get("strict_match", True)),
+            workers=int(settings.get("workers") or state.MAX_WORKERS),
+            scrobble_workers=int(
+                settings.get("scrobble_workers") or state.SCROBBLE_WORKERS
+            ),
+            verbose=bool(settings.get("verbose") or False),
+            log_dir_root=settings.get("log_dir") or "./plex_logs",
+            output_dir=settings.get("output_dir"),
+            stop_event=stop_event,
+            # PR-3 / Phase D - four-flag data-type filter (fan-out import).
+            # The Pydantic validator translates any legacy skip_* into
+            # include_* upstream.
+            include_playlists=bool(settings.get("include_playlists", True)),
+            include_watch_history=bool(settings.get("include_watch_history", True)),
+            include_ratings=bool(settings.get("include_ratings", True)),
+            include_collections=bool(settings.get("include_collections", True)),
+        )
+        _apply_fan_out_result(rec, result)
+
+
+# ── Helpers used by both snapshot and import paths ──────────────────────────────
 
 class _JobCancelled(Exception):
     """Raised when stop_event is set before the engine call completes."""
+
+
+def _resolve_dest_names(settings: Dict[str, Any]) -> List[str]:
+    """
+    Return the ordered destination-server list for a direct-transfer or
+    import job.
+
+    The Pydantic model validator already collapses ``dest_server_name``
+    and ``dest_server_names`` into the plural form, but this helper
+    keeps working for callers that supply the singular form only (CLI
+    invocations, scheduler payloads written before v0.10.0). Empty
+    strings are dropped; duplicates are preserved as the validator's
+    job. Returns an empty list if neither field has any value - the
+    caller decides whether that's an error.
+    """
+    plural = settings.get("dest_server_names") or []
+    if isinstance(plural, list) and any(isinstance(n, str) and n.strip() for n in plural):
+        return [n.strip() for n in plural if isinstance(n, str) and n.strip()]
+    singular = settings.get("dest_server_name")
+    if isinstance(singular, str) and singular.strip():
+        return [singular.strip()]
+    return []
+
+
+def _apply_fan_out_result(rec: JobRecord, result: "FanOutResult") -> None:
+    """
+    Translate a :class:`server.fan_out.FanOutResult` into the worker
+    loop's terminal-state vocabulary.
+
+    The worker's ``try`` block sets ``rec.state = STATE_COMPLETED``
+    after we return cleanly; we raise :class:`_JobCancelled` if the
+    fan-out was cancelled, or a plain ``RuntimeError`` if at least one
+    destination failed (which the worker turns into ``STATE_FAILED``
+    with ``rec.error``).
+    """
+    if result.cancelled and not result.has_failures():
+        raise _JobCancelled("Fan-out cancelled before all destinations completed.")
+    if result.has_failures():
+        # The destination errors are already in the run logs and the
+        # WS payload; the JobRecord.error field carries the first one
+        # so the failed-job header in the UI surfaces a concrete
+        # message instead of a bare "Failed."
+        raise RuntimeError(result.first_error() or "fan-out: at least one destination failed.")
 
 
 def _merge_settings(params: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
@@ -594,7 +1147,7 @@ def _merge_settings(params: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
     is a flat dict that's safe to pass to the engine.
 
     Multi-server (v0.9.0): ``plex_url`` and ``plex_token`` are no
-    longer required at this layer — the connection is normally
+    longer required at this layer - the connection is normally
     resolved later via the registered server name. The legacy v0.8.0
     fields stay accepted so an ad-hoc CLI call (--server URL --token X)
     keeps working.
@@ -615,6 +1168,11 @@ def _merge_settings(params: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
         "remap_new": None,
         "source_server_name": None,
         "dest_server_name": None,
+        # v0.10.0: fan-out destinations. The Pydantic model collapses
+        # singular ``dest_server_name`` into this list at the API
+        # boundary, but we keep the legacy key populated for any
+        # downstream code that hasn't been migrated yet.
+        "dest_server_names": None,
     }
     for key, value in params.items():
         if value is None:
@@ -628,13 +1186,13 @@ def _resolve_source_connection(
 ) -> Tuple[Any, str, str, str, str]:
     """
     Resolve the registered server named in ``settings`` to a live
-    connection. Strict — requires ``source_server_name`` to identify
+    connection. Strict - requires ``source_server_name`` to identify
     a registered row, and raises if it's missing or unmatched.
 
     v0.9.1 change: the previous build had a "legacy ad-hoc" fallback
     that used raw ``plex_url`` / ``plex_token`` from ``settings.json``
     when no ``source_server_name`` was supplied. That fallback caused
-    the symptom of "every operation hits the first/default server" —
+    the symptom of "every operation hits the first/default server" -
     a request that *should* fail loudly (no server selected) was
     silently succeeding against whichever server happened to be in
     legacy settings. The fallback is gone from this API path; the CLI
@@ -644,7 +1202,7 @@ def _resolve_source_connection(
 
     Returns ``(PlexServer, url, token, owner_name, slug)``. ``slug``
     is the filename-safe form of the friendly server name, used by
-    :func:`_set_run_timestamp` to prefix log dirs and export filenames.
+    :func:`_set_run_timestamp` to prefix log dirs and snapshot filenames.
     """
     name = (settings.get("source_server_name") or "").strip()
     if not name:
@@ -665,19 +1223,19 @@ def _resolve_source_connection(
     # so the user knows the job hasn't stalled. connect_registered_server
     # also does a probe / library enumeration which can take several
     # seconds on a large server.
-    if state._dashboard:
-        state._dashboard.push_activity(
-            "phase", "—", f"Connecting to Plex source '{name}'…",
+    if state.get_dashboard():
+        state.get_dashboard().push_activity(
+            "phase", "-", f"Connecting to Plex source '{name}'…",
         )
     server, fresh = connect_registered_server(name, logger)
-    if state._dashboard:
-        state._dashboard.push_activity(
-            "started", "—", f"Connected to '{name}' as {fresh.get('owner_name') or '?'}",
+    if state.get_dashboard():
+        state.get_dashboard().push_activity(
+            "started", "-", f"Connected to '{name}' as {fresh.get('owner_name') or '?'}",
         )
     # ``fresh["token"]`` is ciphertext (servers.json is encrypted at
-    # rest). Decrypt here so the caller — which assigns the result
+    # rest). Decrypt here so the caller - which assigns the result
     # to ``state._plex_token`` for use by direct-HTTP helpers
-    # (/:/scrobble, /:/rate, etc.) — gets plaintext.
+    # (/:/scrobble, /:/rate, etc.) - gets plaintext.
     plain_token = decrypt_server_token(fresh)
     return (
         server, fresh["url"], plain_token,
@@ -705,7 +1263,7 @@ def _populate_run_user_context(
       per-tick REST hit. The map is otherwise rebuilt by the next
       ``Servers`` tab visit.
 
-    Both operations are best-effort — failures here must not block
+    Both operations are best-effort - failures here must not block
     the actual run.
     """
     try:
@@ -718,11 +1276,11 @@ def _populate_run_user_context(
 
     # Carry the cached display-name map into the dashboard so the WS
     # snapshot can ship it to the frontend.
-    if state._dashboard is not None and source_name:
+    if state.get_dashboard() is not None and source_name:
         try:
             row = get_server_by_name(source_name, include_token=False)
             if row is not None:
-                state._dashboard.set_user_display_names(
+                state.get_dashboard().set_user_display_names(
                     row.get("user_display_names") or {}
                 )
         except Exception:
@@ -732,16 +1290,16 @@ def _populate_run_user_context(
 def _set_run_timestamp(slug: str) -> None:
     """
     Re-derive ``state._run_timestamp`` so the current run's log dir
-    and export filenames are prefixed with the server's slug.
+    and snapshot filenames are prefixed with the server's slug.
 
     The engine reads ``state._run_timestamp`` lazily inside
     :func:`services.logging_ops.setup_logging` and
-    :func:`services.exporter.export_library`, so we can reassign it
+    :func:`services.snapshotter.snapshot_library`, so we can reassign it
     here without touching either of those modules.
 
     Example: ``slug="Plex1"`` →
         log dir   : plex_logs/run_Plex1_20260510_135425/
-        filename  : Movies_Plex1_20260510_135425.plexbackup.json
+        filename  : Movies_Plex1_20260510_135425.plexexport.json
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     state._run_timestamp = f"{slug}_{ts}" if slug and slug != "adhoc" else ts
@@ -774,12 +1332,236 @@ def _close_logger(logger: logging.Logger, run_log_dir: str) -> None:
                 lg.removeHandler(h)
 
 
+def _resolve_server_id(source_server_name: Optional[str]) -> str:
+    """
+    Map a friendly ``source_server_name`` (the one operators see in
+    the registry) to the registry row's stable ``id`` field used as
+    foreign key in media.db. Returns an empty string when no match -
+    callers treat that as "no snapshot capture possible."
+    """
+    if not source_server_name:
+        return ""
+    try:
+        from server.server_registry import list_servers
+        for row in list_servers(include_tokens=False):
+            if (row.get("name") or "") == source_server_name:
+                return str(row.get("id") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def _capture_snapshot_after_run(
+    *,
+    rec: JobRecord,
+    server_id: str,
+    server_name: str,
+    output_dir: str,
+    server_slug: str,
+    libraries: List[str],
+) -> None:
+    """
+    PR-13 snapshot capture (Rule 1 - payload-direct edition).
+
+    The engine fetches every metric live during ``snapshot_library``
+    and appends its per-library ``export_data`` to
+    ``state._snapshot_payloads``. By the time this wrapper runs we
+    have the full set of live-fetched payloads in memory. The
+    snapshot .db is built directly from THAT data via
+    :func:`snapshot_capture.build_snapshot_db_from_payloads` -
+    media.db is no longer the source of truth for snapshot content
+    (it remains a cumulative side-effect cache for the resolver's
+    Tier-0 GUID/ratingKey lookups).
+
+    Steps:
+      1. Build a per-server snapshot ``.db`` from the run's in-memory
+         payload list.
+      2. Register the snapshot in ``snapshots.db``. Retention
+         enforcement runs inside the register call.
+
+    JSON is always generated on demand from the snapshot ``.db`` when
+    the operator clicks Download in the Exports panel - no sidecar
+    files are written here. The ``prebuild_json`` toggle from Commit
+    B/C has been removed.
+    """
+    log = logging.getLogger("plexmigrate.server.jobs")
+    if not server_id:
+        msg = "Snapshot artifact capture skipped: no registered server_id."
+        rec.error = msg
+        log.warning("%s job=%r", msg, rec.job_id)
+        return
+
+    run_ts = state._run_timestamp or ""
+    if not run_ts:
+        msg = "Snapshot artifact capture skipped: state._run_timestamp empty."
+        rec.error = msg
+        log.warning("%s job=%r", msg, rec.job_id)
+        return
+
+    from server import snapshot_capture, snapshot_registry
+    # Compose a friendly snapshot_name from the registry fields the
+    # operator already cares about: server, libraries, captured_at.
+    # The result is both the on-disk .db basename AND the registry's
+    # ``snapshot_name`` field, so the file on disk reads e.g.
+    # ``My Server - Audio-Books, Music - 2026-05-13 02-26.db`` instead
+    # of the previous ``My-Server_20260513_022609.db``.
+    captured_at_ts = time.time()
+    snapshot_name = snapshot_registry.format_snapshot_filename(
+        server_name=server_name,
+        libraries=libraries,
+        captured_at=captured_at_ts,
+    )
+
+    # Capture-time include_* flags drive BOTH the registry's
+    # captured_types_json field AND the per-table copy scope inside
+    # the snapshot .db. Moved before create_snapshot_db so the
+    # gating is applied at capture rather than after.
+    captured_types: List[str] = []
+    if bool(rec.params.get("include_watch_history", True)):
+        captured_types.append("watch_history")
+    if bool(rec.params.get("include_ratings", True)):
+        captured_types.append("ratings")
+    if bool(rec.params.get("include_playlists", True)):
+        captured_types.append("playlists")
+    if bool(rec.params.get("include_collections", True)):
+        captured_types.append("collections")
+
+    # Pre-generate the snapshot id so snapshot_meta inside the .db
+    # carries the SAME id as the registry row we'll insert below.
+    # ``register()`` re-uses any pre-generated id when passed; if it
+    # isn't (legacy callers), it generates its own. Use a fresh uuid
+    # here so the two stay in lockstep.
+    snapshot_id_for_meta = uuid.uuid4().hex
+
+    # Pull the operator-supplied display-name map from the registry
+    # row so snapshot_users.display_name can be populated for the
+    # users who have data. Best-effort - missing fields fall through
+    # to NULL display_name on the snapshot row.
+    user_display_names: Dict[str, str] = {}
+    try:
+        from server import server_registry as _sr
+        srv_row = _sr.get_server_by_id(server_id, include_token=False) or {}
+        raw = srv_row.get("user_display_names") or {}
+        if isinstance(raw, dict):
+            user_display_names = {str(k): str(v) for k, v in raw.items() if v}
+    except Exception:
+        # Display-name lookup is purely cosmetic; never fail capture
+        # on a registry hiccup.
+        pass
+
+    # Operator who triggered the run, if auth is on. The job runner
+    # stamps this in rec.params under a synthetic underscore-prefixed
+    # key so it never collides with the standard SnapshotJobIn fields.
+    created_by_user = rec.params.get("_actor_username") or None
+
+    # Fix 3: store absolute paths so list_snapshots / Download / orphan
+    # reconciliation never have to second-guess the CWD the FastAPI
+    # process was launched from.
+    snapshot_db_path = Path(output_dir).resolve() / f"{snapshot_name}.db"
+    # Rule 1: snapshot content comes from the in-memory payload list
+    # the engine appended during this run, NOT from media.db. The
+    # collector is populated by services.snapshotter.snapshot_library
+    # after each live-fetch; reset_run_state primed it as an empty
+    # list at the top of the run.
+    payloads = state._snapshot_payloads or []
+    if not payloads:
+        # An empty list here means the engine ran but no library
+        # finished a successful capture (every library errored
+        # before reaching the append-to-collector site). Don't
+        # write an empty .db - that would create a misleading
+        # zero-row registry row. Let the outer wrapper surface
+        # rec.error instead.
+        msg = (
+            "Snapshot capture skipped: no per-library payload was "
+            "produced by the engine (state._snapshot_payloads is empty)."
+        )
+        rec.error = msg
+        log.warning("%s job=%r", msg, rec.job_id)
+        return
+    try:
+        capture_counts = snapshot_capture.build_snapshot_db_from_payloads(
+            snapshot_path=snapshot_db_path,
+            snapshot_id=snapshot_id_for_meta,
+            server_id=server_id,
+            server_name=server_name,
+            libraries=libraries,
+            metrics=captured_types,
+            captured_at=captured_at_ts,
+            created_by=created_by_user,
+            user_display_names=user_display_names,
+            payloads=payloads,
+        )
+    except Exception as exc:
+        # Re-raise so the outer wrapper in _run_snapshot picks the
+        # exception up, stamps rec.error, and pushes the activity-feed
+        # entry. The log.exception here also lands in the per-run log
+        # because plexmigrate.server.jobs is whitelisted by
+        # _EngineOnlyFilter.
+        log.exception("Snapshot DB creation failed for %s", snapshot_db_path)
+        raise
+
+    row_counts = {k: v for k, v in capture_counts.items() if k != "file_size"}
+    file_size = int(capture_counts.get("file_size") or 0)
+
+    try:
+        registered = snapshot_registry.register(
+            server_id=server_id,
+            server_name=server_name,
+            snapshot_name=snapshot_name,
+            file_path=str(snapshot_db_path),
+            # Pass the same timestamp we baked into snapshot_name so
+            # the on-disk filename and the registry's captured_at are
+            # consistent (otherwise register() uses time.time() at
+            # insert and they could drift by milliseconds, breaking
+            # any future round-trip filename reconstruction).
+            captured_at=captured_at_ts,
+            libraries=libraries,
+            user_count=snapshot_capture.count_distinct_users(server_id),
+            row_counts=row_counts,
+            file_size=file_size,
+            prebuilt_json_path=None,
+            captured_types=captured_types,
+            # Re-use the id we baked into the snapshot file's own
+            # snapshot_meta table so the .db is internally consistent
+            # with the registry row pointing at it.
+            snapshot_id=snapshot_id_for_meta,
+        )
+        log.info(
+            "Snapshot captured for %r: %s (%d bytes, %d libraries, %s users)",
+            server_name, snapshot_name, file_size, len(libraries),
+            row_counts.get("watch_events", "?"),
+        )
+        # Operator opt-in: render the .plexexport.json sidecar now so
+        # the first Download click is instant. Off by default - this
+        # is the legacy v0.11-era behaviour brought back as a checkbox.
+        if rec.params.get("prebuild_json_sidecar"):
+            t0 = time.time()
+            sidecar = snapshot_registry.materialise_sidecar(registered["id"])
+            if sidecar:
+                log.info(
+                    "Prebuilt JSON sidecar for %r in %.1fs: %s",
+                    snapshot_name, time.time() - t0, sidecar,
+                )
+            else:
+                log.warning(
+                    "Prebuilt JSON sidecar requested but render returned no path for %r",
+                    snapshot_name,
+                )
+    except Exception:
+        # Re-raise so the outer wrapper banners the failure. The .db
+        # is already on disk at this point - if the registry insert
+        # failed, the next startup's reconcile pass picks the file up
+        # as an orphan and recovers it.
+        log.exception("snapshot_registry.register failed for %s", snapshot_db_path)
+        raise
+
+
 def _finalise_run_dir(run_log_dir: str) -> None:
     """
     Mirror :func:`plexmigrate.main`'s end-of-run PASS/FAIL rename so a
     job invoked over the API leaves the same on-disk artefact a CLI
     run does. Best-effort: a rename failure on a locked file is logged
-    and ignored — the logs themselves are still readable.
+    and ignored - the logs themselves are still readable.
     """
     p = Path(run_log_dir)
     if not p.exists():

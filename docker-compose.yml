@@ -1,17 +1,17 @@
-# PlexMigrate v0.8.0 — docker compose orchestration.
+# PlexMigrate v0.8.0  docker compose orchestration.
 #
 # `docker compose up --build` brings up two services on a shared
 # bridge network:
 #
-#   * backend   — FastAPI / uvicorn process exposing /api and /ws
+#   * backend    FastAPI / uvicorn process exposing /api and /ws
 #                 on port 8000. Holds the Plex token; never exposed
 #                 to the LAN by default (bound to 127.0.0.1).
-#   * frontend  — nginx serving the compiled React bundle on port
+#   * frontend   nginx serving the compiled React bundle on port
 #                 8080, proxying /api/* and /ws/* to the backend.
 #
 # Three host bind mounts let exports, logs, and the schedule store
 # outlive `docker compose down`:
-#   ./plex_exports  ↔  /app/plex_exports
+#   ./snapshots  ↔  /app/snapshots
 #   ./plex_logs     ↔  /app/plex_logs
 #   ./server_data   ↔  /app/server_data   (schedules.json + settings.json)
 #
@@ -26,17 +26,17 @@ services:
       dockerfile: Dockerfile.backend
     container_name: plexmigrate-backend
     restart: unless-stopped
-    # Bind to localhost only — the backend holds a Plex token and
+    # Bind to localhost only  the backend holds a Plex token and
     # has no auth layer of its own. Operators who want LAN access
     # should put a reverse proxy with auth in front.
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./plex_exports:/app/plex_exports
+      - ./snapshots:/app/snapshots
       - ./plex_logs:/app/plex_logs
       - ./server_data:/app/server_data
       # ── Optional: external / NAS backup destination ─────────────
-      # The backend is a Linux container — it CANNOT see Windows host
+      # The backend is a Linux container  it CANNOT see Windows host
       # paths like Y:\plexbackups directly. To send exports to an
       # external drive or a NAS mapped to a Windows drive letter:
       #
@@ -61,11 +61,30 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       PLEXMIGRATE_DATA_DIR: /app/server_data
-      # Container timezone — used by the schedule engine so the hour/
+      # Container timezone  used by the schedule engine so the hour/
       # minute fields in the UI mean wallclock time in your zone, not
       # UTC. Change this to your IANA zone if you're not on Pacific
       # (full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
       TZ: America/Los_Angeles
+      # ── PR-A2: web-UI authentication ────────────────────────────
+      # Auth is ALWAYS ON as of PR-A2 (was opt-in via
+      # PLEXMIGRATE_AUTH_ENABLED in older builds - that env var has
+      # been removed). On first boot the UI walks you through creating
+      # a root admin account; every subsequent boot goes to the login
+      # screen. Every API call (and the WebSocket) requires a JWT
+      # issued by /api/auth/login. Tokens are 24h-lived; close the tab
+      # to log out.
+      #
+      # The signing key auto-generates on first boot at
+      # server_data/.auth_secret; override with PLEXMIGRATE_AUTH_SECRET
+      # (64-char hex string) if you manage your own secrets.
+      #
+      # Upgrade note: on first boot after upgrading to PR-A2 you will
+      # be prompted to log in with your existing admin credentials.
+      # If you never set up auth before (PLEXMIGRATE_AUTH_ENABLED was
+      # never set to true in older versions), the UI will prompt you
+      # to create a root admin account through the setup page on
+      # first load.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health',timeout=2).status==200 else 1)"]
       interval: 30s
@@ -79,8 +98,21 @@ services:
       dockerfile: Dockerfile
     container_name: plexmigrate-frontend
     restart: unless-stopped
-    # Open the web UI on http://localhost:8080
+    # ── Port binding (v0.12.0) ─────────────────────────────────────
+    # ``"8080:80"`` with no leading interface = bind on every host
+    # interface, including the LAN-facing one. The web UI is then
+    # reachable from any device on the same network at
+    # ``http://<host-LAN-IP>:8080`` (phone, tablet, another desktop).
+    #
+    # Auth is always on (PR-A2), so exposing the UI to the LAN is
+    # safe by default - every API call requires a JWT. The backend
+    # itself stays loopback-only above, so the only path into the
+    # API is through the auth-gated nginx proxy.
+    #
+    # To restrict back to localhost-only (single-user desktop install),
+    # change the line below back to:
+    #   - "127.0.0.1:8080:80"
     ports:
-      - "127.0.0.1:8080:80"
+      - "8080:80"
     depends_on:
       - backend

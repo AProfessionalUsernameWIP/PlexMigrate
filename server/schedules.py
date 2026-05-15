@@ -1,15 +1,15 @@
 """
-Background scheduler for recurring exports.
+Background scheduler for recurring snapshots.
 
 A schedule entry (defined in :mod:`server.persistence`) describes a
-recurring export run: which libraries, where to write output, and how
+recurring snapshot run: which libraries, where to write output, and how
 often the run should fire. This module owns a single daemon thread
 that:
 
 1. Wakes every 30 seconds.
 2. Iterates over every enabled schedule.
 3. Compares each schedule's *next firing time* to ``time.time()``.
-4. If due, enqueues an export job via :class:`server.jobs.JobQueue`
+4. If due, enqueues an snapshot job via :class:`server.jobs.JobQueue`
    and rolls ``next_run_at`` forward by the schedule's interval.
 5. Persists the updated ``next_run_at`` back to disk so a restart
    doesn't re-fire something that was already handled.
@@ -23,7 +23,7 @@ Timezone policy
 All comparisons are done in *local time* via the host clock (Docker's
 ``TZ`` env var if set). Schedules store wallclock fields (``hour``,
 ``minute``) and a UNIX timestamp ``next_run_at``. The UNIX timestamp
-is the source of truth — the wallclock fields are only inputs to
+is the source of truth - the wallclock fields are only inputs to
 :func:`_compute_next`.
 """
 
@@ -57,10 +57,10 @@ def _compute_next(schedule: Dict[str, Any], now: Optional[float] = None) -> floa
     Return the UNIX timestamp of the next firing for ``schedule``.
 
     ``schedule`` carries:
-      * ``frequency`` — "hourly", "daily", or "weekly"
-      * ``hour``       — int 0..23  (used by daily / weekly)
-      * ``minute``     — int 0..59  (used by all frequencies)
-      * ``day_of_week``— int 0..6   (used by weekly; 0 = Monday)
+      * ``frequency`` - "hourly", "daily", or "weekly"
+      * ``hour``       - int 0..23  (used by daily / weekly)
+      * ``minute``     - int 0..59  (used by all frequencies)
+      * ``day_of_week``- int 0..6   (used by weekly; 0 = Monday)
 
     The returned timestamp is strictly *in the future* relative to
     ``now`` (or :func:`time.time`).
@@ -86,7 +86,7 @@ def _compute_next(schedule: Dict[str, Any], now: Optional[float] = None) -> floa
         return candidate.timestamp()
 
     if freq == "weekly":
-        # Python's weekday(): Monday=0 … Sunday=6 — matches our spec.
+        # Python's weekday(): Monday=0 … Sunday=6 - matches our spec.
         target_dow = max(0, min(6, dow))
         candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
         delta_days = (target_dow - candidate.weekday()) % 7
@@ -95,7 +95,7 @@ def _compute_next(schedule: Dict[str, Any], now: Optional[float] = None) -> floa
         candidate += dt.timedelta(days=delta_days)
         return candidate.timestamp()
 
-    # Unknown frequency — fall back to 24 hours from now so the
+    # Unknown frequency - fall back to 24 hours from now so the
     # scheduler doesn't loop fire-immediately on a malformed entry.
     return now_ts + 86400
 
@@ -134,10 +134,10 @@ class Scheduler:
         FastAPI startup hook so jobs persist across server restarts.
 
         On startup we re-validate every schedule's ``next_run_at``
-        — if the server was down through a fire time, the schedule
+        - if the server was down through a fire time, the schedule
         is simply rolled forward to the next future fire. We do not
-        try to retroactively run missed backups; the user's intent
-        with a scheduled backup is "do it again soon", not "catch up
+        try to retroactively run missed exports; the user's intent
+        with a scheduled export is "do it again soon", not "catch up
         on the ones I missed", and silently spawning queued jobs
         after a downtime would be surprising.
         """
@@ -175,21 +175,21 @@ class Scheduler:
             except Exception as exc:  # pragma: no cover (defensive)
                 log.exception("Scheduler tick failed: %s", exc)
             # ``Event.wait`` returns early if .stop() is called while
-            # we're sleeping — that gives us a clean shutdown.
+            # we're sleeping - that gives us a clean shutdown.
             self._stop.wait(_TICK_SECONDS)
 
     def _tick(self) -> None:
         """
         One scheduler iteration. Reads schedules from disk, fires any
         that are due (and not skipped because a job is already running
-        — we let the job queue serialise them naturally), and writes
+        - we let the job queue serialise them naturally), and writes
         the updated next_run_at values back.
 
         Multi-server (v0.9.0): each schedule carries a
         ``source_server_name`` that resolves against the registry at
         fire time. A schedule missing this field (carried over from a
         pre-v0.9.0 install) is skipped with a warning and its
-        ``next_run_at`` is still rolled forward — we don't keep
+        ``next_run_at`` is still rolled forward - we don't keep
         firing the same broken schedule once per minute, but we also
         don't auto-pick a server because that risks running against
         the wrong server.
@@ -217,7 +217,7 @@ class Scheduler:
                 mutated = True
                 continue
             if row["next_run_at"] <= now_ts:
-                # Build the export params from the schedule. The job
+                # Build the snapshot params from the schedule. The job
                 # queue inherits any unset fields from saved settings
                 # automatically.
                 params: Dict[str, Any] = {
@@ -225,9 +225,9 @@ class Scheduler:
                 }
                 if row.get("output_dir"):
                     params["output_dir"] = row["output_dir"]
-                # Tag the run so the resulting .plexbackup.json carries
-                # "Scheduled: <schedule name>" in its metadata — the
-                # Exports tab uses this to badge each row by origin.
+                # Tag the run so the resulting .plexexport.json carries
+                # "Scheduled: <schedule name>" in its metadata - the
+                # Snapshots tab uses this to badge each row by origin.
                 params["_trigger"] = "schedule"
                 params["_schedule_name"] = str(row.get("name") or "")
                 if row.get("source_server_name"):
@@ -245,7 +245,18 @@ class Scheduler:
                 # None on the schedule row means "inherit settings.json".
                 if row.get("strict_match") is not None:
                     params["strict_match"] = bool(row["strict_match"])
-                rec = queue.submit_export(params)
+                # PR-3 / Phase D - forward the four-flag data-type filter
+                # from the schedule row. Schedules saved before Phase D
+                # default to all-true at load time via the Pydantic
+                # model so unset fields preserve pre-Phase-D behaviour.
+                for _flag in (
+                    "include_watch_history", "include_ratings",
+                    "include_playlists", "include_collections",
+                    "prebuild_json_sidecar",
+                ):
+                    if _flag in row:
+                        params[_flag] = bool(row[_flag])
+                rec = queue.submit_snapshot(params)
                 row["last_job_id"] = rec.job_id
                 row["last_fired_at"] = now_ts
                 # Roll forward to the next future occurrence.

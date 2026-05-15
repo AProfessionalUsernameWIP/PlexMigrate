@@ -26,19 +26,51 @@ frontend/.vite/
 # ── User runtime data (NEVER commit) ───────────────────────────────
 # Contains your Plex token and registered server credentials.
 server_data/
-# Explicit — already covered by server_data/ above, but called out
+# Explicit - already covered by server_data/ above, but called out
 # so a deployment that flattens the directory rule still keeps the
 # encryption key (server/secrets.py) private to the host volume.
 server_data/.keyfile
 
-# Per-run logs and exports. May contain server URLs, library names,
+# Per-run logs and snapshots. May contain server URLs, library names,
 # file paths, and other library-shape information. Keep local.
 plex_logs/
+snapshots/
+# Legacy directory from before the PR-13 rename; kept here so an
+# operator who didn't run the auto-migration doesn't accidentally
+# commit a directory of old .plexbackup.json files.
 plex_exports/
 
-# Stray .plexbackup.json files in the repo root (e.g. test exports).
+# Snapshot / export payloads written by the engine. May land in the
+# repo root (loose runs, chained-transfer temp files) as well as in
+# the snapshots/ dir above. Both the legacy .plexbackup.json name and
+# the current .plexexport.json name (PR-13 rename) are covered, plus
+# the .tmp.* chained-fallback files server/direct_transfer.py leaves
+# behind on import failure.
 /*.plexbackup.json
 *.tmp.plexbackup.json
+*.plexexport.json
+*.tmp.plexexport.json
+# Explorer / browser "duplicate download" copies insert " (N)" BEFORE
+# the final .json, so the name ends in "(1).json" not ".plexexport.json"
+# and the rules above miss it. Catch those too.
+*.plexexport (*).json
+*.plexbackup (*).json
+
+# SQLite databases - media.db, snapshots.db, the auth DB, and the
+# per-server snapshot .db files. All are runtime data: library
+# contents, watch history, and (for the auth / managed-user tables)
+# encrypted credentials. None of these should ever be committed.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Per-run engine logs. setup_logging() writes runtime.log / errors.log
+# / media.log / troubleshoot.log (and Explorer-style "runtime (1).log"
+# duplicates) into the working directory. They carry server URLs,
+# library names, and file paths - keep them local.
+*.log
 
 # ── IDE / OS ───────────────────────────────────────────────────────
 .vscode/
@@ -63,3 +95,18 @@ Thumbs.db
 # docker-compose.yml itself IS tracked. These are local-only:
 docker-compose.override.yml
 .env.local
+
+# ── Local-only dev scaffolding (NOT for the repo) ──────────────────
+# Everything host-only lives under dev_docs/: developer working-notes,
+# the backend unit-test suite (dev_docs/tests_backend/), its
+# requirements-dev.txt, sample data/logs, reviews, specs, and the
+# CHANGELOG. None of it is part of the shipped product.
+dev_docs/
+
+# Root-level Markdown is local-only working/dev docs (design notes,
+# etc.) EXCEPT the three shipped docs. Add a new doc at the repo root
+# and it stays local unless it's explicitly un-ignored below.
+/*.md
+!/README.md
+!/SOURCES.md
+!/QUICKSTART.md

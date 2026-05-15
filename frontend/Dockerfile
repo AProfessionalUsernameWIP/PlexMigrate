@@ -1,9 +1,9 @@
 # PlexMigrate frontend container.
 #
 # Two-stage build:
-#   1. `build` — node:20-alpine compiles the Vite + React + TS app
+#   1. `build` - node:20-alpine compiles the Vite + React + TS app
 #                into static HTML/JS/CSS under /app/dist.
-#   2. `serve` — nginx:alpine serves /app/dist and proxies /api + /ws
+#   2. `serve` - nginx:alpine serves /app/dist and proxies /api + /ws
 #                to the backend service.
 
 FROM node:20-alpine AS build

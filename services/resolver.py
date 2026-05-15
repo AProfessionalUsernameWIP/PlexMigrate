@@ -2,7 +2,7 @@
 Item serialization and four-tier resolution for PlexMigrate.
 
 serialize_item / serialize_playlist / serialize_collection convert live
-plexapi objects to JSON-ready dicts for the backup file. resolve_item
+plexapi objects to JSON-ready dicts for the export file. resolve_item
 tries four strategies in order (GUID → exact path → suffix path → fuzzy
 title) to find the same item on the target server.
 """
@@ -18,7 +18,45 @@ from plexapi.server import PlexServer
 import services.state as state
 
 
+# Module logger for the serialize_* helpers, which take no ``logger``
+# argument. Engine resolution paths get their logger passed in; these
+# serialization helpers fall back to the shared engine logger so a
+# swallowed Plex error is still diagnosable.
+_log = logging.getLogger("plexmigrate")
+
+
 # ── Path / GUID Helpers ───────────────────────────────────────────────────────
+
+def _disable_autoreload(*objs) -> None:
+    """
+    Turn off plexapi's implicit per-item ``reload()`` on the given
+    objects. Used by the snapshot ``serialize_*`` helpers below.
+
+    plexapi reloads a *partial* object the instant you read an
+    attribute whose value is ``None`` / ``[]`` - and it cannot tell
+    "[] because the listing was partial" from "[] because the item
+    genuinely has none". An unmatched episode (no metadata-agent match
+    -> no guids) therefore triggers a full ``/library/metadata``
+    reload the moment ``serialize_item`` touches ``item.guids``. Worse,
+    plexapi's reload bundles ``includeMarkers`` / ``includeChapters``,
+    which makes Plex run slow on-demand intro/chapter analysis -
+    ~20-30s per item. That is the per-show slowdown in the snapshot
+    logs (matched shows instant, unmatched shows 20s/episode).
+
+    The bulk ``search*`` / container responses already include guids +
+    media inline for items that have them, so disabling autoreload on
+    the snapshot path loses nothing real: matched items keep their
+    inline data, unmatched items correctly serialize with empty guids,
+    and no hidden round-trip ever fires. Best-effort and silent - a
+    plexapi object that doesn't expose ``_autoReload`` is simply left
+    as-is.
+    """
+    for obj in objs:
+        try:
+            obj._autoReload = False
+        except Exception:
+            pass
+
 
 def _safe_file_path(item) -> str:
     """
@@ -111,6 +149,12 @@ def serialize_item(item, user: str = "") -> Dict:
     Returns:
         Dict with all fields needed for import-time matching and restoration.
     """
+    # Kill plexapi's implicit per-item reload before touching any
+    # attribute - an unmatched item (empty guids) would otherwise
+    # trigger a slow ``/library/metadata`` round-trip here. See
+    # ``_disable_autoreload``.
+    _disable_autoreload(item)
+
     guids = _all_guids(item)
     filepath = _safe_file_path(item)
 
@@ -149,7 +193,7 @@ def serialize_playlist(playlist, prefetched_items: Optional[List] = None) -> Dic
     """
     Serializes a Plex playlist and all its items to a JSON-ready dict.
 
-    Playlists are references to other items — they don't contain the media
+    Playlists are references to other items - they don't contain the media
     themselves, just pointers to it. We save enough information about each
     item (GUIDs + file path + title) to find it again on the target server
     using the three-tier match logic.
@@ -160,8 +204,13 @@ def serialize_playlist(playlist, prefetched_items: Optional[List] = None) -> Dic
 
     If ``prefetched_items`` is supplied, it is used in place of
     ``playlist.items()`` to avoid the second round-trip when the caller
-    already fetched the item list (see export_playlists' shared cache).
+    already fetched the item list (see snapshot_playlists' shared cache).
     """
+    # Kill plexapi's implicit per-item reload on the playlist object
+    # and every member before touching attributes (see
+    # ``_disable_autoreload``).
+    _disable_autoreload(playlist)
+
     is_smart = getattr(playlist, "smart", False)
     smart_content = getattr(playlist, "content", "") if is_smart else ""
 
@@ -170,6 +219,7 @@ def serialize_playlist(playlist, prefetched_items: Optional[List] = None) -> Dic
     if not is_smart:
         try:
             source = prefetched_items if prefetched_items is not None else playlist.items()
+            _disable_autoreload(*source)
             for position, item in enumerate(source):
                 guids = _all_guids(item)
                 filepath = _safe_file_path(item)
@@ -179,6 +229,12 @@ def serialize_playlist(playlist, prefetched_items: Optional[List] = None) -> Dic
                     "guids": guids,
                     "filepath": filepath,
                     "position": position,
+                    # ratingKey is what media_db.ingest_snapshot_payload
+                    # uses to map members back to items.id; without it
+                    # the playlist row's ``item_ids_json`` ingests as []
+                    # and the membership is lost.
+                    "rating_key": getattr(item, "ratingKey", None),
+                    "year": getattr(item, "year", None),
                 }
                 if item.type == "track":
                     entry["artist"] = getattr(item, "grandparentTitle", "")
@@ -187,8 +243,15 @@ def serialize_playlist(playlist, prefetched_items: Optional[List] = None) -> Dic
                     entry["show_title"] = getattr(item, "grandparentTitle", "")
                     entry["season_title"] = getattr(item, "parentTitle", "")
                 items.append(entry)
-        except Exception:
-            pass
+        except Exception as exc:
+            # A transient Plex error here yields a silently-empty
+            # member list - log it so the truncated playlist is
+            # diagnosable rather than looking like an empty playlist.
+            _log.warning(
+                "serialize_playlist: failed to enumerate items for "
+                "playlist %r (captured %d so far): %s",
+                getattr(playlist, "title", "?"), len(items), exc,
+            )
 
     return {
         "name": playlist.title,
@@ -212,7 +275,7 @@ def _build_scan_cache(
     """
     Build scan_cache + suffix index once, with single-builder coordination.
 
-    Safe to call from multiple threads concurrently — only the first
+    Safe to call from multiple threads concurrently - only the first
     caller actually enumerates the library; everyone else waits until
     the builder marks the cache ready.
 
@@ -234,7 +297,7 @@ def _build_scan_cache(
             claim = True
 
     if claim:
-        # Surface this on the dashboard's Currently Processing panel —
+        # Surface this on the dashboard's Currently Processing panel -
         # scan-cache build can hold a thread for 30+ seconds on a big
         # music library, and without a row the user would just see a
         # "Scan Cache ×1" ThreadPool entry with no idea what it's
@@ -290,7 +353,7 @@ def _build_scan_cache(
             if time.time() > deadline:
                 logger.warning(
                     f"[scan_cache] Builder for '{section.title}' did not "
-                    f"signal ready within 300s — proceeding without cache."
+                    f"signal ready within 300s - proceeding without cache."
                 )
                 return
             time.sleep(0.05)
@@ -303,10 +366,17 @@ def serialize_collection(collection) -> Dict:
     Collections are groupings of items by reference. We save GUIDs and file
     paths for every member so we can reconstruct the collection on the target.
     """
+    # Kill plexapi's implicit per-item reload on the collection object
+    # and every member before touching attributes (see
+    # ``_disable_autoreload``).
+    _disable_autoreload(collection)
+
     items = []
 
     try:
-        for item in collection.items():
+        members = list(collection.items())
+        _disable_autoreload(*members)
+        for item in members:
             guids = _all_guids(item)
             filepath = _safe_file_path(item)
             items.append({
@@ -314,14 +384,25 @@ def serialize_collection(collection) -> Dict:
                 "type": item.type,
                 "guids": guids,
                 "filepath": filepath,
+                # See serialize_playlist: without rating_key the
+                # media.db ingest can't build the rating_key→items.id
+                # map and item_ids_json lands empty.
+                "rating_key": getattr(item, "ratingKey", None),
+                "year": getattr(item, "year", None),
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        # As in serialize_playlist: a transient Plex error here would
+        # otherwise produce a silently-truncated member list.
+        _log.warning(
+            "serialize_collection: failed to enumerate items for "
+            "collection %r (captured %d so far): %s",
+            getattr(collection, "title", "?"), len(items), exc,
+        )
 
     return {
         "name": collection.title,
         # v0.9.7 Item 9: rating_key surfaces so callers can dedupe by
-        # identity — direct-transfer's per-user gather subtracts the
+        # identity - direct-transfer's per-user gather subtracts the
         # owner's collection set from each user's set so library-level
         # collections (visible to all users) don't get double-counted.
         # ``rating_key`` is server-local but stable within one
@@ -349,17 +430,17 @@ def _resolve_item_impl(
     Attempts to find a matching item on the target Plex server using a
     four-tier strategy: GUID, exact path, suffix path, then fuzzy title match.
 
-    Tier 1 — GUID (most reliable): plex:// and mb:// GUIDs are assigned by
+    Tier 1 - GUID (most reliable): plex:// and mb:// GUIDs are assigned by
         global databases and mean the same thing on any server.
 
-    Tier 2 — Exact file path: The absolute path to the media file on disk.
+    Tier 2 - Exact file path: The absolute path to the media file on disk.
         Works when the folder structure is identical on both servers (or remapped).
 
-    Tier 2.5 — Suffix path match (cross-platform): Strips the root prefix and
+    Tier 2.5 - Suffix path match (cross-platform): Strips the root prefix and
         compares the last 3 then 2 normalised path components. Resolves
         Windows→Linux or Linux→Windows migrations. Uses an O(1) suffix index.
 
-    Tier 3 — Fuzzy title match (last resort): Search by title, filtered by
+    Tier 3 - Fuzzy title match (last resort): Search by title, filtered by
         artist/show when available. Only used if exactly one result matches
         (or --no-strict-match is set).
 
@@ -379,6 +460,52 @@ def _resolve_item_impl(
         if filepath:
             filepath = filepath.replace(old_root, new_root, 1).replace("\\", "/")
 
+    # ── TIER 0: DB rating-key cache (v0.12.1) ─────────────────────────────────
+    # The fastest possible resolution path. If a previous run on this
+    # server already wrote this item's per-server ratingKey to
+    # ``server_items`` (keyed by upstream GUID like imdb://tt0133093),
+    # we can skip Plex's slow ``getByGuid`` round-trip below and fetch
+    # the item by its ratingKey in one call.
+    #
+    # Falls through cleanly when the DB has no record - empty DB,
+    # first run against a new server, etc. - so this is purely
+    # additive. The CLI / server-mode lazy import keeps the resolver
+    # importable in environments that don't have the server package
+    # available (CLI-only checkouts).
+    try:
+        from server import media_db
+        machine_id = str(getattr(server, "machineIdentifier", "") or "")
+        if machine_id and guids:
+            cached_rk = media_db.find_rating_key_on_server(
+                guids=guids, server_id=machine_id,
+            )
+            if cached_rk is not None:
+                try:
+                    item = server.fetchItem(cached_rk)
+                    if item:
+                        logger.debug(
+                            f"[TIER:DB] Resolved '{title}' via cached "
+                            f"ratingKey={cached_rk} on {machine_id}"
+                        )
+                        return item, "DB", ""
+                except (NotFound, PlexApiException):
+                    # Cache was stale - the item was removed or
+                    # re-keyed on Plex's side. Fall through to the
+                    # network-bound tiers; a successful match there
+                    # will refresh the row on the next snapshot.
+                    pass
+                except Exception as e:
+                    logger.debug(
+                        f"[TIER:DB] fetchItem failed for '{title}' "
+                        f"(rating_key={cached_rk}): {e}"
+                    )
+    except Exception as e:
+        # Any DB error: fall through to the network tiers. Tier 0 is a
+        # performance hint, not a correctness path - but log at debug
+        # so a persistently-broken cache is still diagnosable rather
+        # than silently degrading every resolve to the slow path.
+        logger.debug(f"[TIER:DB] cache lookup failed for '{title}': {e}")
+
     # ── TIER 1: GUID Match ─────────────────────────────────────────────────────
     for guid in guids:
         if guid.startswith("plex://") or guid.startswith("mb://"):
@@ -392,8 +519,17 @@ def _resolve_item_impl(
             except Exception as e:
                 logger.debug(f"[TIER:GUID] Error resolving '{title}' via {guid}: {e}")
 
+    # ── Per-tier policy from state ContextVars ─────────────────────────────
+    # Defaults are True for both (snapshot / import paths). Direct
+    # transfer sets these from settings.transfer_resolution at run
+    # start. When a fallback is disabled, the corresponding tier
+    # block is skipped entirely - the resolver falls through with a
+    # "fallback disabled" reason.
+    _allow_filepath = bool(state._resolver_allow_filepath)
+    _allow_fuzzy = bool(state._resolver_allow_fuzzy)
+
     # ── TIER 2: File Path Match ────────────────────────────────────────────────
-    if filepath:
+    if filepath and _allow_filepath:
         cache_is_warm = bool(scan_cache)
         if not cache_is_warm:
             try:
@@ -427,20 +563,43 @@ def _resolve_item_impl(
                         _k = "/".join(_stored_parts[-_n:])
                         _sfx_matches = sfx_idx.get(_k, [])
                         if len(_sfx_matches) == 1:
+                            _cand = _sfx_matches[0]
+                            # A unique path-tail match can still point at
+                            # the wrong media family - the suffix index is
+                            # keyed on path components alone, with no type
+                            # check. Returning a wrong-type item here is
+                            # the root cause of cross-type playlist writes
+                            # downstream, so reject it and fall through to
+                            # fuzzy rather than hand a caller bad data.
+                            if item_type and getattr(_cand, "type", "") != item_type:
+                                logger.warning(
+                                    f"[TIER:filepath-suffix] Rejected wrong-type "
+                                    f"match for '{title}': expected {item_type}, "
+                                    f"got {getattr(_cand, 'type', '?')} - "
+                                    f"falling through to fuzzy"
+                                )
+                                break
                             logger.debug(
                                 f"[TIER:filepath-suffix] Resolved '{title}' "
                                 f"via {_n}-part suffix match"
                             )
-                            return _sfx_matches[0], "filepath-suffix", ""
+                            return _cand, "filepath-suffix", ""
                         elif len(_sfx_matches) > 1:
                             logger.debug(
                                 f"[TIER:filepath-suffix] Ambiguous: "
                                 f"{len(_sfx_matches)} candidates for '{title}' "
-                                f"at {_n} parts — falling through to fuzzy"
+                                f"at {_n} parts - falling through to fuzzy"
                             )
                             break
             else:
-                for candidate in section.all():
+                # M19: iterate leaf items, not ``section.all()``. On
+                # Music / TV sections ``section.all()`` returns Artist /
+                # Show objects, which have no ``media.parts.file`` -
+                # ``_safe_file_path`` returns "" for every one and every
+                # track / episode silently fails this tier. The cached
+                # path already uses ``_section_leaf_items``; this makes
+                # the cache-cold path behave the same.
+                for candidate in _section_leaf_items(section):
                     cpath = _safe_file_path(candidate)
                     if cpath and cpath == filepath:
                         logger.debug(
@@ -451,33 +610,48 @@ def _resolve_item_impl(
             logger.debug(f"[TIER:filepath] Scan error for '{title}': {e}")
 
     # ── TIER 3: Fuzzy Title Match ──────────────────────────────────────────────
-    try:
-        artist = stored.get("artist", "")
-        show = stored.get("show_title", "")
+    if _allow_fuzzy:
+        try:
+            artist = stored.get("artist", "")
+            show = stored.get("show_title", "")
 
-        if item_type == "track" and artist:
-            results = section.search(title=title, libtype="track")
-            matches = [r for r in results if r.grandparentTitle == artist]
-        elif item_type == "episode" and show:
-            results = section.search(title=title, libtype="episode")
-            matches = [r for r in results if r.grandparentTitle == show]
-        else:
-            results = section.search(title=title)
-            matches = results
+            if item_type == "track" and artist:
+                results = section.search(title=title, libtype="track")
+                matches = [r for r in results if r.grandparentTitle == artist]
+            elif item_type == "episode" and show:
+                results = section.search(title=title, libtype="episode")
+                matches = [r for r in results if r.grandparentTitle == show]
+            elif item_type:
+                # Constrain the search to the stored media type. Without
+                # a libtype filter a movie and a track that share a
+                # title are indistinguishable, and the bare best-guess
+                # below would happily return the wrong one - the root
+                # cause of cross-type playlist writes downstream.
+                results = section.search(title=title, libtype=item_type)
+                matches = results
+            else:
+                results = section.search(title=title)
+                matches = results
 
-        if len(matches) == 1:
-            logger.debug(f"[TIER:fuzzy] Resolved '{title}' via unique title match")
-            return matches[0], "fuzzy", ""
-        elif len(matches) > 1 and not strict_match:
-            logger.debug(f"[TIER:fuzzy] Using best-guess for '{title}' (strict-match off)")
-            return matches[0], "fuzzy", ""
-        elif len(matches) > 1:
-            reason = f"Ambiguous: {len(matches)} results for '{title}'"
-            logger.warning(f"[TIER:fuzzy] {reason}")
-            return None, "fuzzy", reason
+            # Defence-in-depth: even with a libtype-constrained search,
+            # drop any candidate whose type doesn't match the stored
+            # item before it can be returned as a match.
+            if item_type:
+                matches = [m for m in matches if getattr(m, "type", "") == item_type]
 
-    except Exception as e:
-        logger.debug(f"[TIER:fuzzy] Search error for '{title}': {e}")
+            if len(matches) == 1:
+                logger.debug(f"[TIER:fuzzy] Resolved '{title}' via unique title match")
+                return matches[0], "fuzzy", ""
+            elif len(matches) > 1 and not strict_match:
+                logger.debug(f"[TIER:fuzzy] Using best-guess for '{title}' (strict-match off)")
+                return matches[0], "fuzzy", ""
+            elif len(matches) > 1:
+                reason = f"Ambiguous: {len(matches)} results for '{title}'"
+                logger.warning(f"[TIER:fuzzy] {reason}")
+                return None, "fuzzy", reason
+
+        except Exception as e:
+            logger.debug(f"[TIER:fuzzy] Search error for '{title}': {e}")
 
     # ── All tiers failed ──────────────────────────────────────────────────────
     # local:// takes precedence in _category_for_failure (it checks guids
@@ -485,16 +659,16 @@ def _resolve_item_impl(
     # without misrouting the category.
     has_local_guid = any(g.startswith("local://") for g in guids)
     if has_local_guid:
-        reason = "local:// GUID only — no MusicBrainz match, path not found, no unique title match"
+        reason = "local:// GUID only - no MusicBrainz match, path not found, no unique title match"
         return None, "none", reason
 
-    # When the backup carried a filepath but nothing on the target matched
+    # When the export carried a filepath but nothing on the target matched
     # it (exact, suffix, or fuzzy), include "path not found" in the reason
     # so the troubleshooting categoriser routes this to file_path_not_found
     # rather than the generic no_tier_match bucket.
     if filepath:
         return None, "none", (
-            f"All three tiers exhausted — path not found on target server "
+            f"All three tiers exhausted - path not found on target server "
             f"(stored: {filepath!r}); title {title!r}"
         )
 
@@ -525,16 +699,23 @@ def resolve_item(
     item, tier, reason = _resolve_item_impl(
         server, section, stored, logger, remap, strict_match, scan_cache, scan_lock
     )
-    if state._dashboard:
+    if state.get_dashboard():
         if item is not None:
             if tier == "GUID":
-                state._dashboard.inc_guid()
+                state.get_dashboard().inc_guid()
             elif tier == "filepath":
-                state._dashboard.inc_filepath()
+                state.get_dashboard().inc_filepath()
             elif tier == "filepath-suffix":
-                state._dashboard.inc_suffix()
+                state.get_dashboard().inc_suffix()
             elif tier == "fuzzy":
-                state._dashboard.inc_fuzzy()
+                state.get_dashboard().inc_fuzzy()
+            # ALWAYS log the tier name (including "DB") into the
+            # per-tier summary counter. Distinct from the existing
+            # inc_guid / inc_filepath / etc. accumulators which feed
+            # the Match Resolution panel; this one feeds the run
+            # summary + the fuzzy-match warning banner in transfer
+            # mode.
+            state.get_dashboard().inc_tier(tier)
     return item, tier, reason
 
 

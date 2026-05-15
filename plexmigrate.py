@@ -1,27 +1,27 @@
 """
-plexmigrate.py — PlexMigrate (CLI driver).
+plexmigrate.py - PlexMigrate (CLI driver).
 
 This script safely moves your Plex Play Count, playlists, collections,
-and star ratings from one Plex server to another. It exports your library
-data to portable JSON backup files, then imports those files onto a new
+and star ratings from one Plex server to another. It snapshots your library
+data to portable JSON export files, then imports those files onto a new
 server, matching each item using three identification methods in sequence.
-All import operations are strictly additive — no existing data is ever
+All import operations are strictly additive - no existing data is ever
 deleted, reduced, or overwritten on the target server.
 
 v0.7.0 additions:
     - Per-user playlists are now exported and imported. Previously only the
       Plex owner's playlists were captured; home users' playlists were silently
-      omitted from the backup. gather_user() now calls export_playlists() for
+      omitted from the export. gather_user() now calls snapshot_playlists() for
       each home user and stores the result under users[username]["playlists"].
-      On import, _import_user() calls import_playlists() with the user's own
+      On import, _restore_user() calls restore_playlists() with the user's own
       server connection so playlists are created in the correct profile.
     - Home user import logging is substantially improved:
-      · After get_home_users() in run_import(), the exact list of users
+      · After get_home_users() in run_restore(), the exact list of users
         available on the target server is logged before import starts.
-      · Backup users are also logged so the admin can immediately see the
+      · Export users are also logged so the admin can immediately see the
         match/miss without reading individual library logs.
       · "Home user not on target server" messages are now logged at INFO
-        (not WARNING) — skipping is expected during a fresh migration and
+        (not WARNING) - skipping is expected during a fresh migration and
         should not alarm the admin.
       · After the per-user import loop, a single summary line logs how many
         users were imported and lists which ones were skipped by name, giving
@@ -60,10 +60,10 @@ v0.6.0 additions:
       through to fuzzy search rather than guessing. Dashboard shows suffix hits
       separately from exact filepath hits. --remap-path and suffix matching
       complement each other.
-    - Export activity feed and phase column now update during export: each gather
+    - Snapshot activity feed and phase column now update during snapshot: each gather
       closure (Watch History / Playlists / Collections / Ratings) pushes an
       activity event and phase label when it completes so the dashboard shows
-      live progress instead of freezing on "Export started".
+      live progress instead of freezing on "Snapshot started".
     - [S] keyboard shortcut now opens the Plex web UI pre-authenticated using
       the stored token (/web/index.html?X-Plex-Token=…). Falls back to the
       bare server URL if the token is unavailable.
@@ -86,11 +86,11 @@ v0.5.0 additions:
       meaningful events appear even in screen=True (full-screen) mode.
 
 v0.4.0 additions:
-    - Rich Live panel with RichHandler replaces tqdm — log lines scroll above
+    - Rich Live panel with RichHandler replaces tqdm - log lines scroll above
       the panel without terminal corruption. Per-library phase labels update
       as each import moves through Play Count → Playlists → Collections →
       Ratings. Transient HTTP errors auto-retry (up to 2×). Home user token
-      fetching is parallelised. TV export uses a server-side watched-only
+      fetching is parallelised. TV snapshot uses a server-side watched-only
       filter. Filepath scan cache is pre-warmed in a background thread.
 
 Usage:
@@ -123,8 +123,8 @@ from services.auth import (
     read_token_from_prefs,
 )
 from services.auth import _make_session
-from services.exporter import run_export
-from services.importer import run_import
+from services.snapshotter import run_snapshot
+from services.restorer import run_restore
 from services.logging_ops import _tz_now, setup_logging
 
 
@@ -132,10 +132,10 @@ from services.logging_ops import _tz_now, setup_logging
 
 def prompt_mode() -> str:
     """
-    Asks the user to choose between export and import mode.
+    Asks the user to choose between snapshot and import mode.
 
     Returns:
-        "E" for export or "I" for import.
+        "E" for snapshot or "I" for import.
     """
     console.print("[bold]Mode?[/bold] [[cyan]E[/cyan]]xport / [[cyan]I[/cyan]]mport")
     choice = Prompt.ask("Enter choice", choices=["E", "e", "I", "i"])
@@ -144,7 +144,7 @@ def prompt_mode() -> str:
 
 def prompt_library_selection(libs: List[dict]) -> List[str]:
     """
-    Prompts the user to select which libraries to export or import.
+    Prompts the user to select which libraries to snapshot or import.
 
     Args:
         libs (List[Dict]): Library list from discover_libraries().
@@ -172,14 +172,14 @@ def prompt_library_selection(libs: List[dict]) -> List[str]:
     return selected
 
 
-def prompt_backup_files() -> List[str]:
+def prompt_export_files() -> List[str]:
     """
-    Prompts the user to enter paths to .plexbackup.json files for import.
+    Prompts the user to enter paths to .plexexport.json files for import.
 
     Returns:
         List of file path strings.
     """
-    console.print("\n[bold]Enter .plexbackup.json file paths[/bold] (comma-separated):")
+    console.print("\n[bold]Enter .plexexport.json file paths[/bold] (comma-separated):")
     raw = Prompt.ask("Files")
     return [p.strip() for p in raw.split(",") if p.strip()]
 
@@ -197,13 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
         prog="plexmigrate",
         description=(
             "Migrate Plex Play Count, playlists, collections, and ratings "
-            "across servers. All import operations are strictly additive — "
+            "across servers. All import operations are strictly additive - "
             "no data on the target server is ever deleted or reduced."
         ),
     )
 
-    parser.add_argument("--export", action="store_true",
-                        help="Run in export mode (save data from this server)")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="Run in snapshot mode (save data from this server)")
     parser.add_argument("--import", dest="do_import", action="store_true",
                         help="Run in import mode (restore data to a server)")
 
@@ -216,17 +216,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument("--output-dir", metavar="PATH", default=DEFAULT_OUTPUT_DIR,
-                        help=f"Directory for export files (default: {DEFAULT_OUTPUT_DIR})")
+                        help=f"Directory for snapshot files (default: {DEFAULT_OUTPUT_DIR})")
     parser.add_argument("--libraries", metavar="NAMES",
-                        help='Comma-separated library names to export, e.g. "Movies,TV Shows,Music"')
+                        help='Comma-separated library names to snapshot, e.g. "Movies,TV Shows,Music"')
 
     parser.add_argument("--input-file", metavar="FILE", nargs="+",
-                        help="One or more .plexbackup.json files to import")
+                        help="One or more .plexexport.json files to import")
     parser.add_argument(
         "--overwrite-playlists", action="store_true",
         help=(
             "Accepted for backward compatibility. In v0.2.0+, all playlist imports "
-            "use additive union merge regardless of this flag — no deletions occur."
+            "use additive union merge regardless of this flag - no deletions occur."
         ),
     )
     parser.add_argument("--remap-path", metavar=("OLD", "NEW"), nargs=2,
@@ -251,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--add-server", metavar="NAME",
                         help="Register a new server with this friendly NAME. Combine with --server URL --token TOK.")
     parser.add_argument("--remove-server", metavar="NAME",
-                        help="Remove the server with this friendly NAME from the registry (does not delete exports or logs).")
+                        help="Remove the server with this friendly NAME from the registry (does not delete snapshots or logs).")
     parser.add_argument("--rename-server", metavar=("OLD", "NEW"), nargs=2,
                         help="Rename an existing registered server.")
     parser.add_argument("--test-server", metavar="NAME",
@@ -259,7 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ── Multi-server operation flags ────────────────────────────────────────
     parser.add_argument("--source-server", metavar="NAME",
-                        help="Friendly name of a registered server to read from (export or direct transfer).")
+                        help="Friendly name of a registered server to read from (snapshot or direct transfer).")
     parser.add_argument("--dest-server", metavar="NAME",
                         help="Friendly name of a registered server to write to (import or direct transfer).")
     parser.add_argument("--direct", action="store_true",
@@ -294,14 +294,14 @@ def _run_cli_export_or_import(
     libs: List[dict],
 ) -> None:
     """
-    Original export / import dispatch, factored out of ``main`` so the
+    Original snapshot / import dispatch, factored out of ``main`` so the
     multi-server (--source-server) and legacy ad-hoc (--server + --token)
     paths share one implementation. Behaviour is byte-for-byte identical
-    to v0.7.1 — only the *connection setup* changed.
+    to v0.7.1 - only the *connection setup* changed.
     """
     remap: Optional[Tuple[str, str]] = tuple(args.remap_path) if args.remap_path else None
 
-    if args.export:
+    if args.snapshot:
         mode = "E"
     elif args.do_import:
         mode = "I"
@@ -323,24 +323,24 @@ def _run_cli_export_or_import(
             console.print("[red]No matching libraries found. Check the library names and try again.[/red]")
             sys.exit(1)
 
-        run_export(server, selected_sections, args.output_dir, logger, run_log_dir, base_url)
+        run_snapshot(server, selected_sections, args.output_dir, logger, run_log_dir, base_url)
 
     else:
         if args.input_file:
-            backup_files = args.input_file
+            export_files = args.input_file
         else:
-            backup_files = prompt_backup_files()
+            export_files = prompt_export_files()
 
-        valid_files = [f for f in backup_files if Path(f).exists()]
-        missing = set(backup_files) - set(valid_files)
+        valid_files = [f for f in export_files if Path(f).exists()]
+        missing = set(export_files) - set(valid_files)
         for mf in missing:
-            logger.error(f"Backup file not found: {mf}")
+            logger.error(f"Export file not found: {mf}")
 
         if not valid_files:
-            console.print("[red]No valid backup files found. Check the file paths and try again.[/red]")
+            console.print("[red]No valid export files found. Check the file paths and try again.[/red]")
             sys.exit(1)
 
-        run_import(
+        run_restore(
             server, valid_files, token, base_url,
             logger, run_log_dir, remap, args.strict_match,
         )
@@ -353,7 +353,7 @@ def _run_cli_direct(args: argparse.Namespace, logger: logging.Logger, run_log_di
     Resolves both registered servers, prefixes ``_run_timestamp`` with
     the combined slug ("Src-to-Dst"), and hands off to
     :func:`server.direct_transfer.run_direct_transfer`. The engine
-    code itself is unchanged — direct transfer is a new orchestrator
+    code itself is unchanged - direct transfer is a new orchestrator
     on top of the existing export_* and import_* primitives.
     """
     from datetime import datetime as _dt
@@ -405,7 +405,7 @@ def _run_cli_direct(args: argparse.Namespace, logger: logging.Logger, run_log_di
         strict_match=args.strict_match,
         stop_event=None,
     )
-    logger.info(f"PlexMigrate v{VERSION} direct transfer finished — {_tz_now()}")
+    logger.info(f"PlexMigrate v{VERSION} direct transfer finished - {_tz_now()}")
     console.print("[bold]Direct transfer complete.[/bold]")
 
 
@@ -414,9 +414,9 @@ def _handle_registry_commands(args: argparse.Namespace) -> bool:
     Run any of the multi-server registry management commands.
 
     Returns True if a registry command was handled (caller should exit
-    cleanly), False otherwise so the regular export/import flow runs.
+    cleanly), False otherwise so the regular snapshot/import flow runs.
 
-    These commands intentionally do NOT call setup_logging() — they
+    These commands intentionally do NOT call setup_logging() - they
     just print to stdout. The registry file is the only artefact and
     a per-run log directory would be noise.
     """
@@ -469,14 +469,14 @@ def _handle_registry_commands(args: argparse.Namespace) -> bool:
         if summary is None:
             console.print(f"[red]No server named {args.remove_server!r} in the registry.[/red]")
             sys.exit(2)
-        # v0.9.5: remove is now a cascading delete — drops the registry
+        # v0.9.5: remove is now a cascading delete - drops the registry
         # row, schedules referencing the server, and any
-        # ``.plexbackup.json`` / ``run_<slug>_*`` artefacts attributable
+        # ``.plexexport.json`` / ``run_<slug>_*`` artefacts attributable
         # to it. Report the counts so the operator sees what happened.
         console.print(f"[green]Removed {args.remove_server!r} from the registry.[/green]")
         console.print(
             f"[dim]Cascade: {summary['schedules']} schedule(s), "
-            f"{summary['exports']} export file(s), "
+            f"{summary['snapshots']} snapshot file(s), "
             f"{summary['log_dirs']} log directory/ies deleted.[/dim]"
         )
         if summary.get("errors"):
@@ -521,7 +521,7 @@ def _handle_registry_commands(args: argparse.Namespace) -> bool:
 
 def main() -> None:
     """
-    Main entry point: parses arguments, connects to Plex, and runs export or import.
+    Main entry point: parses arguments, connects to Plex, and runs snapshot or import.
     """
     parser = build_parser()
     args = parser.parse_args()
@@ -529,7 +529,7 @@ def main() -> None:
     # ── Multi-server registry commands take precedence ──────────────────
     # If any of --list-servers / --add-server / --remove-server /
     # --rename-server / --test-server is present, run that and exit
-    # without touching the export/import pipeline.
+    # without touching the snapshot/import pipeline.
     if any([args.list_servers, args.add_server, args.remove_server,
             args.rename_server, args.test_server]):
         if _handle_registry_commands(args):
@@ -542,7 +542,7 @@ def main() -> None:
     logger = setup_logging(args.log_dir, args.verbose)
     run_log_dir = str(state._run_log_dir)
     console.print(f"[dim]Logs: {state._run_log_dir}[/dim]")
-    logger.info(f"PlexMigrate v{VERSION} starting — {_tz_now()}")
+    logger.info(f"PlexMigrate v{VERSION} starting - {_tz_now()}")
 
     # ── Direct server-to-server transfer (v0.9.0) ──────────────────────
     # Requires --source-server and --dest-server. Both must be in the
@@ -556,7 +556,7 @@ def main() -> None:
         _run_cli_direct(args, logger, run_log_dir)
         return
 
-    # ── Multi-server export ────────────────────────────────────────────
+    # ── Multi-server snapshot ────────────────────────────────────────────
     # If --source-server is supplied, resolve URL+token via the registry
     # and ignore --server / --token. Otherwise the legacy ad-hoc path runs.
     token: Optional[str] = args.token
@@ -574,7 +574,13 @@ def main() -> None:
         state._plex_base_url = base_url
         state._plex_token = token
         state._plex_owner_name = srv_row.get("owner_name") or "Plex Owner"
-        # Prefix log dir + export filenames with server slug for parity
+        # PR-13 fix #3 - the engine writes to media.db directly during
+        # snapshot mode. Publish the registered server's id so the
+        # per-library payload knows which ``server_id`` to ingest
+        # under. Non-snapshot modes (import, direct) read it from
+        # ``--source-server`` too without harm.
+        state._snapshot_server_id = str(srv_row.get("id") or "")
+        # Prefix log dir + snapshot filenames with server slug for parity
         # with how the FastAPI job runner names artefacts.
         from datetime import datetime as _dt
         slug = server_registry.safe_server_name(srv_row["name"])
@@ -584,6 +590,21 @@ def main() -> None:
         display_discovery(server, libs)
         _run_cli_export_or_import(args, server, base_url, token, logger, run_log_dir, libs)
         return
+
+    # PR-13 fix #3 - snapshot mode requires a registered server now.
+    # The legacy ad-hoc path below (--server URL --token TOKEN) is
+    # still supported for non-snapshot modes (e.g. ``--import`` from
+    # a legacy .plexexport.json file) but ``--snapshot`` writes to
+    # media.db, which is keyed by server_id - and without a registry
+    # row there is no id to write under.
+    if args.snapshot:
+        console.print(
+            "[red]--snapshot requires a registered server in PR-13.\n"
+            "Register one first with:\n"
+            "  python plexmigrate.py --add-server NAME --server URL --token TOKEN\n"
+            "Then re-run with --source-server NAME.[/red]"
+        )
+        sys.exit(2)
 
     if not token:
         prefs = find_preferences_xml()
@@ -615,7 +636,7 @@ def main() -> None:
     display_discovery(server, libs)
 
     _run_cli_export_or_import(args, server, args.server, token, logger, run_log_dir, libs)
-    logger.info(f"PlexMigrate v{VERSION} finished — {_tz_now()}")
+    logger.info(f"PlexMigrate v{VERSION} finished - {_tz_now()}")
     console.print("[bold]Done.[/bold]")
 
     for lg in (logging.getLogger("plexmigrate"), logging.getLogger("plexmigrate.media")):

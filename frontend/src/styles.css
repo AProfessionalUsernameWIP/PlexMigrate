@@ -1,7 +1,7 @@
-/* PlexMigrate frontend — global styles.
+/* PlexMigrate frontend - global styles.
  *
  * Dark theme by default (matches the terminal dashboard aesthetic).
- * Single CSS file, no preprocessor — the styling surface is small
+ * Single CSS file, no preprocessor - the styling surface is small
  * enough that a Tailwind / styled-components dependency would be
  * overkill, and keeping plain CSS makes the bundle a few KB smaller.
  */
@@ -30,6 +30,11 @@
   --color-done: #3fb950;
   --color-error: #f85149;
   --color-started: #c9d1d9;
+  /* Violet for the snapshot-time `capturing` phase. Distinct from the
+     blue `phase` colour used by import-time workers (resolving /
+     indexing / fetching) so a glance at Currently Processing tells
+     you whether you're looking at a snapshot or an import. */
+  --color-capturing: #a78bfa;
   --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
 }
 
@@ -171,6 +176,23 @@ label.switch > span.help {
   border-bottom-color: var(--accent);
 }
 
+/* Secondary tab bar nested under Servers */
+.tabs.sub-tabs {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px;
+}
+.tabs.sub-tabs > button {
+  padding: 7px 12px;
+  font-size: 13px;
+  color: var(--text-dim);
+  border-bottom-color: transparent;
+}
+.tabs.sub-tabs > button.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
 .main {
   flex: 1;
   padding: 20px;
@@ -296,13 +318,35 @@ table.list td.num  { text-align: right; font-family: var(--mono); }
 .tag.done     { color: var(--color-done);     }
 .tag.error    { color: var(--color-error);    background:#3a1414; }
 .tag.started  { color: var(--color-started);  }
+.tag.capturing { color: var(--color-capturing); }
+/* Spec Section 4.3 - per-phase stall escalation. Amber and red are
+   saturated so they pull the operator's eye away from the
+   blue/violet/green phase identity colours. ``red`` carries a pulse
+   animation so a genuinely stuck worker stands out across the room. */
+.tag.stall-amber {
+  color: #fff;
+  background: #d97706;
+  border-color: #d9770655;
+  font-weight: 700;
+}
+.tag.stall-red {
+  color: #fff;
+  background: #dc2626;
+  border-color: #dc262655;
+  font-weight: 700;
+  animation: stallPulse 1.4s ease-in-out infinite;
+}
+@keyframes stallPulse {
+  0%, 100% { opacity: 1.0; box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.6); }
+  50%      { opacity: 0.85; box-shadow: 0 0 0 6px rgba(220, 38, 38, 0); }
+}
 /* v0.9.6 Feature 2C: rate-limit feed entries get their own amber
    visual identity so a 429 burst is unmistakable. Distinct from
-   ``error`` (red) and ``unresolved`` (red background) — rate limiting
+   ``error`` (red) and ``unresolved`` (red background) - rate limiting
    is not a failure, just back-pressure from Plex. */
 .tag.rate_limit { color:#ffb74d; background:#3a2a14; }
 
-/* v0.9.7 Item 8: log keyword filter — highlight matched substrings
+/* v0.9.7 Item 8: log keyword filter - highlight matched substrings
    inside filtered log lines. Tinted amber so the highlight is
    visible against the standard dark log background without
    masking the surrounding text. Inherits the line's font and
@@ -324,8 +368,12 @@ mark.log-match {
   background: var(--bg-panel);
   font-size: 11px;
   font-family: var(--mono);
+  /* Signals the native ``title=`` tooltip is available - cursor flips
+     to the help variant so operators know hovering yields extra
+     context (the full description from Help -> Thread Pool). */
+  cursor: help;
 }
-/* v0.9.2: emphasis split inside a thread pill — the category × count
+/* v0.9.2: emphasis split inside a thread pill - the category × count
  * stays bright, the plain-English description is dimmed so the pill
  * stays scannable but the meaning is right there. */
 .thread-pill-label { font-weight: 600; color: var(--text); }
@@ -359,6 +407,7 @@ mark.log-match {
 .banner.error { background: #3a1414; border: 1px solid var(--bad); color: #ffd2cd; }
 .banner.info  { background: #14233a; border: 1px solid var(--accent); color: #c8e1ff; }
 .banner.good  { background: #14361b; border: 1px solid var(--good); color: #b9f5c4; }
+.banner.warn  { background: #3a2c14; border: 1px solid var(--warn); color: #ffe6b3; }
 
 .kv {
   display: grid;
@@ -448,3 +497,199 @@ mark.log-match {
   color: var(--text-dim);
   white-space: nowrap;
 }
+
+/* v0.10.0 - fan-out destination cards. One ``.panel`` per destination
+   in a multi-destination job; the border colour reflects the
+   destination's current state so the page is scannable at a glance. */
+.fanout-card.fanout-state-running {
+  border-left: 3px solid var(--accent);
+}
+.fanout-card.fanout-state-completed {
+  border-left: 3px solid var(--good);
+}
+.fanout-card.fanout-state-failed {
+  border-left: 3px solid var(--bad);
+}
+.fanout-card.fanout-state-cancelled {
+  border-left: 3px solid var(--warn);
+}
+.fanout-card.fanout-state-queued {
+  border-left: 3px solid var(--border);
+  opacity: 0.85;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+.badge-running   { color: var(--accent); border-color: var(--accent); }
+.badge-completed { color: var(--good);   border-color: var(--good);   }
+.badge-failed    { color: var(--bad);    border-color: var(--bad);    }
+.badge-cancelled { color: var(--warn);   border-color: var(--warn);   }
+.badge-queued    { color: var(--text-dim); }
+
+
+/* ── Mobile / tablet responsive rules ───────────────────────────────────────
+ * The desktop layout above is the source of truth; everything below it is
+ * narrow-viewport refinements. Two breakpoints:
+ *
+ *   * 900px and under - tablets in portrait, narrow desktop windows.
+ *     Grids collapse, padding shrinks, tab strips become horizontally
+ *     scrollable instead of wrapping into stacks.
+ *   * 540px and under - true phone widths. Topbar items stack vertically,
+ *     row-grid feeds simplify, kv grids become single-column.
+ *
+ * Tables get an outer-scroll treatment at the tablet breakpoint because
+ * 5-column tables (User Accounts, Servers, Schedules) don't fit even on
+ * a portrait iPad without truncation. The native ``overflow-x: auto`` on
+ * the table itself works because the table's children stay laid out as
+ * a normal table; only the wrapper viewport is narrow.
+ *
+ * Touch-target sizing: buttons get a min-height ≈ 36px to stay reachable
+ * with a thumb. Existing 14px font + 6px padding is close already; we
+ * just lock the floor.
+ */
+
+@media (max-width: 900px) {
+  .main {
+    padding: 12px;
+  }
+  .panel {
+    padding: 12px;
+    margin-bottom: 12px;
+  }
+
+  /* Tab strips become single-line horizontal scrollers instead of wrapping
+   * to multiple rows. Wrapping looked bad once we got past three or four
+   * buttons (Servers + Networking + etc, fan-out destinations, Account
+   * Management inner nav). The horizontal scroll matches what every
+   * mobile browser already does for overflowing nav strips. */
+  .tabs,
+  .tabs.sub-tabs {
+    padding: 0 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-wrap: nowrap;
+    scrollbar-width: thin;
+  }
+  .tabs > button,
+  .tabs.sub-tabs > button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  /* Two-column form grids collapse to a single column. JobFormPanel's
+   * worker fields, AccountSettingsPanel's password fields, etc. all use
+   * .grid-2 - one column reads better on narrow screens than two
+   * 140px-wide fields. */
+  .grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Tables overflow horizontally rather than crush their columns. The
+   * scroll affordance is the standard pattern - every browser handles
+   * it natively, and the operator can swipe to see the right-side
+   * columns (delete buttons, timestamps). */
+  table.list {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  table.list thead,
+  table.list tbody {
+    display: table;
+    width: 100%;
+    min-width: 600px;
+  }
+
+  /* Activity feed: the 70 / 110 / 110 / 1fr grid is too wide. Flow it
+   * into a two-row layout where the timestamp + tag + library all sit
+   * on row 1 and the title gets the full width on row 2. */
+  .feed .row {
+    grid-template-columns: 70px 100px 1fr;
+    grid-template-areas:
+      "ts tag lib"
+      "title title title";
+    row-gap: 2px;
+  }
+  .feed .row > span:nth-child(1) { grid-area: ts; }
+  .feed .row > span:nth-child(2) { grid-area: tag; }
+  .feed .row > span:nth-child(3) { grid-area: lib; }
+  .feed .row > span:nth-child(4) { grid-area: title; word-break: break-word; }
+
+  /* Key-value grids - 200px label column doesn't fit when the screen is
+   * 768px wide; stack them. */
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .kv .k { font-weight: 600; }
+
+  /* Touch-target floor. */
+  button {
+    min-height: 36px;
+  }
+}
+
+
+@media (max-width: 540px) {
+  /* Phone-tight layout. The topbar's user chip, Switch View Mode, and
+   * Log out cluster gets cramped - let the right-side group wrap below
+   * the brand. */
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .topbar .conn {
+    width: 100%;
+    align-items: flex-end;
+  }
+
+  .main {
+    padding: 8px;
+  }
+  .panel {
+    padding: 10px;
+    margin-bottom: 10px;
+    border-radius: 6px;
+  }
+  .panel h2 {
+    font-size: 14px;
+    margin-bottom: 8px;
+  }
+
+  /* Even narrower padding on the tab strips. */
+  .tabs,
+  .tabs.sub-tabs {
+    padding: 0 8px;
+  }
+  .tabs > button {
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+
+  /* Stack server-card metadata vertically so the URL doesn't truncate
+   * mid-domain and the response-time chip gets its own row. */
+  .server-card {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .server-card-meta {
+    width: 100%;
+    text-align: right;
+  }
+
+  /* Modal default widths set inline are typically ``92vw`` already so
+   * those scale fine. The few remaining inline ``width: 480`` /
+   * ``width: 520`` literals in App.tsx + UserAccountsExplorer already
+   * have ``maxWidth: '92vw'`` next to them, so this CSS doesn't need
+   * to overrule them. */
+}
+

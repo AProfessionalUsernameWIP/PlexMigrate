@@ -2,7 +2,7 @@
 #
 # Runs the FastAPI server defined in server/app.py under uvicorn.
 # The engine code (services/) and the CLI driver (plexmigrate.py)
-# are copied in unchanged — the same image can be used to run the
+# are copied in unchanged - the same image can be used to run the
 # CLI from inside the container if needed (docker compose exec
 # backend python plexmigrate.py ...).
 
@@ -27,7 +27,7 @@ COPY server/ ./server/
 
 # Default mount points. These are also declared as named volumes in
 # docker-compose.yml so the data lives on the host.
-RUN mkdir -p /app/plex_exports /app/plex_logs /app/server_data
+RUN mkdir -p /app/snapshots /app/plex_logs /app/server_data
 ENV PLEXMIGRATE_DATA_DIR=/app/server_data
 
 EXPOSE 8000

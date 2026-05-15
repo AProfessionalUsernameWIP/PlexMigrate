@@ -1,13 +1,13 @@
 """
-Read-only browser over the ``plex_exports/`` directory.
+Read-only browser over the ``snapshots/`` directory.
 
-Lists every ``*.plexbackup.json`` produced by the export pipeline so
+Lists every ``*.plexexport.json`` produced by the snapshot pipeline so
 the frontend can show them in a table and let the user download or
 re-import them.
 
-The contents of each file are NOT read on listing — we only parse the
-``library`` and ``exported_at`` keys for the index, and that requires
-reading the first few KB. ``.plexbackup.json`` files can be hundreds
+The contents of each file are NOT read on listing - we only parse the
+``library`` and ``captured_at`` keys for the index, and that requires
+reading the first few KB. ``.plexexport.json`` files can be hundreds
 of MB on large libraries; reading them all on every list request
 would make the page slow.
 """
@@ -22,40 +22,63 @@ from typing import Any, Dict, List, Optional, Tuple
 from server.persistence import load_settings
 
 
-# How many bytes to read from the start of a backup file when building
+# How many bytes to read from the start of a export file when building
 # the index. The two metadata keys we care about appear within the
 # first few KB; reading more is wasteful.
 _HEAD_PEEK_BYTES = 8 * 1024
 
 
 def _resolve_within(base: Path, relative: str) -> Path:
-    """Path containment guard — same idea as in :mod:`server.log_browser`."""
+    """Path containment guard - same idea as in :mod:`server.log_browser`."""
     candidate = (base / relative).resolve()
     base_resolved = base.resolve()
     try:
         candidate.relative_to(base_resolved)
     except ValueError as e:
-        raise ValueError(f"Path {relative!r} escapes export directory {base!s}") from e
+        raise ValueError(f"Path {relative!r} escapes snapshot directory {base!s}") from e
     return candidate
 
 
-def list_exports() -> List[Dict[str, Any]]:
+def _archive_dir() -> Path:
     """
-    Return one entry per .plexbackup.json under the configured output
-    directory. Newest first.
+    Resolve the JSON-archive directory: ``<output_dir>/legacy/``.
+
+    Standalone JSON archives (operator-kept after deleting a
+    snapshot, or pre-PR-13 archives relocated by
+    ``relocate_legacy_exports``) live here. The directory is named
+    ``legacy/`` for historical reasons; the UI labels it "JSON
+    Archives" and the JobForm exposes it as "From JSON archive".
+
+    Distinct from ``<output_dir>`` top-level which holds *active*
+    cached sidecars next to their .db files - those belong to the
+    snapshot registry and are listed via ``/api/snapshots``.
+    """
+    settings = load_settings()
+    return Path(settings.get("output_dir") or "./snapshots") / "legacy"
+
+
+def list_snapshots() -> List[Dict[str, Any]]:
+    """
+    Return one entry per .plexexport.json in the JSON-archive
+    directory (``<output_dir>/legacy/``). Newest first.
 
     Each entry: ``name`` (filename), ``size`` (bytes), ``mtime``
     (UNIX timestamp), ``library`` (parsed from file metadata), and
-    ``exported_at`` (parsed from file metadata, ISO 8601 string).
+    ``captured_at`` (parsed from file metadata, ISO 8601 string).
+
+    Pre-fix this read the top of ``output_dir`` which mixed active
+    cached sidecars (registered to live .db files) with genuine
+    archives. The Exports panel now distinguishes the two: registered
+    snapshots come from ``/api/snapshots``; archived JSON files come
+    from here.
     """
-    settings = load_settings()
-    base = Path(settings.get("output_dir") or "./plex_exports")
+    base = _archive_dir()
     if not base.exists():
         return []
 
     items: List[Dict[str, Any]] = []
     for f in base.iterdir():
-        if not f.is_file() or not f.name.endswith(".plexbackup.json"):
+        if not f.is_file() or not f.name.endswith((".plexexport.json", ".plexbackup.json")):
             continue
         st = f.stat()
         meta = _peek_metadata(f)
@@ -64,17 +87,9 @@ def list_exports() -> List[Dict[str, Any]]:
             "size": st.st_size,
             "mtime": st.st_mtime,
             "library": meta.get("library"),
-            "exported_at": meta.get("exported_at"),
-            # v0.9.3: source server label so the user can tell which
-            # registered server produced this backup at a glance. Older
-            # backups without the field show ``null`` and the UI renders
-            # an em-dash.
+            "captured_at": meta.get("captured_at"),
             "source_server": meta.get("source_server_name"),
             "source_server_url": meta.get("source_server_url"),
-            # v0.9.5: how this backup was initiated — "manual" or
-            # "schedule" — with the schedule name when applicable.
-            # Both ``null`` on backups produced before this field
-            # existed; the UI renders those as "—".
             "trigger": meta.get("trigger"),
             "schedule_name": meta.get("schedule_name"),
         })
@@ -82,51 +97,79 @@ def list_exports() -> List[Dict[str, Any]]:
     return items
 
 
-def export_path(file_name: str) -> Path:
+def snapshot_path(file_name: str) -> Path:
     """
-    Return the absolute path of one export file, after the containment
-    check. Used by the download endpoint.
+    Return the absolute path of one archived snapshot file, after the
+    containment check. Used by the archive-download endpoint.
     """
-    settings = load_settings()
-    base = Path(settings.get("output_dir") or "./plex_exports")
+    base = _archive_dir()
     p = _resolve_within(base, file_name)
     if not p.is_file():
-        raise FileNotFoundError(f"No such export: {file_name}")
+        raise FileNotFoundError(f"No such snapshot: {file_name}")
     return p
 
 
-def delete_export(file_name: str) -> None:
+def delete_snapshot(file_name: str) -> None:
     """
-    Delete one export file from the configured output directory.
+    Delete one archived ``.plexexport.json`` file from
+    ``<output_dir>/legacy/``.
 
     Goes through :func:`_resolve_within` so a crafted ``file_name``
-    (``../etc/passwd`` etc.) can't escape the export root. Raises
+    (``../etc/passwd`` etc.) can't escape the archive root. Raises
     :class:`FileNotFoundError` if the target doesn't exist and
-    :class:`ValueError` on containment failure — the route layer
-    maps those to 404 / 400 respectively. The ``.plexbackup.json``
-    suffix is enforced here too so this endpoint can't be repurposed
-    to wipe arbitrary files that happen to land in the export dir.
+    :class:`ValueError` on containment failure - the route layer
+    maps those to 404 / 400 respectively. The ``.plexexport.json``
+    suffix is enforced here so this endpoint can't be repurposed
+    to wipe arbitrary files.
     """
-    if not file_name.endswith(".plexbackup.json"):
-        raise ValueError(f"Refusing to delete non-backup file: {file_name!r}")
-    settings = load_settings()
-    base = Path(settings.get("output_dir") or "./plex_exports")
+    if not file_name.endswith((".plexexport.json", ".plexbackup.json")):
+        raise ValueError(f"Refusing to delete non-export file: {file_name!r}")
+    base = _archive_dir()
     p = _resolve_within(base, file_name)
     if not p.is_file():
-        raise FileNotFoundError(f"No such export: {file_name}")
+        raise FileNotFoundError(f"No such snapshot: {file_name}")
     p.unlink()
+
+
+def delete_all_archives() -> Dict[str, Any]:
+    """
+    Best-effort wipe of every ``.plexexport.json`` archive in
+    ``<output_dir>/legacy/``. Returns ``{deleted, errors}``.
+
+    Non-archive files in the same directory are left alone so an
+    operator who has dropped something else in there doesn't lose it
+    to a blanket clear-all. The route-level db_admin gate keeps this
+    behind explicit consent.
+    """
+    base = _archive_dir()
+    deleted = 0
+    errors: List[str] = []
+    if not base.exists():
+        return {"deleted": 0, "errors": []}
+    for f in list(base.iterdir()):
+        try:
+            if not f.is_file() or not f.name.endswith((".plexexport.json", ".plexbackup.json")):
+                continue
+        except OSError:
+            continue
+        try:
+            f.unlink()
+            deleted += 1
+        except OSError as e:
+            errors.append(f"{f.name}: {type(e).__name__}: {e}")
+    return {"deleted": deleted, "errors": errors}
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
     """
-    Read only the first ``_HEAD_PEEK_BYTES`` of a backup file and
+    Read only the first ``_HEAD_PEEK_BYTES`` of a export file and
     parse the small handful of top-level string fields the UI needs.
 
-    Returns a dict with keys ``library``, ``exported_at``,
+    Returns a dict with keys ``library``, ``captured_at``,
     ``source_server_name``, ``source_server_url``. Any field that
-    can't be extracted (older backup pre-dating the field, or
+    can't be extracted (older export pre-dating the field, or
     unparseable file) maps to ``None``.
 
     Two-strategy approach: first try to parse the whole prefix as
@@ -136,7 +179,7 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
     """
     out: Dict[str, Optional[str]] = {
         "library": None,
-        "exported_at": None,
+        "captured_at": None,
         "source_server_name": None,
         "source_server_url": None,
         "trigger": None,
@@ -153,7 +196,10 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
         data = json.loads(head.decode("utf-8", errors="replace"))
         if isinstance(data, dict):
             out["library"] = data.get("library")
-            out["exported_at"] = data.get("exported_at")
+            # PR-13 compat: legacy files used ``exported_at``; new files
+            # use ``captured_at``. Accept either when reading so
+            # pre-rename .plexexport.json files remain browseable.
+            out["captured_at"] = data.get("captured_at") or data.get("exported_at")
             out["source_server_name"] = data.get("source_server_name")
             out["source_server_url"] = data.get("source_server_url")
             out["trigger"] = data.get("trigger")
@@ -163,12 +209,16 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
         pass
 
     # Strategy 2: scan the prefix for the top-level fields. The
-    # exporter writes JSON with 2-space indent (services/exporter.py),
+    # snapshotter writes JSON with 2-space indent (services/snapshotter.py),
     # so the top-level keys appear at the start of a line and the
     # values are easy to extract with a tiny string search.
     text = head.decode("utf-8", errors="replace")
     out["library"] = _extract_top_level_string(text, "library")
-    out["exported_at"] = _extract_top_level_string(text, "exported_at")
+    # PR-13 compat: try the new key first, fall back to legacy.
+    out["captured_at"] = (
+        _extract_top_level_string(text, "captured_at")
+        or _extract_top_level_string(text, "exported_at")
+    )
     out["source_server_name"] = _extract_top_level_string(text, "source_server_name")
     out["source_server_url"] = _extract_top_level_string(text, "source_server_url")
     out["trigger"] = _extract_top_level_string(text, "trigger")
@@ -180,39 +230,39 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
 
 def _slug_pattern(slug: str) -> "re.Pattern[str]":
     """
-    Compile the exact-position regex that matches export filenames
+    Compile the exact-position regex that matches snapshot filenames
     produced by the server whose ``safe_server_name`` slug is ``slug``.
 
-    Exporter filename shape (services/exporter.py):
+    Snapshotter filename shape (services/snapshotter.py):
 
-        ``<library>_<slug>_<YYYYMMDD>_<HHMMSS>.plexbackup.json``
+        ``<library>_<slug>_<YYYYMMDD>_<HHMMSS>.plexexport.json``
 
     The slug always appears between an underscore and the run
     timestamp, so the pattern anchors on ``_<slug>_<8 digits>_<6 digits>``
-    immediately preceding ``.plexbackup.json``. This avoids false
+    immediately preceding ``.plexexport.json``. This avoids false
     positives if the slug substring happens to appear inside a
-    library name (e.g. a library literally named "Jade-TV" with a
+    library name (e.g. a library literally named "My-Server" with a
     different server slug).
 
-    Pre-v0.9.0 backups carry no slug at all (``<library>_<ts>``);
-    those never match this pattern by design — they aren't
+    Pre-v0.9.0 exports carry no slug at all (``<library>_<ts>``);
+    those never match this pattern by design - they aren't
     attributable to any specific registered server.
     """
     return re.compile(
-        r"_" + re.escape(slug) + r"_\d{8}_\d{6}\.plexbackup\.json$"
+        r"_" + re.escape(slug) + r"_\d{8}_\d{6}\.plexexport\.json$"
     )
 
 
 def _iter_exports_for_slug(slug: str) -> List[Path]:
-    """Return every export file path attributable to ``slug``."""
+    """Return every snapshot file path attributable to ``slug``."""
     settings = load_settings()
-    base = Path(settings.get("output_dir") or "./plex_exports")
+    base = Path(settings.get("output_dir") or "./snapshots")
     if not base.exists():
         return []
     pat = _slug_pattern(slug)
     out: List[Path] = []
     for f in base.iterdir():
-        if not f.is_file() or not f.name.endswith(".plexbackup.json"):
+        if not f.is_file() or not f.name.endswith((".plexexport.json", ".plexbackup.json")):
             continue
         if pat.search(f.name):
             out.append(f)
@@ -220,15 +270,15 @@ def _iter_exports_for_slug(slug: str) -> List[Path]:
 
 
 def count_exports_by_slug(slug: str) -> int:
-    """How many export files would a cascade delete of ``slug`` remove?"""
+    """How many snapshot files would a cascade delete of ``slug`` remove?"""
     return len(_iter_exports_for_slug(slug))
 
 
 def delete_exports_by_slug(slug: str) -> Tuple[int, List[str]]:
     """
-    Delete every export file matching ``slug``. Returns
+    Delete every snapshot file matching ``slug``. Returns
     ``(deleted_count, errors)`` where ``errors`` is a list of
-    human-readable strings — one per file we tried to delete and
+    human-readable strings - one per file we tried to delete and
     couldn't. Best-effort: a failure on one file does not stop the
     sweep.
     """
@@ -249,7 +299,7 @@ def _extract_top_level_string(text: str, key: str) -> Optional[str]:
 
     Looks for ``"key": "<value>"`` and returns the unescaped value.
     Tolerant of indentation and trailing commas. Not a full JSON parser
-    — only handles the simple case the exporter actually writes.
+    - only handles the simple case the snapshotter actually writes.
     """
     needle = f'"{key}"'
     idx = text.find(needle)
@@ -262,7 +312,23 @@ def _extract_top_level_string(text: str, key: str) -> Optional[str]:
     open_quote = text.find('"', colon + 1)
     if open_quote < 0:
         return None
-    close_quote = text.find('"', open_quote + 1)
+    # L4: find the *unescaped* closing quote. A bare
+    # ``text.find('"', ...)`` stops at the first quote even when it is
+    # a ``\"`` escape inside the value, truncating any value that
+    # contains a quote (e.g. a library name with a double-quote in it).
+    # Walk the string honouring backslash escapes instead.
+    i = open_quote + 1
+    n = len(text)
+    close_quote = -1
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2  # skip the escaped char (\\ or \")
+            continue
+        if c == '"':
+            close_quote = i
+            break
+        i += 1
     if close_quote < 0:
         return None
     # Basic unescape: only handle \" and \\, which are the only

@@ -1,6 +1,6 @@
-// Scheduled exports — list, create, edit, delete.
+// Scheduled snapshots - list, create, edit, delete.
 //
-// Each schedule fires an export run on a recurring trigger. The
+// Each schedule fires an snapshot run on a recurring trigger. The
 // scheduler lives server-side (see server/schedules.py); this panel
 // is just a thin CRUD form over /api/schedules. The list at the top
 // shows the next firing time so the user can confirm their schedule
@@ -8,8 +8,13 @@
 
 import { useEffect, useState } from 'react';
 import { api, LibraryDescriptor, Schedule, ServerTime, ServerView } from '../api';
+import { usePermission } from '../hooks/usePermission';
 
 export function SchedulesPanel() {
+  // PR-A4 - read/write gate. ``schedules.view`` is implied to reach
+  // this panel at all (App.tsx hides the sub-tab without it).
+  // ``schedules.edit`` is what gates the destructive controls.
+  const canEditSchedules = usePermission('schedules.edit');
   const [items, setItems] = useState<Schedule[]>([]);
   const [servers, setServers] = useState<ServerView[]>([]);
   const [libraries, setLibraries] = useState<LibraryDescriptor[]>([]);
@@ -67,6 +72,13 @@ export function SchedulesPanel() {
     minute: 0,
     day_of_week: 0,
     enabled: true,
+    // PR-3 / Phase D - four-flag data-type filter on schedules.
+    // Defaults match the Run-Job form: every data type migrated.
+    include_watch_history: true,
+    include_ratings: true,
+    include_playlists: true,
+    include_collections: true,
+    prebuild_json_sidecar: false,
   });
 
   const cancelEdit = () => setEditing(null);
@@ -103,8 +115,10 @@ export function SchedulesPanel() {
       {error && <div className="banner error">{error}</div>}
       <div className="panel">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-          <h2 style={{ margin: 0 }}>Scheduled Exports</h2>
-          <button className="primary" onClick={startNew}>+ New Schedule</button>
+          <h2 style={{ margin: 0 }}>Scheduled Snapshots</h2>
+          {canEditSchedules && (
+            <button className="primary" onClick={startNew}>+ New Schedule</button>
+          )}
         </div>
 
         {items.length === 0 ? (
@@ -133,12 +147,16 @@ export function SchedulesPanel() {
                   <td>{s.frequency}{s.frequency === 'weekly' && ` (${DAYS[s.day_of_week]})`}</td>
                   <td className="mono">{pad2(s.hour)}:{pad2(s.minute)}</td>
                   <td className="mono">{s.output_dir || '(default)'}</td>
-                  <td className="mono">{s.next_run_at ? formatTs(s.next_run_at) : '—'}</td>
-                  <td>{s.enabled ? '✓' : '—'}</td>
+                  <td className="mono">{s.next_run_at ? formatTs(s.next_run_at) : '-'}</td>
+                  <td>{s.enabled ? '✓' : '-'}</td>
                   <td>
                     <div className="row-buttons">
-                      <button onClick={() => setEditing({ ...s })}>Edit</button>
-                      <button className="danger" onClick={() => removeOne(s.id)}>Delete</button>
+                      <button onClick={() => setEditing({ ...s })}>
+                        {canEditSchedules ? 'Edit' : 'View'}
+                      </button>
+                      {canEditSchedules && (
+                        <button className="danger" onClick={() => removeOne(s.id)}>Delete</button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -188,7 +206,7 @@ function ScheduleEditor(props: {
       <h2>{schedule.id ? 'Edit Schedule' : 'New Schedule'}</h2>
       <label className="field">
         <span className="label">Name</span>
-        <span className="help">Shown in the schedule list. Use anything descriptive — "Nightly full backup", "Music Sundays", etc.</span>
+        <span className="help">Shown in the schedule list. Use anything descriptive - "Nightly full export", "Music Sundays", etc.</span>
         <input type="text" value={schedule.name} onChange={(e) => set('name', e.target.value)} />
       </label>
 
@@ -196,16 +214,16 @@ function ScheduleEditor(props: {
         <span className="label">Source server</span>
         <span className="help">Which registered server this schedule reads from. Manage servers under the <strong>Servers</strong> tab.</span>
         <select value={schedule.source_server_name || ''} onChange={(e) => set('source_server_name', e.target.value)}>
-          <option value="">— pick a server —</option>
+          <option value="">- pick a server -</option>
           {servers.map((s) => (
             <option key={s.id} value={s.name}>{s.name} ({s.url})</option>
           ))}
         </select>
       </label>
 
-      <span className="label">Libraries to export</span>
+      <span className="label">Libraries to snapshot</span>
       <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 6 }}>
-        Leave all unchecked = export every library the server reports at fire time.
+        Leave all unchecked = snapshot every library the server reports at fire time.
       </span>
       <div className="checkbox-grid" style={{ marginBottom: 12 }}>
         {libraries.length === 0 ? (
@@ -230,8 +248,8 @@ function ScheduleEditor(props: {
         </label>
         <label className="field">
           <span className="label">Output directory</span>
-          <span className="help">Where this schedule's <code>.plexbackup.json</code> files land. Blank = use Settings default. Must be a path inside the backend container — Windows host paths (e.g. <code>Y:\…</code>) are rejected; bind-mount external drives in <code>docker-compose.yml</code> first.</span>
-          <input type="text" value={schedule.output_dir || ''} onChange={(e) => set('output_dir', e.target.value || null)} placeholder="./plex_exports" />
+          <span className="help">Where this schedule's <code>.plexexport.json</code> files land. Blank = use Settings default. Must be a path inside the backend container - Windows host paths (e.g. <code>Y:\…</code>) are rejected; bind-mount external drives in <code>docker-compose.yml</code> first.</span>
+          <input type="text" value={schedule.output_dir || ''} onChange={(e) => set('output_dir', e.target.value || null)} placeholder="./snapshots" />
         </label>
       </div>
 
@@ -288,11 +306,80 @@ function ScheduleEditor(props: {
         <span className="help">Disabled schedules stay in the list but the scheduler skips them.</span>
       </label>
 
+      {/* PR-3 / Phase D - same four-flag data-type filter as the
+          Run-Job form. Pre-Phase-D schedule rows arrive with these
+          fields ``undefined`` and the ?? true default treats them as
+          all-on (matches the pre-Phase-D every-type behaviour). */}
+      <fieldset className="field" style={{ borderRadius: 8, padding: '10px 12px', margin: 0 }}>
+        <legend style={{ padding: '0 6px', fontWeight: 600 }}>Data to migrate</legend>
+        <span className="help" style={{ marginTop: 0 }}>
+          Pick which data types this schedule's snapshots include. All four checked is the
+          pre-v0.13 behaviour. At least one must remain checked.
+        </span>
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={schedule.include_watch_history ?? true}
+            onChange={(e) => set('include_watch_history', e.target.checked)}
+          />
+          <span>Watch history</span>
+        </label>
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={schedule.include_ratings ?? true}
+            onChange={(e) => set('include_ratings', e.target.checked)}
+          />
+          <span>Ratings</span>
+        </label>
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={schedule.include_playlists ?? true}
+            onChange={(e) => set('include_playlists', e.target.checked)}
+          />
+          <span>Playlists</span>
+        </label>
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={schedule.include_collections ?? true}
+            onChange={(e) => set('include_collections', e.target.checked)}
+          />
+          <span>Collections</span>
+        </label>
+        <label className="switch" style={{ marginTop: 8 }}>
+          <input
+            type="checkbox"
+            checked={schedule.prebuild_json_sidecar ?? false}
+            onChange={(e) => set('prebuild_json_sidecar', e.target.checked)}
+          />
+          <span>
+            Save JSON copy after snapshot
+            <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 11, marginTop: 2 }}>
+              Writes a <code>.plexexport.json</code> next to the snapshot
+              <code>.db</code> at the end of each scheduled run. Off by
+              default - JSON is otherwise rendered on first Download click
+              in the Exports tab.
+            </span>
+          </span>
+        </label>
+      </fieldset>
+
       <div className="row-buttons">
         <button
           className="primary"
           onClick={onSave}
-          disabled={!schedule.name.trim() || !schedule.source_server_name}
+          disabled={
+            !schedule.name.trim() ||
+            !schedule.source_server_name ||
+            !(
+              (schedule.include_watch_history ?? true) ||
+              (schedule.include_ratings ?? true) ||
+              (schedule.include_playlists ?? true) ||
+              (schedule.include_collections ?? true)
+            )
+          }
         >
           Save
         </button>
