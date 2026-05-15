@@ -291,6 +291,13 @@ class Scheduler:
                 _wr = row.get("watch_ratings_filter_strategy")
                 if isinstance(_wr, str) and _wr.strip() in ("smart", "force_bulk", "force_server_side"):
                     params["watch_ratings_filter_strategy"] = _wr.strip()
+                # v0.14 — forward the per-schedule user_filter. None /
+                # missing = capture every user the source server
+                # reports (historical default). The snapshot engine
+                # filters home_users + derives owner_included.
+                _uf = row.get("user_filter")
+                if isinstance(_uf, list):
+                    params["user_filter"] = [str(s) for s in _uf if isinstance(s, str)]
                 rec = queue.submit_snapshot(params)
                 row["last_job_id"] = rec.job_id
                 row["last_fired_at"] = now_ts

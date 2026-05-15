@@ -79,6 +79,15 @@ STATE_RUNNING = "running"
 # itself "Stopping…" and disable, giving the user immediate feedback.
 STATE_STOPPING = "stopping"
 STATE_COMPLETED = "completed"
+# v0.13.x: terminal state for jobs that completed the engine work
+# successfully (primary data is in media.db; the migration ran end to
+# end) but a non-fatal post-engine step failed. The textbook case is
+# the snapshot-artifact capture: media.db ingest succeeded, but writing
+# the snapshot .db / registering it in snapshots.db raised. Re-running
+# is safe (engine work is idempotent). The dashboard treats this as a
+# yellow / amber outcome - distinct from green "completed" and from
+# red "failed". ``rec.error`` carries the message either way.
+STATE_COMPLETED_WITH_ERRORS = "completed_with_errors"
 STATE_FAILED = "failed"
 STATE_CANCELLED = "cancelled"
 
@@ -395,10 +404,22 @@ class JobQueue:
                 # (soft Stop), the engine returned because the
                 # stop_event was set at an item-level checkpoint - that
                 # is a CANCELLED job, not a COMPLETED one.
-                rec.state = (
-                    STATE_CANCELLED if rec.state == STATE_STOPPING
-                    else STATE_COMPLETED
-                )
+                #
+                # v0.13.x: post-engine helpers (snapshot artifact
+                # capture, auto-capture safety belt) swallow their own
+                # exceptions and stamp ``rec.error`` instead of
+                # re-raising - the engine work succeeded so the rest of
+                # the job shouldn't be classified as ``failed``. But
+                # an error-stamped job isn't a clean ``completed``
+                # either. Route it to ``completed_with_errors`` so the
+                # UI can show the amber chip + error message without
+                # claiming green success.
+                if rec.state == STATE_STOPPING:
+                    rec.state = STATE_CANCELLED
+                elif rec.error:
+                    rec.state = STATE_COMPLETED_WITH_ERRORS
+                else:
+                    rec.state = STATE_COMPLETED
             except _JobCancelled:
                 rec.state = STATE_CANCELLED
             except Exception as exc:
@@ -631,6 +652,16 @@ class JobQueue:
                 include_ratings=bool(settings.get("include_ratings", True)),
                 include_playlists=bool(settings.get("include_playlists", True)),
                 include_collections=bool(settings.get("include_collections", True)),
+                # v0.14 — per-job user filter. None / missing = include
+                # every user the source server reports (the historical
+                # default). When provided, run_snapshot filters
+                # home_users + derives owner_included internally.
+                user_filter=settings.get("user_filter"),
+                # v0.13.x: library-level concurrency cap. 0 (default)
+                # inherits state.MAX_WORKERS to preserve the legacy
+                # behavior; a positive value caps libraries-in-parallel
+                # without affecting the per-library HTTP worker count.
+                library_workers=int(settings.get("snapshot_library_workers") or 0),
             )
         finally:
             try:
@@ -852,6 +883,16 @@ class JobQueue:
             include_collections=bool(settings.get("include_collections", True)),
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
+            # v0.14 — per-job user filter for restore. None = restore
+            # every user from the payload that also exists on the
+            # destination (historical default). When provided, the
+            # importer drops managed users whose handle isn't in the list.
+            user_filter=settings.get("user_filter"),
+            # v0.13.x: operator-tunable library concurrency. Reads from
+            # settings (Run Defaults > Concurrency); default 3 preserves
+            # the legacy hardcoded cap. Lower it (e.g. to 1) when Plex
+            # rate-limits the multi-library API bursts.
+            library_workers=int(settings.get("restore_library_workers") or 3),
         )
 
         # Part B: run-level finalize phase so the dashboard doesn't
@@ -1178,6 +1219,12 @@ class JobQueue:
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
             pre_replace_settings=_build_pre_replace_settings(settings),
+            # v0.13.x: destination concurrency cap. 0 = unlimited
+            # (today's behavior). Direct transfer doesn't expose a
+            # library_workers axis yet (the per-destination engine is
+            # still serial across libraries), so only the destination
+            # axis is wired here.
+            destination_workers=int(settings.get("fan_out_destination_workers") or 0),
         )
         _apply_fan_out_result(rec, result)
 
@@ -1236,6 +1283,18 @@ class JobQueue:
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
             pre_replace_settings=_build_pre_replace_settings(settings),
+            # v0.14 — per-job user filter forwarded to each
+            # destination in the fan-out. The fan-out helper passes
+            # it straight to run_restore.
+            user_filter=settings.get("user_filter"),
+            # v0.13.x: two-axis concurrency for fan-out restore.
+            # destination_workers caps how many destinations run at
+            # once (0 = no cap, today's behavior). library_workers is
+            # forwarded into each destination's own run_restore call
+            # so the within-destination library concurrency stays
+            # consistent with the single-destination restore path.
+            destination_workers=int(settings.get("fan_out_destination_workers") or 0),
+            library_workers=int(settings.get("restore_library_workers") or 3),
         )
         _apply_fan_out_result(rec, result)
 

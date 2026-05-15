@@ -1087,6 +1087,12 @@ def snapshot_library(
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
     run_lazy_caches: Optional[Dict[int, List[Tuple[Any, List]]]] = None,
+    # v0.14 — when False, the owner-phase gather pool is skipped
+    # entirely and only home-user data is captured. ``run_snapshot``
+    # derives this from the user_filter (False when owner email is
+    # absent from the filter list). Default True preserves historical
+    # behaviour for ad-hoc / unfiltered runs.
+    owner_included: bool = True,
     # PR-3 / Phase D - four-flag data-type filter. ``skip_*`` is folded
     # into the include_* form by ``run_snapshot`` before this is called,
     # so the per-library gather only needs to consult the include_*
@@ -1421,17 +1427,33 @@ def snapshot_library(
     #   their token-bound server connection. Per-user personal
     #   collections need the owner's collection set computed from
     #   Phase 1's output, so Phase 2 can't start until Phase 1 ends.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        owner_futures = [
-            submit_with_context(pool, gather_watch),
-            submit_with_context(pool, gather_playlists),
-            submit_with_context(pool, gather_collections),
-            submit_with_context(pool, gather_ratings),
-        ]
-        for f in concurrent.futures.as_completed(owner_futures):
-            exc = f.exception()
-            if exc:
-                logger.error(f"Error in owner gather thread for {lib_name}: {exc}")
+    #
+    # v0.14 — when ``owner_included`` is False (the operator excluded
+    # the owner via user_filter), Phase 1 is skipped entirely. Phase
+    # 2 still fires for every managed user that survived the filter.
+    if owner_included:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            owner_futures = [
+                submit_with_context(pool, gather_watch),
+                submit_with_context(pool, gather_playlists),
+                submit_with_context(pool, gather_collections),
+                submit_with_context(pool, gather_ratings),
+            ]
+            for f in concurrent.futures.as_completed(owner_futures):
+                exc = f.exception()
+                if exc:
+                    logger.error(f"Error in owner gather thread for {lib_name}: {exc}")
+    else:
+        logger.info(
+            "[%s] Owner excluded by user_filter — skipping Phase 1 (library-wide gather). "
+            "Phase 2 (per-user) will still fire for the %d included managed user(s).",
+            lib_name, len(home_users or []),
+        )
+        # Advance the library counter for the four owner-phase tasks
+        # that didn't run; the dashboard's per-library bar otherwise
+        # stops at "0/X" forever waiting for ticks that never come.
+        for _ in range(4):
+            _advance()
 
     # Phase 1 done - owner_coll_keys is now safe to populate from the
     # owner's collections result.
@@ -1651,6 +1673,20 @@ def run_snapshot(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
+    # v0.14 — per-job user filter. None = capture every user the
+    # source server reports (historical default). When supplied, the
+    # owner email being absent excludes owner-level data (library-
+    # wide watch / playlists / collections); managed usernames
+    # absent excludes those users' data. Empty list excludes
+    # everyone — legal but unusual.
+    user_filter: Optional[List[str]] = None,
+    # v0.13.x: library-level concurrency cap, decoupled from the
+    # per-library HTTP worker pool (``state.MAX_WORKERS``). ``0``
+    # (default) inherits from ``state.MAX_WORKERS`` so the legacy
+    # behavior is preserved for any caller that hasn't been updated
+    # yet. A positive value caps libraries-in-parallel without
+    # touching the per-library worker count.
+    library_workers: int = 0,
 ) -> None:
     """
     Runs the full multi-threaded snapshot pipeline for all selected libraries.
@@ -1694,7 +1730,50 @@ def run_snapshot(
     # troubleshoot.log, and unresolved.log only describe this run.
     state.reset_run_state()
 
+    # v0.13.x: resolve the effective libraries-in-parallel pool size.
+    # 0 (the default) inherits from state.MAX_WORKERS so a caller that
+    # hasn't been updated for the new tunable gets today's behavior
+    # unchanged. Any positive value is taken as-is, then clamped to
+    # >=1 (a negative slip-through never disables the pool entirely)
+    # and capped at the actual library count so the pool can't spawn
+    # idle workers.
+    _effective_lib_workers = int(library_workers) if library_workers > 0 else int(state.MAX_WORKERS)
+    _effective_lib_workers = max(1, min(_effective_lib_workers, max(1, len(selected_libs))))
+    logger.info(
+        "Snapshot library concurrency: %d (from %s)",
+        _effective_lib_workers,
+        "settings.snapshot_library_workers" if library_workers > 0 else "settings.workers",
+    )
+
     home_users = get_home_users(server, base_url, logger)
+    # v0.14 — apply the operator's user filter. The owner is handled
+    # by ``owner_included`` below (it isn't in home_users to begin
+    # with — owner-level data flows through the library-wide gather
+    # paths). When user_filter is None, every user on the server is
+    # included (historical default). When it's a list, only managed
+    # usernames present in the list survive.
+    owner_included = True
+    if user_filter is not None:
+        filter_set = {str(s).strip() for s in user_filter if str(s).strip()}
+        # Owner is keyed by the source server's myPlexAccount email;
+        # any other entry in the list is a managed-user username.
+        try:
+            owner_email = str(getattr(server.myPlexAccount(), "email", "") or "").strip()
+        except Exception:
+            owner_email = ""
+        owner_included = bool(owner_email) and (owner_email in filter_set)
+        before = len(home_users)
+        home_users = [
+            (title, token, user_server)
+            for (title, token, user_server) in home_users
+            if str(title) in filter_set
+        ]
+        logger.info(
+            "user_filter applied: owner=%s (%s), managed=%d→%d",
+            "included" if owner_included else "EXCLUDED",
+            owner_email or "(no email)",
+            before, len(home_users),
+        )
     n_user_tasks = len(home_users)
 
     # Timing engine: zero-init the rolling tracker. Totals are
@@ -1806,12 +1885,13 @@ def run_snapshot(
             "Overall", total=len(selected_libs), completed=0, fields={"phase": ""},
         )
         with Live(state._live_progress, console=console, refresh_per_second=8):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
                 futures = {
                     submit_with_context(
                         pool,
                         snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
                         stop_event, skip_collections, fast_collection_detection, skip_playlists, run_lazy_caches,
+                        owner_included,
                         # PR-3 / Phase D - pass the four include_* flags
                         # explicitly. ``snapshot_library`` honours both the
                         # legacy skip_* and the new include_* (either
@@ -1854,7 +1934,7 @@ def run_snapshot(
         try:
             with Live(console=console, refresh_per_second=4) as live:
                 state._live_instance = live
-                with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
                     futures_map: Dict[Any, str] = {
                         pool.submit(
                             snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
@@ -1910,12 +1990,13 @@ def run_snapshot(
                 f"Dashboard rendering unavailable ({render_err!r}). "
                 f"Running without display - see {log_dir}/ for full details."
             )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=state.MAX_WORKERS) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
                 futures_map = {
                     submit_with_context(
                         pool,
                         snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
                         stop_event, skip_collections, fast_collection_detection, skip_playlists, run_lazy_caches,
+                        owner_included,
                         # PR-3 / Phase D - pass include_* flags.
                         include_watch_history,
                         include_ratings,

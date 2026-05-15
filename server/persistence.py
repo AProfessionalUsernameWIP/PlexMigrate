@@ -135,6 +135,38 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
         # idempotent). Ignored when mode == "replace".
         "merge_watch_strategy": "higher",
     },
+    # v0.13.x: library-level concurrency cap for the file-mediated
+    # restore path. Today the engine hard-caps at min(3, libraries);
+    # this tunable replaces the hard 3 with an operator-controlled
+    # ceiling. Lower it (e.g. to 1) when Plex rate-limits multi-library
+    # API bursts; raise it when the destination is over-provisioned
+    # and idle. The min(value, library_count) clamp still applies, so
+    # setting this higher than the actual library count just caps at
+    # the count. Direct transfer remains serial in this release - this
+    # tunable does not apply there.
+    "restore_library_workers": 3,
+    # v0.13.x: library-level concurrency cap for the snapshot path.
+    # Today snapshot reuses ``workers`` (the per-library HTTP worker
+    # count) as the library-level pool size, which means lowering
+    # per-library concurrency also lowers libraries-in-parallel and
+    # vice-versa. This tunable decouples the two axes:
+    #   * ``0`` (default) - inherit from ``workers`` (today's behavior,
+    #     so an upgrade is a no-op).
+    #   * Positive integer - explicit cap on libraries-in-parallel
+    #     independent of the per-library worker count.
+    # Lower to 1 to serialise snapshot libraries while keeping the
+    # per-library HTTP pool at its full size.
+    "snapshot_library_workers": 0,
+    # v0.13.x: per-fan-out destination concurrency cap. Today fan-out
+    # spawns one worker thread per destination so N destinations run
+    # in parallel. ``0`` (default) preserves that - no cap. A positive
+    # integer caps the pool: ``1`` makes destinations run one at a time
+    # (which is what an operator should pick if all destinations live
+    # behind the same network bottleneck or the source Plex is the
+    # constraint), ``2`` runs at most two at a time, etc. Independent
+    # of restore_library_workers: each destination still uses its own
+    # within-job library concurrency value.
+    "fan_out_destination_workers": 0,
     # media.db retention + cascade-delete policy. cascade_delete is
     # the greedy-restrictive default (auto-purges per-server rows on
     # server removal); operators who want to preserve data must

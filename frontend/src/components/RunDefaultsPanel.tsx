@@ -45,6 +45,18 @@ export function RunDefaultsPanel() {
   const [restoreMode, setRestoreMode] = useState<RestoreMode>('merge');
   const [autoCaptureBeforeReplace, setAutoCaptureBeforeReplace] = useState<boolean>(true);
   const [mergeWatchStrategy, setMergeWatchStrategy] = useState<MergeWatchStrategy>('higher');
+  // v0.13.x: concurrency tunables. Two orthogonal axes:
+  //   - restoreLibraryWorkers: libraries-within-one-restore parallelism.
+  //     Default 3 preserves today's hardcoded cap; lower to 1 if Plex
+  //     rate-limits multi-library API bursts.
+  //   - fanOutDestinationWorkers: destinations-within-one-fan-out
+  //     parallelism. Default 0 = no cap (today's behavior - one thread
+  //     per destination). Set to 1 to serialise destinations.
+  const [restoreLibraryWorkers, setRestoreLibraryWorkers] = useState<number>(3);
+  const [fanOutDestinationWorkers, setFanOutDestinationWorkers] = useState<number>(0);
+  // Snapshot library concurrency. 0 = inherit the Worker threads
+  // value above (today's behavior, preserved on upgrade).
+  const [snapshotLibraryWorkers, setSnapshotLibraryWorkers] = useState<number>(0);
 
   const load = async () => {
     try {
@@ -71,6 +83,21 @@ export function RunDefaultsPanel() {
       setRestoreMode(rd.mode === 'replace' ? 'replace' : 'merge');
       setAutoCaptureBeforeReplace(rd.auto_capture_before_replace !== false);
       setMergeWatchStrategy(rd.merge_watch_strategy === 'sum' ? 'sum' : 'higher');
+      setRestoreLibraryWorkers(
+        typeof s.restore_library_workers === 'number' && s.restore_library_workers >= 1
+          ? s.restore_library_workers
+          : 3,
+      );
+      setFanOutDestinationWorkers(
+        typeof s.fan_out_destination_workers === 'number' && s.fan_out_destination_workers >= 0
+          ? s.fan_out_destination_workers
+          : 0,
+      );
+      setSnapshotLibraryWorkers(
+        typeof s.snapshot_library_workers === 'number' && s.snapshot_library_workers >= 0
+          ? s.snapshot_library_workers
+          : 0,
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -99,6 +126,9 @@ export function RunDefaultsPanel() {
         auto_capture_before_replace: autoCaptureBeforeReplace,
         merge_watch_strategy: mergeWatchStrategy,
       },
+      restore_library_workers: Math.max(1, Math.min(16, Math.floor(Number(restoreLibraryWorkers) || 3))),
+      fan_out_destination_workers: Math.max(0, Math.min(32, Math.floor(Number(fanOutDestinationWorkers) || 0))),
+      snapshot_library_workers: Math.max(0, Math.min(16, Math.floor(Number(snapshotLibraryWorkers) || 0))),
     };
     try {
       const updated = await api.saveSettings(patch);
@@ -256,6 +286,73 @@ export function RunDefaultsPanel() {
           onAutoCaptureChange={setAutoCaptureBeforeReplace}
           idPrefix="run-defaults"
         />
+      </div>
+
+      {/* v0.13.x: Concurrency tunables. Two orthogonal axes that let
+          the operator pull back from default parallelism when Plex
+          rate-limits the multi-library / multi-destination API bursts.
+          Both default to today's behavior so an unchanged install is a
+          no-op. */}
+      <div className="panel">
+        <h2>Concurrency</h2>
+        <div className="banner info" style={{ fontSize: 12, marginBottom: 12 }}>
+          Pull these down when Plex rate-limits the multi-library / multi-destination
+          API bursts. Defaults preserve today's behavior; lowering them trades
+          wall-clock time for fewer concurrent API calls.
+        </div>
+        <label className="field">
+          <span className="label">Snapshot: libraries in parallel</span>
+          <span className="help">
+            How many libraries the snapshot pipeline gathers at once.{' '}
+            <strong>0</strong> (default) inherits from <em>Worker threads</em> above —
+            today's coupled behavior preserved on upgrade. A positive value caps
+            libraries-in-parallel <em>independently</em> of the per-library HTTP
+            worker count, so you can serialise snapshot libraries (<strong>1</strong>)
+            without throttling the within-library workers that fetch from Plex.
+          </span>
+          <input
+            type="number"
+            min={0}
+            max={16}
+            value={snapshotLibraryWorkers}
+            onChange={(e) => setSnapshotLibraryWorkers(Number(e.target.value))}
+          />
+        </label>
+        <label className="field">
+          <span className="label">Restore: libraries in parallel</span>
+          <span className="help">
+            How many libraries the file-mediated restore processes at once.
+            Default <strong>3</strong> (the legacy hardcoded ceiling). Set to{' '}
+            <strong>1</strong> to serialise libraries one at a time — useful when
+            Plex returns 429s during multi-library restores. Capped at the actual
+            library count, so higher values have no effect beyond that.
+          </span>
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={restoreLibraryWorkers}
+            onChange={(e) => setRestoreLibraryWorkers(Number(e.target.value))}
+          />
+        </label>
+        <label className="field">
+          <span className="label">Fan-out: destinations in parallel</span>
+          <span className="help">
+            How many fan-out destinations run at once. <strong>0</strong> (default) =
+            no cap — one worker per destination, current behavior. <strong>1</strong>{' '}
+            serialises destinations (use when all destinations share a network
+            bottleneck or the source Plex is the constraint). Independent of the
+            libraries-in-parallel value above — each destination uses its own
+            within-job library concurrency separately.
+          </span>
+          <input
+            type="number"
+            min={0}
+            max={32}
+            value={fanOutDestinationWorkers}
+            onChange={(e) => setFanOutDestinationWorkers(Number(e.target.value))}
+          />
+        </label>
       </div>
 
       <div className="panel">

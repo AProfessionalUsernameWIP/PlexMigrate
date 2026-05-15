@@ -1320,6 +1320,7 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
   // remaining time after the run finished is meaningless).
   const runIsOver = !!job && (
     job.state === 'completed' ||
+    job.state === 'completed_with_errors' ||
     job.state === 'failed' ||
     job.state === 'cancelled'
   );
@@ -1584,10 +1585,20 @@ function JobBadge({ state }: { state: JobPayload['state'] }) {
     running: 'phase',
     stopping: 'unresolved',
     completed: 'done',
+    // v0.13.x: amber chip for partial-success - distinct from the
+    // green ``done`` chip and the red ``error`` chip. Uses the same
+    // ``unresolved`` class the stopping state uses (amber/yellow).
+    completed_with_errors: 'unresolved',
     failed: 'error',
     cancelled: 'failed',
   };
-  return <span className={`tag ${map[state]}`}>{state.toUpperCase()}</span>;
+  // Friendly label so the UI doesn't shout "COMPLETED_WITH_ERRORS";
+  // every other state's display name is its raw string, but this one
+  // is long enough to deserve a tweaked rendering.
+  const label = state === 'completed_with_errors'
+    ? 'COMPLETED WITH ERRORS'
+    : state.toUpperCase();
+  return <span className={`tag ${map[state]}`}>{label}</span>;
 }
 
 // ── Run coverage (v0.9.3) ─────────────────────────────────────────────────────

@@ -302,7 +302,13 @@ def run_fan_out_direct(
         src_home_users = []
 
     # ── Per-destination loop, parallel ────────────────────────────────
-    max_parallel = min(len(dest_names), max(1, len(dest_names)))
+    # v0.13.x: destination_workers caps the pool. 0 (default) means
+    # "no cap" - one worker per destination, today's behavior. A
+    # positive value (e.g. 1) serialises destinations.
+    max_parallel = len(dest_names)
+    if destination_workers > 0:
+        max_parallel = min(max_parallel, destination_workers)
+    max_parallel = max(1, max_parallel)
     try:
         with ThreadPoolExecutor(
             max_workers=max_parallel,
@@ -387,6 +393,19 @@ def run_fan_out_restore(
     # v0.13.x: per-destination safety-belt settings. See
     # run_fan_out_direct for the contract.
     pre_replace_settings: Optional[Dict[str, Any]] = None,
+    # v0.13.x: library-level concurrency forwarded into each
+    # destination's own run_restore. The two axes are independent:
+    # destination_workers caps how many destinations run at once;
+    # library_workers caps how many libraries each destination
+    # processes in parallel.
+    library_workers: int = 3,
+    # v0.13.x: cap on the per-destination thread pool. ``0`` (default)
+    # means no cap - one worker per destination, current behavior.
+    # ``1`` serialises destinations.
+    destination_workers: int = 0,
+    # v0.14 — per-job user filter. Forwarded verbatim to each
+    # destination's _run_one_import_destination.
+    user_filter: Optional[List[str]] = None,
 ) -> FanOutResult:
     """
     Run one import job that loads the same ``input_files`` into each
@@ -412,7 +431,12 @@ def run_fan_out_restore(
         ))
     _set_active_result(result)
 
-    max_parallel = min(len(dest_names), max(1, len(dest_names)))
+    # v0.13.x: destination_workers caps the pool. See run_fan_out_direct
+    # above for the contract.
+    max_parallel = len(dest_names)
+    if destination_workers > 0:
+        max_parallel = min(max_parallel, destination_workers)
+    max_parallel = max(1, max_parallel)
     try:
         with ThreadPoolExecutor(
             max_workers=max_parallel,
@@ -446,6 +470,8 @@ def run_fan_out_restore(
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
                     pre_replace_settings=pre_replace_settings,
+                    library_workers=library_workers,
+                    user_filter=user_filter,
                 ))
             for _ in as_completed(futs):
                 pass
@@ -500,6 +526,10 @@ def _run_one_direct_destination(
     # which is correct for mode=="merge" OR auto_capture_before_replace
     # set to False at the caller level.
     pre_replace_settings: Optional[Dict[str, Any]] = None,
+    # v0.13.x: forwarded into the destination's own engine call. Per-
+    # destination library concurrency is independent of fan-out's
+    # destination concurrency.
+    library_workers: int = 3,
 ) -> None:
     """
     Execute one destination of a fan-out direct transfer.
@@ -671,6 +701,11 @@ def _run_one_import_destination(
     merge_watch_strategy: str = "higher",
     # v0.13.x: see _run_one_direct_destination for the contract.
     pre_replace_settings: Optional[Dict[str, Any]] = None,
+    # v0.14 — per-job user filter. Each destination applies the same
+    # operator-selected user list; the restore engine drops payload
+    # users not on this destination automatically (no user lookup),
+    # so a destination missing a user just no-ops for that user.
+    user_filter: Optional[List[str]] = None,
 ) -> None:
     """
     Execute one destination of a fan-out import. Mirrors
@@ -774,6 +809,8 @@ def _run_one_import_destination(
             include_collections=include_collections,
             mode=mode,
             merge_watch_strategy=merge_watch_strategy,
+            library_workers=library_workers,
+            user_filter=user_filter,
         )
 
         # Per-destination handler-close suppressed - see note in

@@ -40,7 +40,17 @@ from services.state import VERSION, PLEX_PORT, console
 
 @dataclass
 class ActivityEntry:
-    """One entry in the live activity feed (last 8 significant events).
+    """One entry in the live activity feed.
+
+    The deque holding these entries is sized to keep enough history
+    for the operator to scroll through a full snapshot run's events
+    (see ``DashboardState.__init__`` for the maxlen). Pre-v0.14 the
+    cap was 8 — only the most recent events stayed visible — which
+    matched the dashboard's old 8-line text widget but lost detail on
+    longer runs. The frontend's ``.feed`` panel already caps its
+    rendered height at 240px with ``overflow-y: auto``, so a larger
+    backend buffer translates directly into scrollable history without
+    growing the dashboard window.
 
     ``server_name`` was added in PR-2 / Phase C (ex-Phase A activity-feed
     scoping) to support filtering out entries that belong to servers
@@ -193,7 +203,17 @@ class DashboardState:
         self._lock = threading.Lock()
         self.libraries: Dict[str, LibraryProgress] = {}
         self._lib_order: List[str] = []
-        self.activity: Deque[ActivityEntry] = deque(maxlen=8)
+        # v0.14 — keep enough activity history for the operator to
+        # scroll through a full run's events. Pre-v0.14 this was
+        # ``maxlen=8`` which matched the CLI's 8-line activity widget
+        # but lost detail on longer runs. The web UI's ``.feed`` panel
+        # caps its rendered height at 240px with overflow-y: auto, so
+        # a larger backend buffer translates into scrollable history
+        # without growing the dashboard window. 200 covers a typical
+        # multi-library snapshot (started + 4 phase + done per library
+        # × 20+ libraries) with headroom; the WS payload size remains
+        # tiny (each entry is a handful of short strings).
+        self.activity: Deque[ActivityEntry] = deque(maxlen=200)
         self.completed = 0
         self.skipped = 0
         self.failed = 0

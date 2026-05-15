@@ -175,7 +175,12 @@ export interface JobPayload {
   mode: 'snapshot' | 'restore' | 'direct';
   // 'stopping' (v0.9.3) is the intermediate state between user click
   // and engine return - see server/jobs.py :: STATE_STOPPING.
-  state: 'idle' | 'queued' | 'running' | 'stopping' | 'completed' | 'failed' | 'cancelled';
+  // 'completed_with_errors' (v0.13.x) is the partial-success outcome:
+  // the engine work succeeded (primary data is in media.db, the
+  // migration ran end-to-end) but a non-fatal post-engine step (e.g.
+  // snapshot artifact capture) failed. ``error`` carries the message;
+  // re-running is safe. Surface this as amber/yellow in the UI.
+  state: 'idle' | 'queued' | 'running' | 'stopping' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled';
   queued_at: number;
   started_at: number | null;
   finished_at: number | null;
@@ -363,6 +368,22 @@ export interface SettingsView {
     // current + stored. Operator opt-in. Ignored when mode=='replace'.
     merge_watch_strategy?: 'higher' | 'sum';
   };
+  // v0.13.x: library-level concurrency cap for file-mediated restore.
+  // Replaces the legacy hardcoded ``min(3, libraries)``. Default 3
+  // preserves today's behavior; operators that see Plex 429s during
+  // multi-library restores lower this (1 = serial). Direct transfer
+  // is still serial in this release - this knob does not apply there.
+  restore_library_workers?: number;
+  // v0.13.x: per-fan-out destination concurrency cap. 0 (default)
+  // means no cap — one thread per destination, today's behavior. A
+  // positive integer caps the destination pool. Independent of
+  // restore_library_workers (the two axes are orthogonal).
+  fan_out_destination_workers?: number;
+  // v0.13.x: library-level concurrency cap for snapshot. 0 (default)
+  // inherits ``workers`` (today's coupled behavior — preserved on
+  // upgrade); a positive value caps libraries-in-parallel without
+  // affecting the per-library HTTP worker count.
+  snapshot_library_workers?: number;
 }
 
 // Rule 2: walk + prune types.
@@ -593,6 +614,10 @@ export interface Schedule {
   skip_playlist_prebuild?: boolean;
   fast_collection_detection?: boolean;
   watch_ratings_filter_strategy?: 'smart' | 'force_bulk' | 'force_server_side' | '';
+  // v0.14 — per-schedule user filter. List of Plex identifiers (owner
+  // email + managed usernames). null / undefined = capture every user
+  // the source server reports.
+  user_filter?: string[] | null;
 }
 
 export interface LogRun {
@@ -1266,6 +1291,12 @@ export const api = {
   // call to systemAccounts() - one round-trip per visit, no caching.
   listServerUsers: (id: string) =>
     http<ServerUsersResponse>(`/api/servers/${encodeURIComponent(id)}/users`),
+  // v0.14 — list users captured inside a snapshot .db. Reads the
+  // snapshot_users table. Returns the same ServerUser shape so the
+  // Restore form can intersect snapshot users with destination users
+  // by ``plex_id`` (managed) and ``kind === "owner"`` (owner).
+  listSnapshotUsers: (snapshotId: string) =>
+    http<ServerUsersResponse>(`/api/snapshots/${encodeURIComponent(snapshotId)}/users`),
   // Set or clear one entry in a server's user_display_names map.
   // Empty display_name clears the mapping (UI falls back to raw id).
   setUserDisplayName: (id: string, plex_id: string, display_name: string) =>

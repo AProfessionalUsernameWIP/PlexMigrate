@@ -242,6 +242,37 @@ def _add_to_collection_chunked(collection: Any, items: List[Any]) -> None:
         collection.addItems(items[start:start + _PLAYLIST_CHUNK_SIZE])
 
 
+# ── Restoration math (pure helpers - v0.13.x) ────────────────────────────────
+
+def _compute_merge_views_to_add(
+    *, stored: int, current: int, strategy: str,
+) -> int:
+    """
+    Merge-mode watch-count math. Returns how many scrobble calls the
+    engine should fire against a single item to apply Merge semantics.
+
+    Two strategies:
+      * ``"higher"`` (default, legacy) - bring destination up to
+        ``max(stored, current)``. Idempotent across re-runs: a second
+        run with the same snapshot adds zero (because current already
+        equals or exceeds stored). Computed as ``max(0, stored - current)``.
+      * ``"sum"`` - add stored on top of current; destination ends at
+        ``current + stored``. NOT idempotent: re-running the same
+        snapshot doubles the destination count. Operator opt-in for
+        cases where the snapshot represents real plays on a different
+        server that should contribute alongside, not replace.
+
+    Both strategies still satisfy the "Merge never reduces a count"
+    contract; they differ only in the upper bound. The Replace branch
+    does its own math and does NOT call this helper - Replace is an
+    overwrite, not a merge.
+    """
+    if strategy == "sum":
+        return max(0, stored)
+    # Default / "higher".
+    return max(0, stored - current)
+
+
 # ── Direct HTTP Write Helpers ─────────────────────────────────────────────────
 
 def _scrobble(base_url: str, rating_key: int, token: str) -> None:
@@ -516,18 +547,15 @@ def restore_watch_history(
                 views_to_add = max(0, stored_view_count - current_view_count)
                 set_offset_unconditionally = True
             else:
-                # Merge mode. Two sub-strategies select what "additive"
-                # means for the view count itself:
-                #   higher: bring destination up to max(stored, current) -
-                #           idempotent re-runs, the legacy default.
-                #   sum:    add the snapshot's count on top of current -
-                #           treats every captured play as a real event.
-                # Both still satisfy the "Merge never reduces a count"
-                # contract; the difference is only the upper bound.
-                if merge_watch_strategy == "sum":
-                    views_to_add = stored_view_count
-                else:
-                    views_to_add = max(0, stored_view_count - current_view_count)
+                # Merge mode. The strategy decision (higher vs sum) is
+                # in _compute_merge_views_to_add so the policy is unit-
+                # testable in isolation from the HTTP / dashboard /
+                # threading machinery wrapped around this call.
+                views_to_add = _compute_merge_views_to_add(
+                    stored=stored_view_count,
+                    current=current_view_count,
+                    strategy=merge_watch_strategy,
+                )
                 set_offset_unconditionally = False
 
             if views_to_add == 0:
@@ -1559,6 +1587,12 @@ def restore_export_file(
     # destination ends at current + stored. Ignored when mode=="replace"
     # since Replace overwrites unconditionally. See restore_watch_history.
     merge_watch_strategy: str = "higher",
+    # v0.14 — per-job user filter. None = import every user the
+    # payload carries that also exists on the destination (historical
+    # default). When supplied (set of Plex identifiers — owner email
+    # + managed usernames), the importer drops payload users whose
+    # handle isn't in the set BEFORE running their per-user restore.
+    user_filter: Optional[List[str]] = None,
 ) -> None:
     """
     Imports a single .plexexport.json file into the target server.
@@ -1805,6 +1839,22 @@ def restore_export_file(
         and isinstance(ub, dict)
         and ub.get("role") != "owner"
     }
+    # v0.14 — per-job user filter. When the operator picked a subset
+    # of users on the Restore form, drop everyone else here BEFORE the
+    # per-user fan-out. The owner row was already handled by the role
+    # lookup above; the matching filter for owner is the email
+    # check in run_restore (managed_filter setup) — at this point the
+    # filter list only matters for managed users.
+    if user_filter is not None:
+        filter_set = {str(s).strip() for s in user_filter if str(s).strip()}
+        before = len(users_data)
+        users_data = {h: ub for h, ub in users_data.items() if h in filter_set}
+        if before != len(users_data):
+            logger.info(
+                "[%s] user_filter applied: %d managed user(s) in payload → %d "
+                "selected for restore",
+                lib_name, before, len(users_data),
+            )
     if users_data and not home_users:
         logger.info(
             f"Export contains data for {len(users_data)} home user(s), but no "
@@ -1970,6 +2020,20 @@ def run_restore(
     # restore_export_file → restore_watch_history. Ignored when
     # mode == "replace".
     merge_watch_strategy: str = "higher",
+    # v0.14 — per-job user filter (intersection of snapshot users and
+    # destination users). None = restore every user from the payload
+    # that also exists on the destination (historical default). When
+    # supplied, only Plex identifiers (owner email + managed
+    # usernames) in this list survive. Read at the per-user iteration
+    # boundary in restore_library; users not in the list are skipped
+    # silently with an info log.
+    user_filter: Optional[List[str]] = None,
+    # v0.13.x: library-level concurrency cap. Was a hardcoded
+    # ``min(3, len)``; now operator-tunable via settings. The final
+    # pool size is ``min(library_workers, len(libraries))`` so the
+    # tunable is a ceiling, never a floor. Lower when Plex rate-limits
+    # multi-library bursts during a restore.
+    library_workers: int = 3,
 ) -> None:
     """
     Runs the full import pipeline for all selected export files.
@@ -2268,7 +2332,11 @@ def run_restore(
                 f"{missing}"
             )
 
-    n_lib_workers = min(3, len(readable_tasks))
+    # v0.13.x: library-level concurrency is operator-tunable via the
+    # ``restore_library_workers`` setting. Clamped at 1 (a 0/negative
+    # value would silently disable the pool) and capped at the actual
+    # library count so a high setting doesn't spawn idle workers.
+    n_lib_workers = max(1, min(int(library_workers), len(readable_tasks)))
 
     # Stop coordination - hoisted before the if/else so both branches share
     # one event. _keyboard_thread in CLI mode reads [Q]; the server-mode
@@ -2302,6 +2370,7 @@ def run_restore(
                 section_override,
                 mode,
                 merge_watch_strategy,
+                user_filter,
             )
             fmap[fut] = lib_names[task]
         return fmap

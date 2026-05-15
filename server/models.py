@@ -328,6 +328,50 @@ class SettingsIn(BaseModel):
             "stall thresholds. Clamped to [0.5, 2.0]. Default 1.0."
         ),
     )
+    # v0.13.x: library-level concurrency cap on the file-mediated restore
+    # path. Replaces a hardcoded ``min(3, libraries)``. Operators that
+    # see Plex 429s during multi-library restores lower this; operators
+    # with idle destinations and plenty of headroom can raise it. The
+    # ``min(value, library_count)`` clamp still applies so setting this
+    # above the actual library count has no effect beyond capping at
+    # the count. Direct transfer is still serial in this release.
+    restore_library_workers: Optional[int] = Field(
+        default=None, ge=1, le=16,
+        description=(
+            "Max libraries processed in parallel during a file-mediated "
+            "restore. Default 3 preserves today's behavior; lower it (e.g. "
+            "to 1) when Plex rate-limits the multi-library API bursts."
+        ),
+    )
+    # v0.13.x: same decoupling story as restore_library_workers, but for
+    # snapshot. Snapshot today reuses the ``workers`` field as the
+    # library-level pool size, so the two concurrency axes are
+    # entangled. ``0`` inherits from ``workers`` (today's behavior);
+    # any positive value caps libraries-in-parallel separately.
+    snapshot_library_workers: Optional[int] = Field(
+        default=None, ge=0, le=16,
+        description=(
+            "Max libraries snapshotted in parallel. 0 (default) = inherit "
+            "from Worker threads, which preserves today's behavior. A "
+            "positive value caps libraries-in-parallel independently of "
+            "the per-library HTTP worker count."
+        ),
+    )
+    # v0.13.x: per-fan-out destination concurrency cap. ``0`` (default)
+    # means no cap - every destination runs in its own thread, matching
+    # today's behavior. A positive integer caps the destination pool.
+    # Independent of restore_library_workers: each destination still
+    # uses its own within-job library concurrency separately.
+    fan_out_destination_workers: Optional[int] = Field(
+        default=None, ge=0, le=32,
+        description=(
+            "Max fan-out destinations processed in parallel. 0 (default) "
+            "= no cap (current behavior - one thread per destination). "
+            "Set to 1 to serialise destinations one at a time, useful "
+            "when all destinations share a network bottleneck or the "
+            "source Plex is the constraint."
+        ),
+    )
 
 
 # ── Job requests ─────────────────────────────────────────────────────────────
@@ -425,6 +469,23 @@ class SnapshotJobIn(BaseModel):
             "One of: \"smart\", \"force_bulk\", \"force_server_side\". "
             "None inherits from the per-server override or the global "
             "default on Settings ▸ Run Defaults."
+        ),
+    )
+    # Per-job user filter — mirrors DirectTransferIn.user_filter so the
+    # operator can scope a snapshot to a subset of the source server's
+    # users (owner + managed). Matching is by raw Plex identifier
+    # (email for owner, username for managed). ``None`` (or omitted)
+    # means "include every user the source server reports" — the
+    # historical default. Empty list ``[]`` excludes ALL users and is
+    # honoured as such (rare but legal). When the list contains the
+    # owner email, owner-level data is captured; otherwise the snapshot
+    # captures only managed-user data for the listed names.
+    user_filter: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "List of Plex identifiers (owner email + managed usernames) "
+            "whose data the snapshot should capture. None = include all "
+            "users the source server reports."
         ),
     )
 
@@ -592,6 +653,22 @@ class RestoreJobIn(BaseModel):
             "Merge-mode watch-count math. 'higher' (default) keeps the "
             "larger of stored/current; 'sum' adds stored on top of "
             "current. Ignored when mode == 'replace'."
+        ),
+    )
+    # Per-job user filter — mirrors the snapshot + direct-transfer
+    # fields. Matching is by raw Plex identifier (email for owner,
+    # username for managed). The list is the OPERATOR'S explicit
+    # selection from the intersection of (users present in the
+    # snapshot payload) and (users present on the destination server).
+    # ``None`` = include every user the payload carries that ALSO has
+    # a matching account on the destination. Users in the payload but
+    # not on the destination are skipped server-side regardless of
+    # this list (no destination user = nothing to restore to).
+    user_filter: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "List of Plex identifiers to restore. None = restore every "
+            "user from the payload that also exists on the destination."
         ),
     )
 
@@ -787,6 +864,16 @@ class ScheduleIn(BaseModel):
             "Per-schedule owner-phase watch+ratings strategy override. "
             "One of \"smart\", \"force_bulk\", \"force_server_side\". "
             "None or empty string = inherit per-server or global default."
+        ),
+    )
+    # Per-schedule user filter — same semantics as SnapshotJobIn.user_filter.
+    # Set when the operator wants the schedule to capture only a
+    # subset of the source server's users. None = include all.
+    user_filter: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "List of Plex identifiers to include. None = capture every "
+            "user the source server reports."
         ),
     )
 

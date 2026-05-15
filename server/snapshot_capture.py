@@ -440,7 +440,14 @@ def _write_snapshot_meta(
             json.dumps(libraries), json.dumps(metrics), created_by,
         ),
     )
-    dst.commit()
+    # No commit here: this function is called from two paths, and the
+    # ``build_snapshot_db_from_payloads`` path wraps every row-write in
+    # one explicit BEGIN/COMMIT. A mid-flight ``dst.commit()`` would
+    # close that outer transaction early, leaving the explicit COMMIT
+    # at the end of the caller to fail with "cannot commit - no
+    # transaction is active." The legacy ``create_snapshot_db`` path
+    # opens its connection in autocommit (isolation_level=None) so the
+    # INSERTs above are already individually committed.
 
 
 def _write_snapshot_users(
@@ -474,7 +481,10 @@ def _write_snapshot_users(
 
     if not populated_tables:
         # Nothing to derive from - leave snapshot_users empty.
-        dst.commit()
+        # No explicit commit: same rationale as _write_snapshot_meta -
+        # the autocommit caller has nothing to flush, and the
+        # transaction caller would have its outer COMMIT broken by a
+        # mid-flight commit here.
         return
 
     # UNION across only the populated tables. Empty strings (owner)
@@ -501,7 +511,7 @@ def _write_snapshot_users(
             """,
             (handle, display, is_owner),
         )
-    dst.commit()
+    # No commit here: see _write_snapshot_meta for the contract.
 
 
 # ── Summary helper for the registry row ─────────────────────────────────────
@@ -1057,7 +1067,25 @@ def build_snapshot_db_from_payloads(
     # a no-op in autocommit mode (every prior statement already committed
     # individually) - the explicit COMMIT is what flushes the WAL once
     # for the whole row-write phase.
-    dst_conn.execute("COMMIT")
+    #
+    # Defensive: only issue COMMIT when a transaction is actually open.
+    # If anything mid-flight ran a DDL or called .commit() internally,
+    # the transaction may have closed early. Issuing COMMIT against an
+    # autocommit connection raises ``OperationalError: cannot commit -
+    # no transaction is active`` and the prior writes would be lost to
+    # the operator behind a confusing error. The right writers are
+    # commit-free (see _write_snapshot_meta / _write_snapshot_users)
+    # but this guard makes a future regression visible as a warning
+    # instead of a hard fail.
+    if dst_conn.in_transaction:
+        dst_conn.execute("COMMIT")
+    else:
+        log.warning(
+            "snapshot .db write completed without an active transaction - "
+            "an intermediate writer closed the BEGIN block early. Rows were "
+            "still written (autocommit fallback) but the WAL fsync didn't "
+            "happen as one batch."
+        )
     dst_conn.close()
 
     counters["file_size"] = int(snapshot_path.stat().st_size)

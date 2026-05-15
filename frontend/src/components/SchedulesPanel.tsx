@@ -7,7 +7,7 @@
 // is wired correctly.
 
 import { useEffect, useState } from 'react';
-import { api, LibraryDescriptor, Schedule, ServerTime, ServerView } from '../api';
+import { api, LibraryDescriptor, Schedule, ServerTime, ServerUser, ServerView } from '../api';
 import { usePermission } from '../hooks/usePermission';
 import { serverSupportsFastCollections } from '../utils/plexVersion';
 
@@ -201,6 +201,57 @@ function ScheduleEditor(props: {
   const [perRunOpen, setPerRunOpen] = useState(false);
   const [perRunSubTab, setPerRunSubTab] = useState<'general' | 'advanced'>('general');
 
+  // v0.14 — Source server user list for the per-schedule user picker.
+  // Refetched whenever the schedule's source_server_name changes;
+  // ``null`` while loading, ``[]`` if the fetch failed or the server
+  // has no users to report.
+  const [sourceUsers, setSourceUsers] = useState<ServerUser[] | null>(null);
+  useEffect(() => {
+    if (!schedule.source_server_name) {
+      setSourceUsers(null);
+      return;
+    }
+    const src = servers.find((s) => s.name === schedule.source_server_name);
+    if (!src) {
+      setSourceUsers(null);
+      return;
+    }
+    let cancelled = false;
+    api.listServerUsers(src.id)
+      .then((r) => {
+        if (cancelled) return;
+        setSourceUsers(r.users || []);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSourceUsers([]);
+      });
+    return () => { cancelled = true; };
+  }, [schedule.source_server_name, servers]);
+
+  // Set of selected user plex_ids. Default to "all selected" once the
+  // user list arrives so the operator only ever needs to UNcheck to
+  // exclude. ``null`` user_filter on the schedule row means "all" too.
+  const selectedUsers = new Set<string>(
+    Array.isArray(schedule.user_filter) ? schedule.user_filter : (sourceUsers || []).map((u) => u.plex_id),
+  );
+  const toggleUser = (plex_id: string) => {
+    const next = new Set(selectedUsers);
+    if (next.has(plex_id)) next.delete(plex_id);
+    else next.add(plex_id);
+    set('user_filter', Array.from(next));
+  };
+  const selectAllUsers = () => {
+    set('user_filter', (sourceUsers || []).map((u) => u.plex_id));
+  };
+  const clearAllUsers = () => {
+    set('user_filter', []);
+  };
+  const resetUsersToAll = () => {
+    // null means "all" — clears any saved subset.
+    set('user_filter', null);
+  };
+
   // v0.14 — Fast Collection Detection version gating. When the
   // schedule's source server is at Plex ≥ 1.32, default the toggle
   // ON; below 1.32 (or unknown version) force it OFF and disable
@@ -393,6 +444,67 @@ function ScheduleEditor(props: {
             </span>
           </span>
         </label>
+      </fieldset>
+
+      {/* v0.14 — Per-schedule user filter. Mirrors the Run-Job
+          form's user picker but is simpler (no destination side):
+          when set, every scheduled fire captures only the listed
+          users; when ``null`` the schedule captures every user the
+          source server reports (historical default). */}
+      <fieldset className="field" style={{ borderRadius: 8, padding: '10px 12px', margin: '12px 0 0' }}>
+        <legend style={{ padding: '0 6px', fontWeight: 600 }}>Users</legend>
+        <span className="help" style={{ marginTop: 0 }}>
+          Pick which users' data this schedule captures. Leave at "all" (default) and the
+          schedule captures everyone the source server reports at fire time. Owner row is
+          checkable too — unchecking it skips owner-level (library-wide) data.
+        </span>
+        {!schedule.source_server_name ? (
+          <div className="empty" style={{ fontSize: 12 }}>Pick a source server above to load its users.</div>
+        ) : sourceUsers === null ? (
+          <div className="empty" style={{ fontSize: 12 }}>Loading users…</div>
+        ) : sourceUsers.length === 0 ? (
+          <div className="empty" style={{ fontSize: 12 }}>No users reported by this server.</div>
+        ) : (
+          <>
+            <div className="row-buttons" style={{ marginBottom: 6 }}>
+              <button type="button" onClick={selectAllUsers}>All</button>
+              <button type="button" onClick={clearAllUsers}>None</button>
+              <button
+                type="button"
+                onClick={resetUsersToAll}
+                disabled={!Array.isArray(schedule.user_filter)}
+                title="Clear the explicit list and let this schedule capture every user the source server reports at each fire time."
+              >
+                Reset to all (auto)
+              </button>
+              {Array.isArray(schedule.user_filter) && (
+                <span className="tag" style={{ marginLeft: 6, fontSize: 10 }}>
+                  custom ({schedule.user_filter.length}/{sourceUsers.length})
+                </span>
+              )}
+            </div>
+            <div className="checkbox-grid">
+              {sourceUsers.map((u) => (
+                <label key={u.plex_id} className="switch">
+                  <input
+                    type="checkbox"
+                    checked={selectedUsers.has(u.plex_id)}
+                    onChange={() => toggleUser(u.plex_id)}
+                  />
+                  <span>
+                    <strong>{u.display_name || u.raw_name}</strong>{' '}
+                    <span
+                      className={`tag ${u.kind === 'owner' ? 'started' : 'phase'}`}
+                      style={{ fontSize: 10, marginLeft: 4 }}
+                    >
+                      {u.kind === 'owner' ? 'Owner' : 'Managed'}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </>
+        )}
       </fieldset>
 
       {/* v0.14 — Per-Run Settings on schedules. Mirrors the Run-Job

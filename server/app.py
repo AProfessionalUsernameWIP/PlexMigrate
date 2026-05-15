@@ -1445,6 +1445,85 @@ def _register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail=str(e))
         return {"deleted": file_name}
 
+    @app.get("/api/snapshots/{snapshot_id}/users")
+    def list_snapshot_users(snapshot_id: str) -> Dict[str, Any]:
+        """
+        Return the user list captured inside a snapshot ``.db`` file.
+
+        Reads the ``snapshot_users`` table from the .db at the registry
+        row's ``file_path``. Each row is shaped to mirror the
+        ``ServerUser`` payload the destination's ``/api/servers/{id}/users``
+        endpoint returns so the frontend can intersect both lists without
+        a translation step:
+
+            { "users": [ { "kind", "plex_id", "raw_name", "display_name" }, ... ] }
+
+        ``kind`` is derived from the table's ``is_owner`` flag.
+        ``plex_id`` mirrors ``user_handle`` (the canonical join key —
+        owner email for owner rows, managed-user username for the
+        rest). The Restore form uses this to render the intersection
+        picker (snapshot ∩ destination) with a "no destination user"
+        badge for rows that only exist on one side.
+
+        Returns 404 / 410 for missing row / missing .db file (same
+        contract as the download endpoints below) and 500 with a
+        sanitised detail on any other failure.
+        """
+        try:
+            from server import snapshot_registry
+            row = snapshot_registry.get(snapshot_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"No snapshot with id {snapshot_id!r}")
+            db_path = Path(row.get("file_path") or "")
+            if not db_path.is_file():
+                raise HTTPException(
+                    status_code=410,
+                    detail=(
+                        "Snapshot .db is missing on disk. The registry row "
+                        "still exists but the file behind it cannot be found."
+                    ),
+                )
+            import sqlite3
+            uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                try:
+                    rows = conn.execute(
+                        "SELECT user_handle, display_name, is_owner "
+                        "FROM snapshot_users ORDER BY is_owner DESC, user_handle ASC"
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    # Older snapshot files (pre-snapshot_users) — no
+                    # table to read. Return an empty list rather than
+                    # raise; the UI handles the empty case as
+                    # "user filter unavailable for this snapshot."
+                    rows = []
+            finally:
+                conn.close()
+            users: List[Dict[str, Any]] = []
+            for r in rows:
+                handle = str(r["user_handle"] or "")
+                display = str(r["display_name"] or "")
+                is_owner = bool(r["is_owner"])
+                users.append({
+                    "kind": "owner" if is_owner else "managed",
+                    "plex_id": handle,
+                    "raw_name": handle,
+                    "display_name": display or handle,
+                })
+            return {"users": users, "error": None}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logging.getLogger("plexmigrate.server.jobs").exception(
+                "list_snapshot_users failed for %r", snapshot_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Could not read snapshot users — see the run log for details.",
+            )
+
     @app.get("/api/snapshots/{snapshot_id}/download-db")
     def download_snapshot_db(snapshot_id: str) -> FileResponse:
         """

@@ -440,6 +440,31 @@ export function JobFormPanel({ snapshot }: Props) {
     setDestUsers(null);
     setIncludedUsers(new Set());
     setUsersError(null);
+    // v0.14 — Snapshot mode loads ONLY the source server's users
+    // (no intersection needed; snapshot is one-way capture). We treat
+    // ``destUsers`` as a mirror of ``sourceUsers`` so the shared
+    // ``DirectUsersPanel`` renders the source list as "transferable"
+    // (no greyed-out rows). Default-include everyone.
+    if (mode === 'snapshot') {
+      if (!sourceServerName) return;
+      const src = servers.find((s) => s.name === sourceServerName);
+      if (!src) return;
+      let cancelled = false;
+      fetchPickerUsers(src.id)
+        .then((srcList) => {
+          if (cancelled) return;
+          setSourceUsers(srcList);
+          setDestUsers(srcList);   // mirror so intersection = full list
+          setIncludedUsers(new Set(srcList.map((u) => u.plex_id)));
+        })
+        .catch((e) => {
+          if (cancelled) return;
+          setUsersError(`source: ${String(e)}`);
+          setSourceUsers([]);
+          setDestUsers([]);
+        });
+      return () => { cancelled = true; };
+    }
     if (mode !== 'direct') return;
     if (!sourceServerName || destServerNames.size === 0) return;
     if (destServerNames.has(sourceServerName)) return;
@@ -495,6 +520,88 @@ export function JobFormPanel({ snapshot }: Props) {
     return () => { cancelled = true; };
   }, [mode, sourceServerName, destNamesKey, servers]);
 
+  // v0.14 — Restore mode user picker. Loads the snapshot's user list
+  // (from snapshot_users in the .db) plus every destination's user
+  // list, intersects them, and exposes the result through the same
+  // ``sourceUsers`` / ``destUsers`` state the rest of the form reads.
+  //
+  // Owner-row normalisation: the snapshot stores the owner with
+  // ``plex_id = ""`` (it never knew the destination's owner email at
+  // capture time). The destination stores the owner with
+  // ``plex_id = <owner_email>``. To make ``DirectUsersPanel``'s
+  // plex_id-keyed intersection work, we rewrite the snapshot's owner
+  // row to carry the FIRST destination's owner email before storing.
+  // Multi-destination fan-out where destinations have different owner
+  // emails is rare in practice (most operators run the same Plex
+  // account across servers); the user-filter resolution catches a
+  // mismatch by simply excluding owner from that destination.
+  //
+  // Only fires when restoring from a registered snapshot. File-based
+  // restore (loose .plexexport.json picks) doesn't get a user picker
+  // — the file would need to be parsed; we treat that as a future
+  // refinement and leave the filter empty (= all users).
+  useEffect(() => {
+    if (mode !== 'restore') return;
+    if (restoreSource !== 'snapshot') return;
+    if (!selectedSnapshotId) return;
+    if (destServerNames.size === 0) return;
+    const dsts = Array.from(destServerNames)
+      .map((n) => servers.find((s) => s.name === n))
+      .filter((s): s is ServerView => !!s);
+    if (dsts.length === 0) return;
+    let cancelled = false;
+    // Snapshot users + destination users have DIFFERENT response
+    // shapes (snapshot returns the wrapped ``{users, error}``;
+    // ``fetchPickerUsers`` already unwraps to ServerUser[]), so we
+    // run them as two separate Promise.allSettled groups to keep the
+    // result types straight.
+    const snapPromise = Promise.allSettled([api.listSnapshotUsers(selectedSnapshotId)]);
+    const destPromise = Promise.allSettled(dsts.map((d) => fetchPickerUsers(d.id)));
+    Promise.all([snapPromise, destPromise]).then(([snapRs, destResults]) => {
+      if (cancelled) return;
+      const snapRes = snapRs[0];
+      const snapUsers = (snapRes.status === 'fulfilled' && snapRes.value && Array.isArray(snapRes.value.users))
+        ? snapRes.value.users
+        : [];
+      const perDestLists: ServerUser[][] = destResults.map((r) =>
+        r.status === 'fulfilled' ? r.value : []
+      );
+      let destIntersection: ServerUser[] = perDestLists[0] ?? [];
+      for (let i = 1; i < perDestLists.length; i += 1) {
+        const ids = new Set(perDestLists[i].map((u) => u.plex_id));
+        destIntersection = destIntersection.filter((u) => ids.has(u.plex_id));
+      }
+      // Owner normalisation: rewrite the snapshot's owner row
+      // (plex_id="") to carry the first destination's owner email so
+      // the intersection by plex_id picks owner up correctly.
+      const firstDestOwner = (perDestLists[0] || []).find((u) => u.kind === 'owner');
+      const normalisedSnapUsers: ServerUser[] = snapUsers.map((u) => {
+        if (u.kind === 'owner' && firstDestOwner) {
+          return { ...u, plex_id: firstDestOwner.plex_id };
+        }
+        return u;
+      });
+      setSourceUsers(normalisedSnapUsers);
+      setDestUsers(destIntersection);
+      const dstIds = new Set(destIntersection.map((u) => u.plex_id));
+      const intersection = normalisedSnapUsers
+        .filter((u) => dstIds.has(u.plex_id))
+        .map((u) => u.plex_id);
+      setIncludedUsers(new Set(intersection));
+      const errors: string[] = [];
+      if (snapRes.status !== 'fulfilled') {
+        errors.push(`snapshot users: ${String((snapRes as PromiseRejectedResult).reason)}`);
+      }
+      destResults.forEach((r, i) => {
+        if (r.status !== 'fulfilled') {
+          errors.push(`${dsts[i].name}: ${String((r as PromiseRejectedResult).reason)}`);
+        }
+      });
+      if (errors.length) setUsersError(errors.join(' · '));
+    });
+    return () => { cancelled = true; };
+  }, [mode, restoreSource, selectedSnapshotId, destNamesKey, servers]);
+
   const jobRunning = !!snapshot?.job && snapshot.job.state === 'running';
 
   // ── Submit handler ────────────────────────────────────────────────
@@ -547,6 +654,17 @@ export function JobFormPanel({ snapshot }: Props) {
         // chain). Empty string means "inherit" → omit field so backend
         // falls through to per-server / global / default.
         if (watchRatingsStrategy) payload.watch_ratings_filter_strategy = watchRatingsStrategy;
+        // v0.14 — per-snapshot user filter. Send the explicit list
+        // when the operator has picked a subset; omit entirely when
+        // every available user is checked (= historical "all users"
+        // default at the backend).
+        if (sourceUsers !== null && destUsers !== null) {
+          const dstIds = new Set(destUsers.map((u) => u.plex_id));
+          const transferable = sourceUsers.filter((u) => dstIds.has(u.plex_id));
+          if (includedUsers.size < transferable.length) {
+            payload.user_filter = Array.from(includedUsers);
+          }
+        }
         const r = await api.submitSnapshot(payload);
         setSubmitOk(`Snapshot job ${r.job_id} queued.`);
       } else if (mode === 'restore') {
@@ -573,6 +691,23 @@ export function JobFormPanel({ snapshot }: Props) {
         payload.include_ratings = includeRatings;
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
+        // v0.14 — per-restore user filter. Only applicable to the
+        // snapshot-based restore path (file-based restore doesn't
+        // surface a user picker yet — would require parsing the
+        // file). Send the explicit list when the operator picked a
+        // subset; omit entirely when every intersectable user is
+        // selected (= historical "all users" default at the backend).
+        if (
+          restoreSource === 'snapshot'
+          && sourceUsers !== null
+          && destUsers !== null
+        ) {
+          const dstIds = new Set(destUsers.map((u) => u.plex_id));
+          const transferable = sourceUsers.filter((u) => dstIds.has(u.plex_id));
+          if (includedUsers.size < transferable.length) {
+            payload.user_filter = Array.from(includedUsers);
+          }
+        }
 
         let r;
         if (restoreSource === 'snapshot') {
@@ -856,8 +991,12 @@ export function JobFormPanel({ snapshot }: Props) {
         </div>
       )}
 
-      {mode === 'direct' && sourceUsers !== null && destUsers !== null && (
+      {(mode === 'direct'
+        || mode === 'snapshot'
+        || (mode === 'restore' && restoreSource === 'snapshot')) &&
+        sourceUsers !== null && destUsers !== null && (
         <DirectUsersPanel
+          mode={mode}
           sourceUsers={sourceUsers}
           destUsers={destUsers}
           included={includedUsers}
@@ -1666,6 +1805,10 @@ function ServerPicker(props: ServerPickerProps) {
 // either side" line to make that explicit.
 
 function DirectUsersPanel(props: {
+  // v0.14 — same picker, three contexts. The mode drives copy + the
+  // "source only" panel's wording (the user picker re-uses the same
+  // intersection logic regardless of which side is source vs dest).
+  mode?: 'direct' | 'snapshot' | 'restore';
   sourceUsers: ServerUser[];
   destUsers: ServerUser[];
   included: Set<string>;
@@ -1674,7 +1817,7 @@ function DirectUsersPanel(props: {
   onNone: () => void;
   loadError: string | null;
 }) {
-  const { sourceUsers, destUsers, included, onToggle, onAll, onNone, loadError } = props;
+  const { mode = 'direct', sourceUsers, destUsers, included, onToggle, onAll, onNone, loadError } = props;
   // v0.9.7 Item 7: the owner is selectable alongside managed users.
   // Intersection is by raw identifier across both kinds; unchecking
   // the owner narrows the transfer so library-level data
@@ -1685,13 +1828,35 @@ function DirectUsersPanel(props: {
 
   const allEmpty = sourceUsers.length === 0 && destUsers.length === 0;
 
+  // Mode-driven copy. The picker logic is identical; only the
+  // operator-facing language changes.
+  const copy: { help: string; missingLabel: string; missingTitle: string } = (() => {
+    if (mode === 'snapshot') {
+      return {
+        help: "Pick which users' data the snapshot captures. The server owner's library-level data (collections + watch / playlists / ratings) is included only when the owner row is checked.",
+        missingLabel: '',
+        missingTitle: '',
+      };
+    }
+    if (mode === 'restore') {
+      return {
+        help: "Pick which users' data to restore. Users present in the snapshot but not on the destination are greyed out — invite them to Plex Home on the destination to enable restore.",
+        missingLabel: 'Not on destination',
+        missingTitle: 'No matching account on the destination server.',
+      };
+    }
+    return {
+      help: "Pick which managed users' watch history, playlists, collections, and ratings travel with this direct transfer. The server owner's data always transfers regardless of what's checked here.",
+      missingLabel: 'Not on destination server',
+      missingTitle: 'Not on destination server',
+    };
+  })();
+
   return (
     <div className="panel">
       <h2>Users</h2>
       <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
-        Pick which managed users' watch history, playlists, collections, and ratings travel
-        with this direct transfer. The server owner's data always transfers regardless of
-        what's checked here.
+        {copy.help}
       </span>
       {loadError && (
         <div className="banner error" style={{ fontSize: 12, marginBottom: 8 }}>
@@ -1748,18 +1913,24 @@ function DirectUsersPanel(props: {
               </div>
             )}
           </div>
-          {sourceOnly.length > 0 && (
+          {/* "Source only" panel renders in direct / restore modes
+              when the source carries users the destination doesn't.
+              In snapshot mode we treat ``destUsers === sourceUsers``
+              so this block stays empty by construction. */}
+          {mode !== 'snapshot' && sourceOnly.length > 0 && (
             <div style={{ marginBottom: 10 }}>
-              <strong style={{ fontSize: 13 }}>Source only ({sourceOnly.length})</strong>
+              <strong style={{ fontSize: 13 }}>
+                {mode === 'restore' ? 'Snapshot only' : 'Source only'} ({sourceOnly.length})
+              </strong>
               <div className="checkbox-grid" style={{ opacity: 0.55 }}>
                 {sourceOnly.map((u) => (
-                  <label key={u.plex_id} className="switch" title="Not on destination server">
+                  <label key={u.plex_id} className="switch" title={copy.missingTitle}>
                     <input type="checkbox" checked={false} disabled />
                     <span>
                       {/* v0.9.7 follow-up: prefer display_name same as the transferable list. */}
                       <strong>{u.display_name || u.raw_name}</strong>{' '}
                       <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-                        - Not on destination server
+                        - {copy.missingLabel}
                       </span>
                     </span>
                   </label>
@@ -1767,9 +1938,11 @@ function DirectUsersPanel(props: {
               </div>
             </div>
           )}
-          <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-dim)' }}>
-            Users not on the destination can be invited via the Servers tab.
-          </div>
+          {mode !== 'snapshot' && (
+            <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-dim)' }}>
+              Users not on the destination can be invited via the Servers tab.
+            </div>
+          )}
         </>
       )}
     </div>
