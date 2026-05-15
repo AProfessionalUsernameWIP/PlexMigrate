@@ -46,6 +46,9 @@ import { UserAccountsExplorer } from './components/UserAccountsExplorer';
 import { ServersPanel } from './components/ServersPanel';
 import { NetworkingPanel } from './components/NetworkingPanel';
 import { ServerAdvancedSettingsPanel } from './components/ServerAdvancedSettingsPanel';
+import { RunDefaultsPanel } from './components/RunDefaultsPanel';
+import { TunablesPanel } from './components/TunablesPanel';
+import { AccessControlPanel } from './components/AccessControlPanel';
 import { UserManagementPanel } from './components/UserManagementPanel';
 import { LoginPage } from './components/LoginPage';
 import { SetupPage } from './components/SetupPage';
@@ -58,7 +61,7 @@ type RunSubTab = 'run' | 'schedules';
 // Sub-tabs nested under Servers. PR-7 removed 'logs' and 'snapshots'
 // from here and moved them under Settings; PR-10 added 'users' for
 // the User Management panel (operator+ only).
-type ServersSubTab = 'servers' | 'networking' | 'users' | 'advanced';
+type ServersSubTab = 'servers' | 'networking' | 'users' | 'run_defaults' | 'advanced' | 'exports';
 // Sub-tabs nested under Account. ``account`` is every operator's own
 // self-service surface (display name, password, clock). ``account_management``
 // is admin/root_admin only and contains the Database Admin Account
@@ -70,10 +73,14 @@ type AccountSubTab = 'account' | 'account_management';
 // Sub-tabs nested under Settings. After the Account-promotion, the
 // Settings tab houses system-level operator views only: system
 // preferences, logs, exports, plus a flat Help reference page.
-type SettingsSubTab = 'settings' | 'logs' | 'exports' | 'help';
+type SettingsSubTab = 'settings' | 'tunables' | 'logs' | 'help';
 
-// Inner nav inside the Account Management sub-tab. Two pages.
-type AccountMgmtPage = 'db_admin' | 'user_accounts';
+// Inner nav inside the Account Management sub-tab. Three pages:
+//   db_admin       — Database Admin Account credential (db_admin.access)
+//   user_accounts  — User Accounts explorer (users.manage)
+//   access_control — Access Control (per-user permission grants/revokes;
+//                    root_admin only — gated by canManageAccessControl)
+type AccountMgmtPage = 'db_admin' | 'user_accounts' | 'access_control';
 
 // Connection states surfaced in the topbar dot. "connecting" is the
 // initial state before the first WS frame; the dashboard panel uses
@@ -334,6 +341,10 @@ function Main({
   const canStartJobs = usePermission('jobs.start');
   const canViewSchedules = usePermission('schedules.view');
   const canEditSettings = usePermission('settings.edit');
+  // ``settings.tunables`` is root_admin-only and gates the System
+  // Tunables sub-tab under Settings (infrastructure-level knobs that
+  // could lock users out if set wrong).
+  const canManageTunables = usePermission('settings.tunables');
   const canManageUsers = usePermission('users.manage');
   // The Database Admin Account inner page sits behind its own
   // permission so the inner-nav button hides for any role that can
@@ -346,6 +357,13 @@ function Main({
   const canAccessDbAdmin = usePermission('db_admin.access');
   const canViewLogs = usePermission('logs.view');
   const canViewExports = usePermission('exports.view');
+  // Access Control is the most sensitive admin surface in the app —
+  // it edits every other user's permission set. Gated to root_admin
+  // only at both the UI (here) and backend (require_role("root_admin")
+  // on the /api/auth/users/{u}/permissions routes). View-mode-aware:
+  // a root_admin dropped into viewer mode loses the button just like
+  // any other privileged surface.
+  const canManageAccessControl = auth.effectiveRole === 'root_admin';
 
   // PR-A5 - Switch View Mode modal visibility. Only root_admin ever
   // sees the trigger button (rendered conditionally below).
@@ -367,13 +385,17 @@ function Main({
     if (tab === 'settings' && !canSeeSettingsTab) setTab('dashboard');
   }, [tab, canStartJobs, canSeeSettingsTab]);
   // Servers sub-tab snap-back. ``users`` (User Management, PR-10) is
-  // operator+ only. If a Switch View Mode drop strands the caller on
-  // it, bounce back to the plain Servers list.
+  // operator+ only; ``exports`` is gated by canViewExports. If a
+  // Switch View Mode drop strands the caller on either, bounce back
+  // to the plain Servers list.
   useEffect(() => {
     if (tab === 'servers' && serversSubTab === 'users' && !canStartJobs) {
       setServersSubTab('servers');
     }
-  }, [tab, serversSubTab, canStartJobs]);
+    if (tab === 'servers' && serversSubTab === 'exports' && !canViewExports) {
+      setServersSubTab('servers');
+    }
+  }, [tab, serversSubTab, canStartJobs, canViewExports]);
   // Account sub-tab snap-back. Only ``account_management`` can become
   // forbidden via a Switch View Mode drop - the personal ``account``
   // page is always available to every role.
@@ -386,19 +408,21 @@ function Main({
   // current one is no longer visible (e.g. ``settings`` after a drop
   // out of canEditSettings). ``help`` is unconditional, so it's the
   // ultimate fallback when no operator surface is available.
+  // ``exports`` moved to the Servers tab in v0.13.0 and is no longer
+  // a Settings sub-tab.
   useEffect(() => {
     if (tab !== 'settings') return;
     const valid =
       (settingsSubTab === 'settings' && canEditSettings) ||
+      (settingsSubTab === 'tunables' && canManageTunables) ||
       (settingsSubTab === 'logs' && canViewLogs) ||
-      (settingsSubTab === 'exports' && canViewExports) ||
       settingsSubTab === 'help';
     if (valid) return;
     if (canEditSettings) setSettingsSubTab('settings');
+    else if (canManageTunables) setSettingsSubTab('tunables');
     else if (canViewLogs) setSettingsSubTab('logs');
-    else if (canViewExports) setSettingsSubTab('exports');
     else setSettingsSubTab('help');
-  }, [tab, settingsSubTab, canEditSettings, canViewLogs, canViewExports]);
+  }, [tab, settingsSubTab, canEditSettings, canManageTunables, canViewLogs]);
   // If the operator was viewing the Database Admin inner page and a
   // Switch View Mode drop removes ``db_admin.access``, fall back to
   // the User Accounts inner page so the surrounding nav doesn't show
@@ -413,6 +437,19 @@ function Main({
       setAccountMgmtPage('user_accounts');
     }
   }, [tab, accountSubTab, accountMgmtPage, canAccessDbAdmin]);
+  // Same snap-back for Access Control: if the operator was on this
+  // page and lost root_admin (e.g. View Mode drop), bounce them to
+  // User Accounts so the page doesn't render under the wrong identity.
+  useEffect(() => {
+    if (
+      tab === 'account' &&
+      accountSubTab === 'account_management' &&
+      accountMgmtPage === 'access_control' &&
+      !canManageAccessControl
+    ) {
+      setAccountMgmtPage('user_accounts');
+    }
+  }, [tab, accountSubTab, accountMgmtPage, canManageAccessControl]);
   // PR-8 - Dashboard multi-job sub-tab selection. ``null`` means
   // "auto-pick the running job," which is also the only sane choice
   // when there's just one job. The strip renders dynamically from
@@ -711,10 +748,27 @@ function Main({
           {canStartJobs && (
             <button className={serversSubTab === 'users' ? 'active' : ''} onClick={() => setServersSubTab('users')}>User Management</button>
           )}
+          {/* Run Defaults — moved here from Settings ▸ General Settings.
+              These are the run-level knobs (paths, performance, snapshot
+              defaults, transfer resolution, retention ceiling) that
+              describe HOW snapshots and direct transfers operate
+              against Plex. settings.edit gates write access; the panel
+              itself stays read-only without it. */}
+          {canEditSettings && (
+            <button className={serversSubTab === 'run_defaults' ? 'active' : ''} onClick={() => setServersSubTab('run_defaults')}>Run Defaults</button>
+          )}
           {/* Per-server snapshot defaults + retention overrides. Gated
               behind settings.edit since it changes engine behaviour. */}
           {canEditSettings && (
             <button className={serversSubTab === 'advanced' ? 'active' : ''} onClick={() => setServersSubTab('advanced')}>Advanced Settings</button>
+          )}
+          {/* v0.13.0: Export moved from Settings to Servers since the
+              exports list is server-scoped anyway. Same exports.view
+              permission gate; rendered last so the existing Servers
+              flow (Overview -> Networking -> Users -> Advanced) is
+              preserved at the front of the strip. */}
+          {canViewExports && (
+            <button className={serversSubTab === 'exports' ? 'active' : ''} onClick={() => setServersSubTab('exports')}>Export</button>
           )}
         </nav>
       )}
@@ -740,19 +794,25 @@ function Main({
         </nav>
       )}
 
-      {/* Settings sub-tabs filtered by role: system settings (admin+),
-          logs (operator+), exports (operator+). Help is always visible
-          since it's a reference page with no destructive controls. */}
+      {/* Settings sub-tabs filtered by role: general settings (admin+),
+          logs (operator+). Help is always visible since it's a reference
+          page with no destructive controls. v0.13.0 moved Exports to
+          the Servers tab; the "Settings" sub-tab is now labeled
+          "General Settings" to distinguish it from Servers > Advanced
+          Settings (per-server config). */}
       {tab === 'settings' && (
         <nav className="tabs sub-tabs">
           {canEditSettings && (
-            <button className={settingsSubTab === 'settings' ? 'active' : ''} onClick={() => setSettingsSubTab('settings')}>Settings</button>
+            <button className={settingsSubTab === 'settings' ? 'active' : ''} onClick={() => setSettingsSubTab('settings')}>General Settings</button>
+          )}
+          {/* System Tunables — root_admin only. Infrastructure-level
+              knobs (HTTP timeouts, JWT TTL, SQLite busy timeout, etc.)
+              that used to be hardcoded literals. */}
+          {canManageTunables && (
+            <button className={settingsSubTab === 'tunables' ? 'active' : ''} onClick={() => setSettingsSubTab('tunables')}>Tunables</button>
           )}
           {canViewLogs && (
             <button className={settingsSubTab === 'logs' ? 'active' : ''} onClick={() => setSettingsSubTab('logs')}>Logs</button>
-          )}
-          {canViewExports && (
-            <button className={settingsSubTab === 'exports' ? 'active' : ''} onClick={() => setSettingsSubTab('exports')}>Exports</button>
           )}
           <button className={settingsSubTab === 'help' ? 'active' : ''} onClick={() => setSettingsSubTab('help')}>Help</button>
         </nav>
@@ -815,7 +875,9 @@ function Main({
         {tab === 'servers' && serversSubTab === 'servers' && <ServersPanel />}
         {tab === 'servers' && serversSubTab === 'networking' && <NetworkingPanel snapshot={snapshot} />}
         {tab === 'servers' && serversSubTab === 'users' && canStartJobs && <UserManagementPanel />}
+        {tab === 'servers' && serversSubTab === 'run_defaults' && canEditSettings && <RunDefaultsPanel />}
         {tab === 'servers' && serversSubTab === 'advanced' && canEditSettings && <ServerAdvancedSettingsPanel />}
+        {tab === 'servers' && serversSubTab === 'exports' && canViewExports && <ExportsPanel />}
         {tab === 'account' && accountSubTab === 'account' && <AccountSettingsPanel />}
         {tab === 'account' && accountSubTab === 'account_management' && canManageUsers && (
           <>
@@ -839,14 +901,25 @@ function Main({
               >
                 User Accounts
               </button>
+              {/* Access Control — root_admin only. Per-user permission
+                  grant/revoke layered on top of the role baseline. */}
+              {canManageAccessControl && (
+                <button
+                  className={accountMgmtPage === 'access_control' ? 'active' : ''}
+                  onClick={() => setAccountMgmtPage('access_control')}
+                >
+                  Access Control
+                </button>
+              )}
             </nav>
             {accountMgmtPage === 'db_admin' && canAccessDbAdmin && <AccountsPanel />}
             {accountMgmtPage === 'user_accounts' && <UserAccountsExplorer />}
+            {accountMgmtPage === 'access_control' && canManageAccessControl && <AccessControlPanel />}
           </>
         )}
         {tab === 'settings' && settingsSubTab === 'settings' && canEditSettings && <SettingsPanel />}
+        {tab === 'settings' && settingsSubTab === 'tunables' && canManageTunables && <TunablesPanel />}
         {tab === 'settings' && settingsSubTab === 'logs' && canViewLogs && <LogsPanel />}
-        {tab === 'settings' && settingsSubTab === 'exports' && canViewExports && <ExportsPanel />}
         {tab === 'settings' && settingsSubTab === 'help' && <HelpPanel />}
       </main>
 

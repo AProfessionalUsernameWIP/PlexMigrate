@@ -15,6 +15,9 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api, ExportArchive, LibraryDescriptor, PingResult, ServerManagedUser, ServerUser, ServerView, DashboardFrame, Snapshot } from '../api';
+import { serverSupportsFastCollections } from '../utils/plexVersion';
+import { RestoreModeSelector, RestoreMode, MergeWatchStrategy } from './RestoreModeSelector';
+import { ReplaceConfirmModal } from './ReplaceConfirmModal';
 
 // v0.9.1: live status indicator polling cadence for the server pickers.
 const PING_INTERVAL_MS = 30_000;
@@ -112,6 +115,23 @@ export function JobFormPanel({ snapshot }: Props) {
   const [overwritePlaylists, setOverwritePlaylists] = useState(false);
   const [fastCollectionDetection, setFastCollectionDetection] = useState(false);
   const [skipPlaylistPrebuild, setSkipPlaylistPrebuild] = useState(false);
+
+  // v0.13.x Restore mode (Merge / Replace). Shared between the
+  // ``restore`` and ``direct`` operations - both end up in the same
+  // engine path. Defaults to ``merge`` (the safe, additive, current
+  // behaviour); Replace is opt-in and gated by the typed-confirmation
+  // modal below.
+  const [restoreMode, setRestoreMode] = useState<RestoreMode>('merge');
+  const [autoCaptureBeforeReplace, setAutoCaptureBeforeReplace] = useState(true);
+  // v0.13.x: Merge-mode sub-toggle for the watch-count math. Defaults
+  // to "higher" (the legacy idempotent behaviour) so existing job
+  // submissions are wire-identical until the operator opts into the
+  // additive variant.
+  const [mergeWatchStrategy, setMergeWatchStrategy] = useState<MergeWatchStrategy>('higher');
+  // Gate for the typed-REPLACE modal. Submit() flips it true when the
+  // operator hits Submit with mode=replace; the modal's onConfirm
+  // calls ``submitConfirmed()`` which actually fires the API request.
+  const [replaceModalOpen, setReplaceModalOpen] = useState(false);
   // PR-3 / Phase D - four-flag data-type filter. Replaces the two old
   // skip_* checkboxes (skip_collections / skip_playlists). Applies to
   // every job mode (snapshot / import / direct) so the operator can
@@ -188,13 +208,29 @@ export function JobFormPanel({ snapshot }: Props) {
 
   // v0.13 form-layout refactor: the Run-Job form is now grouped into
   // three sections - Mode & Servers (always visible) → Scope (always
-  // visible) → Advanced options (collapsed by default). The Scope
+  // visible) → Per-Run Settings (collapsed by default). The Scope
   // card holds the controls that answer "what data moves" (libraries,
-  // data types, users, export files for import). The Advanced card
-  // holds everything else (engine tuning, retry behaviour, path
-  // remap, output / log dirs). 90%+ of operators never touch the
-  // Advanced section so collapsing it keeps the form scannable.
+  // data types, users, export files for import). The Per-Run Settings
+  // card holds everything else (engine tuning, retry behaviour, path
+  // remap, output / log dirs, watch+ratings strategy override).
+  // 90%+ of operators never touch this section so collapsing it
+  // keeps the form scannable.
   const [advancedOpen, setAdvancedOpen] = useState(false);
+
+  // Per-Run Settings sub-tab. ``general`` holds the common knobs
+  // (workers, scrobble_workers, strict_match, sidecar toggle, verbose);
+  // ``advanced`` holds the deeper / migration-specific knobs
+  // (output_dir, log_dir, path remap, skip prebuild, fast collection
+  // detection, watch+ratings strategy override). Workspace state —
+  // not persisted across submissions.
+  const [perRunSubTab, setPerRunSubTab] = useState<'general' | 'advanced'>('general');
+
+  // Per-job watch+ratings filter strategy override. Top of the
+  // resolution chain (per-job → per-server → global default → "smart").
+  // ``''`` means "inherit" (no override sent to backend).
+  const [watchRatingsStrategy, setWatchRatingsStrategy] = useState<
+    '' | 'smart' | 'force_bulk' | 'force_server_side'
+  >('');
 
   // Load registered servers on mount.
   // v0.9.1 change: do NOT pre-select source/destination. The previous
@@ -329,6 +365,35 @@ export function JobFormPanel({ snapshot }: Props) {
     if (typeof o.fast_collection_detection === 'boolean') setFastCollectionDetection(o.fast_collection_detection);
   }, [sourceServerName, perServerSnapshotDefaults, servers, mode]);
 
+  // v0.14 — Fast Collection Detection auto-defaulting based on Plex
+  // version. Runs after the per-server-override effect above so an
+  // explicit per-server value wins. When the source server's
+  // ``plex_version`` is >= 1.32, default the toggle ON; otherwise
+  // force it OFF (the engine would auto-fall-back anyway, but
+  // surfacing the forced-off state in the UI is clearer than letting
+  // operators tick a box that silently does nothing).
+  //
+  // Re-runs every time the source server changes — switching from a
+  // supported server to an unsupported one drops the flag back to
+  // OFF automatically, so a stale "on" can't leak into a job aimed
+  // at an old Plex. There's no separate "user touched it" guard:
+  // each new server-pick resets the toggle to the version-driven
+  // default. If the operator wants a different value after that,
+  // their click stays until the next server-pick.
+  useEffect(() => {
+    if (mode !== 'snapshot' && mode !== 'direct') return;
+    if (!sourceServerName) return;
+    const srv = servers.find((s) => s.name === sourceServerName);
+    if (!srv) return;
+    // Per-server explicit override on this field wins outright —
+    // don't touch the toggle in that case (the previous effect
+    // already applied it). Skip rule mirrors the override effect's
+    // ``typeof === 'boolean'`` test exactly.
+    const o = perServerSnapshotDefaults[srv.id];
+    if (o && typeof o.fast_collection_detection === 'boolean') return;
+    setFastCollectionDetection(serverSupportsFastCollections(srv.plex_version));
+  }, [sourceServerName, perServerSnapshotDefaults, servers, mode]);
+
   // When the operator picks a snapshot as the import source (or
   // switches between snapshots), reseed the four include_* toggles
   // so "checked == this type was actually captured by the run".
@@ -433,7 +498,25 @@ export function JobFormPanel({ snapshot }: Props) {
   const jobRunning = !!snapshot?.job && snapshot.job.state === 'running';
 
   // ── Submit handler ────────────────────────────────────────────────
+  //
+  // Two entry points share one body:
+  //   - submit() is the button click. For restore/direct in Replace
+  //     mode it intercepts and pops the typed-REPLACE modal instead
+  //     of immediately firing the API request.
+  //   - submitConfirmed() is what the modal's onConfirm calls (and
+  //     what snapshot/Merge submissions flow through directly). It
+  //     does the actual API work.
   const submit = async () => {
+    if ((mode === 'restore' || mode === 'direct') && restoreMode === 'replace') {
+      setSubmitError(null);
+      setSubmitOk(null);
+      setReplaceModalOpen(true);
+      return;
+    }
+    await submitConfirmed();
+  };
+
+  const submitConfirmed = async () => {
     setSubmitError(null);
     setSubmitOk(null);
     setSubmitting(true);
@@ -460,6 +543,10 @@ export function JobFormPanel({ snapshot }: Props) {
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
         payload.prebuild_json_sidecar = prebuildJsonSidecar;
+        // Per-job watch+ratings strategy override (top of resolution
+        // chain). Empty string means "inherit" → omit field so backend
+        // falls through to per-server / global / default.
+        if (watchRatingsStrategy) payload.watch_ratings_filter_strategy = watchRatingsStrategy;
         const r = await api.submitSnapshot(payload);
         setSubmitOk(`Snapshot job ${r.job_id} queued.`);
       } else if (mode === 'restore') {
@@ -469,6 +556,10 @@ export function JobFormPanel({ snapshot }: Props) {
           dest_server_names: destList,
           strict_match: strictMatch,
           overwrite_playlists: overwritePlaylists,
+          mode: restoreMode,
+          auto_capture_before_replace: autoCaptureBeforeReplace,
+          confirm_replace: restoreMode === 'replace',
+          merge_watch_strategy: mergeWatchStrategy,
         };
         if (workers) payload.workers = Number(workers);
         if (scrobbleWorkers) payload.scrobble_workers = Number(scrobbleWorkers);
@@ -511,6 +602,10 @@ export function JobFormPanel({ snapshot }: Props) {
           dest_server_names: destList,
           libraries: Array.from(selectedLibs),
           strict_match: strictMatch,
+          mode: restoreMode,
+          auto_capture_before_replace: autoCaptureBeforeReplace,
+          confirm_replace: restoreMode === 'replace',
+          merge_watch_strategy: mergeWatchStrategy,
         };
         if (workers) payload.workers = Number(workers);
         if (scrobbleWorkers) payload.scrobble_workers = Number(scrobbleWorkers);
@@ -526,6 +621,7 @@ export function JobFormPanel({ snapshot }: Props) {
         payload.include_ratings = includeRatings;
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
+        if (watchRatingsStrategy) payload.watch_ratings_filter_strategy = watchRatingsStrategy;
         // v0.9.6 Feature 4 / v0.9.7 Item 7: send ``user_filter``
         // whenever the Users section rendered AND at least one
         // transferable entry exists (owner OR managed). If both
@@ -931,14 +1027,46 @@ export function JobFormPanel({ snapshot }: Props) {
         )}
       </div>
 
+      {/* ── Restoration mode (Merge / Replace) ───────────────────────
+            v0.13.x: shown for any job that writes into a destination
+            (restore + direct transfer). Snapshot jobs don't write into
+            Plex so the selector is hidden in snapshot mode. The selector
+            is intentionally placed close to the bottom of the form, just
+            above the submit button, so the operator's last decision
+            before submit is the destructive-vs-additive choice. */}
+      {(mode === 'restore' || mode === 'direct') && (
+        <div className="panel">
+          <h2 style={{ marginTop: 0 }}>Restoration mode</h2>
+          <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+            <strong>Merge</strong> is the default - additive and safe to re-run.
+            <strong> Replace</strong> overwrites the destination to match the snapshot
+            exactly. Replace asks you to type <code>REPLACE</code> on submit, and
+            (with the safety belt on) auto-captures the destination first so you
+            have a rollback point.
+          </span>
+          <RestoreModeSelector
+            mode={restoreMode}
+            autoCaptureBeforeReplace={autoCaptureBeforeReplace}
+            mergeWatchStrategy={mergeWatchStrategy}
+            onMergeWatchStrategyChange={setMergeWatchStrategy}
+            onModeChange={setRestoreMode}
+            onAutoCaptureChange={setAutoCaptureBeforeReplace}
+            idPrefix={mode === 'restore' ? 'jobform-restore' : 'jobform-direct'}
+          />
+        </div>
+      )}
+
       {/* ── Advanced options (collapsible) ───────────────────────────
             v0.13 form-layout refactor: every knob below is engine
             tuning, retry behaviour, path remapping, output paths, or
             logging - things the average operator never touches. The
             section starts collapsed; clicking the header toggles it.
-            The single header replaces what used to be three or four
-            separate panels (Output Location, Path Remap, Resolution
-            & Performance, Logging). */}
+            Renamed from "Advanced options" to "Per-Run Settings" with
+            General / Advanced sub-tabs in v0.14 — the new layout
+            separates common operator-level knobs (workers, strict
+            match, sidecar) from migration-specific deep knobs
+            (output dir, path remap, engine tuning, watch+ratings
+            strategy override). */}
       <div className="panel">
         <button
           type="button"
@@ -954,146 +1082,258 @@ export function JobFormPanel({ snapshot }: Props) {
           <span style={{ fontSize: 14, color: 'var(--text-dim)' }}>
             {advancedOpen ? '▾' : '▸'}
           </span>
-          <h2 style={{ margin: 0 }}>Advanced options</h2>
+          <h2 style={{ margin: 0 }}>Per-Run Settings</h2>
         </button>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
-          Performance tuning, path remapping, output / log directories. Defaults are right for most operators -
-          start here only if a run misbehaves or you need cross-platform path translation.
+          Override what's set under <strong>Servers ▸ Run Defaults</strong> for this one
+          run only. Defaults are right for most operators — start here only if a run
+          misbehaves, you need cross-platform path translation, or you're tuning
+          per-job for an unusual server.
         </span>
 
         {advancedOpen && (
-          <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
-            {/* ── Output location (snapshot only) ──────────────────── */}
-            {mode === 'snapshot' && (
-              <div>
-                <h3 style={{ marginTop: 0 }}>Output location</h3>
-                <label className="field">
-                  <span className="label">Output directory</span>
-                  <span className="help">Where the <code>.plexexport.json</code> files will be written. Mirrors <code>--output-dir</code>. Leave blank to use the default from Settings.</span>
-                  <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} placeholder="./snapshots" />
-                </label>
-              </div>
-            )}
+          <div style={{ marginTop: 12 }}>
+            {/* Sub-tab strip. Switching tabs is workspace state only —
+                doesn't reset any field values. */}
+            <nav className="tabs sub-tabs" style={{ marginBottom: 12 }}>
+              <button
+                type="button"
+                className={perRunSubTab === 'general' ? 'active' : ''}
+                onClick={() => setPerRunSubTab('general')}
+              >
+                General
+              </button>
+              <button
+                type="button"
+                className={perRunSubTab === 'advanced' ? 'active' : ''}
+                onClick={() => setPerRunSubTab('advanced')}
+              >
+                Advanced
+              </button>
+            </nav>
 
-            {/* ── Path remap (import/direct) ─────────────────────── */}
-            {(mode === 'restore' || mode === 'direct') && (
-              <div>
-                <h3 style={{ marginTop: 0 }}>Path remap (cross-platform migrations)</h3>
-                <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
-                  Only needed when the media root path on the destination server differs from the stored path
-                  (e.g. exporting from Windows <code>C:\Media</code>, importing on Linux <code>/mnt/plex</code>).
-                  Suffix matching handles most cases automatically. Mirrors <code>--remap-path OLD NEW</code>.
-                </span>
-                <div className="grid-2">
-                  <label className="field">
-                    <span className="label">Old root prefix</span>
-                    <input type="text" value={remapOld} onChange={(e) => setRemapOld(e.target.value)} placeholder="C:\Media\" />
-                  </label>
-                  <label className="field">
-                    <span className="label">New root prefix</span>
-                    <input type="text" value={remapNew} onChange={(e) => setRemapNew(e.target.value)} placeholder="/mnt/plex/" />
-                  </label>
-                </div>
-              </div>
-            )}
-
-            {/* ── Resolution & performance ───────────────────────── */}
-            <div>
-              <h3 style={{ marginTop: 0 }}>Resolution &amp; performance</h3>
-              {mode === 'direct' && (
-                <div className="banner info">
-                  Direct transfers hit two Plex servers simultaneously. Start with about <strong>half</strong> the default worker count
-                  and watch the Failed counter on the dashboard - if it climbs, lower workers further.
-                </div>
-              )}
-              <div className="grid-2">
-                <label className="field">
-                  <span className="label">Worker threads</span>
-                  <span className="help">How many threads run in parallel. Mirrors <code>--workers</code>. Blank = use default from Settings.</span>
-                  <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(e.target.value)} placeholder="(default)" />
-                </label>
-                <label className="field">
-                  <span className="label">Scrobble workers</span>
-                  <span className="help">Max simultaneous view-count writes during import or direct transfer. Mirrors <code>--scrobble-workers</code>.</span>
-                  <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(e.target.value)} placeholder="(default)" />
-                </label>
-              </div>
-              {(mode === 'restore' || mode === 'direct') && (
-                <>
-                  <label className="switch">
-                    <input type="checkbox" checked={strictMatch} onChange={(e) => setStrictMatch(e.target.checked)} />
-                    <span>Strict match</span>
-                    <span className="help">Require exactly one fuzzy title match (default). Unchecking is equivalent to <code>--no-strict-match</code>.</span>
-                  </label>
-                  {mode === 'restore' && (
+            {perRunSubTab === 'general' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {/* ── Resolution & performance ─ */}
+                <div>
+                  <h3 style={{ marginTop: 0 }}>Resolution &amp; performance</h3>
+                  {mode === 'direct' && (
+                    <div className="banner info">
+                      Direct transfers hit two Plex servers simultaneously. Start with about <strong>half</strong> the default worker count
+                      and watch the Failed counter on the dashboard - if it climbs, lower workers further.
+                    </div>
+                  )}
+                  <div className="grid-2">
+                    <label className="field">
+                      <span className="label">Worker threads</span>
+                      <span className="help">How many threads run in parallel. Mirrors <code>--workers</code>. Blank = use default from Run Defaults.</span>
+                      <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(e.target.value)} placeholder="(default)" />
+                    </label>
+                    <label className="field">
+                      <span className="label">Scrobble workers</span>
+                      <span className="help">Max simultaneous view-count writes during import or direct transfer. Mirrors <code>--scrobble-workers</code>.</span>
+                      <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(e.target.value)} placeholder="(default)" />
+                    </label>
+                  </div>
+                  {(mode === 'restore' || mode === 'direct') && (
+                    <>
+                      <label className="switch">
+                        <input type="checkbox" checked={strictMatch} onChange={(e) => setStrictMatch(e.target.checked)} />
+                        <span>Strict match</span>
+                        <span className="help">Require exactly one fuzzy title match (default). Unchecking is equivalent to <code>--no-strict-match</code>.</span>
+                      </label>
+                      {mode === 'restore' && (
+                        <label className="switch">
+                          <input type="checkbox" checked={overwritePlaylists} onChange={(e) => setOverwritePlaylists(e.target.checked)} />
+                          <span>Overwrite playlists</span>
+                          <span className="help">Mirrors <code>--overwrite-playlists</code>. No-op for backward compat - all imports are additive since v0.2.0.</span>
+                        </label>
+                      )}
+                    </>
+                  )}
+                  {mode === 'snapshot' && (
                     <label className="switch">
-                      <input type="checkbox" checked={overwritePlaylists} onChange={(e) => setOverwritePlaylists(e.target.checked)} />
-                      <span>Overwrite playlists</span>
-                      <span className="help">Mirrors <code>--overwrite-playlists</code>. No-op for backward compat - all imports are additive since v0.2.0.</span>
+                      <input
+                        type="checkbox"
+                        checked={prebuildJsonSidecar}
+                        onChange={(e) => setPrebuildJsonSidecar(e.target.checked)}
+                      />
+                      <span>Save JSON copy after snapshot</span>
+                      <span className="help">
+                        Writes a <code>.plexexport.json</code> file next to the snapshot
+                        <code>.db</code> at the end of the run. Useful when you want a
+                        portable text-format archive ready to download immediately. Off
+                        by default - the JSON is otherwise rendered on first
+                        <strong> Download</strong> click in the Exports tab and cached
+                        from that point on. Adds wall-clock time to the run.
+                      </span>
                     </label>
                   )}
-                </>
-              )}
-              {(mode === 'snapshot' || mode === 'direct') && (
-                <>
-                  <label className="switch">
-                    <input type="checkbox" checked={skipPlaylistPrebuild} onChange={(e) => setSkipPlaylistPrebuild(e.target.checked)} />
-                    <span>Skip playlist pre-building</span>
-                    <span className="help">
-                      Skip the parallel upfront fetch that loads all playlists and their items
-                      before snapshot starts. Playlists still snapshot correctly - the data is fetched
-                      lazily the first time each server needs it, and the result is shared so each
-                      server is still only fetched once per run. Use this to eliminate the
-                      "Warming playlist cache" stall at job start without losing any playlist data.
-                    </span>
-                  </label>
-                  <label className="switch">
-                    <input type="checkbox" checked={fastCollectionDetection} onChange={(e) => setFastCollectionDetection(e.target.checked)} />
-                    <span>Fast collection detection</span>
-                    <span className="help">
-                      Use Plex's <code>librarySectionUserID</code> attribute to distinguish
-                      library-wide from personal collections without a set lookup. Measurably
-                      faster on large libraries (300+ collections, 10+ users). Requires
-                      Plex Media Server ≥ 1.32. On older servers the engine falls back to
-                      the standard rating-key method automatically - safe to enable.
-                    </span>
-                  </label>
-                </>
-              )}
-              {mode === 'snapshot' && (
-                <label className="switch">
-                  <input
-                    type="checkbox"
-                    checked={prebuildJsonSidecar}
-                    onChange={(e) => setPrebuildJsonSidecar(e.target.checked)}
-                  />
-                  <span>Save JSON copy after snapshot</span>
-                  <span className="help">
-                    Writes a <code>.plexexport.json</code> file next to the snapshot
-                    <code>.db</code> at the end of the run. Useful when you want a
-                    portable text-format archive ready to download immediately. Off
-                    by default - the JSON is otherwise rendered on first
-                    <strong> Download</strong> click in the Exports tab and cached
-                    from that point on. Adds wall-clock time to the run.
-                  </span>
-                </label>
-              )}
-            </div>
+                </div>
 
-            {/* ── Logging ─────────────────────────────────────────── */}
-            <div>
-              <h3 style={{ marginTop: 0 }}>Logging</h3>
-              <label className="switch">
-                <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.target.checked)} />
-                <span>Verbose logging</span>
-                <span className="help">DEBUG-level output. Mirrors <code>--verbose</code>.</span>
-              </label>
-              <label className="field">
-                <span className="label">Log directory</span>
-                <span className="help">Where per-run log subdirectories are created (each is prefixed with the server name). Mirrors <code>--log-dir</code>. Blank = use default from Settings.</span>
-                <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} placeholder="./plex_logs" />
-              </label>
-            </div>
+                {/* ── Logging ─ */}
+                <div>
+                  <h3 style={{ marginTop: 0 }}>Logging</h3>
+                  <label className="switch">
+                    <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.target.checked)} />
+                    <span>Verbose logging</span>
+                    <span className="help">DEBUG-level output. Mirrors <code>--verbose</code>.</span>
+                  </label>
+                </div>
+              </div>
+            )}
+
+            {perRunSubTab === 'advanced' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+                {/* ── Output location ─ */}
+                {mode === 'snapshot' && (
+                  <div>
+                    <h3 style={{ marginTop: 0 }}>Output location</h3>
+                    <label className="field">
+                      <span className="label">Output directory</span>
+                      <span className="help">Where the <code>.plexexport.json</code> files will be written. Mirrors <code>--output-dir</code>. Leave blank to use the default from Run Defaults.</span>
+                      <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} placeholder="./snapshots" />
+                    </label>
+                    <label className="field">
+                      <span className="label">Log directory</span>
+                      <span className="help">Where per-run log subdirectories are created. Mirrors <code>--log-dir</code>. Blank = use default from Run Defaults.</span>
+                      <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} placeholder="./plex_logs" />
+                    </label>
+                  </div>
+                )}
+                {mode !== 'snapshot' && (
+                  <div>
+                    <h3 style={{ marginTop: 0 }}>Log location</h3>
+                    <label className="field">
+                      <span className="label">Log directory</span>
+                      <span className="help">Where per-run log subdirectories are created. Mirrors <code>--log-dir</code>. Blank = use default from Run Defaults.</span>
+                      <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} placeholder="./plex_logs" />
+                    </label>
+                  </div>
+                )}
+
+                {/* ── Path remap ─ */}
+                {(mode === 'restore' || mode === 'direct') && (
+                  <div>
+                    <h3 style={{ marginTop: 0 }}>Path remap (cross-platform migrations)</h3>
+                    <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+                      Only needed when the media root path on the destination server differs from the stored path
+                      (e.g. exporting from Windows <code>C:\Media</code>, importing on Linux <code>/mnt/plex</code>).
+                      Suffix matching handles most cases automatically. Mirrors <code>--remap-path OLD NEW</code>.
+                    </span>
+                    <div className="grid-2">
+                      <label className="field">
+                        <span className="label">Old root prefix</span>
+                        <input type="text" value={remapOld} onChange={(e) => setRemapOld(e.target.value)} placeholder="C:\Media\" />
+                      </label>
+                      <label className="field">
+                        <span className="label">New root prefix</span>
+                        <input type="text" value={remapNew} onChange={(e) => setRemapNew(e.target.value)} placeholder="/mnt/plex/" />
+                      </label>
+                    </div>
+                  </div>
+                )}
+
+                {/* ── Engine tuning (snapshot/direct) ─ */}
+                {(mode === 'snapshot' || mode === 'direct') && (
+                  <div>
+                    <h3 style={{ marginTop: 0 }}>Engine tuning</h3>
+                    <label className="switch">
+                      <input type="checkbox" checked={skipPlaylistPrebuild} onChange={(e) => setSkipPlaylistPrebuild(e.target.checked)} />
+                      <span>Skip playlist pre-building</span>
+                      <span className="help">
+                        Skip the parallel upfront fetch that loads all playlists and their items
+                        before snapshot starts. Playlists still snapshot correctly - the data is fetched
+                        lazily the first time each server needs it, and the result is shared so each
+                        server is still only fetched once per run. Use this to eliminate the
+                        "Warming playlist cache" stall at job start without losing any playlist data.
+                      </span>
+                    </label>
+                    {(() => {
+                      const srv = servers.find((s) => s.name === sourceServerName);
+                      const ver = srv?.plex_version ?? '';
+                      const supported = serverSupportsFastCollections(ver);
+                      const unknown = !ver;
+                      const disabled = !supported;
+                      return (
+                        <label
+                          className="switch"
+                          style={{ opacity: disabled ? 0.55 : 1 }}
+                          title={
+                            disabled
+                              ? unknown
+                                ? 'Plex version unknown for this server — refresh it from the Servers tab to enable this option.'
+                                : `Requires Plex Media Server ≥ 1.32. Source server reports ${ver}.`
+                              : `Plex ${ver} supports librarySectionUserID — fast detection is available.`
+                          }
+                        >
+                          <input
+                            type="checkbox"
+                            checked={disabled ? false : fastCollectionDetection}
+                            disabled={disabled}
+                            onChange={(e) => setFastCollectionDetection(e.target.checked)}
+                          />
+                          <span>
+                            Fast collection detection
+                            {disabled && (
+                              <span className="tag failed" style={{ marginLeft: 8, fontSize: 10 }}>
+                                {unknown ? 'unknown version' : 'unsupported'}
+                              </span>
+                            )}
+                            {!disabled && (
+                              <span className="tag done" style={{ marginLeft: 8, fontSize: 10 }}>
+                                Plex {ver}
+                              </span>
+                            )}
+                          </span>
+                          <span className="help">
+                            Use Plex's <code>librarySectionUserID</code> attribute to distinguish
+                            library-wide from personal collections without a set lookup. Measurably
+                            faster on large libraries (300+ collections, 10+ users). Requires
+                            Plex Media Server ≥ 1.32; greyed out below that. Defaults ON when the
+                            source server supports it.
+                          </span>
+                        </label>
+                      );
+                    })()}
+                  </div>
+                )}
+
+                {/* ── Watch+Ratings strategy override (snapshot/direct) ─ */}
+                {(mode === 'snapshot' || mode === 'direct') && (
+                  <div>
+                    <h3 style={{ marginTop: 0 }}>Watch+Ratings capture strategy</h3>
+                    <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+                      Overrides the per-server / Run-Defaults strategy for this run only.
+                      Useful when a server is having a 429-storm today (force bulk) or when
+                      you specifically want smaller payloads back from Plex (force server-side).
+                    </span>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <label className="switch" title="Use the per-server override → Run Defaults → built-in 'smart' value. Recommended unless you have a specific reason to override.">
+                        <input type="radio" name="wr-strategy-job" checked={watchRatingsStrategy === ''} onChange={() => setWatchRatingsStrategy('')} />
+                        <span>Inherit <em>(recommended)</em></span>
+                        <span className="help">Use the per-server override from Servers ▸ Advanced Settings, or the global default from Run Defaults.</span>
+                      </label>
+                      <label className="switch" title="Engine picks per library — bulk-fetch when both watch+ratings wanted, server-side filter when only one.">
+                        <input type="radio" name="wr-strategy-job" checked={watchRatingsStrategy === 'smart'} onChange={() => setWatchRatingsStrategy('smart')} />
+                        <span>Smart</span>
+                        <span className="help">Engine picks per library. Equivalent to the global default behaviour.</span>
+                      </label>
+                      <label className="switch" title="Always fetch the full library and filter locally. Best for rate-limited Plex servers — fewer API calls, larger payloads.">
+                        <input type="radio" name="wr-strategy-job" checked={watchRatingsStrategy === 'force_bulk'} onChange={() => setWatchRatingsStrategy('force_bulk')} />
+                        <span>Force bulk</span>
+                        <span className="help">Always bulk-fetch + filter locally. Best for rate-limited / 429-prone Plex servers.</span>
+                      </label>
+                      <label className="switch" title="Always let Plex filter on its side. Best when wire-traffic back from Plex is the constraint.">
+                        <input type="radio" name="wr-strategy-job" checked={watchRatingsStrategy === 'force_server_side'} onChange={() => setWatchRatingsStrategy('force_server_side')} />
+                        <span>Force server-side</span>
+                        <span className="help">Always use server-side filter scans. Smaller payloads, more API calls.</span>
+                      </label>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1106,13 +1346,33 @@ export function JobFormPanel({ snapshot }: Props) {
             onClick={submit}
           >
             {submitting ? 'Submitting…' :
-              mode === 'direct' ? 'Submit Direct Transfer' :
+              mode === 'direct' ? (restoreMode === 'replace' ? 'Submit Direct Transfer (Replace)' : 'Submit Direct Transfer') :
               mode === 'snapshot' ? 'Submit Snapshot Job' :
+              restoreMode === 'replace' ? 'Submit Replace Restore' :
               'Submit Restore Job'}
           </button>
         </div>
       </div>
       </fieldset>
+
+      <ReplaceConfirmModal
+        open={replaceModalOpen}
+        targetLabel={
+          mode === 'restore'
+            ? destServerNames.size > 1
+              ? `${destServerNames.size} destinations`
+              : Array.from(destServerNames)[0] || 'destination'
+            : destServerNames.size > 1
+              ? `${destServerNames.size} destinations`
+              : Array.from(destServerNames)[0] || 'destination'
+        }
+        autoCaptureBeforeReplace={autoCaptureBeforeReplace}
+        onCancel={() => setReplaceModalOpen(false)}
+        onConfirm={() => {
+          setReplaceModalOpen(false);
+          void submitConfirmed();
+        }}
+      />
     </>
   );
 }

@@ -288,6 +288,16 @@ export interface SettingsView {
   scrobble_workers: number;
   verbose: boolean;
   strict_match: boolean;
+  // Global on/off for per-run log FILES (runtime.log / errors.log /
+  // media.log). When false the engine still runs and the dashboard
+  // / activity feed still update; only the per-run files on disk
+  // are suppressed. Default true.
+  run_logging_enabled?: boolean;
+  // Global on/off for the db-access audit log. Default true. Read
+  // here as a status flag; the value is changed only through the
+  // db_admin-gated /api/settings/audit-log-toggle endpoint - a
+  // plain PATCH on /api/settings silently strips this field.
+  audit_log_enabled?: boolean;
   // PR-13 - snapshot retention. ``global`` is the ceiling; the per-
   // server override map only applies when an entry is strictly LOWER
   // than the global. Higher per-server values are ignored.
@@ -297,6 +307,23 @@ export interface SettingsView {
   // every snapshot job + schedule that hasn't explicitly set its own
   // value uses this as the initial state of the per-job toggle.
   prebuild_json_sidecar_default?: boolean;
+  // Owner-phase watch+ratings capture strategy. "smart" (default) lets
+  // the engine pick; "force_bulk" always bulk-fetches; "force_server_side"
+  // always uses server-side filter scans. Per-server overrides accepted
+  // under snapshot_defaults_per_server[server_id].
+  watch_ratings_filter_strategy?: 'smart' | 'force_bulk' | 'force_server_side';
+  // System Tunables (root_admin only). Free-form map; see
+  // services/tunables.py for the recognised keys + defaults. Surfaced
+  // via Settings ▸ Tunables.
+  tunables?: Record<string, number | string>;
+  // Per-server tunable overrides (root_admin only). Only meaningful
+  // for the small set of tunables that have a sensible per-server
+  // interpretation — currently plex_connect_timeout_seconds and
+  // viewcount_increment_cap. Map: server_id → {key: value}.
+  tunables_per_server?: Record<string, Record<string, number>>;
+  // ETR colour multiplier for the dashboard stall thresholds (Phase 4).
+  // Clamped to [0.5, 2.0] at the read boundary. Default 1.0.
+  etr_color_multiplier?: number;
   // Direct-transfer resolver-tier policy. Tiers 0/1 (DB + API GUID
   // matching) are always active and never appear here. Tier 2 is
   // the filepath-suffix fallback (default ON). Tier 3 is fuzzy
@@ -324,6 +351,17 @@ export interface SettingsView {
     enabled?: boolean;
     interval_seconds?: number;
     stale_threshold_days?: number;
+  };
+  // v0.13.x — Restore-side run defaults (Merge / Replace). Per-run +
+  // per-server overrides take precedence; this is the bottom-of-chain
+  // fallback. Defaults: {"mode": "merge", "auto_capture_before_replace": true}.
+  restore_defaults?: {
+    mode?: 'merge' | 'replace';
+    auto_capture_before_replace?: boolean;
+    // v0.13.x: Merge sub-strategy for watch-count math. "higher"
+    // (default) = destination ends at max(stored, current); "sum" =
+    // current + stored. Operator opt-in. Ignored when mode=='replace'.
+    merge_watch_strategy?: 'higher' | 'sum';
   };
 }
 
@@ -419,6 +457,13 @@ export interface ServerView {
   // refreshed yet.
   machine_identifier?: string;
   friendly_name?: string;
+  // v0.14 — Plex Media Server software version (e.g. "1.32.5.7349").
+  // Captured at probe / refresh time. Used by the JobForm + Schedule
+  // forms to gate Fast Collection Detection (which requires Plex ≥1.32).
+  // Empty string when the row pre-dates this field or hasn't been
+  // refreshed yet — treat unknown as "unsupported" so we never enable
+  // a feature against an unverified server.
+  plex_version?: string;
   // Timing-spec inputs. Server-wide counts the ETR estimator needs.
   // ``null`` (or missing) means we never captured them; the next
   // Refresh / Test populates them. The frontend renders unknown
@@ -537,6 +582,17 @@ export interface Schedule {
   include_playlists?: boolean;
   include_collections?: boolean;
   prebuild_json_sidecar?: boolean;
+  // v0.14 Per-Run Settings on schedules. Mirrors the same per-job
+  // knobs the Run Job form exposes — when set, each scheduled fire
+  // forwards them to the snapshot job request as overrides on the
+  // global / per-server defaults.
+  workers?: number | null;
+  scrobble_workers?: number | null;
+  verbose?: boolean;
+  log_dir?: string | null;
+  skip_playlist_prebuild?: boolean;
+  fast_collection_detection?: boolean;
+  watch_ratings_filter_strategy?: 'smart' | 'force_bulk' | 'force_server_side' | '';
 }
 
 export interface LogRun {
@@ -759,7 +815,7 @@ export type Permission =
   | 'jobs.start' | 'jobs.stop'
   | 'schedules.view' | 'schedules.edit'
   | 'logs.view' | 'exports.view'
-  | 'settings.edit'
+  | 'settings.edit' | 'settings.tunables'
   | 'users.manage' | 'db_admin.access'
   | 'sync.view' | 'sync.edit';
 
@@ -802,6 +858,24 @@ export interface ManagedUser {
   display_name: string | null;
   last_login: number | null;
   created_at: number;
+}
+
+// Access Control — per-user permission grant/revoke layer. Returned
+// by GET /api/auth/users/{username}/permissions and the corresponding
+// PATCH. ``baseline`` = role's normal permission set; ``extra`` =
+// granted on top; ``revoked`` = removed from baseline; ``effective``
+// = the final resolved set the user actually has.
+export interface UserPermissionsResponse {
+  username: string;
+  role: Role;
+  baseline: Permission[];
+  extra: Permission[];
+  revoked: Permission[];
+  effective: Permission[];
+  all_permissions: Permission[];
+  // True when this row is root_admin — revokes are ignored by the
+  // resolver so the UI can grey out the revoke toggles.
+  root_admin_immune_to_revokes?: boolean;
 }
 
 // PR-10 - per-server managed users (Plex / Emby / Jellyfin operators
@@ -1062,6 +1136,19 @@ export const api = {
       `/api/auth/users/${encodeURIComponent(username)}`,
       { method: 'DELETE' },
     ),
+  // Access Control: per-user permission grant/revoke layer. Root-admin only.
+  getUserPermissions: (username: string) =>
+    http<UserPermissionsResponse>(
+      `/api/auth/users/${encodeURIComponent(username)}/permissions`,
+    ),
+  setUserPermissions: (
+    username: string,
+    body: { extra: Permission[]; revoked: Permission[] },
+  ) =>
+    http<UserPermissionsResponse>(
+      `/api/auth/users/${encodeURIComponent(username)}/permissions`,
+      { method: 'PATCH', body: JSON.stringify(body) },
+    ),
   updateOwnDisplayName: (display_name: string) =>
     http<{ username: string; display_name: string | null }>(
       '/api/auth/users/me/display-name',
@@ -1124,6 +1211,21 @@ export const api = {
   getSettings: () => http<SettingsView>('/api/settings'),
   saveSettings: (patch: Partial<SettingsView & { plex_token: string }>) =>
     http<SettingsView>('/api/settings', { method: 'POST', body: JSON.stringify(patch) }),
+
+  // Audit log on/off. db_admin-gated server-side: the body must carry
+  // the separate db_admin username + password (not the JWT). The
+  // backend writes a self-documenting "DISABLED by <user>" or
+  // "RE-ENABLED by <user>" line in the audit log itself across the
+  // transition.
+  toggleAuditLog: (body: {
+    db_admin_username: string;
+    db_admin_password: string;
+    enabled: boolean;
+  }) =>
+    http<{ audit_log_enabled: boolean }>('/api/settings/audit-log-toggle', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   // Multi-server registry (v0.9.0)
   listServers: () => http<ServerView[]>('/api/servers'),

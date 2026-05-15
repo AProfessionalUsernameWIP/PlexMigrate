@@ -120,6 +120,18 @@ def run_direct_transfer(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # v0.13.x: restore mode forwarded into restore_export_file by both
+    # the in-memory path (_transfer_one_library) and the chained-
+    # fallback path (_chained_fallback_library). Default "merge" =
+    # additive; "replace" = destructive point-in-time. The job worker
+    # in server/jobs.py handles the pre-Replace safety-belt snapshot
+    # and the confirm_replace gate before calling this.
+    mode: str = "merge",
+    # v0.13.x: Merge sub-strategy for watch-count math. "higher" =
+    # destination ends at max(stored, current) (legacy); "sum" =
+    # destination ends at current + stored (operator opt-in). Ignored
+    # when mode=="replace".
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """
     Drive an end-to-end direct transfer.
@@ -240,6 +252,22 @@ def run_direct_transfer(
         "Direct transfer data types: %s",
         ", ".join(_included) if _included else "(none)",
     )
+    # v0.13.x: restore-mode header. Same forensic-trail rationale as
+    # the matching log line in services.restorer.run_restore - the
+    # mode + sub-strategy are recorded at INFO so runtime.log makes
+    # it obvious whether a destination was additive-merged or
+    # destructively-replaced.
+    if mode == "replace":
+        logger.info("Direct transfer mode: REPLACE (destination overwritten).")
+    else:
+        if merge_watch_strategy == "sum":
+            logger.info(
+                "Direct transfer mode: merge (additive, watch counts COMBINE current+stored)."
+            )
+        else:
+            logger.info(
+                "Direct transfer mode: merge (additive, watch counts keep HIGHER of stored/current)."
+            )
 
     # ── v0.9.6 Feature 4 / v0.9.7 Item 7: per-user data + owner ──────
     # Compute the effective per-user roster. Pre-Feature 4 direct
@@ -451,6 +479,8 @@ def run_direct_transfer(
                     include_watch_history=include_watch_history,
                     include_ratings=include_ratings,
                     include_collections=include_collections,
+                    mode=mode,
+                    merge_watch_strategy=merge_watch_strategy,
                 )
             except DirectTransferUnavailable as exc:
                 logger.warning(
@@ -485,6 +515,8 @@ def run_direct_transfer(
                     include_watch_history=include_watch_history,
                     include_ratings=include_ratings,
                     include_collections=include_collections,
+                    mode=mode,
+                    merge_watch_strategy=merge_watch_strategy,
                 )
             except Exception as exc:
                 # Any unexpected exception in the direct path: log and
@@ -523,6 +555,8 @@ def run_direct_transfer(
                     include_watch_history=include_watch_history,
                     include_ratings=include_ratings,
                     include_collections=include_collections,
+                    mode=mode,
+                    merge_watch_strategy=merge_watch_strategy,
                 )
             state.get_dashboard().finish_library(lib_name)
     finally:
@@ -554,28 +588,24 @@ def _compute_import_total(
     already short-circuits for them, so including their items would
     inflate the total and prevent the bar from reaching 100%.
     """
-    items = payload.get("items", {}) or {}
-    total = 0
-    total += len(items.get("watch_history", []) or [])
-    total += sum(len(pl.get("items", []) or []) for pl in (items.get("playlists", []) or []))
-    total += len(items.get("playlists", []) or [])
-    total += sum(len(c.get("items", []) or []) for c in (items.get("collections", []) or []))
-    total += len(items.get("collections", []) or [])
-    total += len(items.get("ratings", []) or [])
-
+    # v0.13.0: unified users map. Owner is identified by role='owner'
+    # and is always counted (we always restore the owner block);
+    # managed users are counted only when the destination has a matching
+    # home user (otherwise their work is skipped at restore time).
     users_block = payload.get("users", {}) or {}
-    for uname, udata in users_block.items():
-        if uname not in home_user_names:
+    total = 0
+    for handle, udata in users_block.items():
+        if not isinstance(udata, dict):
+            continue
+        role = udata.get("role") or ("owner" if handle == "" else "managed")
+        if role != "owner" and handle not in home_user_names:
             continue
         total += len(udata.get("watch_history", []) or [])
         total += sum(len(pl.get("items", []) or []) for pl in (udata.get("playlists", []) or []))
         total += len(udata.get("playlists", []) or [])
-        total += len(udata.get("ratings", []) or [])
-        # v0.9.7 Item 9 adds per-user collections; size them too so
-        # the bar reflects the work. Older payloads without the key
-        # short-circuit to 0 via the get() default.
         total += sum(len(c.get("items", []) or []) for c in (udata.get("collections", []) or []))
         total += len(udata.get("collections", []) or [])
+        total += len(udata.get("ratings", []) or [])
     return total
 
 
@@ -705,6 +735,10 @@ def _transfer_one_library(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # v0.13.x restore mode (merge / replace). Forwarded into
+    # restore_export_file when this function calls it below.
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """
     Transfer a single library source→dest. See :func:`run_direct_transfer`
@@ -810,20 +844,53 @@ def _transfer_one_library(
         include_collections=include_collections,
     )
 
-    # ── Build the dict in the on-disk schema's shape ─────────────────
-    # ``restore_export_file`` reads ``library``, ``items.{watch_history,
-    # playlists, collections, ratings}``, and ``users`` (per-user data).
+    # ── Build the v0.13.0 unified-users payload ──────────────────────
+    # The owner is folded into ``users`` with ``role='owner'``; managed
+    # users are ``role='managed'``. ``restore_export_file`` reads the
+    # owner block via its role and the managed users via the same map.
+    owner_display = source_owner or "Plex Owner"
+    owner_json_key = owner_display
+    _used = set(users_data.keys())
+    _n = 2
+    while owner_json_key in _used:
+        owner_json_key = f"{owner_display} ({_n})"
+        _n += 1
+    unified_users: Dict[str, Any] = {
+        owner_json_key: {
+            "role": "owner",
+            "display_name": owner_display,
+            "backend_user_id": None,
+            "watch_history": watch_history,
+            "ratings":       ratings,
+            "playlists":     playlists,
+            "collections":   collections,
+        },
+    }
+    for _h, _ub in users_data.items():
+        if not isinstance(_ub, dict):
+            continue
+        unified_users[_h] = {
+            "role": "managed",
+            "display_name": _h,
+            "backend_user_id": None,
+            "watch_history": _ub.get("watch_history", []),
+            "ratings":       _ub.get("ratings", []),
+            "playlists":     _ub.get("playlists", []),
+            "collections":   _ub.get("collections", []),
+        }
+
     payload: Dict[str, Any] = {
         "library": lib_name,
         "captured_at": datetime.now().isoformat(),
-        "server_version": getattr(source_server, "version", "unknown"),
-        "items": {
-            "watch_history": watch_history,
-            "playlists": playlists,
-            "collections": collections,
-            "ratings": ratings,
+        "snapshot_meta": {
+            "server_name": getattr(source_server, "friendlyName", "") or "",
+            "server_url": getattr(source_server, "_baseurl", "") or "",
+            "server_machine_id": getattr(source_server, "machineIdentifier", "") or "",
+            "server_version": getattr(source_server, "version", "unknown"),
+            "backend": "plex",
+            "trigger": "direct-transfer",
         },
-        "users": users_data,
+        "users": unified_users,
         "stats": {
             "total_watched": len(watch_history),
             "total_playlists": len(playlists),
@@ -844,8 +911,9 @@ def _transfer_one_library(
     # them. Best-effort - a DB hiccup must not break the transfer.
     try:
         from server import media_db
+        from services.snapshotter import _should_cache_payload_to_media_db
         src_machine = str(getattr(source_server, "machineIdentifier", "") or "")
-        if src_machine:
+        if src_machine and _should_cache_payload_to_media_db(src_machine, lib_name, logger):
             counts = media_db.ingest_snapshot_payload(src_machine, payload)
             logger.debug(
                 "[%s] DB ingest from source machine %r: %s",
@@ -893,8 +961,10 @@ def _transfer_one_library(
         # playlists AND the source-side payload carries any. Without
         # this gate, even ``skip_playlists=True`` runs paid a wasted
         # ``dest_server.playlists()`` round-trip per library.
-        payload_has_playlists = bool(payload.get("items", {}).get("playlists")) or any(
-            bool(u.get("playlists"))
+        # v0.13.0: owner is just another user in the unified map, so
+        # one any() walks both owner and managed-user blocks at once.
+        payload_has_playlists = any(
+            isinstance(u, dict) and bool(u.get("playlists"))
             for u in (payload.get("users", {}) or {}).values()
         )
         if include_playlists and payload_has_playlists:
@@ -918,6 +988,8 @@ def _transfer_one_library(
             include_watch_history=include_watch_history,
             include_ratings=include_ratings,
             include_collections=include_collections,
+            mode=mode,
+            merge_watch_strategy=merge_watch_strategy,
         )
     finally:
         state._plex_base_url = prev_url
@@ -996,6 +1068,10 @@ def _chained_fallback_library(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # v0.13.x restore mode forwarded to restore_export_file at the
+    # end of the chained-fallback flow.
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """
     Fallback path used by :func:`run_direct_transfer` when the
@@ -1082,17 +1158,50 @@ def _chained_fallback_library(
         include_collections=include_collections,
     )
 
+    # v0.13.0 unified-users payload (matches the in-memory path above).
+    owner_display = source_owner or "Plex Owner"
+    owner_json_key = owner_display
+    _used = set(users_data.keys())
+    _n = 2
+    while owner_json_key in _used:
+        owner_json_key = f"{owner_display} ({_n})"
+        _n += 1
+    unified_users: Dict[str, Any] = {
+        owner_json_key: {
+            "role": "owner",
+            "display_name": owner_display,
+            "backend_user_id": None,
+            "watch_history": watch_history,
+            "ratings":       ratings,
+            "playlists":     playlists,
+            "collections":   collections,
+        },
+    }
+    for _h, _ub in users_data.items():
+        if not isinstance(_ub, dict):
+            continue
+        unified_users[_h] = {
+            "role": "managed",
+            "display_name": _h,
+            "backend_user_id": None,
+            "watch_history": _ub.get("watch_history", []),
+            "ratings":       _ub.get("ratings", []),
+            "playlists":     _ub.get("playlists", []),
+            "collections":   _ub.get("collections", []),
+        }
+
     payload: Dict[str, Any] = {
         "library": lib_name,
         "captured_at": datetime.now().isoformat(),
-        "server_version": getattr(source_server, "version", "unknown"),
-        "items": {
-            "watch_history": watch_history,
-            "playlists": playlists,
-            "collections": collections,
-            "ratings": ratings,
+        "snapshot_meta": {
+            "server_name": getattr(source_server, "friendlyName", "") or "",
+            "server_url": getattr(source_server, "_baseurl", "") or "",
+            "server_machine_id": getattr(source_server, "machineIdentifier", "") or "",
+            "server_version": getattr(source_server, "version", "unknown"),
+            "backend": "plex",
+            "trigger": "direct-transfer",
         },
-        "users": users_data,
+        "users": unified_users,
         "stats": {
             "total_watched": len(watch_history),
             "total_playlists": len(playlists),
@@ -1108,8 +1217,9 @@ def _chained_fallback_library(
     # fallback doesn't leave a gap in the DB cache.
     try:
         from server import media_db
+        from services.snapshotter import _should_cache_payload_to_media_db
         src_machine = str(getattr(source_server, "machineIdentifier", "") or "")
-        if src_machine:
+        if src_machine and _should_cache_payload_to_media_db(src_machine, lib_name, logger):
             counts = media_db.ingest_snapshot_payload(src_machine, payload)
             logger.debug(
                 "[%s] DB ingest (chained fallback) from %r: %s",
@@ -1165,8 +1275,9 @@ def _chained_fallback_library(
         # PR-1 / Phase B (skip-playlists end-to-end): mirror the
         # in-memory path's gate. Only prefetch destination playlists
         # when we'll actually use them.
-        payload_has_playlists = bool(payload.get("items", {}).get("playlists")) or any(
-            bool(u.get("playlists"))
+        # v0.13.0: unified users map - one any() covers owner + managed.
+        payload_has_playlists = any(
+            isinstance(u, dict) and bool(u.get("playlists"))
             for u in (payload.get("users", {}) or {}).values()
         )
         if include_playlists and payload_has_playlists:
@@ -1185,6 +1296,8 @@ def _chained_fallback_library(
             include_watch_history=include_watch_history,
             include_ratings=include_ratings,
             include_collections=include_collections,
+            mode=mode,
+            merge_watch_strategy=merge_watch_strategy,
         )
     except Exception as exc:
         # M2: the import failed, so Phase 4's unlink is never reached -

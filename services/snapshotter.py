@@ -36,6 +36,7 @@ from services.dashboard import (
 from services.logging_ops import _fmt_media_line
 from services.resolver import (
     _all_guids,
+    _disable_autoreload,
     _safe_file_path,
     serialize_item,
     serialize_playlist,
@@ -88,9 +89,204 @@ def _log_serialize_diag(
 
 # ── Snapshot Functions ──────────────────────────────────────────────────────────
 
+_VALID_WR_STRATEGIES = ("smart", "force_bulk", "force_server_side")
+
+
+def _should_cache_payload_to_media_db(
+    server_id: str,
+    lib_name: str,
+    logger: logging.Logger,
+) -> bool:
+    """
+    Decide whether this snapshot run's per-library payload should be
+    ingested into media.db.
+
+    Resolution rule:
+      1. Operator explicitly opted in via the
+         ``cache_snapshot_payloads_to_media_db`` tunable → cache.
+      2. Tunable left at default false, but media.db has NO rows
+         tagged with this server_id → auto-seed (one-shot ingest to
+         populate the resolver Tier 0 GUID cache).
+      3. Tunable false AND server already has rows → skip the ingest.
+
+    Failures of either lookup are treated as "skip" — we never want
+    to accidentally cache a run when the configured state is unclear.
+    """
+    try:
+        from services import tunables
+        if tunables.cache_snapshot_payloads_to_media_db():
+            logger.info(
+                "[%s] media.db caching: ENABLED via tunable (operator opt-in)",
+                lib_name,
+            )
+            return True
+    except Exception:
+        return False
+
+    if not server_id:
+        return False
+
+    try:
+        from server import media_db
+        seeded = media_db.has_any_items_for_server(server_id)
+    except Exception:
+        return False
+
+    if not seeded:
+        logger.info(
+            "[%s] media.db caching: AUTO-SEED (first run for server %r — "
+            "ingesting to populate the resolver Tier 0 cache; subsequent "
+            "runs will skip unless the operator flips the tunable on)",
+            lib_name, server_id,
+        )
+        return True
+
+    return False
+
+
+def _resolve_watch_ratings_strategy(
+    *,
+    server_id: Optional[str],
+    logger: logging.Logger,
+) -> str:
+    """
+    Resolve the owner-phase watch+ratings capture strategy for one
+    snapshot run.
+
+    Resolution chain (first match wins):
+
+      0. Per-job override from
+         ``state._watch_ratings_strategy_override_var`` — set by the
+         job runner from the JobIn / ScheduleIn payload when the
+         operator picked something other than "Inherit" on the
+         Per-Run Settings ▸ Advanced sub-tab.
+      1. Per-server override at
+         ``settings.snapshot_defaults_per_server[server_id]
+         .watch_ratings_filter_strategy``
+      2. Global default at ``settings.watch_ratings_filter_strategy``
+      3. Built-in default ``"smart"``
+
+    Unknown / malformed values at any tier fall through to the next
+    tier rather than raising, so a stale settings.json from before
+    this setting existed Just Works.
+    """
+    # Tier 0: per-job override carried on the ContextVar. Empty
+    # string = "no override" (the default).
+    try:
+        per_job = state._watch_ratings_strategy_override_var.get()
+    except LookupError:
+        per_job = ""
+    if isinstance(per_job, str) and per_job.lower() in _VALID_WR_STRATEGIES:
+        return per_job.lower()
+
+    try:
+        from server.persistence import load_settings
+        settings = load_settings() or {}
+    except Exception:
+        return "smart"
+
+    if server_id:
+        per_server = settings.get("snapshot_defaults_per_server") or {}
+        override = (per_server.get(server_id) or {}).get("watch_ratings_filter_strategy")
+        if isinstance(override, str) and override.lower() in _VALID_WR_STRATEGIES:
+            return override.lower()
+
+    glob = settings.get("watch_ratings_filter_strategy")
+    if isinstance(glob, str) and glob.lower() in _VALID_WR_STRATEGIES:
+        return glob.lower()
+
+    return "smart"
+
+
+def _bulk_fetch_for_filters(
+    section, logger: logging.Logger, want_shows: bool = False,
+) -> Dict[str, Any]:
+    """
+    Perf #2 helper: fetch every leaf-level item in ``section`` (and the
+    show-level container list for show libraries when ``want_shows``)
+    in **one** Plex round-trip per list. Watch-history and ratings then
+    filter the same in-memory list locally instead of issuing separate
+    server-side ``viewCount__gt=0`` and ``userRating__gt=0`` filter
+    scans.
+
+    Why this is faster: Plex's filter engine scans the full library
+    table for every filtered ``search*`` call. With both watch and
+    ratings enabled the section is scanned 2-3 times depending on type
+    (3 for shows: episode-watched, show-rated, episode-rated). One
+    unfiltered fetch returns the same data in a single scan, and the
+    inline XML response already carries ``viewCount`` and ``userRating``
+    so the local filter is a trivial attribute read.
+
+    Returns ``{"items": [...], "shows": [...] | None, "fetch_seconds":
+    float, "http_calls": int, "ok": bool}``. On any exception the
+    caller falls back to the per-task server-side filter path, so this
+    is a soft-fail optimisation - a failure never breaks a snapshot.
+    """
+    libtype = getattr(section, "type", "")
+    t0 = time.monotonic()
+    http0 = state.get_http_count()
+    items: List = []
+    shows: Optional[List] = None
+    try:
+        if libtype == "artist":
+            items = section.searchTracks()
+        elif libtype == "show":
+            items = section.searchEpisodes()
+            if want_shows:
+                shows = section.search()  # show-level container
+        else:
+            items = section.search()
+        ok = True
+    except Exception as exc:
+        logger.warning(
+            "[%s] bulk-fetch for shared watch+ratings filter failed (%s) "
+            "- gathers will use per-task server-side filter scans instead",
+            section.title, exc,
+        )
+        ok = False
+    # Perf #2 follow-up: disable plexapi's autoreload on the freshly-
+    # fetched lists BEFORE the per-attribute filter loops in
+    # ``snapshot_watch_history`` / ``snapshot_ratings`` touch them.
+    # The bulk responses are partial objects; reading ``viewCount`` /
+    # ``userRating`` on an unwatched / unrated item would otherwise
+    # trip ``PlexPartialObject.__getattribute__``'s auto-reload, which
+    # bundles ``includeMarkers + includeChapters`` and triggers Plex
+    # intro/chapter analysis on shows that haven't been analysed —
+    # potentially 20-30s per item. On a 6 000-episode library with
+    # mostly-unrated content that's hours, not seconds.
+    #
+    # Best-effort: the helper is silent on objects that don't expose
+    # ``_autoReload`` and a no-op when the tunable
+    # ``plexapi_autoreload_enabled`` is true (operator opt-in to
+    # vanilla plexapi behaviour for diagnostics).
+    if ok:
+        try:
+            _disable_autoreload(*items)
+            if shows is not None:
+                _disable_autoreload(*shows)
+        except Exception:
+            pass
+    return {
+        "items": items,
+        "shows": shows,
+        "fetch_seconds": time.monotonic() - t0,
+        "http_calls": state.get_http_count() - http0,
+        "ok": ok,
+    }
+
+
 def snapshot_watch_history(
     section, logger: logging.Logger, user: str = "Plex Owner",
     stop_event: Optional[threading.Event] = None,
+    # Perf #2: shared library-item list pre-fetched by
+    # ``_bulk_fetch_for_filters``. When supplied, skip the server-side
+    # ``viewCount__gt=0`` filter scan and walk the shared list locally.
+    # ``None`` keeps the per-task server-side-filter path - a
+    # first-class strategy for runs where only one of watch / ratings
+    # is wanted (avoids over-fetching the full library to filter for a
+    # single type) and for home-user gathers (each user's section is
+    # distinct, so sharing across users wouldn't help).
+    prefetched_items: Optional[List] = None,
 ) -> List[Dict]:
     """
     Fetches all watched items from a library section.
@@ -109,14 +305,21 @@ def snapshot_watch_history(
     watched = []
     try:
         libtype = section.type
-        # DIAGNOSTIC: each branch tries a server-side ``viewCount``
-        # filter and falls back to a FULL-library fetch + client-side
-        # filter on any exception. That fallback is the prime suspect
-        # for ``show`` libraries snapshotting far slower than ``artist``
-        # ones - so log loudly when it fires, with the exception, so a
-        # single run tells us whether the server-side filter is the
-        # problem. (Was a silent ``except Exception: pass``-style swallow.)
-        if libtype == "artist":
+        if prefetched_items is not None:
+            # Perf #2: filter the shared bulk-fetched list locally.
+            # No new Plex round-trip; the attribute read is in-memory
+            # because the inline XML response already carries
+            # ``viewCount``.
+            all_items = [
+                it for it in prefetched_items
+                if getattr(it, "viewCount", 0)
+            ]
+            logger.info(
+                "[%s] watch-history: filtering shared bulk-fetched list "
+                "(%d candidates → %d watched)",
+                section.title, len(prefetched_items), len(all_items),
+            )
+        elif libtype == "artist":
             try:
                 all_items = section.searchTracks(viewCount__gt=0)
             except Exception as _filter_exc:
@@ -713,6 +916,18 @@ def snapshot_collections(
 def snapshot_ratings(
     section, logger: logging.Logger, user: str = "Plex Owner",
     stop_event: Optional[threading.Event] = None,
+    # Perf #2: shared library-item list pre-fetched by
+    # ``_bulk_fetch_for_filters``. ``prefetched_items`` is the leaf
+    # list (tracks / episodes / movies); ``prefetched_shows`` is the
+    # show-level container list, only meaningful for show libraries
+    # where ratings can live on both shows and episodes. Either may
+    # be ``None`` to keep the per-task server-side-filter path - a
+    # first-class strategy for runs where only one of watch / ratings
+    # is wanted (no point over-fetching the whole library for one
+    # type) and for home-user gathers (per-user sections differ, so
+    # cross-user sharing doesn't apply).
+    prefetched_items: Optional[List] = None,
+    prefetched_shows: Optional[List] = None,
 ) -> List[Dict]:
     """
     Fetches all items in a library that have a user star rating.
@@ -732,12 +947,34 @@ def snapshot_ratings(
     rated = []
     try:
         libtype = section.type
-        # DIAGNOSTIC: same silent server-side-filter fallback as
-        # snapshot_watch_history. For ``show`` this runs TWICE (shows
-        # + episodes), so a failing episode filter means a full
-        # 40k-episode walk on top of everything else - log loudly
-        # when any branch falls back.
-        if libtype == "artist":
+        if prefetched_items is not None:
+            # Perf #2: filter the shared bulk-fetched list locally.
+            leaf_rated = [
+                it for it in prefetched_items
+                if getattr(it, "userRating", None) is not None
+            ]
+            if libtype == "show" and prefetched_shows is not None:
+                show_rated = [
+                    s for s in prefetched_shows
+                    if getattr(s, "userRating", None) is not None
+                ]
+                all_items = show_rated + leaf_rated
+                logger.info(
+                    "[%s] ratings: filtering shared bulk-fetched lists "
+                    "(%d show candidates → %d rated; "
+                    "%d episode candidates → %d rated)",
+                    section.title,
+                    len(prefetched_shows), len(show_rated),
+                    len(prefetched_items), len(leaf_rated),
+                )
+            else:
+                all_items = leaf_rated
+                logger.info(
+                    "[%s] ratings: filtering shared bulk-fetched list "
+                    "(%d candidates → %d rated)",
+                    section.title, len(prefetched_items), len(leaf_rated),
+                )
+        elif libtype == "artist":
             try:
                 all_items = section.searchTracks(userRating__gt=0)
             except Exception as _filter_exc:
@@ -924,6 +1161,60 @@ def snapshot_library(
     def _advance():
         _advance_lib(lib_name)
 
+    # Perf #2: watch+ratings capture strategy. Resolves
+    # per-server override → global default → "smart".
+    #
+    #   "smart"             — bulk-fetch when BOTH watch+ratings wanted,
+    #                         server-side filter when only one wanted.
+    #   "force_bulk"        — always bulk-fetch + local filter, even
+    #                         for single-type runs (best when Plex is
+    #                         rate-limited / hits 429s).
+    #   "force_server_side" — always server-side filter (no shared
+    #                         prefetch). Best when wire-traffic back
+    #                         from the server is the constraint.
+    strategy = _resolve_watch_ratings_strategy(server_id=server_id, logger=logger)
+    if strategy == "force_server_side":
+        # Skip the prefetch entirely; each gather will use its
+        # per-task server-side-filter path.
+        shared_prefetch: Optional[Dict[str, Any]] = None
+        logger.info(
+            "[%s] watch+ratings strategy=force_server_side — skipping shared bulk-fetch",
+            lib_name,
+        )
+    else:
+        want_prefetch = (
+            strategy == "force_bulk"
+            or (include_watch_history and include_ratings)
+        )
+        shared_prefetch = None
+        if want_prefetch:
+            # Only show libraries need the show-level container in
+            # addition to episodes; artist/movie ratings live on the
+            # same leaf list watch-history reads. For force_bulk we
+            # still bulk-fetch even when only one type is wanted —
+            # the user opted into the API-call-saving trade-off.
+            _want_shows = (section.type == "show")
+            shared_prefetch = _bulk_fetch_for_filters(
+                section, logger, want_shows=_want_shows,
+            )
+            if shared_prefetch.get("ok"):
+                logger.info(
+                    "[%s] shared bulk-fetch for watch+ratings "
+                    "(strategy=%s): %d item(s)%s in %.1fs, %d Plex HTTP call(s)",
+                    lib_name, strategy,
+                    len(shared_prefetch.get("items") or []),
+                    f" + {len(shared_prefetch.get('shows') or [])} show(s)"
+                        if shared_prefetch.get("shows") else "",
+                    shared_prefetch.get("fetch_seconds", 0.0),
+                    shared_prefetch.get("http_calls", 0),
+                )
+            else:
+                # Failed bulk fetch → don't pass partial / empty lists
+                # to the gathers; let them use the per-task
+                # server-side-filter path so a transient Plex hiccup
+                # doesn't silently lose data.
+                shared_prefetch = None
+
     def gather_watch():
         if not include_watch_history:
             # PR-6: per-library skip notices are INFO. The operator
@@ -939,6 +1230,9 @@ def snapshot_library(
             results["watch_history"] = snapshot_watch_history(
                 section, logger, user=state._plex_owner_name,
                 stop_event=stop_event,
+                prefetched_items=(
+                    shared_prefetch.get("items") if shared_prefetch else None
+                ),
             )
         if state.get_dashboard():
             state.get_dashboard().set_library_phase(lib_name, "Watch History ✓")
@@ -987,6 +1281,12 @@ def snapshot_library(
             results["ratings"] = snapshot_ratings(
                 section, logger, user=state._plex_owner_name,
                 stop_event=stop_event,
+                prefetched_items=(
+                    shared_prefetch.get("items") if shared_prefetch else None
+                ),
+                prefetched_shows=(
+                    shared_prefetch.get("shows") if shared_prefetch else None
+                ),
             )
         if state.get_dashboard():
             state.get_dashboard().set_library_phase(lib_name, "Ratings ✓")
@@ -1159,26 +1459,68 @@ def snapshot_library(
                 if exc:
                     logger.error(f"Error in gather thread for {lib_name}: {exc}")
 
-    # Embed source-server identity so the Snapshots browser can label
-    # each file with the server that produced it. Reads from state
-    # populated by the CLI / job runner before the snapshot starts. All
-    # three fields are best-effort - missing values fall back to "".
+    # v0.13.0: unified users map. The owner is folded into ``users``
+    # with ``role='owner'``; managed users are ``role='managed'``.
+    # There's no longer a top-level ``items`` block - that owner-vs-
+    # users asymmetry forced every downstream consumer to maintain
+    # two code paths. Now the restorer iterates one map and reads
+    # the role to decide which token to use.
+    owner_display = state._plex_owner_name or "Plex Owner"
+    owner_json_key = owner_display or "Plex Owner"
+    # Collision-safe: if a managed user shares the owner's display
+    # name, suffix the owner's JSON key until unique. Highly unlikely
+    # in practice but free defense.
+    _used_keys = set(users_data.keys())
+    _bk, _n = owner_json_key, 2
+    while owner_json_key in _used_keys:
+        owner_json_key = f"{_bk} ({_n})"
+        _n += 1
+
+    unified_users: Dict[str, Any] = {
+        owner_json_key: {
+            "role": "owner",
+            "display_name": owner_display,
+            "backend_user_id": None,  # populated when MyPlexAccount.id is known
+            "watch_history": results.get("watch_history", []),
+            "ratings":       results.get("ratings", []),
+            "playlists":     results.get("playlists", []),
+            "collections":   results.get("collections", []),
+        },
+    }
+    for u_handle, u_block in users_data.items():
+        if not isinstance(u_block, dict):
+            continue
+        unified_users[u_handle] = {
+            "role": "managed",
+            "display_name": u_handle,
+            "backend_user_id": None,
+            "watch_history": u_block.get("watch_history", []),
+            "ratings":       u_block.get("ratings", []),
+            "playlists":     u_block.get("playlists", []),
+            "collections":   u_block.get("collections", []),
+        }
+
     export_data = {
         "library": lib_name,
         "captured_at": datetime.now().isoformat(),
-        "server_version": server.version,
-        # v0.9.3: source server identity (new)
-        "source_server_name": getattr(server, "friendlyName", "") or "",
-        "source_server_url": state._plex_base_url or "",
-        "source_server_machine_id": getattr(server, "machineIdentifier", "") or "",
-        # v0.9.5: how this run was triggered - "manual" for a GUI / API
-        # submission, "schedule" for a scheduler fire. ``schedule_name``
-        # is the schedule's display name when trigger == "schedule".
-        # Both empty strings on older / CLI runs that didn't set them.
-        "trigger": state._run_trigger or "",
-        "schedule_name": state._run_schedule_name or "",
-        "items": results,
-        "users": users_data,
+        # v0.13.0: server identity + run provenance consolidated into
+        # snapshot_meta to match the serializer's shape. ``backend``
+        # is the forward-looking field that lets future Jellyfin /
+        # Emby adapters write payloads readable by the same engine.
+        "snapshot_meta": {
+            "server_id": getattr(state, "_snapshot_server_id", "") or "",
+            "server_name": getattr(server, "friendlyName", "") or "",
+            "server_url": state._plex_base_url or "",
+            "server_machine_id": getattr(server, "machineIdentifier", "") or "",
+            "server_version": server.version,
+            "backend": "plex",
+            # how this run was triggered - "manual" for a GUI / API
+            # submission, "schedule" for a scheduler fire.
+            # schedule_name is the display name when trigger=="schedule".
+            "trigger": state._run_trigger or "",
+            "schedule_name": state._run_schedule_name or "",
+        },
+        "users": unified_users,
         "stats": {
             "total_watched": len(results["watch_history"]),
             "total_playlists": len(results["playlists"]),
@@ -1224,14 +1566,32 @@ def snapshot_library(
     except Exception as e:
         logger.error("media_db import failed: %s; cannot persist snapshot", e)
         return ""
-    try:
-        counters = media_db.ingest_snapshot_payload(server_id, export_data)
-    except Exception:
-        logger.exception(
-            "ingest_snapshot_payload failed for library %r on server %r",
-            lib_name, server_id,
+
+    # v0.14 — media.db caching is now opt-in via the
+    # ``cache_snapshot_payloads_to_media_db`` tunable, with a one-shot
+    # auto-seed for any server that hasn't been ingested yet. See
+    # ``_should_cache_payload_to_media_db`` for the resolution rule.
+    # Note: the .db snapshot artifact + JSON sidecar are payload-
+    # direct (Rule 1) so they're unaffected by this decision.
+    if _should_cache_payload_to_media_db(server_id, lib_name, logger):
+        try:
+            counters = media_db.ingest_snapshot_payload(server_id, export_data)
+        except Exception:
+            logger.exception(
+                "ingest_snapshot_payload failed for library %r on server %r",
+                lib_name, server_id,
+            )
+            return ""
+    else:
+        # Skipping the ingest. Build an empty counter dict so the
+        # downstream code path (logging, payload collector) keeps
+        # working without a media.db write.
+        counters = {}
+        logger.info(
+            "[%s] media.db caching skipped (cache_snapshot_payloads_to_media_db=false, "
+            "server already seeded) — snapshot.db + JSON sidecar are unaffected.",
+            lib_name,
         )
-        return ""
 
     # Rule 1: append the live-fetched payload to the run-scoped
     # collector. ``_capture_snapshot_after_run`` reads this list to
@@ -1524,11 +1884,18 @@ def run_snapshot(
                             if exc:
                                 logger.error(f"Snapshot failed for library '{lib}': {exc}")
                                 state.get_dashboard().finish_library(lib, error=True)
-                                state.get_dashboard().push_activity("error", lib, "Snapshot failed")
+                                # Per-library activity entry. The server-level
+                                # "Snapshot complete" message fires from the
+                                # job runner once every library finishes (see
+                                # the console.print at end of run_snapshot
+                                # and the run-level finalize phase) — here
+                                # we say "Library failed" so the feed
+                                # reflects what actually finished.
+                                state.get_dashboard().push_activity("error", lib, "Library failed")
                             else:
                                 logger.info(f"{lib} → {fut.result()}")
                                 state.get_dashboard().finish_library(lib)
-                                state.get_dashboard().push_activity("done", lib, "Snapshot complete")
+                                state.get_dashboard().push_activity("done", lib, "Library complete")
                     if stop_event.is_set():
                         for f in pending:
                             f.cancel()
@@ -1567,6 +1934,13 @@ def run_snapshot(
         finally:
             stop_event.set()
             state._live_instance = None
-            state._dashboard = None
+            # v0.13.x: do NOT clear state._dashboard here. The job worker
+            # in server/jobs.py has post-engine work to do (snapshot DB
+            # capture, registry insert, JSON-sidecar prebuild, run-dir
+            # rename) and uses ``_dash.set_finalizing("…")`` to surface
+            # what it's doing - records hit a dashboard nulled here
+            # silently. Worker's finally block nulls _dashboard once
+            # all of that completes; CLI mode is unaffected (CLI exits
+            # after the run, garbage-collecting the reference).
 
     console.print(f"\n[bold green]Snapshot complete.[/bold green] Files saved to: {output_dir}\n")

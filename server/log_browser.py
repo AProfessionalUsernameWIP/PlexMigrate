@@ -48,6 +48,31 @@ def _resolve_within(base: Path, relative: str) -> Path:
     return candidate
 
 
+def _resolve_run_dir(base: Path, run_name: str) -> Path:
+    """
+    Resolve a run directory by name, tolerating the ``_PASS`` / ``_FAIL``
+    suffix that :func:`_finalise_run_dir` appends at the end of a job.
+
+    The frontend's live log tail opens a stream at the run's *original*
+    name (``run_<ts>``); when the job finishes the engine renames the
+    directory to ``run_<ts>_PASS`` / ``_FAIL`` and the next poll would
+    404. We try the literal name first, then each suffix variant, so
+    the tail keeps resolving across the boundary.
+
+    Returns the resolved directory path. Caller still applies the
+    containment guard via :func:`_resolve_within`. Raises
+    :class:`FileNotFoundError` when none of the three candidates exist.
+    """
+    for candidate_name in (run_name, f"{run_name}_PASS", f"{run_name}_FAIL"):
+        # Belt-and-suspenders: even though we synthesise the suffixes
+        # ourselves, run every candidate through the containment guard
+        # so a crafted run_name that includes ``..`` can't sneak past.
+        candidate = _resolve_within(base, candidate_name)
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(f"No such run: {run_name}")
+
+
 # ── Listing ──────────────────────────────────────────────────────────────────
 
 def list_runs() -> List[Dict[str, Any]]:
@@ -97,9 +122,9 @@ def list_files(run_name: str) -> List[Dict[str, Any]]:
     """
     settings = load_settings()
     base = Path(settings.get("log_dir") or "./plex_logs")
-    run_dir = _resolve_within(base, run_name)
-    if not run_dir.is_dir():
-        raise FileNotFoundError(f"No such run: {run_name}")
+    # Tolerate the post-finalize rename so the live-tail keeps
+    # resolving when the engine appends ``_PASS`` / ``_FAIL``.
+    run_dir = _resolve_run_dir(base, run_name)
 
     files: List[Dict[str, Any]] = []
     for f in run_dir.iterdir():
@@ -188,9 +213,8 @@ def delete_run(run_name: str) -> Tuple[int, List[str]]:
     """
     settings = load_settings()
     base = Path(settings.get("log_dir") or "./plex_logs")
-    run_dir = _resolve_within(base, run_name)
-    if not run_dir.is_dir():
-        raise FileNotFoundError(f"No such run: {run_name}")
+    # Tolerate the post-finalize ``_PASS`` / ``_FAIL`` rename.
+    run_dir = _resolve_run_dir(base, run_name)
     # os.walk(followlinks=False) so a symlink planted inside the run
     # dir doesn't make the count reach outside it. shutil.rmtree below
     # already unlinks symlinks rather than recursing through them.
@@ -221,9 +245,8 @@ def build_run_zip(run_name: str) -> Tuple[Path, str]:
     """
     settings = load_settings()
     base = Path(settings.get("log_dir") or "./plex_logs")
-    run_dir = _resolve_within(base, run_name)
-    if not run_dir.is_dir():
-        raise FileNotFoundError(f"No such run: {run_name}")
+    # Tolerate the post-finalize ``_PASS`` / ``_FAIL`` rename.
+    run_dir = _resolve_run_dir(base, run_name)
 
     # mkstemp gives us a real path on disk we can hand to FileResponse;
     # NamedTemporaryFile would close-delete it under Windows the moment
@@ -267,7 +290,8 @@ def resolve_file_path(run_name: str, file_name: str) -> Path:
     """
     settings = load_settings()
     base = Path(settings.get("log_dir") or "./plex_logs")
-    run_dir = _resolve_within(base, run_name)
+    # Tolerate the post-finalize ``_PASS`` / ``_FAIL`` rename.
+    run_dir = _resolve_run_dir(base, run_name)
     file_path = _resolve_within(run_dir, file_name)
     if not file_path.is_file():
         raise FileNotFoundError(f"No such file: {run_name}/{file_name}")
@@ -311,7 +335,20 @@ def delete_all_runs() -> Tuple[int, List[str]]:
 # Pre-PR-13 fix #5 this was 4 MB - too aggressive given typical
 # snapshot-run log sizes. 16 MB covers the vast majority of runs in
 # the viewer without forcing the operator to download.
-_MAX_READ_BYTES = 16 * 1024 * 1024
+#
+# Hot-reload (Phase 3): the cap is read from
+# ``services.tunables.log_read_max_bytes`` at each read so an operator
+# bumping it via Settings ▸ Tunables takes effect on the next request.
+# The constant below is the historical fallback.
+_MAX_READ_BYTES_FALLBACK = 16 * 1024 * 1024
+
+
+def _max_read_bytes() -> int:
+    try:
+        from services.tunables import log_read_max_bytes
+        return int(log_read_max_bytes())
+    except Exception:
+        return _MAX_READ_BYTES_FALLBACK
 
 
 def read_file(run_name: str, file_name: str, *, since: int = 0) -> Dict[str, Any]:
@@ -338,7 +375,10 @@ def read_file(run_name: str, file_name: str, *, since: int = 0) -> Dict[str, Any
     """
     settings = load_settings()
     base = Path(settings.get("log_dir") or "./plex_logs")
-    run_dir = _resolve_within(base, run_name)
+    # Tolerate the post-finalize ``_PASS`` / ``_FAIL`` rename so a
+    # live-tail poll that started mid-run keeps resolving once the
+    # engine finishes and the directory gets the suffix.
+    run_dir = _resolve_run_dir(base, run_name)
     file_path = _resolve_within(run_dir, file_name)
     if not file_path.is_file():
         raise FileNotFoundError(f"No such file: {run_name}/{file_name}")
@@ -351,23 +391,24 @@ def read_file(run_name: str, file_name: str, *, since: int = 0) -> Dict[str, Any
     if since < 0 or since > size:
         since = 0
 
+    max_bytes = _max_read_bytes()
     if since > 0:
         # Incremental read - from offset to end, capped.
         readable = size - since
         with open(file_path, "rb") as fh:
             fh.seek(since)
-            if readable > _MAX_READ_BYTES:
-                blob = fh.read(_MAX_READ_BYTES)
+            if readable > max_bytes:
+                blob = fh.read(max_bytes)
                 truncated = True
             else:
                 blob = fh.read()
-    elif size > _MAX_READ_BYTES:
+    elif size > max_bytes:
         truncated = True
         with open(file_path, "rb") as fh:
             # Read the *tail* of the file rather than the head: when
             # something goes wrong the bottom of the log is what the
             # user wants to see first.
-            fh.seek(-_MAX_READ_BYTES, 2)
+            fh.seek(-max_bytes, 2)
             blob = fh.read()
     else:
         with open(file_path, "rb") as fh:

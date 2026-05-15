@@ -17,10 +17,19 @@ export const ALL_PERMISSIONS: Permission[] = [
   'jobs.start', 'jobs.stop',
   'schedules.view', 'schedules.edit',
   'logs.view', 'exports.view',
-  'settings.edit',
+  'settings.edit', 'settings.tunables',
   'users.manage', 'db_admin.access',
   'sync.view', 'sync.edit',
 ];
+
+// Permission bundle for ``admin`` — everything except settings.tunables.
+// Mirrors the backend's ``_ADMIN_PERMS`` in server/auth_router.py:
+// admin can edit normal settings but cannot touch the System Tunables
+// page (HTTP timeouts, JWT TTL, SQLite busy timeouts, etc.) because
+// wrong values there can lock every user out.
+const ADMIN_PERMISSIONS: Permission[] = ALL_PERMISSIONS.filter(
+  (p) => p !== 'settings.tunables',
+);
 
 
 /**
@@ -40,12 +49,11 @@ export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
                'jobs.start', 'jobs.stop',
                'schedules.view', 'schedules.edit',
                'sync.view'],
-  // ``admin`` (sudo-root) has the same permission set as ``root_admin``.
-  // The difference is enforced row-by-row server-side: admin cannot
-  // modify the root_admin user. UI-side, the User Accounts explorer
-  // hides destructive controls for the root_admin row when the
-  // caller is admin.
-  admin:      ALL_PERMISSIONS,
+  // ``admin`` carries every permission EXCEPT settings.tunables.
+  // Mirrors backend ROLE_PERMISSIONS in server/auth_router.py exactly.
+  // Per-row guards on the User Accounts explorer prevent admin from
+  // modifying the root_admin row.
+  admin:      ADMIN_PERMISSIONS,
   root_admin: ALL_PERMISSIONS,
 };
 
@@ -87,6 +95,7 @@ export const PERMISSION_LABELS: Record<Permission, string> = {
   'logs.view':       'Browse run logs',
   'exports.view':    'Browse and download export files',
   'settings.edit':   'Edit system settings (paths, workers, defaults)',
+  'settings.tunables': 'Edit infrastructure tunables (HTTP timeouts, JWT TTL, SQLite busy timeouts, etc.) — root admin only',
   'users.manage':    'Create, edit, and delete other user accounts',
   'db_admin.access': 'Access the Database Admin Account credential',
   'sync.view':       'View the Sync tab',
@@ -163,7 +172,14 @@ export interface AuthProviderProps {
 
 export function AuthProvider(props: AuthProviderProps) {
   const value = useMemo<AuthContextValue>(() => {
-    const effectivePermissions = ROLE_PERMISSIONS[props.effectiveRole] ?? [];
+    // Backend-provided effective permissions take precedence — they
+    // already incorporate per-user grants and revokes from the new
+    // Access Control feature. Fall back to the role baseline only
+    // when /me returns an empty list (e.g. an older backend that
+    // doesn't ship the effective_permissions resolver yet).
+    const effectivePermissions = (props.permissions && props.permissions.length > 0)
+      ? props.permissions
+      : (ROLE_PERMISSIONS[props.effectiveRole] ?? []);
     return {
       username: props.username,
       displayName: props.displayName,

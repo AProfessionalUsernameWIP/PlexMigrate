@@ -321,6 +321,24 @@ def register(
         )
     finally:
         conn.close()
+    # Audit trail: registry insert is the third half of the snapshot
+    # write triple (media.db ingest → snapshot.db file → snapshots.db
+    # row). The first two are already audited in their respective
+    # writers; this closes the loop.
+    try:
+        from services import db_access_log
+        db_access_log.log_write(
+            table="snapshots.db:snapshots",
+            where={"id": snapshot_id, "server_id": server_id},
+            affected_rows=1,
+            intent=(
+                f"register snapshot {snapshot_name!r} "
+                f"(libraries={len(libraries or [])}, "
+                f"file_size={file_size or 0} bytes)"
+            ),
+        )
+    except Exception:
+        pass
     # Best-effort retention sweep. Failures don't fail the register.
     try:
         enforce_retention(server_id)
@@ -723,6 +741,22 @@ def _ingest_orphan(
                 return None
     finally:
         conn.close()
+    # Audit trail: orphan reconcile writes a fresh registry row by
+    # bypassing register(); record the equivalent write so the audit
+    # log doesn't have a gap.
+    try:
+        from services import db_access_log
+        db_access_log.log_write(
+            table="snapshots.db:snapshots",
+            where={"id": snapshot_id, "server_id": server_id},
+            affected_rows=1,
+            intent=(
+                f"recover orphan snapshot {path.name!r} "
+                f"(kind={kind}, file_size={file_size} bytes)"
+            ),
+        )
+    except Exception:
+        pass
     return get(snapshot_id)
 
 
@@ -803,6 +837,18 @@ def materialise_sidecar(snapshot_id: str) -> Optional[str]:
         )
     finally:
         conn.close()
+    # Audit trail: stamping prebuilt_json_path is a mutating write on
+    # the registry row that should appear in db_access.log.
+    try:
+        from services import db_access_log
+        db_access_log.log_write(
+            table="snapshots.db:snapshots",
+            where={"id": snapshot_id, "column": "prebuilt_json_path"},
+            affected_rows=1,
+            intent=f"materialise sidecar {sidecar_path.name!r}",
+        )
+    except Exception:
+        pass
     return str(sidecar_path)
 
 
@@ -917,6 +963,26 @@ def delete(snapshot_id: str, *, keep_json: bool = False) -> Dict[str, Any]:
         conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
     finally:
         conn.close()
+    # Audit trail: the row drop and any side-effects (.db unlink, JSON
+    # archive move, sidecar delete) are operator-visible state changes
+    # that belong in db_access.log.
+    try:
+        from services import db_access_log
+        db_access_log.log_write(
+            table="snapshots.db:snapshots",
+            where={
+                "id": snapshot_id,
+                "server_id": row.get("server_id") or "",
+            },
+            affected_rows=1,
+            intent=(
+                f"delete snapshot {row.get('snapshot_name') or snapshot_id!r} "
+                f"(file_removed={file_removed}, json_removed={json_removed}, "
+                f"json_archived={json_archived}, keep_json={keep_json})"
+            ),
+        )
+    except Exception:
+        pass
     return {
         "deleted": snapshot_id,
         "file_removed": file_removed,

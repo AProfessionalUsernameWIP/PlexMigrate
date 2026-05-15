@@ -124,17 +124,24 @@ def init_auth_db() -> None:
         try:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS app_users (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username      TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role          TEXT NOT NULL DEFAULT 'operator'
-                                  CHECK (role IN (
-                                      'viewer', 'operator', 'manager',
-                                      'admin', 'root_admin', 'db_admin'
-                                  )),
-                    display_name  TEXT,
-                    last_login    REAL,
-                    created_at    REAL NOT NULL
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username            TEXT UNIQUE NOT NULL,
+                    password_hash       TEXT NOT NULL,
+                    role                TEXT NOT NULL DEFAULT 'operator'
+                                        CHECK (role IN (
+                                            'viewer', 'operator', 'manager',
+                                            'admin', 'root_admin', 'db_admin'
+                                        )),
+                    display_name        TEXT,
+                    last_login          REAL,
+                    created_at          REAL NOT NULL,
+                    -- Per-user permission grants/revokes layered on top
+                    -- of the role baseline. Both are JSON arrays of
+                    -- permission strings. NULL = empty (no overrides).
+                    -- Effective = ROLE_PERMS ∪ extra_permissions \\ revoked_permissions
+                    -- with root_admin immune to revokes (always ALL_PERMS).
+                    extra_permissions   TEXT,
+                    revoked_permissions TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_app_users_username
                     ON app_users(username);
@@ -151,10 +158,37 @@ def init_auth_db() -> None:
                     ON refresh_tokens(expires_at);
             """)
             _migrate_schema(conn)
+            _migrate_permission_columns(conn)
         finally:
             conn.close()
         _initialised = True
         log.info("auth.db initialised at %s", _db_path())
+
+
+def _migrate_permission_columns(conn: sqlite3.Connection) -> None:
+    """
+    Add ``extra_permissions`` and ``revoked_permissions`` TEXT columns
+    to ``app_users`` if they're not already present. Idempotent —
+    ``ALTER TABLE ADD COLUMN`` raises ``OperationalError: duplicate
+    column name`` when the column already exists, which we catch.
+
+    These columns store JSON arrays of permission strings used by
+    ``server.auth_router.effective_permissions_for`` to layer per-user
+    grants and revokes on top of the role baseline.
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(app_users)").fetchall()}
+    if "extra_permissions" not in have:
+        try:
+            conn.execute("ALTER TABLE app_users ADD COLUMN extra_permissions TEXT")
+            log.info("auth.db: added extra_permissions column")
+        except sqlite3.OperationalError:
+            pass
+    if "revoked_permissions" not in have:
+        try:
+            conn.execute("ALTER TABLE app_users ADD COLUMN revoked_permissions TEXT")
+            log.info("auth.db: added revoked_permissions column")
+        except sqlite3.OperationalError:
+            pass
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -203,6 +237,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     has_last_login = "last_login" in legacy_cols
     display_expr = "display_name" if has_display else "NULL"
     last_login_expr = "last_login" if has_last_login else "NULL"
+    # Per-user permission columns added in the Access Control feature.
+    # Preserved across the rebuild when present; left NULL otherwise.
+    has_extra_perms = "extra_permissions" in legacy_cols
+    has_revoked_perms = "revoked_permissions" in legacy_cols
+    extra_perms_expr = "extra_permissions" if has_extra_perms else "NULL"
+    revoked_perms_expr = "revoked_permissions" if has_revoked_perms else "NULL"
 
     # We need a CASE expression that:
     #   * remaps the LEGACY ``admin`` (pre-PR-A1) → ``root_admin``,
@@ -225,20 +265,24 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(f"""
         BEGIN TRANSACTION;
         CREATE TABLE app_users_new (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            username      TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role          TEXT NOT NULL DEFAULT 'operator'
-                          CHECK (role IN (
-                              'viewer', 'operator', 'manager',
-                              'admin', 'root_admin', 'db_admin'
-                          )),
-            display_name  TEXT,
-            last_login    REAL,
-            created_at    REAL NOT NULL
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            username            TEXT UNIQUE NOT NULL,
+            password_hash       TEXT NOT NULL,
+            role                TEXT NOT NULL DEFAULT 'operator'
+                                CHECK (role IN (
+                                    'viewer', 'operator', 'manager',
+                                    'admin', 'root_admin', 'db_admin'
+                                )),
+            display_name        TEXT,
+            last_login          REAL,
+            created_at          REAL NOT NULL,
+            extra_permissions   TEXT,
+            revoked_permissions TEXT
         );
         INSERT INTO app_users_new
-            (id, username, password_hash, role, display_name, last_login, created_at)
+            (id, username, password_hash, role,
+             display_name, last_login, created_at,
+             extra_permissions, revoked_permissions)
         SELECT
             id,
             username,
@@ -246,7 +290,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             {role_expr},
             {display_expr},
             {last_login_expr},
-            created_at
+            created_at,
+            {extra_perms_expr},
+            {revoked_perms_expr}
         FROM app_users;
         DROP TABLE app_users;
         ALTER TABLE app_users_new RENAME TO app_users;
@@ -492,6 +538,108 @@ def list_users() -> List[Dict[str, Any]]:
     finally:
         conn.close()
     return [_row_to_user(r) for r in rows]
+
+
+# ── Access Control: per-user permission grants/revokes ────────────────────
+#
+# Layered on top of the role baseline. ``extra_permissions`` adds
+# permissions the role doesn't normally have; ``revoked_permissions``
+# removes permissions the role normally would have. Both stored as
+# JSON arrays of strings.
+#
+# Resolution:  effective = ROLE_PERMS ∪ extra \\ revoked
+# Special case: root_admin is immune to revokes (always full set) so an
+# accidental revoke can never lock root admin out of the system.
+
+def _decode_perm_list(raw: Optional[str]) -> List[str]:
+    """Parse a JSON-encoded permission list. Empty / corrupt → []."""
+    if not raw:
+        return []
+    import json
+    try:
+        v = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(v, list):
+        return []
+    return [str(p) for p in v if isinstance(p, str)]
+
+
+def get_user_permission_grants(username: str) -> Dict[str, List[str]]:
+    """
+    Return the per-user grant + revoke lists for ``username``.
+
+    Shape: ``{"extra": [...], "revoked": [...]}``. Missing user returns
+    empty lists for both — callers blend these with the role baseline
+    via ``effective_permissions_for`` and shouldn't treat "missing
+    user" as an error here.
+    """
+    init_auth_db()
+    uname = (username or "").strip()
+    if not uname:
+        return {"extra": [], "revoked": []}
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT extra_permissions, revoked_permissions "
+            "FROM app_users WHERE username = ?",
+            (uname,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {"extra": [], "revoked": []}
+    return {
+        "extra": _decode_perm_list(row["extra_permissions"]),
+        "revoked": _decode_perm_list(row["revoked_permissions"]),
+    }
+
+
+def set_user_permission_grants(
+    username: str,
+    extra: List[str],
+    revoked: List[str],
+) -> None:
+    """
+    Replace the per-user grant + revoke lists for ``username``.
+
+    Inputs are validated by the caller (the auth_router PATCH endpoint
+    rejects unknown permission strings and blocks revoking from
+    root_admin before reaching here). This function trusts both lists
+    to be already-dedup'd lists of valid permission strings.
+
+    Raises ``ValueError`` if the user doesn't exist — silent no-op
+    would mask a typo in the username arg.
+    """
+    import json
+    init_auth_db()
+    uname = (username or "").strip()
+    if not uname:
+        raise ValueError("Username must not be empty.")
+    # Normalise: dedup, strip, drop empty / non-string.
+    def _clean(lst: List[str]) -> List[str]:
+        seen: List[str] = []
+        for s in lst or []:
+            s = str(s).strip()
+            if not s or s in seen:
+                continue
+            seen.append(s)
+        return seen
+    extra_clean = _clean(extra)
+    revoked_clean = _clean(revoked)
+    extra_json = json.dumps(extra_clean) if extra_clean else None
+    revoked_json = json.dumps(revoked_clean) if revoked_clean else None
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE app_users SET extra_permissions = ?, revoked_permissions = ? "
+            "WHERE username = ?",
+            (extra_json, revoked_json, uname),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"No user with username {uname!r}.")
+    finally:
+        conn.close()
 
 
 # ── PR-A1: mutation helpers for the multi-user system ──────────────────────
@@ -785,7 +933,16 @@ def update_username(old_username: str, new_username: str) -> None:
 #   * Expired rows are reaped daily by a background thread spawned
 #     from server/app.py's startup hook.
 
-_REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 3600  # 7 days
+_REFRESH_TOKEN_TTL_FALLBACK = 7 * 24 * 3600  # 7 days
+
+
+def _refresh_token_ttl() -> int:
+    """Hot-reload via ``services.tunables.refresh_token_ttl_seconds``."""
+    try:
+        from services.tunables import refresh_token_ttl_seconds
+        return int(refresh_token_ttl_seconds())
+    except Exception:
+        return _REFRESH_TOKEN_TTL_FALLBACK
 
 
 def create_refresh_token(username: str) -> str:
@@ -811,7 +968,7 @@ def create_refresh_token(username: str) -> str:
             "INSERT INTO refresh_tokens "
             "(id, username, issued_at, expires_at, revoked) "
             "VALUES (?, ?, ?, ?, 0)",
-            (token_id, uname, now, now + _REFRESH_TOKEN_TTL_SECONDS),
+            (token_id, uname, now, now + _refresh_token_ttl()),
         )
     finally:
         conn.close()

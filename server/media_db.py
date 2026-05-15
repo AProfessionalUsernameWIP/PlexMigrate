@@ -331,6 +331,113 @@ _MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_library_walks_server_started
             ON library_walks(server_id, started_at DESC);
     """),
+    # v0.13.0 - server_users identity table + FK migration.
+    #
+    # Replaces the ``user_handle = ''`` owner sentinel with a real
+    # per-server user record. The owner becomes a row with
+    # ``role = 'owner'``; managed users get ``role = 'managed'``. The
+    # design is multi-backend up-front: future Jellyfin/Emby adapters
+    # will write rows with ``backend = 'jellyfin'`` / ``'emby'`` and
+    # the engine code reads them through one uniform API.
+    #
+    # This migration is ADDITIVE. The ``user_handle`` columns on the
+    # wide tables (watch_events / ratings / playlists / collections)
+    # stay in place as a denormalized fallback while every caller
+    # switches to the FK over the next few commits. A later migration
+    # drops them once nothing reads them.
+    #
+    # Backfill semantics:
+    #   * Every distinct (server_id, user_handle) tuple already present
+    #     in any wide table gets a server_users row.
+    #   * user_handle = '' -> role = 'owner'; everything else
+    #     -> role = 'managed'.
+    #   * display_name / backend_user_id are left NULL; the next
+    #     snapshot or library-walk run upserts those via
+    #     ``get_or_create_server_user`` which knows the live names.
+    (7, """
+        CREATE TABLE IF NOT EXISTS server_users (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id        TEXT NOT NULL,
+            user_handle      TEXT NOT NULL,
+            display_name     TEXT,
+            role             TEXT NOT NULL
+                             CHECK (role IN ('owner', 'managed')),
+            backend          TEXT NOT NULL DEFAULT 'plex'
+                             CHECK (backend IN ('plex', 'emby', 'jellyfin')),
+            backend_user_id  TEXT,
+            created_at       REAL NOT NULL,
+            last_seen_at     REAL,
+            UNIQUE(server_id, user_handle)
+        );
+        CREATE INDEX IF NOT EXISTS idx_server_users_server
+            ON server_users(server_id);
+        CREATE INDEX IF NOT EXISTS idx_server_users_role
+            ON server_users(role);
+
+        ALTER TABLE watch_events ADD COLUMN server_user_id INTEGER
+            REFERENCES server_users(id);
+        ALTER TABLE ratings      ADD COLUMN server_user_id INTEGER
+            REFERENCES server_users(id);
+        ALTER TABLE playlists    ADD COLUMN server_user_id INTEGER
+            REFERENCES server_users(id);
+        ALTER TABLE collections  ADD COLUMN server_user_id INTEGER
+            REFERENCES server_users(id);
+
+        CREATE INDEX IF NOT EXISTS idx_watch_events_server_user_fk
+            ON watch_events(server_user_id);
+        CREATE INDEX IF NOT EXISTS idx_ratings_server_user_fk
+            ON ratings(server_user_id);
+        CREATE INDEX IF NOT EXISTS idx_playlists_server_user_fk
+            ON playlists(server_user_id);
+        CREATE INDEX IF NOT EXISTS idx_collections_server_user_fk
+            ON collections(server_user_id);
+
+        -- Backfill server_users from every (server_id, user_handle)
+        -- tuple already present in the wide tables. INSERT OR IGNORE
+        -- so a tuple seen in multiple tables only produces one row.
+        INSERT OR IGNORE INTO server_users
+            (server_id, user_handle, role, backend, created_at)
+        SELECT DISTINCT server_id, user_handle,
+               CASE WHEN user_handle = '' THEN 'owner' ELSE 'managed' END,
+               'plex',
+               CAST(strftime('%s', 'now') AS REAL)
+        FROM (
+            SELECT server_id, user_handle FROM watch_events
+            UNION
+            SELECT server_id, user_handle FROM ratings
+            UNION
+            SELECT server_id, user_handle FROM playlists
+            UNION
+            SELECT server_id, user_handle FROM collections
+        );
+
+        -- Point each wide-table row at its server_users row. The
+        -- correlated subquery matches on the (server_id, user_handle)
+        -- UNIQUE so each row gets exactly one id back.
+        UPDATE watch_events SET server_user_id = (
+            SELECT su.id FROM server_users su
+            WHERE su.server_id = watch_events.server_id
+              AND su.user_handle = watch_events.user_handle
+        ) WHERE server_user_id IS NULL;
+
+        UPDATE ratings SET server_user_id = (
+            SELECT su.id FROM server_users su
+            WHERE su.server_id = ratings.server_id
+              AND su.user_handle = ratings.user_handle
+        ) WHERE server_user_id IS NULL;
+
+        UPDATE playlists SET server_user_id = (
+            SELECT su.id FROM server_users su
+            WHERE su.server_id = playlists.server_id
+              AND su.user_handle = playlists.user_handle
+        ) WHERE server_user_id IS NULL;
+
+        UPDATE collections SET server_user_id = (
+            SELECT su.id FROM server_users su
+            WHERE su.server_id = collections.server_id
+              AND su.user_handle = collections.user_handle
+        ) WHERE server_user_id IS NULL;
+    """),
 ]
 
 
@@ -634,6 +741,66 @@ def upsert_item(
         return int(cur.lastrowid)
 
 
+def get_or_create_server_user(
+    *,
+    server_id: str,
+    user_handle: str,
+    role: Optional[str] = None,
+    display_name: Optional[str] = None,
+    backend: str = "plex",
+    backend_user_id: Optional[str] = None,
+) -> int:
+    """
+    Return the ``server_users.id`` for ``(server_id, user_handle)``,
+    creating the row on first encounter.
+
+    Role defaulting: when ``role`` is None, an empty ``user_handle``
+    infers ``'owner'`` (matches the legacy sentinel) and any other
+    handle infers ``'managed'``. Callers that already know the role
+    (the snapshotter, the live-API sync helpers) should pass it
+    explicitly so a future engine that decides to give the owner a
+    real handle still labels it correctly.
+
+    ``display_name`` / ``backend_user_id`` are LWW on conflict (a
+    non-NULL incoming value overwrites; a NULL leaves the prior value
+    alone). ``role`` is fixed at INSERT time and never updated on
+    conflict - changing a user's role is a separate, explicit op,
+    not a side effect of upserting their watch history. ``backend``
+    similarly stays at its first-write value.
+
+    The CHECK constraints on the table reject unknown roles and
+    backends, so a typo here surfaces as an IntegrityError rather
+    than a silently malformed row.
+    """
+    handle = user_handle or ""
+    inferred_role = role or ("owner" if handle == "" else "managed")
+    conn = _require_conn()
+    now = time.time()
+    with _DB_LOCK:
+        conn.execute(
+            """
+            INSERT INTO server_users (
+                server_id, user_handle, display_name, role, backend,
+                backend_user_id, created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(server_id, user_handle) DO UPDATE SET
+                display_name    = COALESCE(excluded.display_name,
+                                           server_users.display_name),
+                backend_user_id = COALESCE(excluded.backend_user_id,
+                                           server_users.backend_user_id),
+                last_seen_at    = excluded.last_seen_at
+            """,
+            (server_id, handle, display_name, inferred_role, backend,
+             backend_user_id, now, now),
+        )
+        row = conn.execute(
+            "SELECT id FROM server_users "
+            "WHERE server_id = ? AND user_handle = ?",
+            (server_id, handle),
+        ).fetchone()
+        return int(row["id"])
+
+
 def record_watch_event(
     *,
     item_id: int,
@@ -642,28 +809,45 @@ def record_watch_event(
     view_count: int,
     view_offset: int = 0,
     last_viewed_at: Optional[float] = None,
+    role: Optional[str] = None,
+    display_name: Optional[str] = None,
+    backend_user_id: Optional[str] = None,
 ) -> None:
     """
-    Upsert one ``(item, server, user)`` watch-state row. Used by the
-    snapshotter (during a future v0.12.1 migration) and the targeted
-    scan endpoint (Feature 5).
+    Upsert one ``(item, server, user)`` watch-state row.
+
+    The role / display_name / backend_user_id keyword args are
+    forwarded to :func:`get_or_create_server_user`; callers that know
+    the user's identity (the snapshotter, direct transfer) pass them
+    so the ``server_users`` row gets populated with real data on
+    first sight. Callers that only have a handle (legacy code paths
+    during the transition) can omit them - the row is created with
+    NULL display_name and inferred role.
     """
+    server_user_id = get_or_create_server_user(
+        server_id=server_id,
+        user_handle=user_handle,
+        role=role,
+        display_name=display_name,
+        backend_user_id=backend_user_id,
+    )
     conn = _require_conn()
     now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
             INSERT INTO watch_events (
-                item_id, server_id, user_handle,
+                item_id, server_id, user_handle, server_user_id,
                 view_count, view_offset, last_viewed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, server_id, user_handle) DO UPDATE SET
+                server_user_id = excluded.server_user_id,
                 view_count     = excluded.view_count,
                 view_offset    = excluded.view_offset,
                 last_viewed_at = COALESCE(excluded.last_viewed_at, watch_events.last_viewed_at),
                 updated_at     = excluded.updated_at
             """,
-            (item_id, server_id, user_handle or "",
+            (item_id, server_id, user_handle or "", server_user_id,
              int(view_count), int(view_offset), last_viewed_at, now),
         )
 
@@ -674,20 +858,35 @@ def upsert_rating(
     server_id: str,
     user_handle: str,
     rating: float,
+    role: Optional[str] = None,
+    display_name: Optional[str] = None,
+    backend_user_id: Optional[str] = None,
 ) -> None:
-    """Upsert one star-rating row."""
+    """Upsert one star-rating row. See :func:`record_watch_event` for the
+    role / display_name / backend_user_id forwarding semantics."""
+    server_user_id = get_or_create_server_user(
+        server_id=server_id,
+        user_handle=user_handle,
+        role=role,
+        display_name=display_name,
+        backend_user_id=backend_user_id,
+    )
     conn = _require_conn()
     now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
-            INSERT INTO ratings (item_id, server_id, user_handle, rating, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO ratings (
+                item_id, server_id, user_handle, server_user_id,
+                rating, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, server_id, user_handle) DO UPDATE SET
-                rating     = excluded.rating,
-                updated_at = excluded.updated_at
+                server_user_id = excluded.server_user_id,
+                rating         = excluded.rating,
+                updated_at     = excluded.updated_at
             """,
-            (item_id, server_id, user_handle or "", float(rating), now),
+            (item_id, server_id, user_handle or "", server_user_id,
+             float(rating), now),
         )
 
 
@@ -729,16 +928,20 @@ def upsert_playlist(
     :func:`ingest_snapshot_payload` below applies this discipline
     automatically when callers feed it a full snapshot payload.
     """
+    server_user_id = get_or_create_server_user(
+        server_id=server_id, user_handle=user_handle,
+    )
     conn = _require_conn()
     now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
             INSERT INTO playlists (
-                server_id, user_handle, name, description,
+                server_id, user_handle, server_user_id, name, description,
                 is_smart, smart_filter_json, item_ids_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(server_id, user_handle, name) DO UPDATE SET
+                server_user_id    = excluded.server_user_id,
                 description       = excluded.description,
                 is_smart          = excluded.is_smart,
                 smart_filter_json = excluded.smart_filter_json,
@@ -746,7 +949,7 @@ def upsert_playlist(
                 updated_at        = excluded.updated_at
             """,
             (
-                server_id, user_handle or "", name, description,
+                server_id, user_handle or "", server_user_id, name, description,
                 1 if is_smart else 0,
                 smart_filter,
                 json.dumps(list(item_ids or [])),
@@ -789,19 +992,24 @@ def upsert_collection(
     :func:`ingest_snapshot_payload` below applies this discipline
     automatically when callers feed it a full snapshot payload.
     """
+    server_user_id = get_or_create_server_user(
+        server_id=server_id, user_handle=user_handle,
+    )
     conn = _require_conn()
     now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
             INSERT INTO collections (
-                server_id, user_handle, name, item_ids_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?)
+                server_id, user_handle, server_user_id, name,
+                item_ids_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(server_id, user_handle, name) DO UPDATE SET
-                item_ids_json = excluded.item_ids_json,
-                updated_at    = excluded.updated_at
+                server_user_id = excluded.server_user_id,
+                item_ids_json  = excluded.item_ids_json,
+                updated_at     = excluded.updated_at
             """,
-            (server_id, user_handle or "", name,
+            (server_id, user_handle or "", server_user_id, name,
              json.dumps(list(item_ids or [])), now),
         )
         row = conn.execute(
@@ -850,8 +1058,13 @@ def purge_server_data(server_id: str) -> Dict[str, int]:
 
     Tables purged (all ``WHERE server_id = ?``):
 
-        watch_events, ratings, playlists, collections, server_items,
-        servers
+        watch_events, ratings, playlists, collections, server_users,
+        server_items, servers
+
+    Order matters: the wide tables reference ``server_users`` via
+    ``server_user_id`` FK, so they have to be cleared before the
+    server_users rows they point at. The list below is in
+    purge-safe order.
 
     The ``items`` table is NOT pruned. Items are GUID-keyed and may
     be shared across multiple servers - the resolver's Tier-0 cache
@@ -884,6 +1097,7 @@ def purge_server_data(server_id: str) -> Dict[str, int]:
         "ratings",
         "playlists",
         "collections",
+        "server_users",
         "server_items",
         "servers",
     )
@@ -1396,6 +1610,30 @@ def find_rating_key_on_server(*, guids: List[str], server_id: str) -> Optional[i
     return int(row["rating_key"]) if row else None
 
 
+def has_any_items_for_server(server_id: str) -> bool:
+    """
+    True iff media.db has at least one ``server_items`` row tagged
+    with this ``server_id``. Used by the snapshot-payload caching
+    decision (services.snapshotter._should_cache_payload_to_media_db)
+    to detect a "first run" for an unseeded server and trigger a
+    one-shot ingest that populates the resolver Tier 0 GUID cache.
+
+    Returns False on any DB error (caller treats failure as "not
+    first run" so we never trigger an unexpected ingest).
+    """
+    if not server_id:
+        return False
+    try:
+        conn = _require_conn()
+        row = conn.execute(
+            "SELECT 1 FROM server_items WHERE server_id = ? LIMIT 1",
+            (server_id,),
+        ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
 # ── Snapshot-payload ingestion with dedup discipline (v0.12.1) ─────────────────
 
 def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str, int]:
@@ -1405,47 +1643,61 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
     enforces the dedup discipline documented on :func:`upsert_playlist`
     and :func:`upsert_collection`.
 
-    Input shape (matches the on-disk ``.plexbackup.json`` schema):
+    Input shape (v0.13.0 unified-users JSON schema):
 
     .. code-block:: python
 
         {
             "library": "Movies",
-            "items": {
-                "watch_history": [...],
-                "playlists":     [...],
-                "collections":   [...],
-                "ratings":       [...],
-            },
+            "snapshot_meta": {"server_id": ..., "backend": "plex", ...},
             "users": {
-                "<username>": {
+                "<owner-handle>": {
+                    "role": "owner",
+                    "display_name": "Plex Owner",
+                    "backend_user_id": "1234567",
                     "watch_history": [...],
                     "playlists":     [...],
                     "collections":   [...],
                     "ratings":       [...],
                 },
+                "<managed-handle>": {
+                    "role": "managed",
+                    "display_name": "...",
+                    "watch_history": [...], "playlists": [...], ...
+                },
                 ...
             },
         }
 
+    The owner is identified by ``role == 'owner'`` in the users map,
+    not by a magic empty-string key. Internally we still write the
+    owner's wide-table rows under ``user_handle = ''`` (the legacy DB
+    sentinel) for one release while every caller switches to the
+    ``server_user_id`` FK; the ``server_users`` table is the
+    authoritative source of role / display_name / backend identity.
+
     Walk order:
 
-    1. **Items + server_items** - for every item-bearing entry
-       (watch_history, ratings, playlist members, collection
-       members), upsert into ``items`` keyed by upstream GUID, then
-       record the per-server ratingKey in ``server_items``. This is
-       the data that lights up resolver Tier-0 on subsequent runs.
+    1. **Items + server_items** - for every item-bearing entry across
+       every user's block, upsert into ``items`` keyed by upstream
+       GUID, then record the per-server ratingKey in ``server_items``.
+       This is the data that lights up resolver Tier-0 on subsequent
+       runs. One pass over the unified users map (no separate owner
+       walk needed any more).
 
-    2. **Owner-side / server-wide collections + playlists** - write
-       ``items.collections`` and ``items.playlists`` with
+    2. **Owner block - server-wide collections + playlists** - write
+       the ``role == 'owner'`` user's playlists / collections with
        ``user_handle=""``. Capture the rating_key set for the
-       per-user dedup step.
+       per-user dedup step. Also pre-creates the owner's
+       ``server_users`` row with the display_name from the JSON so
+       it lands on first ingest rather than waiting for a later walk.
 
-    3. **Per-user blocks** - for each user, write watch / ratings /
-       playlists / collections under ``user_handle=<username>``,
-       BUT filter user-private collections / playlists against the
-       owner-side rating_key set so a library-level collection
-       visible to every user doesn't get written N times.
+    3. **Managed users** - for each ``role == 'managed'`` user, write
+       watch / ratings / playlists / collections under
+       ``user_handle=<handle>``, BUT filter user-private collections
+       / playlists against the owner-side rating_key set so a
+       library-level collection visible to every user doesn't get
+       written N times.
 
     Returns a small counter dict so callers (orchestrators) can log
     or assert "ingested K items / M watch events" etc.
@@ -1538,11 +1790,37 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                     except (TypeError, ValueError):
                         pass
 
-    owner_items_block = payload.get("items") or {}
-    _walk_items_block(owner_items_block)
-    for udata in (payload.get("users") or {}).values():
+    # v0.13.0: one pass over the unified users map. Owner and managed
+    # users share the same block shape, so a single loop handles both.
+    users_map = payload.get("users") or {}
+    for udata in users_map.values():
         if isinstance(udata, dict):
             _walk_items_block(udata)
+
+    # Find the owner block (the unique user with role='owner').
+    # If a payload has no role='owner' entry we fall back to the
+    # empty-string handle for compatibility with mid-transition
+    # snapshots, then finally give up gracefully (writes still
+    # land for managed users, just no server-wide rows).
+    owner_handle: Optional[str] = None
+    owner_block: Dict[str, Any] = {}
+    for h, ub in users_map.items():
+        if isinstance(ub, dict) and ub.get("role") == "owner":
+            owner_handle = h
+            owner_block = ub
+            break
+    if owner_handle is None and "" in users_map and isinstance(users_map[""], dict):
+        owner_handle = ""
+        owner_block = users_map[""]
+    # Eagerly upsert the owner's server_users row so display_name /
+    # backend_user_id land now, not on the next walk.
+    if owner_block:
+        get_or_create_server_user(
+            server_id=server_id, user_handle="",
+            role="owner",
+            display_name=owner_block.get("display_name"),
+            backend_user_id=owner_block.get("backend_user_id"),
+        )
 
     def _resolve_member_ids(members: List[Dict[str, Any]]) -> List[int]:
         """
@@ -1580,11 +1858,18 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 out.append(iid)
         return out
 
-    # ── Pass 2: server-wide playlists + collections (user_handle="") ─
-    owner_playlists = owner_items_block.get("playlists") or []
-    owner_collections = owner_items_block.get("collections") or []
+    # ── Pass 2: owner block (server-wide rows, user_handle="") ─────
+    # Owner-side watch / ratings / playlists / collections all land
+    # under the empty-string DB handle. The owner's display_name and
+    # backend_user_id have already been pushed into server_users
+    # above. Capture rating-key sets so the managed-user pass below
+    # can dedup library-level rows it sees re-emitted under personal
+    # handles.
+    owner_playlists  = owner_block.get("playlists")   or []
+    owner_collections = owner_block.get("collections") or []
+    owner_display    = owner_block.get("display_name")
+    owner_backend_id = owner_block.get("backend_user_id")
 
-    # Rating-key sets for the dedup against per-user blocks below.
     owner_playlist_keys = {
         int(pl["rating_key"]) for pl in owner_playlists
         if pl.get("rating_key") is not None
@@ -1620,14 +1905,70 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
         except Exception:
             continue
 
-    # ── Pass 3: per-user blocks (user_handle=<username>) ────────────
-    # Skip per-user collections / playlists that match an owner-side
-    # rating_key - those are server-wide rows we already wrote with
-    # user_handle="". This is THE dedup the Perplexity analysis was
-    # right to flag.
-    for username, udata in (payload.get("users") or {}).items():
-        if not isinstance(udata, dict) or not username:
+    # Owner watch_history / ratings (server-wide, user_handle="").
+    for rec in (owner_block.get("watch_history") or []):
+        rk = rec.get("rating_key")
+        if rk is None:
             continue
+        try:
+            rk_int = int(rk)
+        except (TypeError, ValueError):
+            continue
+        iid = rating_key_to_item_id.get(rk_int)
+        if iid is None:
+            continue
+        try:
+            record_watch_event(
+                item_id=iid, server_id=server_id, user_handle="",
+                role="owner", display_name=owner_display,
+                backend_user_id=owner_backend_id,
+                view_count=int(rec.get("view_count") or 0),
+                view_offset=int(rec.get("view_offset") or 0),
+                last_viewed_at=rec.get("last_viewed_at"),
+            )
+            counters["watch_events"] += 1
+        except Exception:
+            continue
+    for rec in (owner_block.get("ratings") or []):
+        rk = rec.get("rating_key")
+        if rk is None:
+            continue
+        try:
+            rk_int = int(rk)
+            rating_val = float(rec.get("rating") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        iid = rating_key_to_item_id.get(rk_int)
+        if iid is None:
+            continue
+        try:
+            upsert_rating(
+                item_id=iid, server_id=server_id, user_handle="",
+                role="owner", display_name=owner_display,
+                backend_user_id=owner_backend_id,
+                rating=rating_val,
+            )
+            counters["ratings"] += 1
+        except Exception:
+            continue
+
+    # ── Pass 3: managed-user blocks (user_handle=<handle>) ─────────
+    # Skip the user we just processed as owner. Everything else is
+    # role='managed' (or unmarked, defaulted to managed by
+    # get_or_create_server_user). Per-user collections / playlists
+    # are deduped by rating_key against the owner-side set so a
+    # library-level row visible to every user isn't written N times.
+    for username, udata in users_map.items():
+        if not isinstance(udata, dict):
+            continue
+        if username == owner_handle:
+            continue
+        if not username:
+            # Empty handle for a non-owner row is meaningless - skip
+            # rather than collide with the owner sentinel.
+            continue
+        u_display    = udata.get("display_name")
+        u_backend_id = udata.get("backend_user_id")
         # Watch events.
         for rec in (udata.get("watch_history") or []):
             rk = rec.get("rating_key")
@@ -1643,6 +1984,8 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
             try:
                 record_watch_event(
                     item_id=iid, server_id=server_id, user_handle=str(username),
+                    role="managed", display_name=u_display,
+                    backend_user_id=u_backend_id,
                     view_count=int(rec.get("view_count") or 0),
                     view_offset=int(rec.get("view_offset") or 0),
                     last_viewed_at=rec.get("last_viewed_at"),
@@ -1667,6 +2010,8 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 upsert_rating(
                     item_id=iid, server_id=server_id,
                     user_handle=str(username), rating=rating_val,
+                    role="managed", display_name=u_display,
+                    backend_user_id=u_backend_id,
                 )
                 counters["ratings"] += 1
             except Exception:
@@ -1706,48 +2051,6 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 counters["collections"] += 1
             except Exception:
                 continue
-
-    # Library-level watch events / ratings (no user_handle).
-    for rec in (owner_items_block.get("watch_history") or []):
-        rk = rec.get("rating_key")
-        if rk is None:
-            continue
-        try:
-            rk_int = int(rk)
-        except (TypeError, ValueError):
-            continue
-        iid = rating_key_to_item_id.get(rk_int)
-        if iid is None:
-            continue
-        try:
-            record_watch_event(
-                item_id=iid, server_id=server_id, user_handle="",
-                view_count=int(rec.get("view_count") or 0),
-                view_offset=int(rec.get("view_offset") or 0),
-                last_viewed_at=rec.get("last_viewed_at"),
-            )
-            counters["watch_events"] += 1
-        except Exception:
-            continue
-    for rec in (owner_items_block.get("ratings") or []):
-        rk = rec.get("rating_key")
-        if rk is None:
-            continue
-        try:
-            rk_int = int(rk)
-            rating_val = float(rec.get("rating") or 0.0)
-        except (TypeError, ValueError):
-            continue
-        iid = rating_key_to_item_id.get(rk_int)
-        if iid is None:
-            continue
-        try:
-            upsert_rating(
-                item_id=iid, server_id=server_id, user_handle="", rating=rating_val,
-            )
-            counters["ratings"] += 1
-        except Exception:
-            continue
 
     log.debug(
         "ingest_snapshot_payload: library=%r server=%r counts=%s",

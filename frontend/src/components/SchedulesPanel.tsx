@@ -9,6 +9,7 @@
 import { useEffect, useState } from 'react';
 import { api, LibraryDescriptor, Schedule, ServerTime, ServerView } from '../api';
 import { usePermission } from '../hooks/usePermission';
+import { serverSupportsFastCollections } from '../utils/plexVersion';
 
 export function SchedulesPanel() {
   // PR-A4 - read/write gate. ``schedules.view`` is implied to reach
@@ -195,6 +196,34 @@ function ScheduleEditor(props: {
   const { schedule, servers, libraries, serverTime, onChange, onSave, onCancel } = props;
   const set = <K extends keyof Schedule>(k: K, v: Schedule[K]) => onChange({ ...schedule, [k]: v });
 
+  // Per-Run Settings collapse + sub-tab state. Workspace-only; never
+  // persisted to the schedule row.
+  const [perRunOpen, setPerRunOpen] = useState(false);
+  const [perRunSubTab, setPerRunSubTab] = useState<'general' | 'advanced'>('general');
+
+  // v0.14 — Fast Collection Detection version gating. When the
+  // schedule's source server is at Plex ≥ 1.32, default the toggle
+  // ON; below 1.32 (or unknown version) force it OFF and disable
+  // the input. Re-runs every time the source server changes so
+  // pointing a schedule at a different server resets the toggle.
+  const sourceServer = servers.find((s) => s.name === schedule.source_server_name);
+  const fastSupportVersion = sourceServer?.plex_version ?? '';
+  const fastSupported = serverSupportsFastCollections(fastSupportVersion);
+  useEffect(() => {
+    if (!schedule.source_server_name) return;
+    // Don't clobber a saved value when the operator is editing an
+    // existing schedule (schedule.id present) and the value the row
+    // already carries matches what we'd set. The auto-default only
+    // applies on fresh server picks where the field is unset.
+    if (schedule.fast_collection_detection === undefined) {
+      set('fast_collection_detection', fastSupported);
+    } else if (!fastSupported && schedule.fast_collection_detection) {
+      // Unsupported server with stale on-flag → force off.
+      set('fast_collection_detection', false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [schedule.source_server_name, fastSupported]);
+
   const toggleLib = (name: string) => {
     const cur = new Set(schedule.libraries);
     if (cur.has(name)) cur.delete(name); else cur.add(name);
@@ -365,6 +394,202 @@ function ScheduleEditor(props: {
           </span>
         </label>
       </fieldset>
+
+      {/* v0.14 — Per-Run Settings on schedules. Mirrors the Run-Job
+          form's collapsible panel with the same General / Advanced
+          sub-tab split. Each saved field overrides the corresponding
+          global / per-server value when this schedule fires. */}
+      <div className="panel" style={{ marginTop: 12 }}>
+        <button
+          type="button"
+          onClick={() => setPerRunOpen((o) => !o)}
+          aria-expanded={perRunOpen}
+          style={{
+            background: 'none', border: 'none', padding: 0,
+            font: 'inherit', color: 'inherit', cursor: 'pointer',
+            width: '100%', textAlign: 'left',
+            display: 'flex', alignItems: 'center', gap: 8,
+          }}
+        >
+          <span style={{ fontSize: 14, color: 'var(--text-dim)' }}>
+            {perRunOpen ? '▾' : '▸'}
+          </span>
+          <h3 style={{ margin: 0 }}>Per-Run Settings</h3>
+        </button>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
+          Per-fire overrides for the values set under <strong>Servers ▸ Run Defaults</strong>.
+          Leave blank to inherit the global / per-server defaults at fire time.
+        </span>
+
+        {perRunOpen && (
+          <div style={{ marginTop: 12 }}>
+            <nav className="tabs sub-tabs" style={{ marginBottom: 12 }}>
+              <button
+                type="button"
+                className={perRunSubTab === 'general' ? 'active' : ''}
+                onClick={() => setPerRunSubTab('general')}
+              >
+                General
+              </button>
+              <button
+                type="button"
+                className={perRunSubTab === 'advanced' ? 'active' : ''}
+                onClick={() => setPerRunSubTab('advanced')}
+              >
+                Advanced
+              </button>
+            </nav>
+
+            {perRunSubTab === 'general' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div className="grid-2">
+                  <label className="field">
+                    <span className="label">Worker threads</span>
+                    <span className="help">Blank = use Run Defaults.</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={128}
+                      value={schedule.workers ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        set('workers', v === '' ? null : Number(v));
+                      }}
+                      placeholder="(default)"
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="label">Scrobble workers</span>
+                    <span className="help">Blank = use Run Defaults.</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={64}
+                      value={schedule.scrobble_workers ?? ''}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        set('scrobble_workers', v === '' ? null : Number(v));
+                      }}
+                      placeholder="(default)"
+                    />
+                  </label>
+                </div>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={schedule.verbose ?? false}
+                    onChange={(e) => set('verbose', e.target.checked)}
+                  />
+                  <span>Verbose logging</span>
+                  <span className="help">DEBUG-level output for every fire of this schedule.</span>
+                </label>
+              </div>
+            )}
+
+            {perRunSubTab === 'advanced' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <label className="field">
+                  <span className="label">Log directory</span>
+                  <span className="help">Where per-fire log subdirectories are created. Blank = use Run Defaults.</span>
+                  <input
+                    type="text"
+                    value={schedule.log_dir ?? ''}
+                    onChange={(e) => set('log_dir', e.target.value || null)}
+                    placeholder="./plex_logs"
+                  />
+                </label>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={schedule.skip_playlist_prebuild ?? false}
+                    onChange={(e) => set('skip_playlist_prebuild', e.target.checked)}
+                  />
+                  <span>Skip playlist pre-building</span>
+                  <span className="help">Eliminates the start-of-run "Warming playlist cache" stall.</span>
+                </label>
+                <label
+                  className="switch"
+                  style={{ opacity: fastSupported ? 1 : 0.55 }}
+                  title={
+                    fastSupported
+                      ? `Plex ${fastSupportVersion} supports librarySectionUserID — fast detection is available.`
+                      : fastSupportVersion
+                        ? `Requires Plex Media Server ≥ 1.32. Source server reports ${fastSupportVersion}.`
+                        : 'Plex version unknown for this server — refresh it from the Servers tab to enable this option.'
+                  }
+                >
+                  <input
+                    type="checkbox"
+                    checked={fastSupported && (schedule.fast_collection_detection ?? false)}
+                    disabled={!fastSupported}
+                    onChange={(e) => set('fast_collection_detection', e.target.checked)}
+                  />
+                  <span>
+                    Fast collection detection
+                    {!fastSupported && (
+                      <span className="tag failed" style={{ marginLeft: 8, fontSize: 10 }}>
+                        {fastSupportVersion ? 'unsupported' : 'unknown version'}
+                      </span>
+                    )}
+                    {fastSupported && (
+                      <span className="tag done" style={{ marginLeft: 8, fontSize: 10 }}>
+                        Plex {fastSupportVersion}
+                      </span>
+                    )}
+                  </span>
+                  <span className="help">
+                    Uses <code>librarySectionUserID</code>. Requires Plex ≥ 1.32. Defaults ON when
+                    the source server supports it; greyed out below that.
+                  </span>
+                </label>
+
+                <fieldset className="field" style={{ borderRadius: 8, padding: '10px 12px', margin: 0 }}>
+                  <legend style={{ padding: '0 6px', fontWeight: 600 }}>Watch+Ratings capture strategy</legend>
+                  <span className="help" style={{ marginTop: 0 }}>
+                    Overrides the per-server / Run-Defaults value for every fire of this schedule.
+                  </span>
+                  <label className="switch">
+                    <input
+                      type="radio"
+                      name={`wr-strategy-sched-${schedule.id || 'new'}`}
+                      checked={!schedule.watch_ratings_filter_strategy}
+                      onChange={() => set('watch_ratings_filter_strategy', '')}
+                    />
+                    <span>Inherit <em>(recommended)</em></span>
+                  </label>
+                  <label className="switch">
+                    <input
+                      type="radio"
+                      name={`wr-strategy-sched-${schedule.id || 'new'}`}
+                      checked={schedule.watch_ratings_filter_strategy === 'smart'}
+                      onChange={() => set('watch_ratings_filter_strategy', 'smart')}
+                    />
+                    <span>Smart — engine picks per library</span>
+                  </label>
+                  <label className="switch">
+                    <input
+                      type="radio"
+                      name={`wr-strategy-sched-${schedule.id || 'new'}`}
+                      checked={schedule.watch_ratings_filter_strategy === 'force_bulk'}
+                      onChange={() => set('watch_ratings_filter_strategy', 'force_bulk')}
+                    />
+                    <span>Force bulk — fewer API calls (rate-limited servers)</span>
+                  </label>
+                  <label className="switch">
+                    <input
+                      type="radio"
+                      name={`wr-strategy-sched-${schedule.id || 'new'}`}
+                      checked={schedule.watch_ratings_filter_strategy === 'force_server_side'}
+                      onChange={() => set('watch_ratings_filter_strategy', 'force_server_side')}
+                    />
+                    <span>Force server-side — smaller payloads, more API calls</span>
+                  </label>
+                </fieldset>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
 
       <div className="row-buttons">
         <button

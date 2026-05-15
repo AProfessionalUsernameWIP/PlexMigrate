@@ -14,18 +14,29 @@ Two callers:
   directly. (Not used today; the import path still consumes
   per-library JSON files.)
 
-Shape parity with the engine's per-library JSON
------------------------------------------------
+Shape parity with the engine's per-library JSON (v0.13.0 unified-users)
+-----------------------------------------------------------------------
 The engine's :mod:`services.snapshotter` writes one JSON file per
 library with fields::
 
     {
       "library": "<library name>",
       "captured_at": "<ISO timestamp>",
-      "snapshot_meta": {...},
-      "items":   {"watch_history": [...], "playlists": [...], ...},
-      "users":   {"<user_handle>": {...}, ...}
+      "snapshot_meta": {server_id, server_name, backend, libraries, ...},
+      "users": {
+          "<owner-handle>":  {role: "owner",   display_name, backend_user_id,
+                              watch_history, ratings, playlists, collections},
+          "<managed-handle>": {role: "managed", display_name, backend_user_id,
+                              watch_history, ratings, playlists, collections},
+          ...
+      }
     }
+
+The owner used to sit alone at a top-level ``items`` block; v0.13.0
+collapsed it into ``users`` with an explicit ``role`` field so the
+restorer can drive both paths through one loop and the schema stays
+multi-backend (Jellyfin/Emby admin users will use the same shape with
+``backend != "plex"``).
 
 The snapshot ``.db`` covers ALL libraries on one server but the DB
 schema doesn't carry a per-library column - items are keyed by GUID
@@ -38,6 +49,13 @@ The shape carries an explicit ``"reconstructed_from_db": True``
 marker on the snapshot_meta block so a future import path can tell
 when it's looking at a regenerated payload vs. an engine-original
 one (and apply any lossy-shape compensation if needed).
+
+Pre-v0.13.0 snapshot ``.db`` files lack the ``server_users`` table.
+The serializer falls back to the legacy ``user_handle`` grouping in
+that case and synthesizes the role from the empty-string sentinel
+(``""`` -> owner, anything else -> managed). display_name is left
+NULL on those rows; downstream consumers should treat that as "use
+the handle as the friendly name."
 """
 
 from __future__ import annotations
@@ -102,9 +120,51 @@ def build_payload_from_db(
             if rk is not None:
                 payload["rating_key"] = rk
 
+        # ── server_users metadata, keyed by user_handle ─────────────
+        # v0.13.0: identity layer. Maps the legacy ``user_handle``
+        # (which is still the SQL key on the wide tables during the
+        # transition) to role + display_name + backend identity. Pre-
+        # v0.13.0 snapshot .db files don't have this table - the
+        # except-pass keeps the map empty and downstream code falls
+        # back to handle-only grouping with synthesized roles.
+        users_meta_by_handle: Dict[str, Dict[str, Any]] = {}
+        backend_in_db = "plex"
+        try:
+            for r in conn.execute("SELECT * FROM server_users").fetchall():
+                h = r["user_handle"] or ""
+                users_meta_by_handle[h] = {
+                    "role": r["role"],
+                    "display_name": r["display_name"],
+                    "backend": r["backend"],
+                    "backend_user_id": r["backend_user_id"],
+                }
+                # All rows on one snapshot share the same backend; use
+                # whichever value we see (usually 'plex' today).
+                if r["backend"]:
+                    backend_in_db = r["backend"]
+        except sqlite3.OperationalError:
+            pass
+
+        def _bucket_key(row_handle: Optional[str]) -> str:
+            """Group key for accumulating per-user blocks. Empty handle
+            is the owner sentinel; non-empty is the managed user's
+            handle. This is the SQL-level grouping; the JSON-level key
+            is decided after grouping (display_name for owner)."""
+            return (row_handle or "").strip()
+
+        # Buckets keyed by SQL user_handle. Each value is a per-user
+        # block of the four lists.
+        buckets: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+
+        def _bucket(handle: str) -> Dict[str, List[Dict[str, Any]]]:
+            b = buckets.get(handle)
+            if b is None:
+                b = {"watch_history": [], "ratings": [],
+                     "playlists": [], "collections": []}
+                buckets[handle] = b
+            return b
+
         # ── watch_events ──
-        owner_watch: List[Dict[str, Any]] = []
-        per_user_watch: Dict[str, List[Dict[str, Any]]] = {}
         for r in conn.execute("SELECT * FROM watch_events").fetchall():
             iid = int(r["item_id"])
             base = items_by_id.get(iid)
@@ -115,15 +175,9 @@ def build_payload_from_db(
             entry["view_offset"] = int(r["view_offset"] or 0)
             if r["last_viewed_at"] is not None:
                 entry["last_viewed_at"] = r["last_viewed_at"]
-            uh = (r["user_handle"] or "").strip()
-            if not uh:
-                owner_watch.append(entry)
-            else:
-                per_user_watch.setdefault(uh, []).append(entry)
+            _bucket(_bucket_key(r["user_handle"]))["watch_history"].append(entry)
 
         # ── ratings ──
-        owner_ratings: List[Dict[str, Any]] = []
-        per_user_ratings: Dict[str, List[Dict[str, Any]]] = {}
         for r in conn.execute("SELECT * FROM ratings").fetchall():
             iid = int(r["item_id"])
             base = items_by_id.get(iid)
@@ -138,55 +192,69 @@ def build_payload_from_db(
                 continue
             entry = dict(base)
             entry["rating"] = float(r["rating"])
-            uh = (r["user_handle"] or "").strip()
-            if not uh:
-                owner_ratings.append(entry)
-            else:
-                per_user_ratings.setdefault(uh, []).append(entry)
+            _bucket(_bucket_key(r["user_handle"]))["ratings"].append(entry)
 
         # ── playlists ──
-        owner_playlists: List[Dict[str, Any]] = []
-        per_user_playlists: Dict[str, List[Dict[str, Any]]] = {}
         for r in conn.execute("SELECT * FROM playlists").fetchall():
             entry = _playlist_or_collection_row_to_payload(
                 row=r, items_by_id=items_by_id, kind="playlist",
             )
-            uh = (r["user_handle"] or "").strip()
-            if not uh:
-                owner_playlists.append(entry)
-            else:
-                per_user_playlists.setdefault(uh, []).append(entry)
+            _bucket(_bucket_key(r["user_handle"]))["playlists"].append(entry)
 
         # ── collections ──
-        owner_collections: List[Dict[str, Any]] = []
-        per_user_collections: Dict[str, List[Dict[str, Any]]] = {}
         for r in conn.execute("SELECT * FROM collections").fetchall():
             entry = _playlist_or_collection_row_to_payload(
                 row=r, items_by_id=items_by_id, kind="collection",
             )
-            uh = (r["user_handle"] or "").strip()
-            if not uh:
-                owner_collections.append(entry)
-            else:
-                per_user_collections.setdefault(uh, []).append(entry)
+            _bucket(_bucket_key(r["user_handle"]))["collections"].append(entry)
     finally:
         conn.close()
 
-    # Compose user blocks. A given user may appear in only one of the
-    # four tables, so the union of keys is the source of truth.
-    user_handles = (
-        set(per_user_watch)
-        | set(per_user_ratings)
-        | set(per_user_playlists)
-        | set(per_user_collections)
-    )
-    users_block: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for uh in sorted(user_handles):
-        users_block[uh] = {
-            "watch_history": per_user_watch.get(uh, []),
-            "ratings": per_user_ratings.get(uh, []),
-            "playlists": per_user_playlists.get(uh, []),
-            "collections": per_user_collections.get(uh, []),
+    # ── Emit the unified users map ───────────────────────────────────
+    # JSON key for each user:
+    #   - owner (handle = ""): display_name from server_users if set,
+    #     else the literal "Plex Owner" so the JSON dump is readable.
+    #   - managed: the SQL handle directly.
+    # Each bucket carries its role / display_name / backend_user_id so
+    # downstream consumers don't need to re-query the identity table.
+    users_block: Dict[str, Dict[str, Any]] = {}
+    used_keys: set = set()
+
+    def _meta_for(handle: str) -> Dict[str, Any]:
+        m = users_meta_by_handle.get(handle)
+        if m:
+            return m
+        # No metadata row (pre-v0.13.0 snapshot .db). Synthesize.
+        return {
+            "role": "owner" if handle == "" else "managed",
+            "display_name": None,
+            "backend": backend_in_db,
+            "backend_user_id": None,
+        }
+
+    def _json_key_for(handle: str, meta: Dict[str, Any]) -> str:
+        if meta["role"] == "owner":
+            base = (meta.get("display_name") or "").strip() or "Plex Owner"
+        else:
+            base = handle
+        # Collision-safe: a managed user named "Plex Owner" would
+        # otherwise overwrite the owner block. Suffix until unique.
+        key = base
+        n = 2
+        while key in used_keys:
+            key = f"{base} ({n})"
+            n += 1
+        used_keys.add(key)
+        return key
+
+    for handle in sorted(buckets.keys()):
+        meta = _meta_for(handle)
+        json_key = _json_key_for(handle, meta)
+        users_block[json_key] = {
+            "role": meta["role"],
+            "display_name": meta.get("display_name"),
+            "backend_user_id": meta.get("backend_user_id"),
+            **buckets[handle],
         }
 
     captured_iso = (
@@ -201,14 +269,18 @@ def build_payload_from_db(
     # db-access log shows the full snapshot -> restore round trip.
     try:
         from services import db_access_log
+        owner_bucket = buckets.get("", {})
+        managed_count = sum(1 for h in buckets if h != "")
         db_access_log.log_read(
-            table="items,server_items,watch_events,ratings,playlists,collections",
+            table="items,server_items,server_users,watch_events,ratings,playlists,collections",
             where={"snapshot_db": snapshot_db_path.name, "server_id": server_id},
             intent=(
                 f"reconstruct restore payload from snapshot DB "
-                f"(owner: {len(owner_watch)} watched / {len(owner_ratings)} rated / "
-                f"{len(owner_playlists)} playlist(s) / {len(owner_collections)} "
-                f"collection(s); {len(users_block)} home user(s))"
+                f"(owner: {len(owner_bucket.get('watch_history', []))} watched / "
+                f"{len(owner_bucket.get('ratings', []))} rated / "
+                f"{len(owner_bucket.get('playlists', []))} playlist(s) / "
+                f"{len(owner_bucket.get('collections', []))} collection(s); "
+                f"{managed_count} managed user(s))"
             ),
         )
     except Exception:
@@ -223,14 +295,9 @@ def build_payload_from_db(
         "snapshot_meta": {
             "server_id": server_id,
             "server_name": server_name,
+            "backend": backend_in_db,
             "libraries": list(libraries or []),
             "reconstructed_from_db": True,
-        },
-        "items": {
-            "watch_history": owner_watch,
-            "ratings": owner_ratings,
-            "playlists": owner_playlists,
-            "collections": owner_collections,
         },
         "users": users_block,
     }

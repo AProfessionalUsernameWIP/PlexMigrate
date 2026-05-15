@@ -30,7 +30,8 @@ _log = logging.getLogger("plexmigrate")
 def _disable_autoreload(*objs) -> None:
     """
     Turn off plexapi's implicit per-item ``reload()`` on the given
-    objects. Used by the snapshot ``serialize_*`` helpers below.
+    objects. Used by the snapshot ``serialize_*`` helpers + the
+    perf-#2 ``_bulk_fetch_for_filters`` path.
 
     plexapi reloads a *partial* object the instant you read an
     attribute whose value is ``None`` / ``[]`` - and it cannot tell
@@ -50,7 +51,25 @@ def _disable_autoreload(*objs) -> None:
     and no hidden round-trip ever fires. Best-effort and silent - a
     plexapi object that doesn't expose ``_autoReload`` is simply left
     as-is.
+
+    Tunable escape hatch: when
+    ``services.tunables.plexapi_autoreload_enabled()`` returns true,
+    this function becomes a no-op so vanilla plexapi behaviour
+    returns. Default false (autoreload disabled). Use only for
+    diagnostic / recovery scenarios where a bulk response is genuinely
+    missing data — accepting the per-item reload cost knowingly.
     """
+    # Tunable check up front. ``True`` = leave autoreload alone (no-op).
+    # Lazy import keeps this module loadable in CLI-only checkouts.
+    try:
+        from services import tunables
+        if tunables.plexapi_autoreload_enabled():
+            return
+    except Exception:
+        # Tunables unavailable (CLI bootstrap, missing settings.json):
+        # fall through and disable autoreload — matches historical
+        # behaviour before the tunable existed.
+        pass
     for obj in objs:
         try:
             obj._autoReload = False

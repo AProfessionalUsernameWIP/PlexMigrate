@@ -139,6 +139,69 @@ def _fmt_where(where: Dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+# ── Enable/disable flag ──────────────────────────────────────────────────────
+# Operator can disable the audit trail via the db_admin-gated endpoint
+# /api/settings/audit-log-toggle. When disabled all log_* calls no-op.
+# The flag is cached at module level (no settings.json read per call);
+# the toggle endpoint refreshes the cache and lifespan startup
+# initialises it from settings.
+#
+# Self-documenting transitions: the toggle endpoint should call
+# ``log_audit_disabled(user)`` BEFORE flipping to False so the final
+# entry records who switched it off and when, and call
+# ``log_audit_enabled(user)`` AFTER flipping back to True so the first
+# entry on re-enable records who switched it back on. The audit trail
+# always shows that disablement was an explicit, attributable act.
+_enabled: bool = True
+
+
+def set_enabled(value: bool) -> None:
+    """Refresh the in-process enabled flag. Called by the toggle endpoint."""
+    global _enabled
+    _enabled = bool(value)
+
+
+def is_enabled() -> bool:
+    return _enabled
+
+
+def log_audit_disabled(user: str) -> None:
+    """
+    Write the *final* audit entry before switching the flag off. Call
+    this BEFORE :func:`set_enabled(False)` so the line is recorded.
+    """
+    try:
+        _get_logger().warning(
+            "[EVENT] audit logging DISABLED by user=%r - subsequent "
+            "DB-access events will NOT be recorded until re-enabled",
+            user,
+        )
+        # Flush so the line lands even if the process dies before the
+        # next write.
+        for h in logging.getLogger(_LOGGER_NAME).handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def log_audit_enabled(user: str) -> None:
+    """
+    Write the *first* audit entry after switching the flag back on.
+    Call this AFTER :func:`set_enabled(True)`.
+    """
+    try:
+        _get_logger().warning(
+            "[EVENT] audit logging RE-ENABLED by user=%r - recording "
+            "DB-access events resumes from this line",
+            user,
+        )
+    except Exception:
+        pass
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def log_read(
@@ -152,6 +215,8 @@ def log_read(
     Record a database read. ``intent`` is a one-line operator-readable
     reason (e.g. ``"per-user PIN lookup for snapshot impersonation"``).
     """
+    if not _enabled:
+        return
     _get_logger().info(
         "[READ] table=%s%s %s%s",
         table,
@@ -173,6 +238,8 @@ def log_write(
     Record a database write. ``affected_rows`` is logged when known so
     bulk operations show their footprint at a glance.
     """
+    if not _enabled:
+        return
     rows_part = "" if affected_rows is None else f" rows={affected_rows}"
     _get_logger().info(
         "[WRITE] table=%s%s %s%s%s",
@@ -190,4 +257,6 @@ def log_event(message: str, *args: Any) -> None:
     fit a strict read/write shape (e.g. "PIN successfully authorised
     home-user sign-in for Crystal Jean").
     """
+    if not _enabled:
+        return
     _get_logger().info("[EVENT] " + message, *args)

@@ -135,13 +135,37 @@ def _load_or_create_secret() -> str:
 # frontend silently calls /api/auth/refresh to mint a new one,
 # extending the session without a re-login as long as the refresh
 # cookie is still valid.
-JWT_TTL_SECONDS = 30 * 60
+#
+# Hot-reload (Phase 3): the TTL is read from
+# ``services.tunables.jwt_access_token_ttl_seconds`` at each token
+# mint, so a save to the tunable takes effect on the next login /
+# refresh. The constant below is the historical fallback when the
+# tunables module isn't importable.
+_JWT_TTL_FALLBACK = 30 * 60
 JWT_ALG = "HS256"
 
+
+def _jwt_ttl_seconds() -> int:
+    try:
+        from services.tunables import jwt_access_token_ttl_seconds
+        return int(jwt_access_token_ttl_seconds())
+    except Exception:
+        return _JWT_TTL_FALLBACK
+
+
 # 7-day refresh-token lifetime. ``auth_db`` is authoritative; this
-# constant is mirrored here only so the cookie ``Max-Age`` and the DB
-# row expiry agree.
-REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60
+# value is mirrored here only so the cookie ``Max-Age`` and the DB
+# row expiry agree. Hot-reload via
+# ``services.tunables.refresh_token_ttl_seconds``.
+_REFRESH_TTL_FALLBACK = 7 * 24 * 60 * 60
+
+
+def _refresh_ttl_seconds() -> int:
+    try:
+        from services.tunables import refresh_token_ttl_seconds
+        return int(refresh_token_ttl_seconds())
+    except Exception:
+        return _REFRESH_TTL_FALLBACK
 
 # Cookie name + scope for the refresh token. ``Path=/api/auth`` so
 # every auth endpoint receives the cookie (refresh, logout, me,
@@ -187,11 +211,12 @@ def issue_token(
     import jwt as _jwt
 
     now = int(time.time())
+    ttl = _jwt_ttl_seconds()
     payload: Dict[str, Any] = {
         "sub": username,
         "role": role,
         "display_name": display_name,
-        "exp": now + JWT_TTL_SECONDS,
+        "exp": now + ttl,
         "iat": now,
         "jti": uuid.uuid4().hex,
     }
@@ -204,7 +229,7 @@ def issue_token(
     return {
         "access_token": token,
         "token_type": "bearer",
-        "expires_in": JWT_TTL_SECONDS,
+        "expires_in": ttl,
     }
 
 
@@ -221,7 +246,7 @@ def _set_refresh_cookie(
     response.set_cookie(
         key=REFRESH_COOKIE_NAME,
         value=token_id,
-        max_age=REFRESH_TOKEN_TTL_SECONDS,
+        max_age=_refresh_ttl_seconds(),
         path=REFRESH_COOKIE_PATH,
         httponly=True,
         samesite="strict",
@@ -286,11 +311,66 @@ ALL_PERMISSIONS = (
     "logs.view",
     "exports.view",
     "settings.edit",
+    # ``settings.tunables`` gates the System Tunables page (infrastructure
+    # knobs that used to be hardcoded literals). Held by root_admin
+    # ONLY — even ``admin`` can't toggle JWT TTLs, HTTP pool sizes,
+    # SQLite busy timeouts, etc., because those values can lock every
+    # user out of the system if set wrong. The frontend hides the
+    # Tunables sub-tab when this perm is absent; the backend will
+    # gate the PATCH route on the same perm in Phase 3.
+    "settings.tunables",
     "users.manage",
     "db_admin.access",
     "sync.view",
     "sync.edit",
 )
+
+# Permission bundle for ``admin`` — everything except settings.tunables.
+# Built once at module import; if you add a new entry to ALL_PERMISSIONS
+# and it should be admin-visible too, no code change here is needed.
+_ADMIN_PERMS: List[str] = [p for p in ALL_PERMISSIONS if p != "settings.tunables"]
+
+
+def effective_permissions_for(username: str, role: str) -> List[str]:
+    """
+    Resolve the effective permission set for ``username`` at ``role``.
+
+    Baseline = ``ROLE_PERMISSIONS[role]``. The user's per-row
+    ``extra_permissions`` adds permissions on top; ``revoked_permissions``
+    removes them.
+
+    Safety rules:
+      * ``root_admin`` is **immune to revokes** — the role always
+        resolves to the full ``ALL_PERMISSIONS`` set so an accidental
+        revoke can't lock the only restore path out of the system.
+      * Unknown permissions in either list are ignored silently
+        (they couldn't have effect anyway).
+      * Empty / missing username → role baseline only.
+      * ``effective_role`` (post View Mode drop) is what the caller
+        usually passes, so a root_admin in viewer view-mode resolves
+        to viewer's baseline — view-mode trumps grants.
+    """
+    if role == "root_admin":
+        # Always full; ignore revokes so root admin can't be
+        # accidentally locked out via PATCH.
+        return list(ALL_PERMISSIONS)
+    baseline = list(ROLE_PERMISSIONS.get(role, []))
+    if not username:
+        return baseline
+    try:
+        grants = auth_db.get_user_permission_grants(username)
+    except Exception:
+        return baseline
+    extras = [p for p in (grants.get("extra") or []) if p in ALL_PERMISSIONS]
+    revoked = set(p for p in (grants.get("revoked") or []) if p in ALL_PERMISSIONS)
+    result: List[str] = []
+    for p in baseline:
+        if p not in revoked:
+            result.append(p)
+    for p in extras:
+        if p not in result:
+            result.append(p)
+    return result
 
 ROLE_PERMISSIONS: Dict[str, List[str]] = {
     "viewer":     ["dashboard.view", "servers.view"],
@@ -299,10 +379,11 @@ ROLE_PERMISSIONS: Dict[str, List[str]] = {
     "manager":    ["dashboard.view", "servers.view", "logs.view", "exports.view",
                    "jobs.start", "jobs.stop", "schedules.view", "schedules.edit",
                    "sync.view"],
-    # ``admin`` carries the exact same permission set as ``root_admin``.
-    # The difference is enforced at the per-row level via
-    # ``can_modify_user`` below - admin cannot touch the root_admin row.
-    "admin":      list(ALL_PERMISSIONS),
+    # ``admin`` carries every permission EXCEPT settings.tunables — the
+    # infrastructure-knob bundle is root_admin-exclusive (see
+    # ALL_PERMISSIONS comment). Per-row guards via ``can_modify_user``
+    # still prevent admin from touching the root_admin row.
+    "admin":      list(_ADMIN_PERMS),
     "root_admin": list(ALL_PERMISSIONS),
 }
 
@@ -421,6 +502,56 @@ def can_modify_user(caller_role: str, target_role: str) -> bool:
     if caller_role == "admin":
         return True
     return False
+
+
+def require_permission(permission: str):
+    """
+    FastAPI dependency factory that gates an endpoint on a SPECIFIC
+    permission string rather than a role rank. Built on top of
+    :func:`require_role` so the View Mode + immediacy guarantees still
+    apply, but the final admit check uses
+    :func:`effective_permissions_for` so per-user grants and revokes
+    are honoured.
+
+    Use this on endpoints whose access should follow a granted
+    permission rather than the caller's role rank. ``require_role``
+    stays the right choice for endpoints whose access tracks the
+    role hierarchy as a whole (e.g. "anyone manager or up can stop
+    jobs"). Tunables / Access Control endpoints use this so a viewer
+    with a granted ``settings.tunables`` permission really can edit
+    tunables backend-side, not just see the UI.
+    """
+    if permission not in ALL_PERMISSIONS:
+        raise ValueError(f"Invalid permission {permission!r}")
+
+    def _dep(request: Request) -> Dict[str, Any]:
+        ctx = getattr(request.state, "auth", None) or {}
+        username = ctx.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Not authenticated.")
+        user = auth_db.get_user(username)
+        if user is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Account no longer exists; please log in again.",
+            )
+        real_role = user["role"]
+        effective_role = _effective_role_for(ctx, real_role)
+        effective_perms = effective_permissions_for(username, effective_role)
+        if permission not in effective_perms:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This action requires the {permission!r} permission.",
+            )
+        return {
+            "username": user["username"],
+            "role": effective_role,
+            "real_role": real_role,
+            "effective_role": effective_role,
+            "display_name": user.get("display_name"),
+        }
+
+    return _dep
 
 
 def require_role(minimum: str):
@@ -783,7 +914,11 @@ def auth_me(user: Dict[str, Any] = Depends(require_role("viewer"))) -> Dict[str,
     """
     real_role = user["real_role"]
     effective_role = user["effective_role"]
-    perms = ROLE_PERMISSIONS.get(effective_role, [])
+    # Layer per-user grants + revokes on top of the effective role's
+    # baseline. ``effective_permissions_for`` reads the per-user grant
+    # list from auth.db and resolves the final set. Root admin is
+    # immune to revokes (always full set).
+    perms = effective_permissions_for(user["username"], effective_role)
     full = auth_db.get_user(user["username"]) or {}
     return {
         "username": user["username"],
@@ -1121,6 +1256,119 @@ def auth_delete_user(
     except Exception:  # pragma: no cover (defensive)
         log.exception("revoke_all_for_user failed after delete for %r", username)
     return {"deleted": username}
+
+
+@router.get("/users/{username}/permissions")
+def auth_get_user_permissions(
+    username: str,
+    user: Dict[str, Any] = Depends(require_role("root_admin")),
+) -> Dict[str, Any]:
+    """
+    Return the per-user grant + revoke layer for ``username`` plus the
+    role baseline so the Access Control UI can render each permission's
+    current state without a second round-trip.
+
+    Root-admin only — admin can't view or edit these.
+    """
+    target = auth_db.get_user(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"No user named {username!r}.")
+    if target["role"] == "db_admin":
+        raise HTTPException(
+            status_code=400,
+            detail="db_admin is a non-login credential row; no per-user permissions.",
+        )
+    grants = auth_db.get_user_permission_grants(username)
+    role = target["role"]
+    baseline = list(ROLE_PERMISSIONS.get(role, []))
+    effective = effective_permissions_for(username, role)
+    return {
+        "username": username,
+        "role": role,
+        "baseline": baseline,
+        "extra": grants.get("extra") or [],
+        "revoked": grants.get("revoked") or [],
+        "effective": effective,
+        "all_permissions": list(ALL_PERMISSIONS),
+        "root_admin_immune_to_revokes": role == "root_admin",
+    }
+
+
+class UserPermissionsPatchIn(BaseModel):
+    extra: List[str] = Field(
+        default_factory=list,
+        description="Permissions granted on top of the role baseline.",
+    )
+    revoked: List[str] = Field(
+        default_factory=list,
+        description="Permissions removed from the role baseline.",
+    )
+
+
+@router.patch("/users/{username}/permissions")
+def auth_set_user_permissions(
+    username: str,
+    body: UserPermissionsPatchIn,
+    user: Dict[str, Any] = Depends(require_role("root_admin")),
+) -> Dict[str, Any]:
+    """
+    Replace the per-user grant + revoke lists for ``username``.
+
+    Root-admin only. Both lists are validated against
+    ``ALL_PERMISSIONS``; unknown strings raise 400. The root_admin
+    role is immune to revokes server-side (resolver always returns
+    the full set) but we also reject revokes against a root_admin
+    row up front so the UI doesn't pretend the value stuck.
+
+    A grant or revoke that would be a no-op (granting a baseline
+    permission, revoking a non-baseline one) is accepted silently —
+    the effective set is what matters, and the UI may surface those
+    as "redundant" badges later.
+    """
+    target = auth_db.get_user(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"No user named {username!r}.")
+    if target["role"] == "db_admin":
+        raise HTTPException(
+            status_code=400,
+            detail="db_admin is a non-login credential row; cannot edit permissions.",
+        )
+    # Validate each permission string is known.
+    unknown = [p for p in (body.extra + body.revoked) if p not in ALL_PERMISSIONS]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown permission(s): {sorted(set(unknown))!r}",
+        )
+    # Revokes against a root_admin row are pointless (the resolver
+    # ignores them) and would be confusing — reject explicitly.
+    if target["role"] == "root_admin" and body.revoked:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Root admin is immune to revokes (always full permissions). "
+                "Clear the revoked list to save."
+            ),
+        )
+    try:
+        auth_db.set_user_permission_grants(username, body.extra, body.revoked)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    log.info(
+        "Permissions updated for user %r by %r (extra=%d, revoked=%d)",
+        username, user.get("username"), len(body.extra), len(body.revoked),
+    )
+    grants = auth_db.get_user_permission_grants(username)
+    effective = effective_permissions_for(username, target["role"])
+    return {
+        "username": username,
+        "role": target["role"],
+        "baseline": list(ROLE_PERMISSIONS.get(target["role"], [])),
+        "extra": grants.get("extra") or [],
+        "revoked": grants.get("revoked") or [],
+        "effective": effective,
+        "all_permissions": list(ALL_PERMISSIONS),
+    }
 
 
 @router.post("/users/me/display-name")

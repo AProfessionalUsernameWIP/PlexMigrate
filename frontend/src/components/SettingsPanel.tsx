@@ -1,19 +1,27 @@
-// Settings panel - per-run defaults.
+// Settings panel - PlexMigrate app behaviour (Bucket B).
 //
-// Plex server connection details moved to the dedicated Servers tab
-// in v0.9.0 (each registered server has its own URL + token now).
-// This panel handles only the global defaults: output / log directories
-// and worker counts. Any field a Run-Job form leaves blank falls back
-// to whatever's saved here.
+// As of the Phase-2 Settings/Servers reorg, this panel holds only the
+// settings that describe how the PlexMigrate app itself behaves —
+// distinct from the run-level defaults that describe how snapshots
+// and direct transfers operate against Plex (those moved to
+// Servers ▸ Run Defaults).
 //
-// PR-9.1 - the Database Admin Account section was removed from this
-// panel and lives under its own ``Accounts`` sub-tab now, alongside
-// the Login Account management. See ``AccountsPanel.tsx``.
+// What lives here:
+//   * Logging toggles (run-log files + db-access audit log)
+//   * Library Maintenance (background walk cadence + Prune Missing Items)
 //
-// PR-13 - the snapshot-retention block lives here as the global
-// ceiling only. Per-server retention overrides moved to
-// Servers ▸ Advanced Settings (along with the rest of the
-// per-server defaults) so all per-server tunables share one home.
+// What moved to Servers ▸ Run Defaults:
+//   * Default Paths (output_dir, log_dir)
+//   * Default Performance & Behaviour (workers, scrobble_workers,
+//     verbose, strict_match)
+//   * Snapshot Defaults (prebuild_json_sidecar_default,
+//     watch_ratings_filter_strategy)
+//   * Transfer Resolution (allow_filepath_fallback, allow_fuzzy_fallback)
+//   * Snapshot Retention (snapshot_retention_global ceiling)
+//
+// What moved to Settings ▸ Tunables:
+//   * Root-admin-only infrastructure knobs (HTTP timeouts, JWT TTL,
+//     SQLite busy timeouts, etc.) — populated in Phase 3.
 
 import { useEffect, useState } from 'react';
 import { api, PrunePreview, PruneResult, SettingsView } from '../api';
@@ -23,29 +31,14 @@ export function SettingsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
 
-  // Local mirror of the form so the user can type before saving.
-  const [outputDir, setOutputDir] = useState('');
-  const [logDir, setLogDir] = useState('');
-  const [workers, setWorkers] = useState(16);
-  const [scrobbleWorkers, setScrobbleWorkers] = useState(8);
-  const [verbose, setVerbose] = useState(false);
-  const [strictMatch, setStrictMatch] = useState(true);
-
-  // Global retention ceiling. Per-server overrides moved to
-  // Servers ▸ Advanced Settings and write through their own panel.
-  const [globalRetention, setGlobalRetention] = useState<number>(30);
-  // Global default for the "Save JSON copy after snapshot" toggle on
-  // snapshot jobs + schedules. The Run-Job form seeds its per-job
-  // checkbox from this on mount; the operator can still flip it per
-  // run without changing the global.
-  const [prebuildJsonSidecarDefault, setPrebuildJsonSidecarDefault] = useState<boolean>(false);
-
-  // Direct-transfer resolver-tier policy. Snapshot / import paths
-  // are NOT affected by these - they continue to run all four
-  // tiers. The toggles below only gate the tiers used during a
-  // direct server-to-server transfer.
-  const [allowFilepathFallback, setAllowFilepathFallback] = useState<boolean>(true);
-  const [allowFuzzyFallback, setAllowFuzzyFallback] = useState<boolean>(false);
+  // Logging controls. ``runLoggingEnabled`` is a plain global toggle
+  // that rides the normal Save button. ``auditLogEnabled`` is shown
+  // as a status flag here but flipped only through a db_admin-gated
+  // modal - a plain settings PATCH silently strips it server-side so
+  // the audit trail can't be killed by a casual checkbox.
+  const [runLoggingEnabled, setRunLoggingEnabled] = useState<boolean>(true);
+  const [auditLogEnabled, setAuditLogEnabled] = useState<boolean>(true);
+  const [auditToggleOpen, setAuditToggleOpen] = useState<boolean>(false);
 
   // Rule 2: library-walk cadence + Prune Missing Items.
   const [walkEnabled, setWalkEnabled] = useState<boolean>(true);
@@ -54,28 +47,21 @@ export function SettingsPanel() {
   const [pruneServerOpen, setPruneServerOpen] = useState<string | null>(null);
   const [servers, setServers] = useState<{ id: string; name: string }[]>([]);
 
+  // Phase 4: ETR colour multiplier. Scales the dashboard's per-phase
+  // amber/red stall thresholds. 1.0 = ship defaults; <1.0 warns
+  // sooner; >1.0 is more lenient. Clamped to [0.5, 2.0] at the
+  // backend read boundary too.
+  const [etrMultiplier, setEtrMultiplier] = useState<number>(1.0);
+
   const load = async () => {
     try {
       const s = await api.getSettings();
       setView(s);
-      setOutputDir(s.output_dir);
-      setLogDir(s.log_dir);
-      setWorkers(s.workers);
-      setScrobbleWorkers(s.scrobble_workers);
-      setVerbose(s.verbose);
-      setStrictMatch(s.strict_match);
-      setGlobalRetention(
-        typeof s.snapshot_retention_global === 'number' && s.snapshot_retention_global >= 1
-          ? s.snapshot_retention_global
-          : 30,
-      );
-      setPrebuildJsonSidecarDefault(s.prebuild_json_sidecar_default === true);
-      // Transfer resolution: respect server defaults, fall back to
-      // the "permissive Tier 2, restrictive Tier 3" spec defaults if
-      // the field is absent on older settings.json files.
-      const tr = s.transfer_resolution || {};
-      setAllowFilepathFallback(tr.allow_filepath_fallback !== false);
-      setAllowFuzzyFallback(tr.allow_fuzzy_fallback === true);
+      // Logging toggles. ``run_logging_enabled`` defaults to true on
+      // missing (existing installs keep writing per-run files);
+      // ``audit_log_enabled`` likewise defaults to true.
+      setRunLoggingEnabled(s.run_logging_enabled !== false);
+      setAuditLogEnabled(s.audit_log_enabled !== false);
       // Rule 2: library-walk cadence + stale-prune slider default.
       const lw = s.library_walk || {};
       setWalkEnabled(lw.enabled !== false);
@@ -89,6 +75,11 @@ export function SettingsPanel() {
           ? lw.stale_threshold_days
           : 7,
       );
+      // Phase 4: ETR colour multiplier.
+      const m = (s as { etr_color_multiplier?: number }).etr_color_multiplier;
+      if (typeof m === 'number' && Number.isFinite(m)) {
+        setEtrMultiplier(Math.max(0.5, Math.min(2.0, m)));
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -107,23 +98,12 @@ export function SettingsPanel() {
   const save = async () => {
     setError(null);
     setOk(null);
-    // Per-server retention overrides are deliberately NOT sent from
-    // this patch - the new Advanced Settings panel is the sole writer
-    // for that map. Including it here would clobber overrides the
-    // operator just saved through that panel.
     const patch: Record<string, unknown> = {
-      output_dir: outputDir,
-      log_dir: logDir,
-      workers,
-      scrobble_workers: scrobbleWorkers,
-      verbose,
-      strict_match: strictMatch,
-      snapshot_retention_global: Math.max(1, Math.floor(Number(globalRetention) || 30)),
-      prebuild_json_sidecar_default: prebuildJsonSidecarDefault,
-      transfer_resolution: {
-        allow_filepath_fallback: allowFilepathFallback,
-        allow_fuzzy_fallback: allowFuzzyFallback,
-      },
+      // run_logging_enabled rides the normal Save button; audit_log_enabled
+      // is INTENTIONALLY OMITTED here - the backend silently strips it
+      // from a plain PATCH so this checkbox-style page can never flip
+      // the audit trail. Use the db_admin-gated modal below for that.
+      run_logging_enabled: runLoggingEnabled,
       // Rule 2: persist the walk cadence + stale slider default.
       // Interval is stored in seconds at the backend; the UI works
       // in hours.
@@ -132,6 +112,8 @@ export function SettingsPanel() {
         interval_seconds: Math.max(1, Math.floor(Number(walkIntervalHours) || 24)) * 3600,
         stale_threshold_days: Math.max(1, Math.floor(Number(staleThresholdDays) || 7)),
       },
+      // Phase 4: ETR colour multiplier. Backend clamps too.
+      etr_color_multiplier: Math.max(0.5, Math.min(2.0, Number(etrMultiplier) || 1.0)),
     };
     try {
       const updated = await api.saveSettings(patch);
@@ -151,120 +133,56 @@ export function SettingsPanel() {
       {error && <div className="banner error">{error}</div>}
       {ok && <div className="banner good">{ok}</div>}
 
-      <div className="panel">
-        <h2>Default Paths</h2>
-        <div className="banner info" style={{ fontSize: 12, marginBottom: 12 }}>
-          <strong>Docker note:</strong> these paths are inside the backend container, not on your host.
-          The defaults <code>./snapshots</code> and <code>./plex_logs</code> are bind-mounted in
-          <code> docker-compose.yml</code> so they appear on the host too. To use an external drive or
-          a NAS (e.g. <code>Y:\plexexports</code>), add a bind mount in <code>docker-compose.yml</code>
-          first - Windows host paths typed here will be rejected, because the Linux container has no
-          drive letters. See the commented examples at the bottom of <code>docker-compose.yml</code>.
-        </div>
-        <label className="field">
-          <span className="label">Output directory</span>
-          <span className="help">Where snapshots land by default. Job forms can override per-run. Must be a container-visible path (e.g. <code>./snapshots</code> or <code>/app/nas_exports</code>).</span>
-          <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} />
-        </label>
-        <label className="field">
-          <span className="label">Log directory</span>
-          <span className="help">Where per-run log subdirectories are created. Job forms can override per-run. Same container-path constraint as above.</span>
-          <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} />
-        </label>
+      <div className="banner info" style={{ fontSize: 12 }}>
+        Run-level defaults (paths, performance, snapshot defaults, transfer resolution,
+        retention ceiling) moved to <strong>Servers ▸ Run Defaults</strong>. Root-admin
+        infrastructure knobs (HTTP timeouts, JWT TTL, etc.) live under <strong>Settings ▸ Tunables</strong>.
       </div>
 
       <div className="panel">
-        <h2>Default Performance &amp; Behaviour</h2>
-        <div className="grid-2">
-          <label className="field">
-            <span className="label">Worker threads</span>
-            <span className="help">Default value for <code>--workers</code>.</span>
-            <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(Number(e.target.value))} />
-          </label>
-          <label className="field">
-            <span className="label">Scrobble workers</span>
-            <span className="help">Default value for <code>--scrobble-workers</code>.</span>
-            <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(Number(e.target.value))} />
-          </label>
-        </div>
-        <label className="switch">
-          <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.target.checked)} />
-          <span>Verbose logging by default</span>
-          <span className="help">DEBUG-level console and run log output. Equivalent to <code>--verbose</code>.</span>
-        </label>
-        <label className="switch">
-          <input type="checkbox" checked={strictMatch} onChange={(e) => setStrictMatch(e.target.checked)} />
-          <span>Strict match by default</span>
-          <span className="help">When unchecked, behaves like <code>--no-strict-match</code> - uses the first fuzzy result on ambiguity.</span>
-        </label>
-      </div>
-
-      <div className="panel">
-        <h2>Snapshot Defaults</h2>
+        <h2>Logging</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
-          Defaults applied to every snapshot job + scheduled run. The Run-Job
-          form seeds its checkbox from the value here so the operator picks up
-          the global without thinking about it; they can still flip the
-          per-run toggle without touching this page.
+          Operational log files vs the forensic audit log. The first is
+          your convenience — turn it off and the engine still runs and
+          the dashboard still updates, you just don't get per-run files
+          on disk. The second is the security audit trail; toggling it
+          requires the database-admin credential and the transition is
+          self-documenting in the audit log itself.
         </span>
         <label className="switch">
           <input
             type="checkbox"
-            checked={prebuildJsonSidecarDefault}
-            onChange={(e) => setPrebuildJsonSidecarDefault(e.target.checked)}
+            checked={runLoggingEnabled}
+            onChange={(e) => setRunLoggingEnabled(e.target.checked)}
           />
-          <span>Save JSON copy after every snapshot</span>
+          <span>Write per-run log files (<code>runtime.log</code> / <code>errors.log</code> / <code>media.log</code>)</span>
           <span className="help">
-            When on, every snapshot run also writes a <code>.plexexport.json</code>
-            next to the <code>.db</code>. Adds wall-clock time to each run; off
-            by default because the JSON is also built on demand from the
-            <strong> Exports</strong> tab's Download button.
+            Default on. When off, the engine and dashboard still run
+            and update normally — only the per-run files on disk are
+            suppressed. Console output is unaffected.
           </span>
         </label>
-      </div>
-
-      <div className="panel">
-        <h2>Transfer Resolution</h2>
-        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
-          Controls which fallback tiers the resolver tries during a
-          direct server-to-server transfer. Tier 0 (DB GUID cache)
-          and Tier 1 (live API GUID match) are always active.
-          Snapshot and import paths are unaffected by these toggles -
-          they continue to run all four tiers regardless.
-        </span>
-        <label className="switch">
-          <input
-            type="checkbox"
-            checked={allowFilepathFallback}
-            onChange={(e) => setAllowFilepathFallback(e.target.checked)}
-          />
-          <span>
-            Allow filepath-suffix fallback (Tier 2)
-            <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 11, marginTop: 2 }}>
-              Matches by normalised 3-part path suffix. Cross-platform
-              safe; resolves Windows ↔ Linux migrations. Reliable when
-              the file layout is consistent across servers.
+        <div className="field" style={{ marginTop: 12 }}>
+          <span className="label">
+            DB-access audit log:{' '}
+            <span className={`tag ${auditLogEnabled ? 'done' : 'failed'}`} style={{ marginLeft: 6 }}>
+              {auditLogEnabled ? 'enabled' : 'DISABLED'}
             </span>
           </span>
-        </label>
-        <label className="switch" style={{ marginTop: 10 }}>
-          <input
-            type="checkbox"
-            checked={allowFuzzyFallback}
-            onChange={(e) => setAllowFuzzyFallback(e.target.checked)}
-          />
-          <span>
-            <strong style={{ color: 'var(--warn, #d97706)' }}>Allow fuzzy title fallback (Tier 3)</strong> — may produce incorrect matches
-            <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 11, marginTop: 2 }}>
-              Last-resort match by title. Two items with similar titles
-              on different servers can match each other when they
-              shouldn't, causing the wrong destination item to be
-              updated. Off by default. When any item matches via this
-              tier, the Dashboard shows a yellow warning so the
-              operator can review.
-            </span>
+          <span className="help">
+            Records every read / write the engine performs against
+            <code> media.db</code>, <code>auth.db</code>, and{' '}
+            <code>snapshots.db</code>. Forensic control — toggling it
+            requires the database-admin credential. The transition
+            is logged in the audit file itself so the trail always
+            shows it was intentionally disabled and by whom.
           </span>
-        </label>
+          <div style={{ marginTop: 6 }}>
+            <button type="button" onClick={() => setAuditToggleOpen(true)}>
+              {auditLogEnabled ? 'Disable audit log…' : 'Re-enable audit log…'}
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* Rule 2: library walk cadence + Prune Missing Items. */}
@@ -341,34 +259,90 @@ export function SettingsPanel() {
         )}
       </div>
 
-      {/* PR-13 - snapshot retention controls. */}
+      {auditToggleOpen && (
+        <AuditLogToggleModal
+          currentlyEnabled={auditLogEnabled}
+          onClose={() => setAuditToggleOpen(false)}
+          onToggled={(newEnabled) => {
+            setAuditLogEnabled(newEnabled);
+            setAuditToggleOpen(false);
+            setOk(
+              newEnabled
+                ? 'DB-access audit log re-enabled.'
+                : 'DB-access audit log disabled.',
+            );
+          }}
+        />
+      )}
+
+      {/* Phase 4: Dashboard ETR colour-switch timing. */}
       <div className="panel">
-        <h2>Snapshot Retention</h2>
+        <h2>Dashboard Stall Colours</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
-          Each snapshot job writes a per-server <code>.db</code> indexed in the Exports
-          panel. Retention caps how many of those rows live alongside each server;
-          older snapshots beyond the cap are deleted (file + registry row) after every
-          new capture. Per-server values only apply when <em>strictly lower</em> than
-          the global - a per-server number higher than the global is ignored and the
-          global ceiling wins.
+          Scales the per-phase amber/red thresholds the Dashboard's <strong>Currently
+          Processing</strong> table uses to flag stuck phases. <strong>1.0</strong> uses the ship
+          defaults; values <strong>below 1.0</strong> are more sensitive (warns sooner); values
+          <strong> above 1.0</strong> are more lenient. Clamped to [0.5, 2.0]. Takes effect on the
+          next Dashboard mount.
         </span>
-
-        <label className="field" style={{ maxWidth: 240 }}>
-          <span className="label">Global retention (snapshots per server)</span>
+        <label className="field" style={{ maxWidth: 320 }}>
+          <span className="label">ETR colour multiplier: <strong>{etrMultiplier.toFixed(2)}×</strong></span>
           <input
-            type="number"
-            min={1}
-            max={10000}
-            value={globalRetention}
-            onChange={(e) => setGlobalRetention(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+            type="range"
+            min={0.5}
+            max={2.0}
+            step={0.05}
+            value={etrMultiplier}
+            onChange={(e) => setEtrMultiplier(Number(e.target.value))}
           />
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-dim)' }}>
+            <span>0.5× (sensitive)</span>
+            <span>1.0× (default)</span>
+            <span>2.0× (lenient)</span>
+          </div>
         </label>
-
-        <div className="help" style={{ marginTop: 12, fontSize: 12, color: 'var(--text-dim)' }}>
-          Per-server retention overrides moved to
-          <strong> Servers ▸ Advanced Settings</strong>, alongside the
-          other snapshot-time per-server defaults (JSON sidecar,
-          data-type filters, engine tuning).
+        {/* Live preview at the current multiplier. Each row renders
+            the phase name three ways — as the normal tag the
+            Dashboard's Currently Processing table uses (left column),
+            then the stall-amber and stall-red variants the same phase
+            transitions into once its age crosses the thresholds. The
+            seconds columns show the actual amber / red windows at
+            the current multiplier so operators can see both the
+            value and the colour change in one place. */}
+        <div style={{ marginTop: 12, fontSize: 12 }}>
+          <strong>Preview at {etrMultiplier.toFixed(2)}×:</strong>
+          <table className="list" style={{ marginTop: 6, maxWidth: 720 }}>
+            <thead>
+              <tr>
+                <th>Normal</th>
+                <th>Amber after</th>
+                <th>Red after</th>
+              </tr>
+            </thead>
+            <tbody>
+              {([
+                ['fetching', 45, 120, 'phase'],
+                ['capturing', 30, 60, 'capturing'],
+                ['indexing', 45, 90, 'phase'],
+                ['resolving', 30, 75, 'phase'],
+                ['scrobbling', 20, 45, 'merged'],
+                ['rating', 15, 30, 'rated'],
+                ['merging', 30, 60, 'appended'],
+              ] as Array<[string, number, number, string]>).map(([name, a, r, normalCls]) => (
+                <tr key={name}>
+                  <td><span className={`tag ${normalCls}`}>{name}</span></td>
+                  <td>
+                    <span className="tag stall-amber" style={{ marginRight: 6 }}>{name}</span>
+                    <span style={{ color: 'var(--text-dim)' }}>{(a * etrMultiplier).toFixed(0)}s</span>
+                  </td>
+                  <td>
+                    <span className="tag stall-red" style={{ marginRight: 6 }}>{name}</span>
+                    <span style={{ color: 'var(--text-dim)' }}>{(r * etrMultiplier).toFixed(0)}s</span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -575,6 +549,165 @@ function PruneMissingItemsModal({
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+// ── Audit-log toggle modal ─────────────────────────────────────────────────
+// Flips the global db-access audit log on/off. The action is the
+// security-equivalent of a destructive op: it can blind every future
+// destructive call (prune, server purge, credential delete) so it's
+// gated behind the db_admin credential, not just the JWT. Backend
+// writes a self-documenting "DISABLED by <user>" line as the last
+// audit entry on disable, and a matching "RE-ENABLED by <user>" line
+// as the first entry on re-enable - the trail always records that the
+// off period was an explicit, attributable act.
+
+function AuditLogToggleModal({
+  currentlyEnabled,
+  onClose,
+  onToggled,
+}: {
+  currentlyEnabled: boolean;
+  onClose: () => void;
+  onToggled: (newEnabled: boolean) => void;
+}) {
+  const [dbAdminUsername, setDbAdminUsername] = useState<string>('');
+  const [dbAdminPassword, setDbAdminPassword] = useState<string>('');
+  const [confirmAcknowledged, setConfirmAcknowledged] = useState<boolean>(false);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // The "target state" is the opposite of the current state - the
+  // operator clicked the button to flip it.
+  const targetEnabled = !currentlyEnabled;
+  const disabling = currentlyEnabled;  // we're about to turn it off
+
+  const submit = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const r = await api.toggleAuditLog({
+        db_admin_username: dbAdminUsername,
+        db_admin_password: dbAdminPassword,
+        enabled: targetEnabled,
+      });
+      onToggled(r.audit_log_enabled);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 1000,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="panel"
+        style={{
+          maxWidth: 560, maxHeight: '90vh', overflow: 'auto',
+          background: 'var(--bg, #181818)',
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2>
+          {disabling ? 'Disable' : 'Re-enable'} DB-access audit log
+        </h2>
+        {disabling ? (
+          <div
+            className="banner"
+            style={{
+              background: 'rgba(217, 119, 6, 0.12)',
+              border: '1px solid var(--warn, #d97706)',
+              color: 'var(--warn, #d97706)',
+              padding: '10px 14px', borderRadius: 6, marginBottom: 12, fontSize: 13,
+            }}
+          >
+            <strong>Read this before continuing.</strong>{' '}
+            With the audit log off, every destructive media.db operation
+            (prune missing items, purge server data, delete managed user,
+            tombstone changes) will <strong>succeed without leaving a record</strong> of
+            who did it or when. The audit trail will resume only when an
+            admin explicitly re-enables it through this dialog. The act
+            of turning it off is itself logged as the final entry — under
+            your db-admin username below — so the off period is always
+            attributable. Continue only if you understand the
+            accountability trade-off.
+          </div>
+        ) : (
+          <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
+            Re-enables the db-access audit log. The first entry after
+            re-enable will record your db-admin username and the time so
+            the resumption is itself audited.
+          </span>
+        )}
+
+        {error && (
+          <div className="banner error" style={{ marginBottom: 12 }}>{error}</div>
+        )}
+
+        <div className="grid-2">
+          <label className="field">
+            <span className="label">db-admin username</span>
+            <input
+              type="text"
+              value={dbAdminUsername}
+              onChange={(e) => setDbAdminUsername(e.target.value)}
+              autoComplete="username"
+            />
+          </label>
+          <label className="field">
+            <span className="label">db-admin password</span>
+            <input
+              type="password"
+              value={dbAdminPassword}
+              onChange={(e) => setDbAdminPassword(e.target.value)}
+              autoComplete="current-password"
+            />
+          </label>
+        </div>
+
+        {disabling && (
+          <label className="switch" style={{ marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={confirmAcknowledged}
+              onChange={(e) => setConfirmAcknowledged(e.target.checked)}
+            />
+            <span>
+              I understand that disabling the audit log removes the record
+              of who performs destructive database operations until it is
+              re-enabled.
+            </span>
+          </label>
+        )}
+
+        <div className="row-buttons" style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+          <button onClick={onClose} disabled={submitting}>Cancel</button>
+          <button
+            className={disabling ? 'danger' : 'primary'}
+            onClick={() => void submit()}
+            disabled={
+              submitting
+              || !dbAdminUsername
+              || !dbAdminPassword
+              || (disabling && !confirmAcknowledged)
+            }
+          >
+            {submitting
+              ? (disabling ? 'Disabling…' : 'Re-enabling…')
+              : (disabling ? 'Disable audit log' : 'Re-enable audit log')}
+          </button>
+        </div>
       </div>
     </div>
   );

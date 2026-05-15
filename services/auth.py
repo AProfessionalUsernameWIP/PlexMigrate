@@ -8,6 +8,7 @@ home user token fetching, and the shared HTTP session / retry adapter factory.
 import concurrent.futures
 import logging
 import sys
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,9 +23,12 @@ import services.state as state
 from services.state import PLEX_DB_PATHS, console
 
 
+log = logging.getLogger("plexmigrate.services.auth")
+
+
 # ── HTTP Session / Retry Adapter ──────────────────────────────────────────────
 
-def _make_retry_adapter(pool_maxsize: int = 10) -> HTTPAdapter:
+def _make_retry_adapter(pool_maxsize: Optional[int] = None) -> HTTPAdapter:
     """
     Builds an HTTPAdapter with a consistent retry policy.
 
@@ -38,20 +42,92 @@ def _make_retry_adapter(pool_maxsize: int = 10) -> HTTPAdapter:
     surfacing 429s to callers. ``connect`` and ``read`` budgets are
     unchanged.
 
+    Tunables: ``total`` and ``backoff_factor`` come from
+    ``services.tunables`` so an operator can bump retry tolerance for
+    flakier upstream Plex servers without a code change. ``pool_maxsize``
+    falls back to the tunable when the caller doesn't override it.
+
     Args:
-        pool_maxsize (int): Max simultaneous open connections in the pool.
+        pool_maxsize (int, optional): Max simultaneous open connections in
+            the pool. When ``None``, the ``http_pool_maxsize_cap`` tunable
+            is used.
     """
+    # Lazy import so this module stays importable from CLI-only checkouts
+    # that don't have services.tunables on the path (e.g. early test
+    # bootstrap). Falling back to the literals preserves prior behaviour.
+    try:
+        from services import tunables
+        total = int(tunables.plex_retry_total_budget())
+        backoff = float(tunables.plex_retry_backoff_factor())
+        pool_connections = int(tunables.http_pool_connections())
+        if pool_maxsize is None:
+            pool_maxsize = int(tunables.http_pool_maxsize_cap())
+    except Exception:
+        total = 4
+        backoff = 0.5
+        pool_connections = 4
+        if pool_maxsize is None:
+            pool_maxsize = 10
+
     retry = Retry(
-        total=4,
+        total=total,
         connect=2,
         read=1,
-        backoff_factor=0.5,
+        backoff_factor=backoff,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["GET", "PUT"]),
         respect_retry_after_header=True,
         raise_on_status=False,
     )
-    return HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=pool_maxsize)
+    return HTTPAdapter(
+        max_retries=retry,
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
+    )
+
+
+# Registry of every requests.Session the engine has handed out, kept
+# as a weak set so a Session that goes out of scope doesn't keep the
+# entry alive. ``invalidate_sessions()`` walks this list and re-mounts
+# each session's HTTPAdapter from the current tunables.
+import weakref
+
+_LIVE_SESSIONS: "weakref.WeakSet[requests.Session]" = weakref.WeakSet()
+_LIVE_SESSIONS_LOCK = threading.Lock()
+
+
+def _register_session(session: requests.Session) -> None:
+    """Track ``session`` so it can be rebuilt on a tunable change."""
+    with _LIVE_SESSIONS_LOCK:
+        _LIVE_SESSIONS.add(session)
+
+
+def invalidate_sessions() -> None:
+    """
+    Rebuild every live Plex requests.Session with the current tunables.
+
+    Called by ``server.persistence.save_settings`` when one of the
+    HTTP-related tunables (retry budget, backoff, pool sizes,
+    timeouts) actually changed. Walks the weak registry of sessions
+    and re-mounts a fresh ``_make_retry_adapter`` on each. Existing
+    in-flight requests aren't cancelled - they finish on the old
+    adapter; subsequent requests use the new one.
+
+    Phase 1 stub: the weak set is empty until Phase 3 wires
+    ``_make_session`` / ``connect_to_server`` to register sessions.
+    Calling this now is a safe no-op.
+    """
+    with _LIVE_SESSIONS_LOCK:
+        snapshot = list(_LIVE_SESSIONS)
+    if not snapshot:
+        return
+    for session in snapshot:
+        try:
+            adapter = _make_retry_adapter()
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("invalidate_sessions: failed to rebuild adapter on a session")
 
 
 def _http_response_hook(response, *args, **kwargs):
@@ -174,6 +250,7 @@ def _make_session() -> requests.Session:
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     _install_response_hook(session)
+    _register_session(session)
     return session
 
 
@@ -248,6 +325,10 @@ def connect_to_server(url: str, token: str, logger: logging.Logger) -> Optional[
             # captures the bulk of the engine's HTTP traffic so the
             # Network panel doesn't miss it.
             _install_response_hook(server._session)
+            # Phase 1 hot-reload: track every plexapi session so a
+            # later HTTP-tunable change can rebuild the adapter via
+            # invalidate_sessions().
+            _register_session(server._session)
 
         logger.info(
             f"Connected to Plex server: {server.friendlyName} (version {server.version})"

@@ -337,13 +337,42 @@ def restore_watch_history(
     scan_lock: Optional[threading.Lock] = None,
     user: str = "Plex Owner",
     stop_event: Optional[threading.Event] = None,
+    mode: str = "merge",
+    # v0.13.x: Merge-mode watch-count strategy. Two values:
+    #   "higher" (default, legacy) - final destination view count is
+    #       max(stored, current). Add only the difference when stored
+    #       is higher; otherwise no-op. Idempotent across re-runs.
+    #   "sum" - final destination view count is current + stored.
+    #       Every captured play is treated as a real event that adds
+    #       to the destination's count. NOT idempotent: re-running the
+    #       same job will double-count. Operator opt-in.
+    # Ignored when mode == "replace" (Replace overwrites unconditionally,
+    # so there is no notion of combining counts).
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """
-    Imports Play Count for a library using additive-only merge logic.
+    Imports Play Count for a library. Two top-level modes (with a sub-
+    strategy under Merge for watch counts only):
 
-    Merge rules:
-        - View count: only INCREASED, never reduced.
+    Merge (default):
+        - View count: only INCREASED, never reduced. The sub-strategy
+          ``merge_watch_strategy`` picks how the increase is computed:
+            * ``higher`` (default) - increase by max(0, stored - current),
+              so destination ends at max(stored, current). Idempotent.
+            * ``sum`` - increase by exactly ``stored``, so destination
+              ends at current + stored. Operator opt-in; NOT idempotent.
         - Resume position: only set if the target item has NO saved progress.
+
+    Replace (opt-in, destructive):
+        - View count: set to exactly the stored value. If the destination
+          has more plays than the snapshot, ``markUnplayed`` resets to 0
+          first, then we scrobble up to the stored count (capped by
+          VIEWCOUNT_INCREMENT_CAP).
+        - Resume position: set to the stored value unconditionally.
+        - Used for true point-in-time recovery. Operator-gated by the
+          UI's typed-REPLACE confirmation; the safety belt auto-captures
+          a pre-replace snapshot of the destination before the engine
+          fires.
 
     Args:
         server (PlexServer): Active connection to the target server.
@@ -462,9 +491,68 @@ def restore_watch_history(
             stored_view_count = stored.get("view_count", 0) or 0
             stored_view_offset = stored.get("view_offset", 0) or 0
 
-            views_to_add = max(0, stored_view_count - current_view_count)
+            # v0.13.x Replace mode: set viewCount to exactly the stored
+            # value. If the destination is currently HIGHER than the
+            # snapshot (the operator watched something after the
+            # snapshot was taken), reset to 0 first via markUnplayed so
+            # the scrobble loop below can bring it back up to the stored
+            # value. The resume position is always overwritten.
+            if mode == "replace":
+                if current_view_count > stored_view_count:
+                    try:
+                        live_item.markUnplayed()
+                        current_view_count = 0
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Could not reset viewCount on %r before "
+                            "Replace re-scrobble: %s. Stored=%d, target was %d.",
+                            lib_name, stored.get("title", "?"), exc,
+                            stored_view_count, current_view_count,
+                        )
+                        # Best-effort: continue with the scrobble path
+                        # anyway. The end state will be at least
+                        # stored + (original current - stored) - not
+                        # perfect, but the operator was warned.
+                views_to_add = max(0, stored_view_count - current_view_count)
+                set_offset_unconditionally = True
+            else:
+                # Merge mode. Two sub-strategies select what "additive"
+                # means for the view count itself:
+                #   higher: bring destination up to max(stored, current) -
+                #           idempotent re-runs, the legacy default.
+                #   sum:    add the snapshot's count on top of current -
+                #           treats every captured play as a real event.
+                # Both still satisfy the "Merge never reduces a count"
+                # contract; the difference is only the upper bound.
+                if merge_watch_strategy == "sum":
+                    views_to_add = stored_view_count
+                else:
+                    views_to_add = max(0, stored_view_count - current_view_count)
+                set_offset_unconditionally = False
 
             if views_to_add == 0:
+                # Replace mode still needs to write the resume offset
+                # even when view counts already match. Merge mode keeps
+                # the legacy skip-with-no-work behaviour.
+                if mode == "replace" and stored_view_offset != current_view_offset:
+                    try:
+                        with scrobble_sem:
+                            _set_resume_position(
+                                base_url, live_item.ratingKey,
+                                stored_view_offset, token,
+                            )
+                        _record_success(lib_name, {
+                            "ts": ts, "tier": tier,
+                            "title": stored["title"],
+                            "type": stored.get("type", "?"),
+                            "action": f"[REPLACED] view_offset = {stored_view_offset}",
+                        })
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Replace: failed to set view_offset on %r: %s",
+                            lib_name, stored.get("title", "?"), exc,
+                        )
+                    return
                 _record_success(lib_name, {
                     "ts": ts, "tier": tier,
                     "title": stored["title"],
@@ -493,7 +581,12 @@ def restore_watch_history(
                 for _ in range(actual_views):
                     _scrobble(base_url, live_item.ratingKey, token)
 
-                if current_view_offset == 0 and stored_view_offset > 0:
+                # Merge: only set offset when target has no progress.
+                # Replace: always overwrite (operator wants point-in-time).
+                if set_offset_unconditionally:
+                    if stored_view_offset != current_view_offset:
+                        _set_resume_position(base_url, live_item.ratingKey, stored_view_offset, token)
+                elif current_view_offset == 0 and stored_view_offset > 0:
                     _set_resume_position(base_url, live_item.ratingKey, stored_view_offset, token)
 
             if capped:
@@ -568,13 +661,22 @@ def restore_playlists(
     scan_lock: Optional[threading.Lock] = None,
     existing_playlists: Optional[Dict[str, Any]] = None,
     stop_event: Optional[threading.Event] = None,
+    mode: str = "merge",
 ) -> None:
     """
-    Imports playlists using additive union merge - never deletes or overwrites.
+    Imports playlists. Two modes:
 
-    Merge rules:
+    Merge (default, additive union):
         - If a playlist does NOT exist: create it. Log [CREATED].
         - If it DOES exist: append missing items only. Log [APPENDED].
+
+    Replace (opt-in, destructive):
+        - If a playlist does NOT exist: create it. Log [CREATED].
+        - If it DOES exist: diff against snapshot. Members in snapshot but
+          not currently present are added; members currently present but
+          not in snapshot are REMOVED. The playlist row itself is
+          preserved (not deleted/recreated) so out-of-band metadata
+          stays intact. Log [REPLACED] with both counts.
 
     Two-phase design:
         Phase 1 (parallel): Resolve all items across all non-smart playlists.
@@ -862,34 +964,84 @@ def restore_playlists(
                         )
                     continue
                 try:
+                    existing_items = list(existing_pl.items())
                     existing_keys: Set[int] = {
-                        item.ratingKey for item in existing_pl.items()
+                        item.ratingKey for item in existing_items
                     }
-                    items_to_add = [i for i in resolved_items if i.ratingKey not in existing_keys]
-                    items_present = [i for i in resolved_items if i.ratingKey in existing_keys]
+                    snapshot_keys: Set[int] = {
+                        i.ratingKey for i in resolved_items
+                    }
+                    items_to_add = [
+                        i for i in resolved_items if i.ratingKey not in existing_keys
+                    ]
+                    items_present = [
+                        i for i in resolved_items if i.ratingKey in existing_keys
+                    ]
 
-                    if items_to_add:
-                        _add_to_playlist_chunked(existing_pl, items_to_add)
+                    if mode == "replace":
+                        # v0.13.x Replace branch: diff existing vs the
+                        # snapshot's resolved set and REMOVE members
+                        # that aren't in the snapshot. Adds happen as
+                        # in merge mode. The playlist row itself stays
+                        # so any out-of-band metadata (poster, sort)
+                        # survives.
+                        items_to_remove = [
+                            it for it in existing_items
+                            if it.ratingKey not in snapshot_keys
+                        ]
+                        if items_to_remove:
+                            try:
+                                # plexapi's removeItems may not chunk;
+                                # err on the side of one call per item
+                                # to keep URL lengths bounded.
+                                for it in items_to_remove:
+                                    existing_pl.removeItems([it])
+                            except Exception as exc:
+                                logger.warning(
+                                    "[%s] Replace: removeItems failed on %r: %s. "
+                                    "Continuing with adds; pre-Replace snapshot "
+                                    "is the recovery point.",
+                                    lib_name, pl_name, exc,
+                                )
+                        if items_to_add:
+                            _add_to_playlist_chunked(existing_pl, items_to_add)
                         _record_success(lib_name, {
                             "ts": ts, "tier": "N/A", "title": pl_name,
                             "type": "playlist",
-                            "action": f"[APPENDED] {len(items_to_add)} new item(s)",
+                            "action": (
+                                f"[REPLACED] +{len(items_to_add)} / -{len(items_to_remove)} "
+                                f"(snapshot had {len(resolved_items)}, "
+                                f"destination had {len(existing_items)})"
+                            ),
                         })
                         logger.info(
-                            f"Appended {len(items_to_add)} item(s) to existing playlist '{pl_name}'"
+                            f"Replaced playlist '{pl_name}': "
+                            f"+{len(items_to_add)} added, -{len(items_to_remove)} removed"
                         )
+                    else:
+                        # Merge (default): additive union only.
+                        if items_to_add:
+                            _add_to_playlist_chunked(existing_pl, items_to_add)
+                            _record_success(lib_name, {
+                                "ts": ts, "tier": "N/A", "title": pl_name,
+                                "type": "playlist",
+                                "action": f"[APPENDED] {len(items_to_add)} new item(s)",
+                            })
+                            logger.info(
+                                f"Appended {len(items_to_add)} item(s) to existing playlist '{pl_name}'"
+                            )
 
-                    for item in items_present:
-                        _record_success(lib_name, {
-                            "ts": ts, "tier": "N/A", "title": item.title,
-                            "type": item.type,
-                            "action": f"[SKIPPED - already in playlist '{pl_name}']",
-                        })
+                        for item in items_present:
+                            _record_success(lib_name, {
+                                "ts": ts, "tier": "N/A", "title": item.title,
+                                "type": item.type,
+                                "action": f"[SKIPPED - already in playlist '{pl_name}']",
+                            })
 
-                    if not items_to_add:
-                        logger.info(
-                            f"Playlist '{pl_name}': all {len(items_present)} item(s) already present"
-                        )
+                        if not items_to_add:
+                            logger.info(
+                                f"Playlist '{pl_name}': all {len(items_present)} item(s) already present"
+                            )
 
                 except Exception as e:
                     _record_failure(lib_name, {
@@ -937,13 +1089,22 @@ def restore_collections(
     scan_cache: Optional[Dict[str, Any]] = None,
     scan_lock: Optional[threading.Lock] = None,
     stop_event: Optional[threading.Event] = None,
+    mode: str = "merge",
 ) -> None:
     """
-    Imports collections using additive union merge - never deletes or overwrites.
+    Imports collections. Two modes:
 
-    Merge rules:
+    Merge (default, additive union):
         - If collection does NOT exist: create it. Log [CREATED].
         - If it DOES exist: append missing members only. Log [APPENDED].
+
+    Replace (opt-in, destructive):
+        - If collection does NOT exist: create it. Log [CREATED].
+        - If it DOES exist: diff against snapshot. Members in snapshot
+          but not currently present are added; members currently present
+          but not in snapshot are REMOVED. The collection row itself is
+          preserved (not deleted/recreated) so out-of-band metadata
+          stays intact. Log [REPLACED] with both counts.
 
     Two-phase design (mirrors restore_playlists):
         Phase 1 (parallel): Resolve all member items across all collections.
@@ -1063,34 +1224,77 @@ def restore_collections(
         else:
             existing_coll = existing_collections[coll_name]
             try:
+                existing_items = list(existing_coll.items())
                 existing_keys: Set[int] = {
-                    item.ratingKey for item in existing_coll.items()
+                    item.ratingKey for item in existing_items
                 }
-                items_to_add = [i for i in resolved_items if i.ratingKey not in existing_keys]
-                items_present = [i for i in resolved_items if i.ratingKey in existing_keys]
+                snapshot_keys: Set[int] = {
+                    i.ratingKey for i in resolved_items
+                }
+                items_to_add = [
+                    i for i in resolved_items if i.ratingKey not in existing_keys
+                ]
+                items_present = [
+                    i for i in resolved_items if i.ratingKey in existing_keys
+                ]
 
-                if items_to_add:
-                    _add_to_collection_chunked(existing_coll, items_to_add)
+                if mode == "replace":
+                    # v0.13.x Replace branch: diff + remove members
+                    # not in snapshot. Adds happen as in merge. The
+                    # collection row stays so metadata survives.
+                    items_to_remove = [
+                        it for it in existing_items
+                        if it.ratingKey not in snapshot_keys
+                    ]
+                    if items_to_remove:
+                        try:
+                            for it in items_to_remove:
+                                existing_coll.removeItems([it])
+                        except Exception as exc:
+                            logger.warning(
+                                "[%s] Replace: removeItems failed on collection %r: %s. "
+                                "Pre-Replace snapshot is the recovery point.",
+                                lib_name, coll_name, exc,
+                            )
+                    if items_to_add:
+                        _add_to_collection_chunked(existing_coll, items_to_add)
                     _record_success(lib_name, {
                         "ts": ts, "tier": "N/A", "title": coll_name,
                         "type": "collection",
-                        "action": f"[APPENDED] {len(items_to_add)} new member(s)",
+                        "action": (
+                            f"[REPLACED] +{len(items_to_add)} / -{len(items_to_remove)} "
+                            f"(snapshot had {len(resolved_items)}, "
+                            f"destination had {len(existing_items)})"
+                        ),
                     })
                     logger.info(
-                        f"Appended {len(items_to_add)} member(s) to collection '{coll_name}'"
+                        f"Replaced collection '{coll_name}': "
+                        f"+{len(items_to_add)} added, -{len(items_to_remove)} removed"
                     )
+                else:
+                    # Merge (default): additive union only.
+                    if items_to_add:
+                        _add_to_collection_chunked(existing_coll, items_to_add)
+                        _record_success(lib_name, {
+                            "ts": ts, "tier": "N/A", "title": coll_name,
+                            "type": "collection",
+                            "action": f"[APPENDED] {len(items_to_add)} new member(s)",
+                        })
+                        logger.info(
+                            f"Appended {len(items_to_add)} member(s) to collection '{coll_name}'"
+                        )
 
-                for item in items_present:
-                    _record_success(lib_name, {
-                        "ts": ts, "tier": "N/A", "title": item.title,
-                        "type": item.type,
-                        "action": f"[SKIPPED - already in collection '{coll_name}']",
-                    })
+                    for item in items_present:
+                        _record_success(lib_name, {
+                            "ts": ts, "tier": "N/A", "title": item.title,
+                            "type": item.type,
+                            "action": f"[SKIPPED - already in collection '{coll_name}']",
+                        })
 
-                if not items_to_add:
-                    logger.info(
-                        f"Collection '{coll_name}': all {len(items_present)} member(s) already present"
-                    )
+                    if not items_to_add:
+                        logger.info(
+                            f"Collection '{coll_name}': all {len(items_present)} member(s) already present"
+                        )
 
             except Exception as e:
                 _record_failure(lib_name, {
@@ -1135,13 +1339,18 @@ def restore_ratings(
     scan_lock: Optional[threading.Lock] = None,
     user: str = "Plex Owner",
     stop_event: Optional[threading.Event] = None,
+    mode: str = "merge",
 ) -> None:
     """
-    Imports star ratings using additive-only logic - never overwrites existing ratings.
+    Imports star ratings. Two modes:
 
-    Merge rule:
+    Merge (default, additive-only):
         - If the target item has NO rating: set the stored rating. Log [RATING SET].
         - If the target item ALREADY HAS a rating: skip it.
+
+    Replace (opt-in, destructive):
+        - Always set to the stored rating, overwriting any current value.
+        - Used for true point-in-time recovery.
 
     Args:
         server (PlexServer): Active connection to the target server.
@@ -1225,7 +1434,10 @@ def restore_ratings(
             if export_rating is None:
                 export_rating = stored.get("user_rating")
 
-            if current_rating is not None:
+            # v0.13.x Replace mode: drop the "skip if target already
+            # has a rating" gate. Always overwrite to the stored value
+            # for true point-in-time semantics.
+            if mode == "merge" and current_rating is not None:
                 _record_success(lib_name, {
                     "ts": ts, "tier": tier,
                     "title": stored["title"],
@@ -1250,13 +1462,24 @@ def restore_ratings(
                         "carries no value (neither 'rating' nor 'user_rating'); skipped."
                     )
                     return
+                # In Replace mode, a same-value rating is a no-op API
+                # call but still worth logging as REPLACED so the audit
+                # trail shows the run was destructive.
+                already_matches = (
+                    mode == "replace"
+                    and current_rating is not None
+                    and float(current_rating) == float(export_rating)
+                )
                 try:
-                    _rate_item(base_url, live_item.ratingKey, export_rating, token)
+                    if not already_matches:
+                        _rate_item(base_url, live_item.ratingKey, export_rating, token)
+                    action_tag = "[REPLACED]" if mode == "replace" else "[RATING SET]"
+                    note = " (no change - already matched)" if already_matches else ""
                     _record_success(lib_name, {
                         "ts": ts, "tier": tier,
                         "title": stored["title"],
                         "type": stored.get("type", "?"),
-                        "action": f"[RATING SET] {export_rating}",
+                        "action": f"{action_tag} {export_rating}{note}",
                     })
                     logger.debug(
                         f"[{lib_name}] Set rating {export_rating} for '{stored['title']}'"
@@ -1326,6 +1549,16 @@ def restore_export_file(
     # detects ``snapshot_meta.reconstructed_from_db`` on the payload
     # and submits one task per target section with this set.
     target_section_name_override: Optional[str] = None,
+    # v0.13.x restore mode. "merge" = legacy additive behaviour (never
+    # destroys data); "replace" = true point-in-time, overwrites view
+    # counts / ratings / playlist+collection membership to match the
+    # snapshot exactly. Forwarded to every restore_* primitive.
+    mode: str = "merge",
+    # v0.13.x: sub-strategy for Merge mode's watch-count math. "higher"
+    # (default) = destination ends at max(stored, current); "sum" =
+    # destination ends at current + stored. Ignored when mode=="replace"
+    # since Replace overwrites unconditionally. See restore_watch_history.
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """
     Imports a single .plexexport.json file into the target server.
@@ -1402,6 +1635,34 @@ def restore_export_file(
 
     if sections_by_name is not None:
         section = sections_by_name.get(lib_name)
+        if section is None:
+            # Plex may have hidden a library mid-refresh during the
+            # one-shot fetch at run start (or returned a partial list
+            # while warming up). One self-healing retry: refetch the
+            # section list and update the shared cache in place so any
+            # subsequent libraries benefit from the warmer response too.
+            logger.warning(
+                "Library '%s' missing from initial section cache - "
+                "refetching from destination...", lib_name,
+            )
+            try:
+                time.sleep(1)
+                refreshed = {s.title: s for s in server.library.sections()}
+            except Exception as exc:
+                logger.error(
+                    "Section refetch failed for library '%s': %s", lib_name, exc,
+                )
+                refreshed = None
+            if refreshed:
+                sections_by_name.clear()
+                sections_by_name.update(refreshed)
+                section = sections_by_name.get(lib_name)
+                if section is not None:
+                    logger.info(
+                        "Library '%s' found after refetch (initial fetch was "
+                        "partial - destination was likely warming up).",
+                        lib_name,
+                    )
     else:
         section = next(
             (s for s in server.library.sections() if s.title == lib_name), None
@@ -1414,7 +1675,23 @@ def restore_export_file(
         )
         return
 
-    items = data.get("items", {})
+    # v0.13.0: unified users map. The owner is identified by
+    # ``role == 'owner'`` rather than living at a top-level ``items``
+    # block. Find them once here; the four restore_* calls below
+    # read ``owner_block`` instead of the old ``items`` dict.
+    # Mid-transition payloads with no explicit role fall back to the
+    # legacy empty-handle convention.
+    users_map = data.get("users") or {}
+    owner_handle: Optional[str] = None
+    owner_block: Dict[str, Any] = {}
+    for _h, _ub in users_map.items():
+        if isinstance(_ub, dict) and _ub.get("role") == "owner":
+            owner_handle = _h
+            owner_block = _ub
+            break
+    if owner_handle is None and "" in users_map and isinstance(users_map[""], dict):
+        owner_handle = ""
+        owner_block = users_map[""]
 
     scan_cache: Dict[str, Any] = {}
     scan_lock = threading.Lock()
@@ -1452,10 +1729,12 @@ def restore_export_file(
     if include_watch_history:
         _set_phase("Play Count" if section.type == "artist" else "Watched")
         restore_watch_history(
-            server, section, items.get("watch_history", []),
+            server, section, owner_block.get("watch_history", []),
             token, base_url, logger, log_dir, remap, strict_match,
             scan_cache, scan_lock, user=state._plex_owner_name,
             stop_event=stop_event,
+            mode=mode,
+            merge_watch_strategy=merge_watch_strategy,
         )
     else:
         # PR-6: per-library skip notices are INFO. They're expected
@@ -1471,11 +1750,12 @@ def restore_export_file(
     if include_playlists:
         _set_phase("Playlists")
         restore_playlists(
-            server, section, items.get("playlists", []),
+            server, section, owner_block.get("playlists", []),
             logger, log_dir, remap, strict_match,
             scan_cache, scan_lock,
             existing_playlists,
             stop_event=stop_event,
+            mode=mode,
         )
     else:
         logger.info(
@@ -1487,10 +1767,11 @@ def restore_export_file(
     if include_collections:
         _set_phase("Collections")
         restore_collections(
-            server, section, items.get("collections", []),
+            server, section, owner_block.get("collections", []),
             logger, log_dir, remap, strict_match,
             scan_cache, scan_lock,
             stop_event=stop_event,
+            mode=mode,
         )
     else:
         logger.info(
@@ -1502,17 +1783,28 @@ def restore_export_file(
     if include_ratings:
         _set_phase("Ratings")
         restore_ratings(
-            server, section, items.get("ratings", []),
+            server, section, owner_block.get("ratings", []),
             token, base_url, logger, remap, strict_match,
             scan_cache, scan_lock, user=state._plex_owner_name,
             stop_event=stop_event,
+            mode=mode,
         )
     else:
         logger.info(
             "[%s] Ratings import skipped (include_ratings=False)", lib_name,
         )
 
-    users_data = data.get("users", {})
+    # Managed users only - the owner block was already restored
+    # above via the role lookup. Filter against owner_handle (the
+    # JSON key) AND any explicit role marker so a payload with two
+    # owner rows (shouldn't happen, but defensive) doesn't accidentally
+    # treat the second one as managed.
+    users_data = {
+        h: ub for h, ub in users_map.items()
+        if h != owner_handle
+        and isinstance(ub, dict)
+        and ub.get("role") != "owner"
+    }
     if users_data and not home_users:
         logger.info(
             f"Export contains data for {len(users_data)} home user(s), but no "
@@ -1577,6 +1869,8 @@ def restore_export_file(
                     user_token, base_url, logger, log_dir, remap, strict_match,
                     scan_cache, scan_lock, user=username,
                     stop_event=stop_event,
+                    mode=mode,
+                    merge_watch_strategy=merge_watch_strategy,
                 )
             if include_playlists:
                 restore_playlists(
@@ -1585,6 +1879,7 @@ def restore_export_file(
                     scan_cache, scan_lock,
                     existing_playlists=None,
                     stop_event=stop_event,
+                    mode=mode,
                 )
             # v0.9.7 Item 9: restore this user's personal collections
             # (Plex Pass feature - collections that live in their
@@ -1597,6 +1892,7 @@ def restore_export_file(
                     logger, log_dir, remap, strict_match,
                     scan_cache, scan_lock,
                     stop_event=stop_event,
+                    mode=mode,
                 )
             if include_ratings:
                 restore_ratings(
@@ -1604,6 +1900,7 @@ def restore_export_file(
                     user_token, base_url, logger, remap, strict_match,
                     scan_cache, scan_lock, user=username,
                     stop_event=stop_event,
+                    mode=mode,
                 )
         finally:
             # Restore the prior current_user (owner email or None) so
@@ -1663,6 +1960,16 @@ def run_restore(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # v0.13.x: restore mode. "merge" is the default additive behaviour;
+    # "replace" is the opt-in point-in-time overwrite. The job worker
+    # in server/jobs.py forwards the user's request body value and
+    # runs the pre-Replace auto-capture safety belt before calling this
+    # function when mode == "replace".
+    mode: str = "merge",
+    # v0.13.x: Merge-mode watch-count math sub-strategy. Forwarded to
+    # restore_export_file → restore_watch_history. Ignored when
+    # mode == "replace".
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """
     Runs the full import pipeline for all selected export files.
@@ -1702,6 +2009,21 @@ def run_restore(
         ) if v
     ]
     logger.info("Import data types: %s", ", ".join(_included) if _included else "(none)")
+    # v0.13.x: restore-mode header. Visible at INFO so the runtime.log
+    # forensic trail makes it obvious whether a given run was the safe
+    # additive default (merge) or the destructive point-in-time variant
+    # (replace). For merge, also surface the sub-strategy.
+    if mode == "replace":
+        logger.info("Restore mode: REPLACE (point-in-time overwrite - destructive).")
+    else:
+        if merge_watch_strategy == "sum":
+            logger.info(
+                "Restore mode: merge (additive, watch counts COMBINE current+stored)."
+            )
+        else:
+            logger.info(
+                "Restore mode: merge (additive, watch counts keep HIGHER of stored/current)."
+            )
 
     home_users = get_home_users(server, base_url, logger)
     home_user_names: Set[str] = {n for n, _, _ in home_users}
@@ -1722,7 +2044,32 @@ def run_restore(
     # snapshot time and the export files contained no playlists at all.
     all_playlists: Dict[str, Any] = {}
 
+    # One-shot section enumeration for the whole run. Defensive retry:
+    # a Plex server warming up from idle, or one mid-refresh on a
+    # library, can return an empty (or partial) section list on the
+    # first call - which would silently strand every subsequent
+    # library lookup as "not found." Retry once after a short delay,
+    # then hard-fail with a clear message rather than the misleading
+    # per-library error a downstream lookup would emit.
     sections_by_name: Dict[str, Any] = {s.title: s for s in server.library.sections()}
+    if not sections_by_name:
+        logger.warning(
+            "Destination returned no libraries on first fetch - server may "
+            "be warming up from idle. Retrying in 2 seconds..."
+        )
+        time.sleep(2)
+        sections_by_name = {s.title: s for s in server.library.sections()}
+        if not sections_by_name:
+            raise RuntimeError(
+                "Destination server returned no libraries after retry. "
+                "Verify the server is awake, the token has library access, "
+                "and at least one library is published. Re-run the job once "
+                "the destination is fully responsive."
+            )
+        logger.info(
+            "Section list refetched - %d libraries now visible: %s",
+            len(sections_by_name), sorted(sections_by_name),
+        )
 
     # P1-2: don't hold every export file in memory at once. Peek each
     # file just long enough to extract its library name, item totals,
@@ -1731,26 +2078,35 @@ def run_restore(
     # this path natively via preloaded_data=None). Peak resident set
     # is now ~n_lib_workers files instead of len(export_files) files.
     def _peek_metadata(data: dict) -> Tuple[str, int, Set[str], bool]:
-        items = data.get("items", {})
-        total = (
-            len(items.get("watch_history", []))
-            + sum(len(pl.get("items", [])) for pl in items.get("playlists", []))
-            + len(items.get("playlists", []))
-            + sum(len(c.get("items", [])) for c in items.get("collections", []))
-            + len(items.get("collections", []))
-            + len(items.get("ratings", []))
-        )
-        users = set(data.get("users", {}).keys())
-        has_playlists = bool(items.get("playlists"))
-        for uname, udata in data.get("users", {}).items():
-            if uname in home_user_names:
+        # v0.13.0: unified users map. Walk every user and accumulate
+        # totals; the owner (role='owner') is always counted (we always
+        # restore the owner block), managed users only count when the
+        # target server actually has them.
+        users_map = data.get("users") or {}
+        total = 0
+        has_playlists = False
+        managed_keys: Set[str] = set()
+        for handle, udata in users_map.items():
+            if not isinstance(udata, dict):
+                continue
+            role = udata.get("role") or ("owner" if handle == "" else "managed")
+            if udata.get("playlists"):
+                has_playlists = True
+            if role == "owner":
                 total += len(udata.get("watch_history", []))
                 total += sum(len(pl.get("items", [])) for pl in udata.get("playlists", []))
                 total += len(udata.get("playlists", []))
+                total += sum(len(c.get("items", [])) for c in udata.get("collections", []))
+                total += len(udata.get("collections", []))
                 total += len(udata.get("ratings", []))
-            if udata.get("playlists"):
-                has_playlists = True
-        return data.get("library", ""), total, users, has_playlists
+            else:
+                managed_keys.add(handle)
+                if handle in home_user_names:
+                    total += len(udata.get("watch_history", []))
+                    total += sum(len(pl.get("items", [])) for pl in udata.get("playlists", []))
+                    total += len(udata.get("playlists", []))
+                    total += len(udata.get("ratings", []))
+        return data.get("library", ""), total, managed_keys, has_playlists
 
     # Task = one (export_file, section_override) pair. Non-reconstructed
     # payloads produce one task with override=None (uses the file's own
@@ -1944,6 +2300,8 @@ def run_restore(
                 include_ratings,
                 include_collections,
                 section_override,
+                mode,
+                merge_watch_strategy,
             )
             fmap[fut] = lib_names[task]
         return fmap
@@ -2045,7 +2403,12 @@ def run_restore(
         finally:
             stop_event.set()
             state._live_instance = None
-            state._dashboard = None
+            # v0.13.x: do NOT clear state._dashboard here. The job worker
+            # in server/jobs.py runs post-engine finalization
+            # (``write_troubleshoot_log`` below already needs the
+            # dashboard alive for any cleanup hooks; the worker's
+            # ``set_finalizing("finalizing run")`` writes to it too).
+            # Worker's finally block nulls it once everything completes.
 
     write_troubleshoot_log(log_dir)
     write_unresolved_log(log_dir)

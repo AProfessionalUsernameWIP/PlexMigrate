@@ -121,6 +121,14 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # its own friendly name (set inside Plex's own settings).
     "machine_identifier": "",
     "friendly_name": "",
+    # v0.14 — Plex Media Server software version (e.g. "1.32.5.7349").
+    # Captured at probe / refresh time from plexapi's ``PlexServer.version``
+    # attribute. Used by the frontend to gate features that require a
+    # minimum Plex version (currently: Fast Collection Detection
+    # requires ≥1.32 because it relies on the ``librarySectionUserID``
+    # attribute Plex didn't ship until then). Empty string when the
+    # row was added before this field landed or hasn't been refreshed.
+    "plex_version": "",
     # v0.9.1: response time in milliseconds for the last lightweight
     # ping. ``None`` if no ping has succeeded yet. Used by the Servers
     # tab live indicator and the JobForm server selector chips.
@@ -554,6 +562,9 @@ def probe_unsaved(
     owner = str(getattr(server, "myPlexUsername", "") or "Plex Owner")
     friendly = str(getattr(server, "friendlyName", "") or "")
     machine_id = str(getattr(server, "machineIdentifier", "") or "")
+    # PMS version string (e.g. "1.32.5.7349-abcdef") — captured so the
+    # UI can gate version-locked features without an extra round-trip.
+    plex_version = str(getattr(server, "version", "") or "")
 
     libraries: List[Dict[str, Any]] = []
     sections_seq: List[Any] = []
@@ -580,6 +591,7 @@ def probe_unsaved(
             "ok": False, "status": "auth_error",
             "detail": f"Connected but could not list libraries: {exc}",
             "friendly_name": friendly, "machine_identifier": machine_id,
+            "plex_version": plex_version,
             "owner_name": owner, "libraries": [], "response_ms": response_ms,
         }
 
@@ -588,6 +600,7 @@ def probe_unsaved(
     return {
         "ok": True, "status": "ok", "detail": "",
         "friendly_name": friendly, "machine_identifier": machine_id,
+        "plex_version": plex_version,
         "owner_name": owner, "libraries": libraries,
         "response_ms": response_ms,
         # Timing-spec inputs (see _DEFAULT_SERVER for shape).
@@ -706,6 +719,7 @@ def add_server(
             "last_response_ms": probe.get("response_ms"),
             "machine_identifier": machine_id,
             "friendly_name": probe.get("friendly_name") or "",
+            "plex_version": probe.get("plex_version") or "",
             "owner_name": probe.get("owner_name") or "Plex Owner",
             "last_libraries": probe.get("libraries") or [],
             "playlist_count": probe.get("playlist_count"),
@@ -1163,6 +1177,7 @@ def test_connection(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
         owner = getattr(server, "myPlexUsername", None) or "Plex Owner"
         machine_id = str(getattr(server, "machineIdentifier", "") or "")
         friendly = str(getattr(server, "friendlyName", "") or "")
+        plex_version = str(getattr(server, "version", "") or "")
         libs_raw = list(server.library.sections())
         libs: List[Dict[str, Any]] = []
         for sec in libs_raw:
@@ -1183,6 +1198,7 @@ def test_connection(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
             server_id, status="ok", detail="", checked_at=now,
             owner=owner, libraries=libs,
             machine_identifier=machine_id, friendly_name=friendly,
+            plex_version=plex_version,
             playlist_count=playlist_count,
             collection_count=collection_count,
             counts_refreshed_at=time.time(),
@@ -1309,6 +1325,7 @@ def _record_status(server_id: str, *, status: str, detail: str, checked_at: floa
                    response_ms: Optional[float] = None,
                    machine_identifier: Optional[str] = None,
                    friendly_name: Optional[str] = None,
+                   plex_version: Optional[str] = None,
                    playlist_count: Optional[int] = None,
                    collection_count: Optional[int] = None,
                    counts_refreshed_at: Optional[float] = None) -> None:
@@ -1349,6 +1366,8 @@ def _record_status(server_id: str, *, status: str, detail: str, checked_at: floa
                     row["machine_identifier"] = machine_identifier
                 if friendly_name is not None:
                     row["friendly_name"] = friendly_name
+                if plex_version is not None:
+                    row["plex_version"] = plex_version
                 # Timing-spec counts: only overwrite when the caller
                 # explicitly passed a value (None means "leave alone").
                 # A successful Refresh / Test always passes all three

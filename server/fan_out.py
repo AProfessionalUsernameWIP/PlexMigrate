@@ -67,6 +67,12 @@ class FanOutDestResult:
     finished_at: Optional[float] = None
     error: Optional[str] = None
     dashboard: Optional[DashboardState] = field(repr=False, default=None)
+    # v0.13.x: when this destination's fan-out leg was a Replace and the
+    # safety belt fired successfully, this carries the snapshot_id of
+    # the pre-Replace rollback point. Surfaced into the parent JobRecord's
+    # summary["pre_replace_snapshots"] map so the operator can find every
+    # destination's recovery point on the Snapshots tab.
+    pre_replace_snapshot_id: Optional[str] = None
 
 
 @dataclass
@@ -242,6 +248,18 @@ def run_fan_out_direct(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
+    # v0.13.x: restore-side knobs forwarded to every destination. Per-job
+    # value (e.g. mode=replace) applies uniformly to all destinations in
+    # this fan-out; per-destination overrides are not supported.
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
+    # v0.13.x: when Replace + auto-capture is requested, this dict carries
+    # the per-destination safety-belt settings (include_* flags, log_dir,
+    # output_dir, verbose). Forwarded into each destination worker which
+    # uses it to capture a pre-Replace rollback snapshot before the
+    # engine fires. ``None`` skips the belt for the whole fan-out (when
+    # mode != "replace" OR auto_capture_before_replace is False).
+    pre_replace_settings: Optional[Dict[str, Any]] = None,
 ) -> FanOutResult:
     """
     Run one direct-transfer job that copies from ``source_name`` into
@@ -327,6 +345,9 @@ def run_fan_out_direct(
                     include_ratings=include_ratings,
                     include_playlists=include_playlists,
                     include_collections=include_collections,
+                    mode=mode,
+                    merge_watch_strategy=merge_watch_strategy,
+                    pre_replace_settings=pre_replace_settings,
                 ))
             # Drain completions. Exceptions from a destination land on
             # the dest_result and never re-raise - the per-destination
@@ -359,6 +380,13 @@ def run_fan_out_restore(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # v0.13.x: restore-side knobs forwarded to every destination. See
+    # run_fan_out_direct for the per-destination uniformity rationale.
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
+    # v0.13.x: per-destination safety-belt settings. See
+    # run_fan_out_direct for the contract.
+    pre_replace_settings: Optional[Dict[str, Any]] = None,
 ) -> FanOutResult:
     """
     Run one import job that loads the same ``input_files`` into each
@@ -415,6 +443,9 @@ def run_fan_out_restore(
                     include_watch_history=include_watch_history,
                     include_ratings=include_ratings,
                     include_collections=include_collections,
+                    mode=mode,
+                    merge_watch_strategy=merge_watch_strategy,
+                    pre_replace_settings=pre_replace_settings,
                 ))
             for _ in as_completed(futs):
                 pass
@@ -457,6 +488,18 @@ def _run_one_direct_destination(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
+    # v0.13.x: restore-side knobs. Forwarded into run_direct_transfer
+    # below; default "merge" / "higher" preserves legacy behaviour for
+    # any caller that hasn't been updated yet.
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
+    # v0.13.x: when Replace + auto-capture is requested, this dict
+    # carries the include_* + log_dir + verbose settings the safety
+    # belt needs to capture this destination's rollback snapshot.
+    # ``None`` (the default) means no safety belt for this destination,
+    # which is correct for mode=="merge" OR auto_capture_before_replace
+    # set to False at the caller level.
+    pre_replace_settings: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Execute one destination of a fan-out direct transfer.
@@ -478,6 +521,16 @@ def _run_one_direct_destination(
     dest_result.started_at = time.time()
 
     logger = logging.getLogger(f"plexmigrate.fanout.{safe_server_name(dest_name)}")
+
+    # v0.13.x: install this destination's MDC tag on the worker's
+    # ContextVar BEFORE setup_logging runs. The DestinationContextFilter
+    # in services/logging_ops.py reads this on every LogRecord; the
+    # per-destination admission filter attached to each new FileHandler
+    # by setup_logging admits only records carrying this tag. Net
+    # effect: every destination's runtime/errors/media file writes
+    # only its own records - fixes the cross-contamination caveat the
+    # code review's M-class finding flagged.
+    state._destination = dest_name
 
     try:
         # ── Connect to this destination ──────────────────────────────
@@ -511,6 +564,30 @@ def _run_one_direct_destination(
         # once on the main thread before fan-out spawns; written
         # here too would race siblings.
 
+        # v0.13.x: per-destination pre-Replace safety belt. Each fan-out
+        # destination gets its own rollback snapshot before the engine
+        # overwrites data. Lazy-imported to avoid an import cycle
+        # between server.jobs and server.fan_out.
+        if mode == "replace" and pre_replace_settings:
+            from server.jobs import _capture_pre_replace_snapshot, _resolve_server_id
+            dst_id = _resolve_server_id(dst_row.get("name") or dest_name)
+            if not dst_id:
+                raise ValueError(
+                    f"Replace fan-out destination {dest_name!r} has no "
+                    "registered server_id - cannot capture a rollback "
+                    "snapshot. Re-register the destination from the "
+                    "Servers tab."
+                )
+            pre_id = _capture_pre_replace_snapshot(
+                job_id=f"fanout-direct:{dest_name}",
+                settings=pre_replace_settings,
+                dest_server=dst_server,
+                dest_server_id=dst_id,
+                dest_server_name=str(dst_row.get("name") or dest_name),
+                dest_url=dst_row["url"],
+            )
+            dest_result.pre_replace_snapshot_id = pre_id
+
         run_direct_transfer(
             source_server=source_server,
             source_url=source_url,
@@ -537,6 +614,8 @@ def _run_one_direct_destination(
             include_ratings=include_ratings,
             include_playlists=include_playlists,
             include_collections=include_collections,
+            mode=mode,
+            merge_watch_strategy=merge_watch_strategy,
         )
 
         # Do NOT call ``_close_logger`` here. It strips handlers from
@@ -587,6 +666,11 @@ def _run_one_import_destination(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # v0.13.x: restore-side knobs forwarded into run_restore below.
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
+    # v0.13.x: see _run_one_direct_destination for the contract.
+    pre_replace_settings: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Execute one destination of a fan-out import. Mirrors
@@ -603,6 +687,12 @@ def _run_one_import_destination(
     dest_result.started_at = time.time()
     logger = logging.getLogger(f"plexmigrate.fanout.{safe_server_name(dest_name)}")
 
+    # v0.13.x: install this destination's MDC tag on the worker's
+    # ContextVar BEFORE setup_logging runs (same reason as the
+    # direct-transfer worker above). See logging_ops.DestinationContextFilter
+    # for the full propagation story.
+    state._destination = dest_name
+
     try:
         dst_server, dst_row = connect_registered_server(dest_name, logger)
         dst_token = decrypt_server_token(dst_row)
@@ -613,8 +703,10 @@ def _run_one_import_destination(
         )
         dest_result.log_dir = run_log_dir
 
-        # Per-destination input-file resolution (relative paths resolved
-        # against the configured output_dir for exports).
+        # Per-destination input-file resolution. Three attempts:
+        # direct path, then ``<output_dir>/<file>`` (active snapshots),
+        # then ``<output_dir>/legacy/<file>`` (JSON-archive picker
+        # source). Mirrors the single-destination resolver in jobs.py.
         resolved_inputs: List[str] = []
         missing: List[str] = []
         eff_output_dir = output_dir or "./snapshots"
@@ -626,6 +718,10 @@ def _run_one_import_destination(
             scoped = Path(eff_output_dir) / f
             if scoped.exists():
                 resolved_inputs.append(str(scoped))
+                continue
+            legacy_scoped = Path(eff_output_dir) / "legacy" / f
+            if legacy_scoped.exists():
+                resolved_inputs.append(str(legacy_scoped))
                 continue
             missing.append(f)
         if not resolved_inputs:
@@ -640,6 +736,29 @@ def _run_one_import_destination(
         state._plex_token = dst_token
         state._plex_owner_name = owner_name
 
+        # v0.13.x: per-destination pre-Replace safety belt. Each fan-out
+        # destination gets its own rollback snapshot before the engine
+        # overwrites data. Lazy-imported to dodge the jobs↔fan_out cycle.
+        if mode == "replace" and pre_replace_settings:
+            from server.jobs import _capture_pre_replace_snapshot, _resolve_server_id
+            dst_id = _resolve_server_id(dest_name)
+            if not dst_id:
+                raise ValueError(
+                    f"Replace fan-out destination {dest_name!r} has no "
+                    "registered server_id - cannot capture a rollback "
+                    "snapshot. Re-register the destination from the "
+                    "Servers tab."
+                )
+            pre_id = _capture_pre_replace_snapshot(
+                job_id=f"fanout-restore:{dest_name}",
+                settings=pre_replace_settings,
+                dest_server=dst_server,
+                dest_server_id=dst_id,
+                dest_server_name=str(dst_row.get("name") or dest_name),
+                dest_url=dst_row["url"],
+            )
+            dest_result.pre_replace_snapshot_id = pre_id
+
         run_restore(
             dst_server,
             resolved_inputs,
@@ -653,6 +772,8 @@ def _run_one_import_destination(
             include_watch_history=include_watch_history,
             include_ratings=include_ratings,
             include_collections=include_collections,
+            mode=mode,
+            merge_watch_strategy=merge_watch_strategy,
         )
 
         # Per-destination handler-close suppressed - see note in
@@ -731,17 +852,16 @@ def _close_logger(logger: logging.Logger) -> None:
     raise if the underlying file is still open in another thread; we
     swallow and continue so the per-dest run dir rename still proceeds.
 
-    Caveat - named-logger contention: in parallel fan-out, multiple
-    destinations concurrently install FileHandlers on the same named
-    loggers (``plexmigrate``, ``plexmigrate.media``). The runtime / errors
-    / media log files for each destination still receive every record
-    routed through those loggers - including records emitted from
-    sibling destinations' worker threads. The per-library success / fail
-    logs and the troubleshoot.log are correctly isolated because they're
-    derived from ContextVar-backed accumulator dicts. A future release
-    can route the runtime/errors/media files through a context-aware
-    filter; for now the per-library logs are the authoritative
-    per-destination artefacts.
+    v0.13.x: the cross-contamination caveat that previous versions of
+    this docstring described is now fixed. Each destination worker
+    sets ``state._destination`` (a ContextVar) to its dest_name before
+    setup_logging runs; the ``DestinationContextFilter`` in
+    services/logging_ops.py stamps every LogRecord with that tag, and
+    each per-destination FileHandler carries a
+    ``_DestinationHandlerFilter`` that admits only matching records.
+    Records emitted in sibling destinations' threads are filtered out
+    at the handler level, so each destination's runtime/errors/media
+    file writes only its own records.
     """
     for lg in (logging.getLogger("plexmigrate"), logging.getLogger("plexmigrate.media")):
         for h in lg.handlers[:]:

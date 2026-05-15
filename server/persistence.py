@@ -98,6 +98,18 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     # False means "off"; the operator-set per-server map below or the
     # per-job toggle override at job-fire time.
     "prebuild_json_sidecar_default": False,
+    # Owner-phase watch+ratings capture strategy.
+    #   "smart" (default) — bulk-fetch the library once when BOTH
+    #       watch-history and ratings are wanted on the owner phase,
+    #       filter locally; server-side filter when only one is wanted.
+    #   "force_bulk" — always bulk-fetch + local filter, even for
+    #       single-type runs (best for rate-limited Plex servers).
+    #   "force_server_side" — always use server-side filter scans, no
+    #       shared prefetch (best when bandwidth back from the server
+    #       is the constraint).
+    # Per-server override accepted under
+    # ``snapshot_defaults_per_server[server_id].watch_ratings_filter_strategy``.
+    "watch_ratings_filter_strategy": "smart",
     # Per-server snapshot-time defaults map (Servers ▸ Advanced Settings).
     # See SettingsIn.snapshot_defaults_per_server for the recognised fields.
     "snapshot_defaults_per_server": {},
@@ -108,6 +120,20 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "transfer_resolution": {
         "allow_filepath_fallback": True,
         "allow_fuzzy_fallback": False,
+    },
+    # v0.13.x: restore-mode defaults. Operators pick per-job in the UI;
+    # the per-server override in ``snapshot_defaults_per_server`` wins
+    # when set; this global block is the final fallback. Merge is the
+    # safe default everywhere - Replace requires explicit opt-in per
+    # job AND a typed-REPLACE confirmation in the modal.
+    "restore_defaults": {
+        "mode": "merge",
+        "auto_capture_before_replace": True,
+        # v0.13.x sub-strategy for Merge mode's watch-count math.
+        # "higher" = destination ends at max(stored, current) (legacy,
+        # idempotent); "sum" = current + stored (operator opt-in, not
+        # idempotent). Ignored when mode == "replace".
+        "merge_watch_strategy": "higher",
     },
     # media.db retention + cascade-delete policy. cascade_delete is
     # the greedy-restrictive default (auto-purges per-server rows on
@@ -133,6 +159,19 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
         "interval_seconds": 86400,
         "stale_threshold_days": 7,
     },
+    # System Tunables nested map. Empty by default; the
+    # ``services.tunables`` module owns the source-of-truth defaults
+    # so callers always read a value even when this map is empty.
+    # Operators populate keys via Settings ▸ Tunables (root_admin
+    # only) and the saved values override the module defaults.
+    "tunables": {},
+    # Per-server tunable overrides. {server_id: {tunable_key: value}}.
+    # Only consulted by tunables that explicitly support per-server
+    # resolution (currently ``plex_connect_timeout_seconds`` and
+    # ``viewcount_increment_cap``); all other tunables stay global.
+    "tunables_per_server": {},
+    # ETR colour multiplier (Phase 4). 1.0 = ship defaults.
+    "etr_color_multiplier": 1.0,
 }
 
 
@@ -183,6 +222,30 @@ def load_settings() -> Dict[str, Any]:
     return merged
 
 
+# HTTP-related tunables that require ``services.auth.invalidate_sessions``
+# to be called after a save so live requests Sessions pick up the new
+# adapter / retry policy without a process restart.
+_HTTP_TUNABLE_KEYS = frozenset((
+    "plex_retry_total_budget",
+    "plex_retry_backoff_factor",
+    "http_pool_connections",
+    "http_pool_maxsize_cap",
+))
+
+
+def _http_tunables_changed(
+    before: Dict[str, Any], after: Dict[str, Any],
+) -> bool:
+    """True iff any HTTP-pool / retry tunable differs between
+    ``before`` and ``after``. Both dicts are full settings documents."""
+    b = (before or {}).get("tunables") or {}
+    a = (after or {}).get("tunables") or {}
+    for key in _HTTP_TUNABLE_KEYS:
+        if b.get(key) != a.get(key):
+            return True
+    return False
+
+
 def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     """
     Atomically replace the on-disk settings document. Returns the full
@@ -195,9 +258,18 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     the ``_encrypted`` marker is set. The returned dict still holds
     the plaintext token so callers that immediately consume the
     document don't need to know about encryption.
+
+    Hot-reload (Phase 3): when a save changes any HTTP-related
+    tunable (retry budget, backoff, pool sizes) the function rebuilds
+    every live requests Session's HTTPAdapter via
+    ``services.auth.invalidate_sessions``. The tunables module's
+    mtime-keyed cache invalidates automatically on the next read.
     """
     with _FILE_LOCK:
         existing = load_settings()
+        # Snapshot the pre-save shape so we can decide whether to
+        # rebuild HTTP sessions after the write.
+        before = dict(existing)
         existing.update(settings)
 
         # Build the on-disk payload with the token encrypted. Returned
@@ -209,7 +281,22 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         on_disk["_encrypted"] = True
 
         _atomic_write_json(_settings_path(), on_disk)
-        return existing
+
+    # Outside the file lock: rebuild HTTP sessions when an HTTP
+    # tunable changed. Done after the write so a transient
+    # invalidate_sessions failure doesn't block the persistence.
+    if _http_tunables_changed(before, existing):
+        try:
+            from services.auth import invalidate_sessions
+            invalidate_sessions()
+            log.info(
+                "save_settings: HTTP tunables changed — rebuilt %s live session(s).",
+                "all",
+            )
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("save_settings: invalidate_sessions failed")
+
+    return existing
 
 
 # ── Schedule I/O ─────────────────────────────────────────────────────────────

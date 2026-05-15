@@ -15,6 +15,7 @@
 
 import { useEffect, useState } from 'react';
 import { api, ServerView, SettingsView } from '../api';
+import { serverSupportsFastCollections } from '../utils/plexVersion';
 
 // Per-server overrides. Each field is independently optional; absence
 // means "use the global default." Mirrors the shape stored under
@@ -27,13 +28,26 @@ interface PerServerOverrides {
   include_collections?: boolean;
   skip_playlist_prebuild?: boolean;
   fast_collection_detection?: boolean;
+  // Owner-phase watch+ratings capture strategy. Enum, not a boolean,
+  // so it's rendered as a select below the main boolean table rather
+  // than retrofitted into TriStateToggle. ``undefined`` = inherit
+  // from the global Run Defaults value.
+  watch_ratings_filter_strategy?: 'smart' | 'force_bulk' | 'force_server_side';
 }
+
+type WrStrategy = 'smart' | 'force_bulk' | 'force_server_side';
+
+// Only the boolean-valued fields can be rendered by ``TriStateToggle``.
+// ``watch_ratings_filter_strategy`` is an enum and lives in its own
+// section below the main table, so we exclude it from the column type
+// to keep TS happy when setting values.
+type BoolField = Exclude<keyof PerServerOverrides, 'watch_ratings_filter_strategy'>;
 
 // Column descriptor drives the table render. Keeping these declarative
 // lets us reuse the same toggle widget for every column without
 // branching on field name in the JSX.
 interface ColumnDef {
-  field: keyof PerServerOverrides;
+  field: BoolField;
   label: string;
   // The corresponding global-default key on SettingsView, or null when
   // the field has no global (Pydantic default is the only fallback).
@@ -130,7 +144,7 @@ export function ServerAdvancedSettingsPanel() {
   // Update one server's override for one field. Tri-state cycle:
   // unset → true → false → unset. Passing ``undefined`` resets to
   // "use global default."
-  const setField = (serverId: string, field: keyof PerServerOverrides, value: boolean | undefined) => {
+  const setField = (serverId: string, field: BoolField, value: boolean | undefined) => {
     setOverrides((prev) => {
       const next = { ...prev };
       const row: PerServerOverrides = { ...(next[serverId] || {}) };
@@ -141,6 +155,26 @@ export function ServerAdvancedSettingsPanel() {
       }
       // Drop the server's entry entirely once every field is unset so
       // the saved JSON stays clean.
+      if (Object.keys(row).length === 0) {
+        delete next[serverId];
+      } else {
+        next[serverId] = row;
+      }
+      return next;
+    });
+  };
+
+  // Update one server's watch+ratings strategy override.
+  // ``undefined`` resets to "inherit from global Run Defaults."
+  const setWrStrategy = (serverId: string, value: WrStrategy | undefined) => {
+    setOverrides((prev) => {
+      const next = { ...prev };
+      const row: PerServerOverrides = { ...(next[serverId] || {}) };
+      if (value === undefined) {
+        delete row.watch_ratings_filter_strategy;
+      } else {
+        row.watch_ratings_filter_strategy = value;
+      }
       if (Object.keys(row).length === 0) {
         delete next[serverId];
       } else {
@@ -167,12 +201,30 @@ export function ServerAdvancedSettingsPanel() {
     setOk(null);
     setSaving(true);
     try {
+      // v0.14 — normalise fast_collection_detection on save. If the
+      // row's server doesn't support Plex's ``librarySectionUserID``
+      // (< 1.32 or unknown version), drop any saved override on this
+      // field. The UI already shows the toggle as locked-off; the
+      // normaliser makes sure a stale "true" left over from before
+      // the version was known doesn't ship to the backend.
+      const normalisedOverrides: Record<string, typeof overrides[string]> = {};
+      for (const [sid, row] of Object.entries(overrides)) {
+        const srv = servers.find((s) => s.id === sid);
+        const ver = srv?.plex_version ?? '';
+        if (!serverSupportsFastCollections(ver) && row.fast_collection_detection !== undefined) {
+          const { fast_collection_detection: _drop, ...rest } = row;
+          void _drop;
+          if (Object.keys(rest).length > 0) normalisedOverrides[sid] = rest;
+        } else {
+          normalisedOverrides[sid] = row;
+        }
+      }
       // Send both maps so the backend can persist atomically. The
       // existing snapshot_retention_per_server field stays separate
       // from snapshot_defaults_per_server - the resolver reads each
       // from its own map.
       const patch: Record<string, unknown> = {
-        snapshot_defaults_per_server: overrides,
+        snapshot_defaults_per_server: normalisedOverrides,
         snapshot_retention_per_server: retentionOverrides,
       };
       const updated = await api.saveSettings(patch);
@@ -261,12 +313,31 @@ export function ServerAdvancedSettingsPanel() {
                     {COLUMNS.map((col) => {
                       const row = overrides[s.id] || {};
                       const value = row[col.field];
+                      // v0.14 — per-row version gate on
+                      // ``fast_collection_detection``. Plex < 1.32
+                      // doesn't expose ``librarySectionUserID`` so
+                      // enabling the override there silently
+                      // degrades. Render the toggle as a locked
+                      // "off — unsupported" pill with a tooltip
+                      // instead of letting the operator pick a
+                      // value that does nothing.
+                      const isFastCol = col.field === 'fast_collection_detection';
+                      const ver = s.plex_version ?? '';
+                      const fastSupported = serverSupportsFastCollections(ver);
+                      const colDisabled = isFastCol && !fastSupported;
+                      const disabledReason = colDisabled
+                        ? (ver
+                            ? `Requires Plex Media Server ≥ 1.32. ${s.name} reports ${ver}.`
+                            : `Plex version unknown for ${s.name} — refresh it from the Servers tab.`)
+                        : undefined;
                       return (
                         <td key={col.field}>
                           <TriStateToggle
                             value={value}
                             inheritedLabel={inheritedValue(col) ? 'on' : 'off'}
                             onChange={(v) => setField(s.id, col.field, v)}
+                            disabled={colDisabled}
+                            disabledReason={disabledReason}
                           />
                         </td>
                       );
@@ -294,6 +365,63 @@ export function ServerAdvancedSettingsPanel() {
       </div>
 
       <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Per-server watch+ratings strategy</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
+          Overrides the global <strong>Watch+Ratings capture strategy</strong> from{' '}
+          <strong>Run Defaults</strong> on a per-server basis. Useful when one Plex server is
+          rate-limited (favour <em>Force bulk</em>) while another has slow wire-traffic
+          (favour <em>Force server-side</em>).
+        </span>
+
+        {servers.length === 0 ? (
+          <div className="empty">No registered servers yet.</div>
+        ) : (
+          <table className="list" style={{ width: '100%' }}>
+            <thead>
+              <tr>
+                <th style={{ minWidth: 160, textAlign: 'left' }}>Server</th>
+                <th style={{ textAlign: 'left' }}>
+                  Strategy
+                  <div style={{ fontSize: 10, fontWeight: 400, color: 'var(--text-dim)' }}>
+                    inherits {(view.watch_ratings_filter_strategy as string) || 'smart'}
+                  </div>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {servers.map((s) => {
+                const row = overrides[s.id] || {};
+                const current = row.watch_ratings_filter_strategy;
+                return (
+                  <tr key={s.id}>
+                    <td style={{ fontWeight: 600 }}>
+                      {s.name}
+                      <div style={{ fontSize: 11, color: 'var(--text-dim)', fontWeight: 400 }}>{s.url}</div>
+                    </td>
+                    <td>
+                      <select
+                        value={current ?? ''}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (v === '') setWrStrategy(s.id, undefined);
+                          else setWrStrategy(s.id, v as WrStrategy);
+                        }}
+                      >
+                        <option value="">Inherit (global default)</option>
+                        <option value="smart">Smart — engine picks</option>
+                        <option value="force_bulk">Force bulk — fewer API calls</option>
+                        <option value="force_server_side">Force server-side — smaller payloads</option>
+                      </select>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="panel">
         <h2 style={{ marginTop: 0 }}>How resolution works</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
           For every snapshot-time setting, the engine walks this chain at fire-time
@@ -302,7 +430,7 @@ export function ServerAdvancedSettingsPanel() {
         <ol style={{ fontSize: 13, lineHeight: 1.7, color: 'var(--text-dim)' }}>
           <li><strong>Per-job value</strong> from the Run Job form or schedule row.</li>
           <li><strong>Per-server override</strong> from this page.</li>
-          <li><strong>Global default</strong> from <em>Settings → Snapshot Defaults</em>.</li>
+          <li><strong>Global default</strong> from <em>Servers → Run Defaults → Snapshot Defaults</em>.</li>
           <li><strong>Built-in default</strong> baked into the engine.</li>
         </ol>
       </div>
@@ -319,11 +447,30 @@ function TriStateToggle({
   value,
   inheritedLabel,
   onChange,
+  disabled = false,
+  disabledReason,
 }: {
   value: boolean | undefined;
   inheritedLabel: string;
   onChange: (v: boolean | undefined) => void;
+  // v0.14 — when true (e.g. version-gated features against an
+  // unsupported PMS), the toggle renders as a single "off — <reason>"
+  // pill that the operator can't interact with. The value is
+  // assumed to be ``false`` by the caller in that state.
+  disabled?: boolean;
+  disabledReason?: string;
 }) {
+  if (disabled) {
+    return (
+      <span
+        className="tag failed"
+        style={{ fontSize: 11, fontWeight: 600 }}
+        title={disabledReason || 'Feature not supported on this server.'}
+      >
+        off — {disabledReason ? 'unsupported' : 'locked'}
+      </span>
+    );
+  }
   // Three discrete buttons rather than a click-cycle - cycling makes
   // the operator hunt for the right state on a wide table; explicit
   // buttons are scannable and require one click to land anywhere.

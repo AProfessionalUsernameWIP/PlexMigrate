@@ -139,6 +139,35 @@ class SettingsIn(BaseModel):
         default=None,
         description="DEBUG-level logging on console + run log (--verbose)",
     )
+    # Operator-controlled global on/off for the per-run log FILES
+    # (``runtime.log`` / ``errors.log`` / ``media.log``). When disabled
+    # the engine still runs and the dashboard / activity feed still
+    # update - we just don't create the per-run files on disk. Default
+    # true so existing installs keep their logs.
+    run_logging_enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Write per-run runtime.log / errors.log / media.log files. "
+            "Default true. Turning off keeps the engine and dashboard "
+            "working; it only suppresses the per-run files on disk."
+        ),
+    )
+    # Operator-controlled global on/off for the db-access audit log.
+    # SEPARATE from run_logging_enabled because the audit log is a
+    # forensic control, not a diagnostic convenience: toggling it is
+    # gated behind the db_admin credential at the API layer and the
+    # transition is self-documenting (the last/first log line records
+    # who disabled / re-enabled it).
+    audit_log_enabled: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Write db-access audit log entries. Default true. Toggling "
+            "this is db_admin-gated via /api/settings/audit-log-toggle "
+            "and the transition is self-documenting in the audit log "
+            "itself. Plain /api/settings PATCH ignores this field - "
+            "it is read-only outside the dedicated endpoint."
+        ),
+    )
     strict_match: Optional[bool] = Field(
         default=None,
         description="Require exactly one fuzzy title match (--strict-match / --no-strict-match)",
@@ -170,6 +199,23 @@ class SettingsIn(BaseModel):
             "the .db at the end of the run. Per-job toggles override this."
         ),
     )
+    # Owner-phase watch+ratings capture strategy. Surfaces under
+    # Servers ▸ Run Defaults ▸ Snapshot Defaults. Per-server override is
+    # accepted as ``snapshot_defaults_per_server[server_id]
+    # .watch_ratings_filter_strategy``. See ``services.snapshotter
+    # .snapshot_library`` for resolution + behaviour.
+    watch_ratings_filter_strategy: Optional[str] = Field(
+        default=None,
+        description=(
+            "Strategy for fetching watch-history + ratings on the owner "
+            "phase. One of: \"smart\" (default — bulk-fetch when both "
+            "wanted, server-side filter when only one), \"force_bulk\" "
+            "(always bulk-fetch + local filter; best for rate-limited "
+            "Plex servers), \"force_server_side\" (always server-side "
+            "filter; best when wire-traffic from the server is the "
+            "constraint)."
+        ),
+    )
     # Per-server default overrides. Maps server_id → {field: value}
     # where ``field`` is one of the snapshot-time knobs that has a
     # sensible per-server interpretation. The Servers ▸ Advanced
@@ -178,13 +224,15 @@ class SettingsIn(BaseModel):
     # picks a source server.
     #
     # Recognised fields:
-    #   prebuild_json_sidecar         (bool)
-    #   include_watch_history         (bool)
-    #   include_ratings               (bool)
-    #   include_playlists             (bool)
-    #   include_collections           (bool)
-    #   skip_playlist_prebuild        (bool)
-    #   fast_collection_detection     (bool)
+    #   prebuild_json_sidecar           (bool)
+    #   include_watch_history           (bool)
+    #   include_ratings                 (bool)
+    #   include_playlists               (bool)
+    #   include_collections             (bool)
+    #   skip_playlist_prebuild          (bool)
+    #   fast_collection_detection       (bool)
+    #   watch_ratings_filter_strategy   (str: "smart" / "force_bulk" /
+    #                                    "force_server_side")
     snapshot_defaults_per_server: Optional[Dict[str, Dict[str, Any]]] = Field(
         default=None,
         description=(
@@ -238,6 +286,46 @@ class SettingsIn(BaseModel):
             "(int, default 86400, floored at 3600 by the scheduler); "
             "``stale_threshold_days`` (int, default 7 - the initial "
             "value of the Prune Missing Items day-threshold slider)."
+        ),
+    )
+    # System Tunables — infrastructure-level knobs that used to be
+    # hardcoded literals (HTTP timeouts, retry budgets, JWT TTLs,
+    # SQLite busy timeouts, pool sizes, etc.). Free-form dict because
+    # the list of recognised keys grows over time and the
+    # ``services.tunables`` module is the single source of truth for
+    # defaults + clamps. The Tunables UI is gated by
+    # ``settings.tunables`` (root_admin only); a plain
+    # ``settings.edit`` PATCH may write to this field too, but a
+    # frontend with the proper role gate is what guards normal usage.
+    tunables: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "System tunables (root_admin only via UI). See "
+            "``services.tunables`` for the recognised keys + defaults."
+        ),
+    )
+    # Per-server tunable overrides. Map: server_id → {key: value}.
+    # Only a small subset of the global tunables make sense per-server:
+    #   - ``plex_connect_timeout_seconds`` (slow/remote servers)
+    #   - ``viewcount_increment_cap`` (weaker servers)
+    # Resolution: per-server override → global tunable → built-in default.
+    tunables_per_server: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Per-server overrides for the small set of tunables that "
+            "have a sensible per-server interpretation. Shape: "
+            "{server_id: {tunable_key: value}}. Resolved by "
+            "``services.tunables.get_per_server(server_id, key)``."
+        ),
+    )
+    # ETR colour multiplier for the dashboard stall thresholds.
+    # Scales the per-phase amber/red windows by this factor (clamped
+    # to [0.5, 2.0] at the read boundary). 1.0 = ship defaults.
+    etr_color_multiplier: Optional[float] = Field(
+        default=None,
+        description=(
+            "Multiplier applied to the dashboard's per-phase amber/red "
+            "stall thresholds. Clamped to [0.5, 2.0]. Default 1.0."
         ),
     )
 
@@ -325,6 +413,18 @@ class SnapshotJobIn(BaseModel):
             "renders a .plexexport.json sidecar next to it. Adds wall-clock "
             "time at the end of the run; the JSON is otherwise built on "
             "first Download click via the Exports panel."
+        ),
+    )
+    # Per-job watch+ratings capture strategy override. Top of the
+    # resolution chain (per-job → per-server → global → "smart"). When
+    # None, the per-server / global value applies.
+    watch_ratings_filter_strategy: Optional[str] = Field(
+        default=None,
+        description=(
+            "Per-job override for the owner-phase watch+ratings strategy. "
+            "One of: \"smart\", \"force_bulk\", \"force_server_side\". "
+            "None inherits from the per-server override or the global "
+            "default on Settings ▸ Run Defaults."
         ),
     )
 
@@ -430,6 +530,70 @@ class RestoreJobIn(BaseModel):
         default=True,
         description="Include collections in the import. Supersedes legacy skip_collections.",
     )
+    # v0.13.x: restore mode. "merge" (default) is the legacy additive
+    # behaviour: view counts only increase, ratings only set when target
+    # has none, playlists/collections create-or-append. "replace" is the
+    # opt-in point-in-time overwrite: view counts and ratings set to
+    # exactly the snapshot's value (markUnplayed + re-scrobble when the
+    # destination is currently higher), playlists/collections diff against
+    # the snapshot and members not in the snapshot are removed. The
+    # "no data deletions ever" project rule is honored only for "merge"
+    # mode; "replace" carves an explicit, operator-gated exception.
+    mode: str = Field(
+        default="merge",
+        pattern="^(merge|replace)$",
+        description=(
+            "Restoration mode. 'merge' (default) preserves newer "
+            "destination activity; 'replace' overwrites to make the "
+            "destination match the snapshot exactly."
+        ),
+    )
+    # v0.13.x: safety belt that auto-captures a snapshot of the
+    # destination BEFORE a Replace restore fires. When the restore
+    # finishes, the operator has the pre-replace snapshot to roll back
+    # if the wrong source snapshot was picked. Defaults to True; only
+    # consulted when mode == 'replace'.
+    auto_capture_before_replace: bool = Field(
+        default=True,
+        description=(
+            "When mode == 'replace', auto-capture a snapshot of the "
+            "destination before the restore runs so the operator has a "
+            "recovery point. Ignored when mode == 'merge'."
+        ),
+    )
+    # v0.13.x: required confirmation for Replace mode. The frontend's
+    # typed-REPLACE modal sets this; an API caller wanting Replace must
+    # set it explicitly. Submitting mode == 'replace' without this flag
+    # set to true returns 400 from the API layer.
+    confirm_replace: bool = Field(
+        default=False,
+        description=(
+            "Required confirmation flag for mode == 'replace'. The UI "
+            "sets this after the operator types REPLACE in the "
+            "confirmation modal. API callers must set it explicitly."
+        ),
+    )
+    # v0.13.x: sub-strategy for Merge mode's watch-count math.
+    #   "higher" (default) - destination view count ends at
+    #       max(stored, current). Add only the positive delta.
+    #       Idempotent across re-runs (the legacy behaviour).
+    #   "sum"   - destination view count ends at current + stored.
+    #       Every captured play is added on top. NOT idempotent: a
+    #       second run of the same job will double-count. Operator
+    #       opt-in for cases where the snapshot represents activity
+    #       that genuinely happened on a different server and should
+    #       contribute alongside, not replace.
+    # Only consulted when mode == "merge"; Replace overwrites
+    # unconditionally so the choice is moot there.
+    merge_watch_strategy: str = Field(
+        default="higher",
+        pattern="^(higher|sum)$",
+        description=(
+            "Merge-mode watch-count math. 'higher' (default) keeps the "
+            "larger of stored/current; 'sum' adds stored on top of "
+            "current. Ignored when mode == 'replace'."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -449,6 +613,27 @@ class RestoreJobIn(BaseModel):
         # Mirror the first entry back into the singular field so older
         # error messages / logs that still print it stay meaningful.
         object.__setattr__(self, "dest_server_name", names[0] if names else None)
+        return self
+
+    @model_validator(mode="after")
+    def _require_replace_confirmation(self) -> "RestoreJobIn":
+        """
+        Backend half of the two-layer Replace gate. The UI's typed-REPLACE
+        modal sets ``confirm_replace=True`` on submit; a direct API caller
+        wanting Replace mode must do the same explicitly. Submitting
+        ``mode == "replace"`` without the flag is a 422 from Pydantic.
+        Reason this lives on the model (not the route handler): every
+        caller that builds a RestoreJobIn is gated identically — restore
+        from file, restore from snapshot, scheduled restores, internal
+        re-runs — so the rule belongs with the data, not at one endpoint.
+        """
+        if self.mode == "replace" and not self.confirm_replace:
+            raise ValueError(
+                "Replace restore requires confirm_replace=true. "
+                "The typed-REPLACE confirmation modal sets this flag; "
+                "API callers must set it explicitly to acknowledge the "
+                "destructive semantics."
+            )
         return self
 
 
@@ -558,6 +743,52 @@ class ScheduleIn(BaseModel):
             "the end of the run. Off by default to keep scheduled runs fast."
         ),
     )
+    # v0.14 Per-Run Settings on schedules. All optional — None means
+    # "inherit the global / per-server value at fire time," matching the
+    # blank-input convention from the Run-Job form. Each non-None value
+    # is forwarded into the snapshot JobRequest the scheduler builds.
+    workers: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=128,
+        description="Per-schedule override of the workers count. None = use global default.",
+    )
+    scrobble_workers: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=64,
+        description="Per-schedule override of scrobble worker count. None = use global default.",
+    )
+    verbose: Optional[bool] = Field(
+        default=None,
+        description="Per-schedule verbose-logging override. None = use global default.",
+    )
+    log_dir: Optional[str] = Field(
+        default=None,
+        description="Per-schedule log directory override. None = use global default.",
+    )
+    skip_playlist_prebuild: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Skip the upfront playlist-cache warm for this schedule. "
+            "None = use global default."
+        ),
+    )
+    fast_collection_detection: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Use librarySectionUserID for fast personal-collection detection. "
+            "None = use global default."
+        ),
+    )
+    watch_ratings_filter_strategy: Optional[str] = Field(
+        default=None,
+        description=(
+            "Per-schedule owner-phase watch+ratings strategy override. "
+            "One of \"smart\", \"force_bulk\", \"force_server_side\". "
+            "None or empty string = inherit per-server or global default."
+        ),
+    )
 
 
 # ── Outbound shapes ──────────────────────────────────────────────────────────
@@ -662,6 +893,58 @@ class DirectTransferIn(BaseModel):
         default=True,
         description="Include collections in the transfer. Supersedes legacy skip_collections.",
     )
+    # v0.13.x: restore mode for the destination write phase. Mirrors
+    # RestoreJobIn - see the longer commentary there. Direct transfers
+    # write their data using the same restore_export_file primitive,
+    # so the same merge / replace semantics apply.
+    mode: str = Field(
+        default="merge",
+        pattern="^(merge|replace)$",
+        description=(
+            "Destination write mode. 'merge' (default) preserves newer "
+            "destination activity; 'replace' overwrites to make the "
+            "destination match the source exactly."
+        ),
+    )
+    auto_capture_before_replace: bool = Field(
+        default=True,
+        description=(
+            "When mode == 'replace', auto-capture a snapshot of every "
+            "destination before the transfer fires so each destination "
+            "has its own recovery point. Ignored when mode == 'merge'."
+        ),
+    )
+    confirm_replace: bool = Field(
+        default=False,
+        description=(
+            "Required confirmation flag for mode == 'replace'. The UI "
+            "sets this after the operator types REPLACE in the "
+            "confirmation modal. API callers must set it explicitly."
+        ),
+    )
+    # v0.13.x: Merge sub-strategy for watch counts. Mirrors the
+    # matching field on RestoreJobIn - see that field's docstring for
+    # the higher / sum semantics. Direct transfers write with the same
+    # restorer primitive, so the same choice applies.
+    merge_watch_strategy: str = Field(
+        default="higher",
+        pattern="^(higher|sum)$",
+        description=(
+            "Merge-mode watch-count math. 'higher' (default) keeps the "
+            "larger of stored/current; 'sum' adds stored on top of "
+            "current. Ignored when mode == 'replace'."
+        ),
+    )
+    # Per-job watch+ratings strategy override (same semantics as on
+    # SnapshotJobIn). Direct transfers run an inline snapshot capture
+    # for the source side, so the strategy applies there too.
+    watch_ratings_filter_strategy: Optional[str] = Field(
+        default=None,
+        description=(
+            "Per-job override for the owner-phase watch+ratings strategy. "
+            "One of: \"smart\", \"force_bulk\", \"force_server_side\"."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -684,6 +967,22 @@ class DirectTransferIn(BaseModel):
             )
         object.__setattr__(self, "dest_server_names", names)
         object.__setattr__(self, "dest_server_name", names[0])
+        return self
+
+    @model_validator(mode="after")
+    def _require_replace_confirmation(self) -> "DirectTransferIn":
+        """
+        Backend half of the two-layer Replace gate (see the matching
+        validator on :class:`RestoreJobIn`). Direct transfers write
+        with the same restorer primitive, so the same gate applies.
+        """
+        if self.mode == "replace" and not self.confirm_replace:
+            raise ValueError(
+                "Replace direct-transfer requires confirm_replace=true. "
+                "The typed-REPLACE confirmation modal sets this flag; "
+                "API callers must set it explicitly to acknowledge the "
+                "destructive semantics."
+            )
         return self
 
 

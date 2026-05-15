@@ -20,8 +20,11 @@ import { api, LibraryDescriptor, PingResult, ProbeUnsavedResult, ServerUser, Ser
 import type { ServerManagedUser } from '../api';
 import { usePermission } from '../hooks/usePermission';
 
-// Poll cadence for the live status indicator, in milliseconds.
-const PING_INTERVAL_MS = 30_000;
+// Default poll cadence for the live status indicator, in milliseconds.
+// The actual cadence is loaded from settings.tunables.frontend_server_ping_interval_ms
+// at mount time and applied to the polling interval; saves to the
+// tunable take effect on the next ServersPanel mount.
+const PING_INTERVAL_MS_DEFAULT = 30_000;
 
 export function ServersPanel() {
   // PR-A4 - viewers / operators / managers see this panel read-only.
@@ -72,6 +75,25 @@ export function ServersPanel() {
 
   // Track the polling timer so we can clear it on unmount.
   const pollTimerRef = useRef<number | null>(null);
+
+  // Live ping cadence. Loaded once from settings on mount so an operator
+  // who bumps it via Settings ▸ Tunables doesn't need a code change.
+  // A panel re-mount picks up subsequent changes; the effect that arms
+  // the timer below depends on this value, so a new cadence rearms
+  // automatically once the load completes.
+  const [pingIntervalMs, setPingIntervalMs] = useState<number>(PING_INTERVAL_MS_DEFAULT);
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        const raw = (s as unknown as Record<string, unknown>).tunables;
+        const tunables = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+        const v = tunables['frontend_server_ping_interval_ms'];
+        if (typeof v === 'number' && v >= 1000) {
+          setPingIntervalMs(v);
+        }
+      })
+      .catch(() => { /* non-fatal — fall back to the default */ });
+  }, []);
 
   const refresh = async () => {
     try {
@@ -124,7 +146,7 @@ export function ServersPanel() {
     // for the 30 seconds until the first interval fires.
     pingAll();
     if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
-    pollTimerRef.current = window.setInterval(pingAll, PING_INTERVAL_MS);
+    pollTimerRef.current = window.setInterval(pingAll, pingIntervalMs);
 
     return () => {
       if (pollTimerRef.current !== null) {
@@ -132,10 +154,10 @@ export function ServersPanel() {
         pollTimerRef.current = null;
       }
     };
-    // The poll task references ``servers`` so we must re-arm when
-    // the list changes; using server.id values as the dep would also
-    // work but ``servers`` is simpler and equally correct.
-  }, [servers]);
+    // Re-arm when the server list changes (the closure binds the
+    // current list) or when the operator changes the ping cadence
+    // via Settings ▸ Tunables.
+  }, [servers, pingIntervalMs]);
 
   // v0.9.6 Feature 3: fetch per-server user lists in parallel whenever
   // the server list changes. No caching - the user list on a Plex

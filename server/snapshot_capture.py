@@ -228,6 +228,39 @@ def create_snapshot_db(
 
     # 7. Stat the finished file for the registry row.
     counters["file_size"] = int(snapshot_path.stat().st_size)
+
+    # Audit trail: snapshot .db creation is a major write that should
+    # show in db_access.log alongside the matching media.db ingest and
+    # the snapshots.db registry insert below it. ``ingest_snapshot_payload``
+    # already audits the media.db write; this closes the gap on the
+    # snapshot .db file itself.
+    try:
+        from services import db_access_log
+        _row_total = (
+            counters.get("server_items", 0)
+            + counters.get("items", 0)
+            + counters.get("watch_events", 0)
+            + counters.get("ratings", 0)
+            + counters.get("playlists", 0)
+            + counters.get("collections", 0)
+        )
+        db_access_log.log_write(
+            table="snapshot.db",
+            where={
+                "snapshot_db": snapshot_path.name,
+                "server_id": server_id,
+                "snapshot_id": snapshot_id or "",
+            },
+            affected_rows=_row_total,
+            intent=(
+                f"create per-server snapshot .db "
+                f"(file_size={counters.get('file_size', 0)} bytes, "
+                f"metrics={','.join(metrics) if metrics else 'all'})"
+            ),
+        )
+    except Exception:
+        pass
+
     return counters
 
 
@@ -562,6 +595,22 @@ def build_snapshot_db_from_payloads(
     finally:
         src_conn.close()
 
+    # v0.13.x: wrap every row write below in a single explicit
+    # transaction. Pre-fix, the connection was opened with
+    # isolation_level=None (autocommit) so every per-row INSERT was its
+    # own transaction with its own fsync. On a multi-library /
+    # multi-user snapshot that meant tens-to-hundreds of thousands of
+    # one-row commits and dominated the post-engine 6-8 minute hang
+    # the operator saw between "libraries 100%" and the job actually
+    # finishing. One BEGIN / COMMIT pair collapses the whole write
+    # phase into a single fsync at the end.
+    #
+    # Schema DDL above runs OUTSIDE the transaction on purpose: SQLite
+    # implicitly commits any active transaction before executing DDL,
+    # so opening BEGIN before _copy_schema / _create_meta_tables would
+    # be a no-op anyway. We start the transaction immediately after.
+    dst_conn.execute("BEGIN")
+
     # 2. Write the one-row ``servers`` entry. Pull the live row from
     #    media.db so url / machine_id stay consistent with the
     #    registry. Falls back to a minimal row when no media.db entry
@@ -751,11 +800,12 @@ def build_snapshot_db_from_payloads(
                 if iid is not None:
                     _record_server_item(iid, rec.get("rating_key"))
 
+    # v0.13.0: unified users map. Owner is the role='owner' block;
+    # the legacy empty-handle convention is the fallback for mid-
+    # transition payloads. One pass over the users map handles both.
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        owner_block = payload.get("items") or {}
-        _walk_item_records(owner_block)
         for udata in (payload.get("users") or {}).values():
             if isinstance(udata, dict):
                 _walk_item_records(udata)
@@ -775,12 +825,22 @@ def build_snapshot_db_from_payloads(
 
     owner_playlist_keys: set = set()
     owner_collection_keys: set = set()
-    # First pass: owner-side playlists/collections so we can dedup
-    # per-user variants against them by rating_key.
+    # First pass: locate each payload's owner block (role='owner') and
+    # collect its playlist/collection rating_keys so per-user variants
+    # can be deduped against them.
+    def _find_owner_block(p: Dict[str, Any]) -> Dict[str, Any]:
+        users = p.get("users") or {}
+        for _h, _ub in users.items():
+            if isinstance(_ub, dict) and _ub.get("role") == "owner":
+                return _ub
+        if "" in users and isinstance(users[""], dict):
+            return users[""]
+        return {}
+
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        owner_block = payload.get("items") or {}
+        owner_block = _find_owner_block(payload)
         for pl in (owner_block.get("playlists") or []):
             rk = pl.get("rating_key")
             if rk is not None:
@@ -899,11 +959,42 @@ def build_snapshot_db_from_payloads(
         except sqlite3.OperationalError:
             pass
 
+    def _write_server_user_row(user_handle: str, role: str,
+                               display_name: Optional[str],
+                               backend: str = "plex",
+                               backend_user_id: Optional[str] = None) -> None:
+        """Insert a server_users identity row into the snapshot .db so
+        the on-demand serializer can rebuild a payload with proper role
+        + display_name fields. INSERT OR IGNORE is safe because the
+        UNIQUE(server_id, user_handle) constraint prevents dup rows."""
+        try:
+            dst_conn.execute(
+                "INSERT OR IGNORE INTO server_users "
+                "(server_id, user_handle, display_name, role, backend, "
+                " backend_user_id, created_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (server_id, user_handle, display_name, role, backend,
+                 backend_user_id, captured_at_resolved, captured_at_resolved),
+            )
+        except sqlite3.OperationalError:
+            # Pre-v0.13.0 schema in the destination snapshot DB (shouldn't
+            # happen if create_snapshot_db copied today's media.db DDL,
+            # but harmless if it does).
+            pass
+
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        owner_block = payload.get("items") or {}
-        # Owner / server-wide records under user_handle="".
+        owner_block = _find_owner_block(payload)
+        # Owner identity row + owner / server-wide records under
+        # user_handle="" (the legacy DB sentinel kept for one release
+        # while the FK column propagates).
+        if owner_block:
+            _write_server_user_row(
+                "", "owner",
+                owner_block.get("display_name"),
+                backend_user_id=owner_block.get("backend_user_id"),
+            )
         _write_watch_events("", owner_block.get("watch_history") or [])
         _write_ratings("", owner_block.get("ratings") or [])
         for pl in (owner_block.get("playlists") or []):
@@ -913,12 +1004,19 @@ def build_snapshot_db_from_payloads(
 
         # Per-user blocks: dedup playlists / collections against the
         # owner-side rating_key sets so a library-wide entry doesn't
-        # land N times.
-        for username, udata in (payload.get("users") or {}).items():
-            if not isinstance(udata, dict) or not username:
+        # land N times. Skip the owner block we already processed.
+        for handle, udata in (payload.get("users") or {}).items():
+            if not isinstance(udata, dict) or not handle:
                 continue
-            _write_watch_events(str(username), udata.get("watch_history") or [])
-            _write_ratings(str(username), udata.get("ratings") or [])
+            if udata.get("role") == "owner":
+                continue
+            _write_server_user_row(
+                handle, "managed",
+                udata.get("display_name") or handle,
+                backend_user_id=udata.get("backend_user_id"),
+            )
+            _write_watch_events(handle, udata.get("watch_history") or [])
+            _write_ratings(handle, udata.get("ratings") or [])
             for pl in (udata.get("playlists") or []):
                 rk = pl.get("rating_key")
                 if rk is not None:
@@ -927,7 +1025,7 @@ def build_snapshot_db_from_payloads(
                             continue
                     except (TypeError, ValueError):
                         pass
-                _write_playlist_row(str(username), pl)
+                _write_playlist_row(handle, pl)
             for col in (udata.get("collections") or []):
                 rk = col.get("rating_key")
                 if rk is not None:
@@ -936,7 +1034,7 @@ def build_snapshot_db_from_payloads(
                             continue
                     except (TypeError, ValueError):
                         pass
-                _write_collection_row(str(username), col)
+                _write_collection_row(handle, col)
 
     # 4. Meta tables (snapshot_meta + snapshot_users).
     _write_snapshot_meta(
@@ -955,10 +1053,47 @@ def build_snapshot_db_from_payloads(
         user_display_names=user_display_names or {},
     )
 
-    dst_conn.commit()
+    # v0.13.x: matching COMMIT for the BEGIN above. dst_conn.commit() is
+    # a no-op in autocommit mode (every prior statement already committed
+    # individually) - the explicit COMMIT is what flushes the WAL once
+    # for the whole row-write phase.
+    dst_conn.execute("COMMIT")
     dst_conn.close()
 
     counters["file_size"] = int(snapshot_path.stat().st_size)
+
+    # Audit trail: this is the live-capture writer (post-Rule-1) and
+    # mirrors the audit line from ``create_snapshot_db`` so the snapshot
+    # .db creation shows up in db_access.log next to the media.db
+    # ingest and the snapshots.db registry insert.
+    try:
+        from services import db_access_log
+        _row_total = (
+            counters.get("server_items", 0)
+            + counters.get("items", 0)
+            + counters.get("watch_events", 0)
+            + counters.get("ratings", 0)
+            + counters.get("playlists", 0)
+            + counters.get("collections", 0)
+        )
+        db_access_log.log_write(
+            table="snapshot.db",
+            where={
+                "snapshot_db": snapshot_path.name,
+                "server_id": server_id,
+                "snapshot_id": snapshot_id or "",
+            },
+            affected_rows=_row_total,
+            intent=(
+                f"write per-server snapshot .db from payloads "
+                f"(file_size={counters.get('file_size', 0)} bytes, "
+                f"libraries={len(libraries or [])}, "
+                f"metrics={','.join(metrics) if metrics else 'all'})"
+            ),
+        )
+    except Exception:
+        pass
+
     return counters
 
 

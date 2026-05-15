@@ -47,7 +47,13 @@ log = logging.getLogger("plexmigrate.server.scheduler")
 # How often the scheduler thread wakes. 30 seconds is fine: schedules
 # fire at minute resolution, so half-minute polling guarantees no fire
 # is missed by more than 30 s.
-_TICK_SECONDS = 30
+#
+# Hot-reload (Phase 3): the loop reads ``tunables.scheduler_tick_seconds()``
+# at the top of each iteration so a settings save takes effect within
+# at most the previous tick's window. The constant below is the
+# fallback used when the tunables module isn't importable (CLI-only
+# checkouts) and matches the historical hardcoded value.
+_TICK_SECONDS_FALLBACK = 30
 
 
 # ── Next-fire computation ────────────────────────────────────────────────────
@@ -176,7 +182,15 @@ class Scheduler:
                 log.exception("Scheduler tick failed: %s", exc)
             # ``Event.wait`` returns early if .stop() is called while
             # we're sleeping - that gives us a clean shutdown.
-            self._stop.wait(_TICK_SECONDS)
+            # Hot-reload: read the cadence each iteration so a save
+            # to ``tunables.scheduler_tick_seconds`` takes effect on
+            # the next wake without a process restart.
+            try:
+                from services.tunables import scheduler_tick_seconds
+                tick = scheduler_tick_seconds()
+            except Exception:
+                tick = _TICK_SECONDS_FALLBACK
+            self._stop.wait(tick)
 
     def _tick(self) -> None:
         """
@@ -256,6 +270,27 @@ class Scheduler:
                 ):
                     if _flag in row:
                         params[_flag] = bool(row[_flag])
+                # v0.14 Per-Run Settings on schedules. Each non-None
+                # field overrides the global / per-server value the
+                # snapshot job would otherwise inherit at fire time.
+                # Empty / blank strings on watch_ratings_filter_strategy
+                # are skipped so the chain falls through to per-server
+                # or global default.
+                for _num_field in ("workers", "scrobble_workers"):
+                    _v = row.get(_num_field)
+                    if isinstance(_v, (int, float)) and _v >= 1:
+                        params[_num_field] = int(_v)
+                for _bool_field in (
+                    "verbose", "skip_playlist_prebuild", "fast_collection_detection",
+                ):
+                    if row.get(_bool_field) is not None:
+                        params[_bool_field] = bool(row[_bool_field])
+                _log_dir = row.get("log_dir")
+                if isinstance(_log_dir, str) and _log_dir.strip():
+                    params["log_dir"] = _log_dir.strip()
+                _wr = row.get("watch_ratings_filter_strategy")
+                if isinstance(_wr, str) and _wr.strip() in ("smart", "force_bulk", "force_server_side"):
+                    params["watch_ratings_filter_strategy"] = _wr.strip()
                 rec = queue.submit_snapshot(params)
                 row["last_job_id"] = rec.job_id
                 row["last_fired_at"] = now_ts

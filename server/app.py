@@ -365,6 +365,19 @@ def _register_lifecycle(app: FastAPI) -> None:
         except Exception:  # pragma: no cover (defensive)
             log.exception("media_db init failed; continuing without DB.")
 
+        # Restore the persisted audit-log-enabled state into the
+        # in-process cache. Default true on missing or read errors -
+        # the audit trail is on by default; only an explicit
+        # db_admin-gated disable via /api/settings/audit-log-toggle
+        # turns it off.
+        try:
+            from services import db_access_log as _dal
+            _s = persistence.load_settings() or {}
+            _audit_on = _s.get("audit_log_enabled")
+            _dal.set_enabled(True if _audit_on is None else bool(_audit_on))
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("audit-log flag init failed; assuming enabled.")
+
         # Rule 2: start the library-walk scheduler. Daemon thread,
         # cadence read from settings.library_walk.interval_seconds
         # at every tick (default 24h, floored at 1h). Walks at most
@@ -689,6 +702,11 @@ def _register_routes(app: FastAPI) -> None:
         Returns the redacted updated document.
         """
         patch = {k: v for k, v in body.model_dump().items() if v is not None}
+        # ``audit_log_enabled`` is read-only via this endpoint - it
+        # only flips through the db_admin-gated audit-log-toggle below.
+        # Silently strip it from the patch so a stray PATCH from the
+        # Settings UI can never disable the audit trail by accident.
+        patch.pop("audit_log_enabled", None)
         # v0.9.5: refuse Windows host paths early so the operator gets
         # an actionable error in the Settings tab instead of a silent
         # write into the container's ephemeral filesystem.
@@ -701,6 +719,58 @@ def _register_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=400, detail=str(e))
         merged = persistence.save_settings(patch)
         return persistence.redact_settings(merged)
+
+    @app.post("/api/settings/audit-log-toggle")
+    def toggle_audit_log(
+        body: Dict[str, Any],
+        _admin: Dict[str, Any] = Depends(_auth_router_module.require_role("admin")),
+    ) -> Dict[str, Any]:
+        """
+        Enable / disable the db-access audit log.
+
+        Two-factor gated (matches the destructive-endpoint pattern):
+        admin/root_admin JWT plus the separate db_admin credential in
+        the request body. Body: ``{db_admin_username, db_admin_password,
+        enabled: bool}``.
+
+        Self-documenting transition: when disabling, the final audit
+        line records who switched it off; when re-enabling, the first
+        new line records who switched it back on. The audit trail
+        always shows that disablement was an explicit, attributable
+        act - that's the C-design compromise for letting the audit
+        log itself be operator-toggleable.
+        """
+        from server import auth_db
+        from services import db_access_log
+        un = str(body.get("db_admin_username") or "")
+        pw = str(body.get("db_admin_password") or "")
+        if not un or not pw:
+            raise HTTPException(
+                status_code=401,
+                detail="Database admin credentials are required.",
+            )
+        verified = auth_db.verify_password(un, pw)
+        if verified is None or verified.get("role") != "db_admin":
+            raise HTTPException(
+                status_code=401,
+                detail="Database admin credentials are invalid.",
+            )
+        new_enabled = bool(body.get("enabled"))
+        currently_enabled = db_access_log.is_enabled()
+        if currently_enabled and not new_enabled:
+            # Going OFF: write the final entry BEFORE flipping the flag
+            # so the line lands. Then persist + cache.
+            db_access_log.log_audit_disabled(un)
+            db_access_log.set_enabled(False)
+            persistence.save_settings({"audit_log_enabled": False})
+        elif (not currently_enabled) and new_enabled:
+            # Going ON: flip first so the entry actually writes, then
+            # log the resumption.
+            db_access_log.set_enabled(True)
+            db_access_log.log_audit_enabled(un)
+            persistence.save_settings({"audit_log_enabled": True})
+        # Else: no-op transition (already in requested state).
+        return {"audit_log_enabled": db_access_log.is_enabled()}
 
     # ── Servers (multi-server registry, v0.9.0) ─────────────────────
 

@@ -17,14 +17,25 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 
-type HelpPage = 'reference' | 'activity_and_phases' | 'api_usage' | 'db_schema' | 'run_logs' | 'troubleshooting';
+type HelpPage = 'how_to_use' | 'reference' | 'activity_and_phases' | 'api_usage' | 'db_schema' | 'run_logs' | 'troubleshooting';
 
 
 export function HelpPanel() {
-  const [page, setPage] = useState<HelpPage>('reference');
+  // "How to Use" is the first stop for a new operator. Open it by
+  // default so the strip's leftmost tab is what the page actually
+  // shows when this tab is selected (rather than the deeper Reference
+  // page that operators land on after they already know what they're
+  // doing).
+  const [page, setPage] = useState<HelpPage>('how_to_use');
   return (
     <>
       <nav className="tabs sub-tabs">
+        <button
+          className={page === 'how_to_use' ? 'active' : ''}
+          onClick={() => setPage('how_to_use')}
+        >
+          How to Use
+        </button>
         <button
           className={page === 'reference' ? 'active' : ''}
           onClick={() => setPage('reference')}
@@ -62,12 +73,265 @@ export function HelpPanel() {
           Troubleshooting
         </button>
       </nav>
+      {page === 'how_to_use' && <HowToUsePage />}
       {page === 'reference' && <ReferencePage />}
       {page === 'activity_and_phases' && <ActivityStatusesPage />}
       {page === 'api_usage' && <ApiUsagePage />}
       {page === 'db_schema' && <DbSchemaPage />}
       {page === 'run_logs' && <RunLogsPage />}
       {page === 'troubleshooting' && <TroubleshootingPage />}
+    </>
+  );
+}
+
+
+// ── How to Use (v0.13.x) ─────────────────────────────────────────────────────
+//
+// First-stop orientation page for new operators. Walks through what
+// each job mode is for, when to pick it, and (for Restore) what the
+// Merge / Replace distinction actually does to a destination. The
+// Pros/Cons table is the source-of-truth for the warning copy that
+// also appears in tooltips on the Run Job form's mode selector and on
+// the typed-REPLACE modal - keep them in sync when editing.
+
+function HowToUsePage() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>How to Use</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          Walkthrough for new operators. The control-by-control writeup
+          lives on the <strong>Reference</strong> tab; this page covers
+          which job mode to pick and what each one actually does.
+        </span>
+      </div>
+
+      <div className="panel">
+        <h2>Overview</h2>
+        <p>
+          PlexBackUp captures and moves Plex metadata - <strong>watch
+          history</strong>, <strong>ratings</strong>,
+          <strong> playlists</strong>, and <strong>collections</strong>.
+          It does not touch the items in your library themselves
+          (files, metadata agents, posters). The five job modes are:
+        </p>
+        <ul>
+          <li>
+            <strong>Snapshot</strong> - capture from one Plex server to
+            a <code>.db</code> file on disk. Building block for
+            disaster-recovery archives and for any later restore.
+          </li>
+          <li>
+            <strong>Restore</strong> - apply a previously captured
+            snapshot back into a Plex server. Default mode is
+            additive (<em>Merge</em>); the opt-in <em>Replace</em>
+            mode overwrites to match the snapshot exactly.
+          </li>
+          <li>
+            <strong>Direct Transfer</strong> - read from one Plex,
+            write straight into another, with no intermediate file.
+            Uses the same write path as Restore (Merge / Replace).
+          </li>
+          <li>
+            <strong>Fan-out</strong> - one source, many destinations
+            in a single submitted job. Available on Restore and Direct.
+          </li>
+          <li>
+            <strong>Scheduled</strong> - recurring snapshot jobs at a
+            cron-like cadence. Schedules are snapshot-only today.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel">
+        <h2>Snapshot</h2>
+        <p>
+          A snapshot reads everything you've selected (watch history,
+          ratings, playlists, collections - any combination via the
+          four toggles on the Run Job form) from the source server and
+          writes it into a <code>.db</code> in the configured snapshot
+          directory. The same job optionally renders a
+          <code> .plexexport.json</code> sidecar at the end so the
+          first Exports-tab download is instant.
+        </p>
+        <p>
+          Snapshots are nondestructive on the source - they only read.
+          The output directory is set under
+          <strong> Settings → Servers → Run Defaults</strong>; per-job
+          overrides on the Run Job form's <em>Per-Run Settings →
+          Advanced</em> sub-tab.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Restore</h2>
+        <p>
+          A Restore job picks a registered snapshot (or a legacy
+          <code> .plexexport.json</code> archive) and writes its data
+          into one or more destination Plex servers. The
+          <strong> destination is your live Plex</strong>, so this is
+          where the choice between Merge and Replace matters.
+        </p>
+
+        <h3 style={{ marginBottom: 8 }}>Merge vs Replace</h3>
+        <table className="list" style={{ width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ width: '20%' }}>Data type</th>
+              <th>Merge <em>(default)</em></th>
+              <th>Replace</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Watch counts</strong></td>
+              <td>
+                Adds the difference, only ever <em>increasing</em>.
+                A higher count on the destination stays as-is.
+              </td>
+              <td>
+                <strong>Resets</strong> to the snapshot's count.
+                Plays added after the snapshot are erased
+                (<code>markUnplayed</code> + re-scrobble exactly N times).
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Ratings</strong></td>
+              <td>
+                Only set when the destination has <em>no</em> rating.
+                Existing ratings are preserved.
+              </td>
+              <td>
+                <strong>Overwrites</strong> the current rating with the
+                snapshot's value. Set to null if the snapshot had no rating.
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Playlists</strong></td>
+              <td>
+                Creates the playlist if missing, appends members.
+                Existing members and members not in the snapshot are
+                preserved.
+              </td>
+              <td>
+                Diffs against the snapshot. Members in both stay,
+                members in the snapshot are added, members
+                <strong> only on the destination are removed</strong>.
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Collections</strong></td>
+              <td>
+                Same as playlists - creates or appends, never
+                removes.
+              </td>
+              <td>
+                Same as playlists in Replace mode - destination-only
+                members are <strong>removed</strong>.
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Smart playlists</strong></td>
+              <td>Skipped (rules captured for inspection only).</td>
+              <td>Skipped - Plex rebuilds them from their rule.</td>
+            </tr>
+            <tr>
+              <td><strong>Library items</strong></td>
+              <td>Never touched.</td>
+              <td>Never touched.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3 style={{ marginBottom: 8, marginTop: 16 }}>When to pick which</h3>
+        <ul>
+          <li>
+            <strong>Pick Merge</strong> when you want to fold one
+            server's metadata into another without losing anything on
+            the destination. Safe to re-run. This is the right mode
+            for migrations between two active servers, periodic sync
+            jobs, and almost every casual use.
+          </li>
+          <li>
+            <strong>Pick Replace</strong> for disaster recovery
+            (restore a Tuesday snapshot to undo Wednesday's bad
+            ingest), point-in-time rollback, or when you specifically
+            need the destination to <em>exactly</em> match a known-good
+            snapshot. Replace requires you to type <code>REPLACE</code>
+            on submit; the auto-capture safety belt (on by default)
+            snapshots the destination first so you have a rollback
+            point.
+          </li>
+        </ul>
+
+        <h3 style={{ marginBottom: 8, marginTop: 16 }}>Safety belt: auto-capture before Replace</h3>
+        <p>
+          With the safety belt on, the worker captures a fresh
+          snapshot of the destination <em>before</em> the Replace
+          fires. If the pre-snapshot fails, the Replace
+          <strong> aborts</strong> - the engine refuses to destroy
+          data without a recovery point. The pre-snapshot ID is
+          recorded on the job's audit row so you can find it later.
+          Leave this on unless you specifically don't want a rollback
+          point (e.g. you're restoring into a throwaway test
+          instance).
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Direct Transfer</h2>
+        <p>
+          Direct Transfer reads from a source Plex and writes into one
+          or more destination Plex servers in a single run, with no
+          intermediate file. The capture phase is identical to a
+          Snapshot; the write phase is identical to a Restore - so the
+          Merge / Replace choice on the Run Job form applies to the
+          destination write just like it does for Restore.
+        </p>
+        <p>
+          Direct Transfer is the right call when you don't need an
+          archive on disk - e.g. one-shot migrations between two
+          active servers, or fan-out from a primary into a small
+          herd of secondaries. If you also want a portable archive,
+          run a Snapshot job separately.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Fan-out</h2>
+        <p>
+          Fan-out is the multi-destination form of Restore and Direct
+          Transfer: one job that writes into <em>N</em> destinations.
+          Each destination runs in its own dashboard card, with its
+          own per-destination log directory and error tracking, so a
+          failure on one destination doesn't block the others.
+        </p>
+        <p>
+          Replace mode is per-job, not per-destination - if you pick
+          Replace and three destinations, all three get the
+          point-in-time overwrite. The safety belt captures a separate
+          pre-Replace snapshot for each destination so each one has
+          its own rollback point.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Scheduled</h2>
+        <p>
+          Schedules are recurring snapshot runs at a cron-like
+          cadence. The <strong>Schedules</strong> tab lists them and
+          accepts new ones; the form mirrors Run Job's Snapshot mode
+          plus an interval picker. The same per-server defaults from
+          <strong> Servers → Advanced Settings</strong> apply.
+        </p>
+        <p>
+          Schedules are snapshot-only today. Restore + direct
+          transfer schedules are tracked in the roadmap; until then,
+          stand up an external trigger (cron / systemd / Windows Task
+          Scheduler) calling <code>POST /api/job/restore-from-snapshot</code>
+          if you need a recurring restore.
+        </p>
+      </div>
     </>
   );
 }
@@ -364,7 +628,7 @@ const STATUS_ROWS: StatusRow[] = [
     color: '#22c55e',
     modes: 'snapshot, restore, direct',
     when: "A library's processing finished successfully. Fires once per library, after all four data-type gathers (snapshot) or restores complete. Bold green - look for one DONE per library at the end of a successful run.",
-    example: '03:12:01 DONE Music Snapshot complete',
+    example: '03:12:01 DONE Music Library complete',
   },
   {
     label: 'ERROR',
@@ -587,6 +851,56 @@ function ActivityStatusesPage() {
                 ))}
               </tbody>
             </table>
+
+            {/* Stall escalation reference. The dashboard re-colors a
+                phase tag amber once its age crosses the per-phase
+                amber threshold, and red once it crosses red. Operators
+                tune the threshold scale via
+                Settings ▸ General Settings ▸ Dashboard Stall Colours. */}
+            <h3 style={{ marginTop: 24 }}>Stall escalation — when a phase tag changes colour</h3>
+            <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
+              Each phase has an <strong>amber</strong> threshold and a <strong>red</strong>{' '}
+              threshold (in seconds). If a worker stays in one phase past the amber
+              window the tag flips to the amber pill; past the red window it flips to
+              the red pill and the row pulses. Tune the windows globally with the
+              <strong> ETR colour multiplier</strong> under{' '}
+              <em>Settings ▸ General Settings</em>. The numbers below are the ship
+              defaults (multiplier = 1.0).
+            </span>
+            <table className="list" style={{ width: '100%', maxWidth: 760 }}>
+              <thead>
+                <tr>
+                  <th style={{ width: '28%' }}>Normal (in-flight)</th>
+                  <th style={{ width: '36%' }}>Amber (slow)</th>
+                  <th style={{ width: '36%' }}>Red (stuck)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {([
+                  ['fetching', 45, 120, 'phase'],
+                  ['capturing', 30, 60, 'capturing'],
+                  ['indexing', 45, 90, 'phase'],
+                  ['resolving', 30, 75, 'phase'],
+                  ['scrobbling', 20, 45, 'merged'],
+                  ['rating', 15, 30, 'rated'],
+                  ['merging', 30, 60, 'appended'],
+                ] as Array<[string, number, number, string]>).map(([name, a, r, normalCls]) => (
+                  <tr key={`stall-${name}`}>
+                    <td>
+                      <span className={`tag ${normalCls}`}>{name}</span>
+                    </td>
+                    <td>
+                      <span className="tag stall-amber" style={{ marginRight: 6 }}>{name}</span>
+                      <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>after {a}s</span>
+                    </td>
+                    <td>
+                      <span className="tag stall-red" style={{ marginRight: 6 }}>{name}</span>
+                      <span style={{ fontSize: 12, color: 'var(--text-dim)' }}>after {r}s</span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </>
         ) : (
           <>
@@ -664,7 +978,7 @@ PHASE   Music  Playlists → 2 items
 PHASE   Music  Collections → 0 items
 PHASE   Music  Ratings → 758 items
 PHASE   Music  Watch History → 6681 items
-DONE    Music  Snapshot complete`}
+DONE    Music  Library complete`}
             </pre>
             <p style={{ marginTop: 8, fontSize: 12, color: 'var(--text-dim)' }}>
               The four PHASE lines inside a library run in parallel (4-thread pool inside
@@ -1308,7 +1622,7 @@ const DB_DOCS: DbDoc[] = [
     intro_short:
       "The cumulative store. Every snapshot job writes a side-effect copy of its live-fetch payload here so future runs can use it as a fast resolver cache. Keyed by GUID at the item level, by (item, server) at the per-server level.",
     intro_long:
-      "media.db is the longest-lived SQLite file the app owns. It accumulates state from every snapshot, restore, and direct-transfer run, so on the second run of the same source server the resolver can skip the slow GUID-lookup round-trip and go straight to the cached ratingKey. The schema is split into three concerns: a GUID-keyed item pool that's shared across every server the app has ever talked to, per-(item, server) join tables that pin each item's local identity on each server, and per-server activity tables (watch events, ratings, playlist members, collection members) that record what each user on each server has done with each item.\n\nThe split matters because Plex's `ratingKey` is a per-server identifier: the same movie has different ratingKeys on Server A and Server B, but the same `imdb://` GUID on both. We key the items table by GUID so cross-server matching is structural rather than discovered each run.",
+      "media.db is the longest-lived SQLite file the app owns. It accumulates state from every snapshot, restore, and direct-transfer run, so on the second run of the same source server the resolver can skip the slow GUID-lookup round-trip and go straight to the cached ratingKey. The schema is split into four concerns: a GUID-keyed item pool that's shared across every server the app has ever talked to; per-(item, server) join tables that pin each item's local identity on each server; the v0.13.0 identity layer in server_users that names the people who own / have access to each server (with role + multi-backend tag); and per-server activity tables (watch events, ratings, playlist members, collection members) that record what each user on each server has done with each item.\n\nThe split matters because Plex's `ratingKey` is a per-server identifier: the same movie has different ratingKeys on Server A and Server B, but the same `imdb://` GUID on both. We key the items table by GUID so cross-server matching is structural rather than discovered each run.\n\nThe v0.13.0 identity layer (server_users) replaced an earlier convention where the server owner was an implicit sentinel — an empty-string `user_handle` on every activity row. That worked while we only spoke to Plex, but Jellyfin and Emby have first-class owner / admin / managed concepts that don't fit an empty-string-is-the-owner trick. Lifting identity into its own table with a role column and a backend tag means the engine drives the same CRUD path for every backend, and the schema absorbs multi-admin servers (Jellyfin) without another migration.",
     tables: [
       {
         name: 'schema_version',
@@ -1371,14 +1685,33 @@ const DB_DOCS: DbDoc[] = [
           "This table is what makes Tier 0 of the resolver work. Without it, every cross-server lookup would walk the GUID columns; with it, we go from items.id straight to the ratingKey on the target server in one indexed lookup. Two UNIQUE constraints: (item_id, server_id) prevents duplicate rows, (server_id, rating_key) lets us invert the lookup when we have the ratingKey and need the items.id.",
       },
       {
+        name: 'server_users',
+        purpose: 'Per-server identity layer (v0.13.0). One row per known user on a server — owner or managed — with role, display name, and a backend tag so the engine can drive Plex / Jellyfin / Emby uniformly.',
+        key_columns: ['server_id', 'user_handle', 'role', 'backend', 'display_name'],
+        columns: [
+          { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id. Referenced by server_user_id on every wide table (watch_events / ratings / playlists / collections).' },
+          { name: 'server_id', type: 'TEXT NOT NULL', note: 'Which server this user belongs to.' },
+          { name: 'user_handle', type: 'TEXT NOT NULL', note: 'Stable per-server identifier. Empty string = the owner sentinel (kept for one release while every reader switches to the FK; role is the source of truth for "is this the owner").' },
+          { name: 'display_name', type: 'TEXT', note: 'Human-readable name from the live API. May be NULL on rows created from legacy data; the next snapshot/walk fills it in.' },
+          { name: 'role', type: "TEXT NOT NULL CHECK (role IN ('owner', 'managed'))", note: 'Server owner or managed home user. The engine routes Plex tokens by this field.' },
+          { name: 'backend', type: "TEXT NOT NULL DEFAULT 'plex' CHECK (backend IN ('plex', 'emby', 'jellyfin'))", note: 'Which media-server product this row describes. Plex today; future Jellyfin / Emby adapters will write their own backend string and the engine reads them uniformly.' },
+          { name: 'backend_user_id', type: 'TEXT', note: "The backend's native user id (Plex userID, Jellyfin user GUID, etc.). May be NULL on rows backfilled from pre-v0.13.0 data." },
+          { name: 'created_at', type: 'REAL NOT NULL', note: 'When the row was first inserted.' },
+          { name: 'last_seen_at', type: 'REAL', note: 'Bumped on every CRUD touch via get_or_create_server_user.' },
+        ],
+        design_note:
+          "Replaces the legacy 'user_handle = \"\"' owner sentinel that ran through every wide table pre-v0.13.0. The owner is now a first-class row with role='owner', queryable directly; managed users are role='managed'. The backend column makes the schema multi-backend without a migration when Jellyfin / Emby support lands — Plex's one-owner-per-server model and Jellyfin's multiple-admins model both fit because role + backend are independent. Separate from managed_users (credentials, Fernet-encrypted, host-bound); server_users is identity metadata and is safe to copy into a portable snapshot .db file. UNIQUE(server_id, user_handle) prevents duplicate identity rows; cascading deletes on server purge are handled in order in server/media_db.py :: purge_server_data.",
+      },
+      {
         name: 'watch_events',
         purpose: "Per-(item, server, user) watch state. One row per item per user per server.",
-        key_columns: ['item_id', 'server_id', 'user_handle', 'view_count', 'last_viewed_at'],
+        key_columns: ['item_id', 'server_id', 'server_user_id', 'view_count', 'last_viewed_at'],
         columns: [
           { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id.' },
           { name: 'item_id', type: 'INTEGER NOT NULL', note: 'FK into items.id.' },
           { name: 'server_id', type: 'TEXT NOT NULL', note: 'Which server saw the watch.' },
-          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Owner or managed-user identifier. Empty string = server owner.' },
+          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Legacy denormalised handle. Empty string = owner sentinel. Kept for one release while every reader switches to server_user_id; dropped in a follow-up migration.' },
+          { name: 'server_user_id', type: 'INTEGER REFERENCES server_users(id)', note: 'v0.13.0 identity FK. The authoritative answer to "who watched this." Lookup display_name / role / backend via JOIN against server_users.' },
           { name: 'view_count', type: 'INTEGER NOT NULL DEFAULT 0', note: 'Total times the user has played this item.' },
           { name: 'view_offset', type: 'INTEGER NOT NULL DEFAULT 0', note: 'Last resume position in milliseconds.' },
           { name: 'last_viewed_at', type: 'REAL', note: 'Unix timestamp of the last play.' },
@@ -1388,12 +1721,13 @@ const DB_DOCS: DbDoc[] = [
       {
         name: 'ratings',
         purpose: 'Per-(item, server, user) star ratings.',
-        key_columns: ['item_id', 'server_id', 'user_handle', 'rating'],
+        key_columns: ['item_id', 'server_id', 'server_user_id', 'rating'],
         columns: [
           { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id.' },
           { name: 'item_id', type: 'INTEGER NOT NULL', note: 'FK into items.id.' },
           { name: 'server_id', type: 'TEXT NOT NULL', note: 'Which server holds the rating.' },
-          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Owner or managed-user identifier.' },
+          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Legacy denormalised handle. Owner = "". Kept transiently alongside server_user_id; dropped in a follow-up migration.' },
+          { name: 'server_user_id', type: 'INTEGER REFERENCES server_users(id)', note: 'v0.13.0 identity FK. JOIN to server_users to get display_name / role / backend.' },
           { name: 'rating', type: 'REAL NOT NULL', note: 'Plex rating value (0.0 to 10.0). UI divides by 2 to display 0-5 stars.' },
           { name: 'updated_at', type: 'REAL NOT NULL', note: 'When this rating was last seen / written.' },
         ],
@@ -1401,11 +1735,12 @@ const DB_DOCS: DbDoc[] = [
       {
         name: 'playlists',
         purpose: 'Per-(server, user) playlist rows. Membership is denormalised into item_ids_json so we can read the whole list in one query.',
-        key_columns: ['server_id', 'user_handle', 'name', 'item_ids_json', 'is_smart'],
+        key_columns: ['server_id', 'server_user_id', 'name', 'item_ids_json', 'is_smart'],
         columns: [
           { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id.' },
           { name: 'server_id', type: 'TEXT NOT NULL', note: 'Which server owns the playlist.' },
-          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Empty string = server-wide playlist; username = user-private playlist.' },
+          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Legacy denormalised handle. "" = server-wide playlist (lives under the owner row); non-empty = user-private. Kept transiently alongside server_user_id.' },
+          { name: 'server_user_id', type: 'INTEGER REFERENCES server_users(id)', note: 'v0.13.0 identity FK. Server-wide playlists FK to the owner row (role="owner"); user-private playlists FK to a managed row.' },
           { name: 'name', type: 'TEXT NOT NULL', note: 'Playlist title.' },
           { name: 'description', type: 'TEXT', note: 'Optional summary text.' },
           { name: 'is_smart', type: 'INTEGER NOT NULL DEFAULT 0', note: '1 if this is a smart playlist (filter-based, no static members).' },
@@ -1414,16 +1749,17 @@ const DB_DOCS: DbDoc[] = [
           { name: 'updated_at', type: 'REAL NOT NULL', note: 'When this row was last written.' },
         ],
         design_note:
-          "We denormalise membership into a JSON array on purpose. Playlists are read as whole lists, never queried by single member, so a normalised playlist_items join table would force a JOIN on every read with no upside. UNIQUE(server_id, user_handle, name) lets a user have a private playlist with the same name as a server-wide one without collision.",
+          "We denormalise membership into a JSON array on purpose. Playlists are read as whole lists, never queried by single member, so a normalised playlist_items join table would force a JOIN on every read with no upside. UNIQUE(server_id, user_handle, name) lets a user have a private playlist with the same name as a server-wide one without collision. The server-wide-vs-user-private split that ingest_snapshot_payload enforces (a library-level playlist visible to every home user lands exactly once under the owner row rather than N times) reads from server_users.role rather than guessing from user_handle in v0.13.0.",
       },
       {
         name: 'collections',
         purpose: 'Same shape as playlists but for collections. Unordered.',
-        key_columns: ['server_id', 'user_handle', 'name', 'item_ids_json'],
+        key_columns: ['server_id', 'server_user_id', 'name', 'item_ids_json'],
         columns: [
           { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id.' },
           { name: 'server_id', type: 'TEXT NOT NULL', note: 'Which server owns the collection.' },
-          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Empty string = server-wide; username = user-private (rare for collections).' },
+          { name: 'user_handle', type: "TEXT NOT NULL DEFAULT ''", note: 'Legacy denormalised handle. "" = server-wide; non-empty = user-private (rare for collections). Kept transiently alongside server_user_id.' },
+          { name: 'server_user_id', type: 'INTEGER REFERENCES server_users(id)', note: 'v0.13.0 identity FK. JOIN to server_users for role + display_name.' },
           { name: 'name', type: 'TEXT NOT NULL', note: 'Collection title.' },
           { name: 'item_ids_json', type: 'TEXT', note: 'JSON array of items.id values.' },
           { name: 'updated_at', type: 'REAL NOT NULL', note: 'When this row was last written.' },

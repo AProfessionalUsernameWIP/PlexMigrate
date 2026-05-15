@@ -15,6 +15,7 @@ import { type ReactNode, Fragment, useEffect, useMemo, useRef, useState } from '
 import { ActivityEntry, ContainerResult, CurrentItem, DashboardState, FanOutDestState, JobPayload, LibraryProgress, LogFile, DashboardFrame, api } from '../api';
 import { LogTailer } from './LogTailer';
 import { NetworkPanel } from './NetworkPanel';
+import { InfoTip } from './InfoTip';
 import { usePermission } from '../hooks/usePermission';
 
 interface Props {
@@ -40,6 +41,19 @@ export function DashboardPanel({
   useEffect(() => {
     const t = window.setInterval(() => force((x) => x + 1), 1000);
     return () => window.clearInterval(t);
+  }, []);
+
+  // Phase 4: pull the operator-set ETR colour multiplier from settings
+  // on mount and stash it in the module-level value the per-phase
+  // stall thresholds read. A change via Settings ▸ General takes
+  // effect on the next DashboardPanel mount.
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        const m = (s as { etr_color_multiplier?: number }).etr_color_multiplier;
+        if (typeof m === 'number' && Number.isFinite(m)) setEtrColorMultiplier(m);
+      })
+      .catch(() => { /* non-fatal — keep the default 1.0 */ });
   }, []);
 
   const dash = snapshot?.dashboard ?? null;
@@ -187,7 +201,7 @@ const DASHBOARD_SECTIONS: {
   // restore-only: the per-container restoration summary.
   { key: 'container', modes: ['restore'], render: (c) => <ContainerSummary dash={c.dash} job={c.job} /> },
   { key: 'batch', modes: 'all', render: (c) => <BatchEtrPanel dash={c.dash} /> },
-  { key: 'libraries', modes: 'all', render: (c) => <LibraryList libs={c.dash.libraries} now={Date.now() / 1000} /> },
+  { key: 'libraries', modes: 'all', render: (c) => <LibraryList libs={c.dash.libraries} now={Date.now() / 1000} job={c.job} /> },
   { key: 'threadpool', modes: 'all', render: (c) => <ThreadPool dash={c.dash} /> },
   { key: 'current', modes: 'all', render: (c) => <CurrentlyProcessing items={c.dash.current_items ?? []} /> },
   { key: 'activity', modes: 'all', render: (c) => <ActivityFeed entries={c.dash.activity} /> },
@@ -1689,8 +1703,25 @@ const STALL_THRESHOLDS: Record<string, { amber: number; red: number }> = {
   merging:    { amber: 30,  red: 60  },
 };
 
+// Phase-4 ETR colour multiplier. Module-level so any component (the
+// top-level DashboardPanel does it via useEffect on mount) can set
+// it once after reading settings.etr_color_multiplier. Clamped to
+// the same [0.5, 2.0] window the backend tunable accessor enforces.
+let _etrColorMultiplier = 1.0;
+
+export function setEtrColorMultiplier(value: number): void {
+  if (!Number.isFinite(value)) return;
+  if (value < 0.5) _etrColorMultiplier = 0.5;
+  else if (value > 2.0) _etrColorMultiplier = 2.0;
+  else _etrColorMultiplier = value;
+}
+
 function getPhaseHealth(phase: string, ageSeconds: number): 'normal' | 'amber' | 'red' {
-  const t = STALL_THRESHOLDS[phase] ?? { amber: 60, red: 120 };
+  const base = STALL_THRESHOLDS[phase] ?? { amber: 60, red: 120 };
+  const t = {
+    amber: base.amber * _etrColorMultiplier,
+    red: base.red * _etrColorMultiplier,
+  };
   if (ageSeconds >= t.red) return 'red';
   if (ageSeconds >= t.amber) return 'amber';
   return 'normal';
@@ -1912,11 +1943,31 @@ const THREAD_DESCRIPTIONS: Record<string, string> = {
 
 // ── Per-library progress ──────────────────────────────────────────────────────
 
-function LibraryList({ libs, now }: { libs: LibraryProgress[]; now: number }) {
+// Per-snapshot-library the "total" the engine emits is structured as
+// ``4 + n_user_tasks`` - four owner-phase gathers (watch history,
+// ratings, playlists, collections) plus one per managed user. Threaded
+// out here so the LibraryList cell can show the two-axis breakdown
+// ("phases 4/4 · users 8/12") that makes the formula self-documenting,
+// instead of a bare "12/16" the operator has to puzzle out.
+const SNAPSHOT_OWNER_PHASES = 4;
+
+function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number; job: JobPayload | null }) {
+  // v0.13.x lightweight stop-state: when the operator stops the run,
+  // libraries that didn't reach 100% read "Stopped" (red) instead of a
+  // misleading percentage; libraries that never started read "Skipped"
+  // (neutral); libraries that genuinely completed BEFORE the stop stay
+  // green. job.state === 'cancelled' is the canonical signal - same one
+  // the job status badge already uses.
+  const jobStopped = job?.state === 'cancelled';
+  // v0.13.x "Steps" column: the per-library count is 4 owner-phase
+  // gathers + N user gathers in snapshot / direct-transfer mode. The
+  // breakdown is meaningful only on those modes; restore counts items
+  // and the cell falls back to the legacy "completed / total" shape.
+  const stepsModeBreakdown = job?.mode === 'snapshot' || job?.mode === 'direct';
   return (
     <div className="panel">
       <h2>Libraries</h2>
-      <SectionHint>Per-library progress with item counts, current phase, and an ETA.</SectionHint>
+      <SectionHint>Per-library progress with step counts, current phase, and an ETA.</SectionHint>
       {libs.length === 0 ? (
         <div className="empty">No libraries in this run.</div>
       ) : (
@@ -1924,13 +1975,28 @@ function LibraryList({ libs, now }: { libs: LibraryProgress[]; now: number }) {
           <thead>
             <tr>
               <th style={{ width: '20%' }}>Library</th>
-              <th style={{ width: '40%' }}>Progress</th>
-              {/* v0.9.7 Item 3: right-align header to match the
-                  ``.num`` cell underneath. Without this the Items
-                  header was left-aligned while the cell was
-                  right-aligned, visually offsetting the value
-                  across the column. */}
-              <th style={{ width: '12%', textAlign: 'right' }}>Items</th>
+              <th style={{ width: '36%' }}>Progress</th>
+              {/* v0.13.x: "Items" -> "Steps" with a formula tooltip.
+                  Each per-library step is either one of the four
+                  owner-phase gathers (watch history / ratings /
+                  playlists / collections) or one managed-user gather,
+                  so "8/16" on a snapshot run means "8 of (4 owner
+                  phases + 12 user gathers) done." On restore /
+                  direct-transfer-import, steps are items being
+                  processed - operator-visible breakdown adapts per
+                  mode via the cell content below. */}
+              <th style={{ width: '16%', textAlign: 'right' }}>
+                Steps
+                <InfoTip>
+                  Snapshot / direct-transfer:{' '}
+                  <strong>4 owner-phase gathers</strong> (watch history, ratings, playlists,
+                  collections) plus{' '}
+                  <strong>one step per managed user</strong>{' '}
+                  whose tokens are active.
+                  <br />
+                  Restore: one step per item resolved or applied.
+                </InfoTip>
+              </th>
               <th style={{ width: '18%' }}>Phase</th>
               <th style={{ width: '10%' }}>ETA</th>
             </tr>
@@ -1940,18 +2006,47 @@ function LibraryList({ libs, now }: { libs: LibraryProgress[]; now: number }) {
               const total = lib.total || 1;
               const pct = total > 0 ? lib.completed / total : 0;
               const eta = computeETA(lib, now);
+              // Stop-state classification for each row. Order matters:
+              // an explicit engine-side error always wins; otherwise a
+              // partially-complete library on a cancelled job reads
+              // "Stopped", a never-started one reads "Skipped".
+              const neverStarted = jobStopped && lib.status === 'queued';
+              const stoppedShort = jobStopped && !neverStarted
+                && lib.status !== 'error' && pct < 1.0;
+              const barClass = lib.status === 'error' || stoppedShort
+                ? 'error'
+                : (lib.status === 'done' ? 'done' : '');
+              const barText = neverStarted
+                ? 'Skipped'
+                : stoppedShort
+                  ? 'Stopped'
+                  : `${(pct * 100).toFixed(0)}%`;
+              const etaText = stoppedShort || neverStarted ? '-' : eta;
+              // Two-axis cell content for snapshot / direct: derive
+              // phases vs user-tasks from the engine's "4 + N" total
+              // (snapshotter.py :: snapshot_library). Owner phases fill
+              // before user gathers (Phase 1 / Phase 2 split), so the
+              // completed-count first satisfies the 4 phases, then
+              // counts towards user gathers.
+              const showBreakdown = stepsModeBreakdown && lib.total >= SNAPSHOT_OWNER_PHASES;
+              const userTotal = Math.max(0, lib.total - SNAPSHOT_OWNER_PHASES);
+              const phasesDone = Math.min(SNAPSHOT_OWNER_PHASES, lib.completed);
+              const usersDone = Math.max(0, lib.completed - SNAPSHOT_OWNER_PHASES);
+              const stepsCell = showBreakdown
+                ? `phases ${phasesDone}/${SNAPSHOT_OWNER_PHASES} · users ${usersDone}/${userTotal}`
+                : `${lib.completed.toLocaleString()} / ${lib.total.toLocaleString()}`;
               return (
                 <tr key={lib.name}>
                   <td>{lib.name} <StatusDot status={lib.status} /></td>
                   <td>
-                    <div className={`bar-outer ${lib.status === 'error' ? 'error' : ''} ${lib.status === 'done' ? 'done' : ''}`}>
+                    <div className={`bar-outer ${barClass}`}>
                       <div className="bar-inner" style={{ width: `${Math.min(100, pct * 100)}%` }} />
-                      <div className="bar-text">{(pct * 100).toFixed(0)}%</div>
+                      <div className="bar-text">{barText}</div>
                     </div>
                   </td>
-                  <td className="num">{lib.completed.toLocaleString()} / {lib.total.toLocaleString()}</td>
+                  <td className="num">{stepsCell}</td>
                   <td>{lib.phase || '-'}</td>
-                  <td className="mono">{eta}</td>
+                  <td className="mono">{etaText}</td>
                 </tr>
               );
             })}

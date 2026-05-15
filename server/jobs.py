@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import re
 import threading
 import time
 import uuid
@@ -478,6 +479,18 @@ class JobQueue:
                             )
                 except Exception:  # pragma: no cover (defensive)
                     pass
+                # v0.13.x: the engine no longer nulls state._dashboard
+                # in its finally block (that was killing the dashboard
+                # before the post-engine "Finalizing …" labels could
+                # reach the WebSocket). The worker now owns the
+                # cleanup, here at the very end after summary capture
+                # is complete. Fan-out path uses its own delayed
+                # cleanup via _finalise_fan_out_state; the unconditional
+                # null here is the single-job equivalent.
+                try:
+                    state._dashboard = None
+                except Exception:
+                    pass
                 self._record_history(rec)
 
     def _record_history(self, rec: JobRecord) -> None:
@@ -513,7 +526,14 @@ class JobQueue:
         settings["resolved_server_slug"] = server_slug
         rec.params = {k: v for k, v in settings.items() if k != "plex_token"}
 
-        _set_run_timestamp(server_slug)
+        # v0.13.x: resolve the requested library list BEFORE we stamp
+        # the run timestamp so the run-dir name can include the
+        # library names (`run_Plex1_Movies_TV-Shows_20260510_135425/`).
+        # The full strict resolution / mismatch error happens further
+        # down once the engine entrypoint takes over - this pass is
+        # just informational for the slug.
+        _wanted_libs = sorted({str(n) for n in (settings.get("libraries") or [])})
+        _set_run_timestamp(server_slug, libraries=_wanted_libs)
         logger, run_log_dir = _build_logger(settings["log_dir"], settings["verbose"])
         rec.run_log_dir = run_log_dir
         state.MAX_WORKERS = int(settings["workers"])
@@ -580,29 +600,43 @@ class JobQueue:
         else:
             selected = all_sections
 
-        # Hand off to the engine. ``run_snapshot`` returns when every
-        # library is done (or stop_event is set, in which case it
-        # finishes the in-flight ones and returns).
-        run_snapshot(
-            server,
-            selected,
-            settings["output_dir"],
-            logger,
-            run_log_dir,
-            url,
-            skip_collections=bool(settings.get("skip_collections") or False),
-            fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
-            skip_playlists=bool(settings.get("skip_playlists") or False),
-            skip_playlist_prebuild=bool(settings.get("skip_playlist_prebuild") or False),
-            # PR-3 / Phase D - four-flag data-type filter forwarded from
-            # the request (or schedule). The Pydantic validator on
-            # SnapshotJobIn / ScheduleIn already mapped any legacy
-            # skip_* fields onto these include_* defaults.
-            include_watch_history=bool(settings.get("include_watch_history", True)),
-            include_ratings=bool(settings.get("include_ratings", True)),
-            include_playlists=bool(settings.get("include_playlists", True)),
-            include_collections=bool(settings.get("include_collections", True)),
-        )
+        # Per-job watch+ratings strategy override. Sets the ContextVar
+        # _resolve_watch_ratings_strategy() reads at tier 0, ahead of
+        # per-server / global. Empty string = "no override". The
+        # token is reset in the finally below so a subsequent job
+        # picked up by the same worker thread inherits a clean state.
+        _wr_strategy_override = str(settings.get("watch_ratings_filter_strategy") or "")
+        _wr_strategy_token = state._watch_ratings_strategy_override_var.set(_wr_strategy_override)
+
+        try:
+            # Hand off to the engine. ``run_snapshot`` returns when every
+            # library is done (or stop_event is set, in which case it
+            # finishes the in-flight ones and returns).
+            run_snapshot(
+                server,
+                selected,
+                settings["output_dir"],
+                logger,
+                run_log_dir,
+                url,
+                skip_collections=bool(settings.get("skip_collections") or False),
+                fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
+                skip_playlists=bool(settings.get("skip_playlists") or False),
+                skip_playlist_prebuild=bool(settings.get("skip_playlist_prebuild") or False),
+                # PR-3 / Phase D - four-flag data-type filter forwarded from
+                # the request (or schedule). The Pydantic validator on
+                # SnapshotJobIn / ScheduleIn already mapped any legacy
+                # skip_* fields onto these include_* defaults.
+                include_watch_history=bool(settings.get("include_watch_history", True)),
+                include_ratings=bool(settings.get("include_ratings", True)),
+                include_playlists=bool(settings.get("include_playlists", True)),
+                include_collections=bool(settings.get("include_collections", True)),
+            )
+        finally:
+            try:
+                state._watch_ratings_strategy_override_var.reset(_wr_strategy_token)
+            except Exception:
+                pass
 
         # Part B: the engine has returned (every library row reads
         # "Done"), but the job is NOT done - close-logger, run-dir
@@ -692,7 +726,58 @@ class JobQueue:
         settings["resolved_server_slug"] = server_slug
         rec.params = {k: v for k, v in settings.items() if k != "plex_token"}
 
-        _set_run_timestamp(server_slug)
+        # v0.13.x: pre-Replace auto-capture safety belt. Runs BEFORE
+        # the restore so the destination has a rollback point on disk
+        # by the time the engine starts overwriting data. On failure
+        # the helper raises and the restore never fires - "no recovery
+        # point" is exactly the case the belt is supposed to prevent.
+        # The captured snapshot's id is stamped on rec.summary so the
+        # operator can find it on the Snapshots tab later. The basic
+        # state setup (session, MAX_WORKERS, plex_*) must happen first
+        # because the helper reuses them.
+        state.MAX_WORKERS = int(settings["workers"])
+        state.SCROBBLE_WORKERS = int(settings["scrobble_workers"])
+        state._session = _make_session()
+        state._plex_base_url = url
+        state._plex_token = token
+        state._plex_owner_name = owner
+        pre_replace_snapshot_id: Optional[str] = None
+        restore_mode = str(settings.get("mode") or "merge")
+        auto_capture = bool(settings.get("auto_capture_before_replace", True))
+        if restore_mode == "replace" and auto_capture:
+            dest_server_id_for_belt = _resolve_server_id(
+                settings.get("dest_server_name") or settings.get("source_server_name"),
+            )
+            if not dest_server_id_for_belt:
+                raise ValueError(
+                    "Replace restore with auto-capture requires a registered "
+                    "destination server (couldn't resolve a server_id). "
+                    "Re-register the destination from the Servers tab."
+                )
+            pre_replace_snapshot_id = _capture_pre_replace_snapshot(
+                job_id=rec.job_id,
+                settings=settings,
+                dest_server=server,
+                dest_server_id=dest_server_id_for_belt,
+                dest_server_name=str(settings.get("dest_server_name") or settings.get("source_server_name") or ""),
+                dest_url=url,
+            )
+            # Stash on rec.summary so the audit row + UI can show it.
+            rec.summary = {
+                **(rec.summary or {}),
+                "pre_replace_snapshot_id": pre_replace_snapshot_id,
+            }
+
+        # v0.13.x: peek the input files' top-level ``library`` fields so
+        # the restore run-dir name carries the libraries being restored
+        # (`run_Plex1_Movies_TV-Shows_20260510_135425/`). Best-effort -
+        # files we can't peek contribute nothing, and the strict
+        # existence check happens further down.
+        _restore_libs = _peek_libraries_from_inputs(
+            list(settings.get("input_files") or []),
+            settings.get("output_dir") or "./snapshots",
+        )
+        _set_run_timestamp(server_slug, libraries=_restore_libs)
         logger, run_log_dir = _build_logger(settings["log_dir"], settings["verbose"])
         rec.run_log_dir = run_log_dir
         state.MAX_WORKERS = int(settings["workers"])
@@ -710,14 +795,16 @@ class JobQueue:
         # the engine - fail fast with a useful message rather than
         # mid-run with a stack trace.
         #
-        # The web frontend's Run-Job form sends bare filenames pulled
-        # from the snapshot browser (e.g. "Movies_20260510.plexexport.json")
-        # because the directory is implied by the configured output
-        # directory. The CLI may send absolute paths. We try the value
-        # as-is first, then fall back to joining it against the
-        # configured output_dir, so both call shapes work without
-        # the client having to know the engine's working directory
-        # inside the container.
+        # Three resolution attempts, in order:
+        #   1. The value as given (absolute path, or cwd-relative for CLI).
+        #   2. Joined against the configured output_dir - the Run-Job
+        #      form sends bare filenames pulled from the active snapshot
+        #      registry, whose .db files live directly under output_dir.
+        #   3. Joined against ``<output_dir>/legacy/`` - the
+        #      "Import from JSON archive" picker sources its filenames
+        #      from ``server/snapshot_browser.list_snapshots`` which reads
+        #      that legacy archive dir. Bare filenames from that picker
+        #      land here. Also covers manually-converted legacy exports.
         output_dir = settings.get("output_dir") or "./snapshots"
         valid: List[str] = []
         missing: List[str] = []
@@ -730,8 +817,15 @@ class JobQueue:
             if scoped.exists():
                 valid.append(str(scoped))
                 continue
+            legacy_scoped = Path(output_dir) / "legacy" / f
+            if legacy_scoped.exists():
+                valid.append(str(legacy_scoped))
+                continue
             missing.append(f)
-            logger.error(f"Export file not found: {f} (also tried {scoped})")
+            logger.error(
+                "Export file not found: %s (tried %s and %s)",
+                f, scoped, legacy_scoped,
+            )
         if not valid:
             raise ValueError(f"No valid export files found. Missing: {missing}")
 
@@ -756,6 +850,8 @@ class JobQueue:
             include_watch_history=bool(settings.get("include_watch_history", True)),
             include_ratings=bool(settings.get("include_ratings", True)),
             include_collections=bool(settings.get("include_collections", True)),
+            mode=str(settings.get("mode") or "merge"),
+            merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
         )
 
         # Part B: run-level finalize phase so the dashboard doesn't
@@ -827,7 +923,10 @@ class JobQueue:
         src_slug = safe_server_name(src_row["name"])
         dst_slug = safe_server_name(dst_row["name"])
         combined_slug = f"{src_slug}-to-{dst_slug}"
-        _set_run_timestamp(combined_slug)
+        # v0.13.x: libraries are known up-front for direct transfer
+        # (operator picks them from the source). Include in the slug.
+        _direct_libs = sorted({str(n) for n in (settings.get("libraries") or [])})
+        _set_run_timestamp(combined_slug, libraries=_direct_libs)
 
         # Decrypt source + destination tokens once, at the point of
         # use. The plaintexts live in local variables ``src_token`` /
@@ -856,6 +955,50 @@ class JobQueue:
         # are not relevant here - users on the destination match by
         # raw identifier, not friendly name.
         _populate_run_user_context(src_server, source_name=src_name)
+
+        # v0.13.x: pre-Replace safety belt. Direct transfer writes into
+        # the destination using the same primitive as restore, so the
+        # same overwrite semantics apply when mode == "replace". Capture
+        # the destination's pre-state before the engine fires so the
+        # operator has a rollback point if they picked the wrong source.
+        pre_replace_snapshot_id: Optional[str] = None
+        restore_mode = str(settings.get("mode") or "merge")
+        auto_capture = bool(settings.get("auto_capture_before_replace", True))
+        if restore_mode == "replace" and auto_capture:
+            dest_server_id_for_belt = _resolve_server_id(dst_name)
+            if not dest_server_id_for_belt:
+                raise ValueError(
+                    "Replace direct-transfer with auto-capture requires a "
+                    "registered destination server (couldn't resolve a "
+                    "server_id). Re-register the destination from the "
+                    "Servers tab."
+                )
+            # Re-stamp plex_* state for the belt's run_snapshot call so
+            # it reads against the DESTINATION (the engine helpers read
+            # state._plex_token / state._plex_base_url). The restore-phase
+            # values are restored immediately after by the existing setup
+            # below; direct transfer keeps both sides' tokens in local
+            # variables anyway.
+            prev_url = state._plex_base_url
+            prev_tok = state._plex_token
+            state._plex_base_url = dst_row["url"]
+            state._plex_token = dst_token
+            try:
+                pre_replace_snapshot_id = _capture_pre_replace_snapshot(
+                    job_id=rec.job_id,
+                    settings=settings,
+                    dest_server=dst_server,
+                    dest_server_id=dest_server_id_for_belt,
+                    dest_server_name=str(dst_row.get("name") or dst_name),
+                    dest_url=dst_row["url"],
+                )
+            finally:
+                state._plex_base_url = prev_url
+                state._plex_token = prev_tok
+            rec.summary = {
+                **(rec.summary or {}),
+                "pre_replace_snapshot_id": pre_replace_snapshot_id,
+            }
 
         remap: Optional[Tuple[str, str]] = None
         if settings.get("remap_old") and settings.get("remap_new"):
@@ -935,6 +1078,8 @@ class JobQueue:
             include_ratings=bool(settings.get("include_ratings", True)),
             include_playlists=bool(settings.get("include_playlists", True)),
             include_collections=bool(settings.get("include_collections", True)),
+            mode=str(settings.get("mode") or "merge"),
+            merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
         )
 
         # Part B: run-level finalize phase so the dashboard doesn't
@@ -1030,6 +1175,9 @@ class JobQueue:
             include_ratings=bool(settings.get("include_ratings", True)),
             include_playlists=bool(settings.get("include_playlists", True)),
             include_collections=bool(settings.get("include_collections", True)),
+            mode=str(settings.get("mode") or "merge"),
+            merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
+            pre_replace_settings=_build_pre_replace_settings(settings),
         )
         _apply_fan_out_result(rec, result)
 
@@ -1085,6 +1233,9 @@ class JobQueue:
             include_watch_history=bool(settings.get("include_watch_history", True)),
             include_ratings=bool(settings.get("include_ratings", True)),
             include_collections=bool(settings.get("include_collections", True)),
+            mode=str(settings.get("mode") or "merge"),
+            merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
+            pre_replace_settings=_build_pre_replace_settings(settings),
         )
         _apply_fan_out_result(rec, result)
 
@@ -1128,6 +1279,23 @@ def _apply_fan_out_result(rec: JobRecord, result: "FanOutResult") -> None:
     destination failed (which the worker turns into ``STATE_FAILED``
     with ``rec.error``).
     """
+    # v0.13.x: copy per-destination safety-belt snapshot ids onto the
+    # parent JobRecord's summary so the operator can find every
+    # destination's rollback point on the Snapshots tab. The single-
+    # destination paths set ``summary["pre_replace_snapshot_id"]``
+    # (scalar); fan-out sets ``summary["pre_replace_snapshots"]`` as
+    # ``{dest_name: snapshot_id}`` so the two shapes are
+    # distinguishable downstream.
+    pre_map: Dict[str, str] = {}
+    for d in result.destinations:
+        if d.pre_replace_snapshot_id:
+            pre_map[d.dest_name] = d.pre_replace_snapshot_id
+    if pre_map:
+        rec.summary = {
+            **(rec.summary or {}),
+            "pre_replace_snapshots": pre_map,
+        }
+
     if result.cancelled and not result.has_failures():
         raise _JobCancelled("Fan-out cancelled before all destinations completed.")
     if result.has_failures():
@@ -1287,32 +1455,148 @@ def _populate_run_user_context(
             pass
 
 
-def _set_run_timestamp(slug: str) -> None:
+_LIB_SLUG_STRIP = re.compile(r'[\\/:*?"<>|]+')
+_LIBRARY_FIELD_RE = re.compile(rb'"library"\s*:\s*"([^"]+)"')
+_LIBRARIES_IN_SLUG = 3  # cap before "+N" overflow kicks in
+
+
+def _safe_lib_slug(name: str) -> str:
+    """Sanitize one library name for use inside a filesystem path.
+
+    Replaces whitespace with hyphens and strips characters that would
+    cause trouble on Windows / macOS / Linux. Empty input -> "".
+    """
+    if not name:
+        return ""
+    cleaned = _LIB_SLUG_STRIP.sub("", name).strip()
+    return re.sub(r"\s+", "-", cleaned) or ""
+
+
+def _libraries_slug(libraries: Optional[List[str]]) -> str:
+    """Compose a short, readable libraries fragment for the run-dir name.
+
+    Caps the visible list at ``_LIBRARIES_IN_SLUG`` and appends ``+N``
+    for the rest so long lists don't blow the dir name into something
+    unreadable. Returns ``""`` when no libraries are supplied (the
+    caller's slug then falls back to server-only).
+
+    Example: ``["Movies", "TV Shows", "Audio-Books", "Music"]`` ->
+    ``"Movies_TV-Shows_Audio-Books+1"``.
+    """
+    if not libraries:
+        return ""
+    parts: List[str] = []
+    for name in libraries:
+        slug = _safe_lib_slug(str(name))
+        if slug:
+            parts.append(slug)
+    if not parts:
+        return ""
+    if len(parts) <= _LIBRARIES_IN_SLUG:
+        return "_".join(parts)
+    overflow = len(parts) - _LIBRARIES_IN_SLUG
+    return "_".join(parts[:_LIBRARIES_IN_SLUG]) + f"+{overflow}"
+
+
+def _peek_library_field(path: Path) -> Optional[str]:
+    """Read the first few KB of a .plexexport.json / .plexbackup.json
+    file and pull the top-level ``"library": "..."`` value out.
+
+    Used by the restore path to enrich the run-dir slug with the
+    libraries being restored, since those names live in the export
+    files (not the job settings). Robust to large files: never reads
+    more than 8KB; never raises.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8192)
+        m = _LIBRARY_FIELD_RE.search(head)
+        if m:
+            return m.group(1).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    return None
+
+
+def _peek_libraries_from_inputs(
+    input_files: List[str], output_dir: str,
+) -> List[str]:
+    """Best-effort: walk every input_file path and pull its top-level
+    ``library`` field. Mirrors the three-attempt resolution the strict
+    file-existence check uses below (direct path, output_dir-scoped,
+    legacy/ -scoped). Files that can't be peeked contribute nothing -
+    the dir slug just falls back to whatever we did find."""
+    libs: List[str] = []
+    for f in input_files or []:
+        for candidate in (
+            Path(f),
+            Path(output_dir or "./snapshots") / f,
+            Path(output_dir or "./snapshots") / "legacy" / f,
+        ):
+            if candidate.is_file():
+                name = _peek_library_field(candidate)
+                if name:
+                    libs.append(name)
+                break
+    return libs
+
+
+def _set_run_timestamp(
+    slug: str,
+    libraries: Optional[List[str]] = None,
+) -> None:
     """
     Re-derive ``state._run_timestamp`` so the current run's log dir
-    and snapshot filenames are prefixed with the server's slug.
+    and snapshot filenames are prefixed with the server's slug and,
+    when known, the libraries the run is about.
 
     The engine reads ``state._run_timestamp`` lazily inside
     :func:`services.logging_ops.setup_logging` and
     :func:`services.snapshotter.snapshot_library`, so we can reassign it
     here without touching either of those modules.
 
-    Example: ``slug="Plex1"`` →
-        log dir   : plex_logs/run_Plex1_20260510_135425/
-        filename  : Movies_Plex1_20260510_135425.plexexport.json
+    Examples:
+      ``slug="Plex1", libraries=None`` ->
+          log dir   : plex_logs/run_Plex1_20260510_135425/
+          filename  : Movies_Plex1_20260510_135425.plexexport.json
+
+      ``slug="Plex1", libraries=["Movies","TV Shows"]`` ->
+          log dir   : plex_logs/run_Plex1_Movies_TV-Shows_20260510_135425/
+
+      ``slug="Plex1", libraries=["Movies","TV","Audio","Music","Photos"]`` ->
+          log dir   : plex_logs/run_Plex1_Movies_TV_Audio+2_20260510_135425/
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    state._run_timestamp = f"{slug}_{ts}" if slug and slug != "adhoc" else ts
+    libs_part = _libraries_slug(libraries)
+    if slug and slug != "adhoc":
+        if libs_part:
+            state._run_timestamp = f"{slug}_{libs_part}_{ts}"
+        else:
+            state._run_timestamp = f"{slug}_{ts}"
+    else:
+        state._run_timestamp = f"{libs_part}_{ts}" if libs_part else ts
 
 
 def _build_logger(log_dir: str, verbose: bool) -> Tuple[logging.Logger, str]:
     """
     Set up the per-run logger the same way :func:`plexmigrate.main` does.
-    Returns ``(logger, run_log_dir)``.
+    Returns ``(logger, run_log_dir)``. When the operator has disabled
+    run logging via the global ``run_logging_enabled`` setting,
+    ``setup_logging`` skips the per-run directory entirely and returns
+    a console-only logger; ``run_log_dir`` is then the empty string so
+    downstream finalize / library-log writers know to no-op.
     """
-    logger = setup_logging(log_dir, verbose)
-    run_log_dir = str(state._run_log_dir) if state._run_log_dir else log_dir
-    return logger, run_log_dir
+    # Resolve the global toggle (default true). Per-server is
+    # intentionally out of scope for run logging - one global switch.
+    run_logging_enabled = bool(
+        (load_settings() or {}).get("run_logging_enabled", True)
+        if (load_settings() or {}).get("run_logging_enabled") is not None
+        else True
+    )
+    logger = setup_logging(log_dir, verbose, run_logging_enabled=run_logging_enabled)
+    if state._run_log_dir is None:
+        return logger, ""
+    return logger, str(state._run_log_dir)
 
 
 def _close_logger(logger: logging.Logger, run_log_dir: str) -> None:
@@ -1351,6 +1635,211 @@ def _resolve_server_id(source_server_name: Optional[str]) -> str:
     return ""
 
 
+def _build_pre_replace_settings(settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Build the per-destination safety-belt payload for fan-out workers.
+
+    Returns ``None`` when no belt should fire - either Merge mode or
+    the operator explicitly disabled auto-capture. Returns a small
+    dict with just the fields _capture_pre_replace_snapshot needs
+    when the belt should run.
+
+    Per-destination snapshots all share the same data-type filter
+    (the upcoming Replace's include_* flags) so they capture exactly
+    what's about to be overwritten on each destination. Log dir +
+    output dir + verbose are inherited from the parent job; the
+    helper writes its own per-destination sub-log-dir underneath.
+    """
+    if str(settings.get("mode") or "merge") != "replace":
+        return None
+    if not bool(settings.get("auto_capture_before_replace", True)):
+        return None
+    return {
+        "include_watch_history": bool(settings.get("include_watch_history", True)),
+        "include_ratings":       bool(settings.get("include_ratings", True)),
+        "include_playlists":     bool(settings.get("include_playlists", True)),
+        "include_collections":   bool(settings.get("include_collections", True)),
+        "log_dir":               settings.get("log_dir") or "./plex_logs",
+        "output_dir":            settings.get("output_dir") or "./snapshots",
+        "verbose":               bool(settings.get("verbose") or False),
+    }
+
+
+def _capture_pre_replace_snapshot(
+    *,
+    job_id: str,
+    settings: Dict[str, Any],
+    dest_server: Any,
+    dest_server_id: str,
+    dest_server_name: str,
+    dest_url: str,
+) -> str:
+    """
+    v0.13.x: pre-Replace auto-capture safety belt.
+
+    Fires when ``mode == "replace"`` and the operator has the safety
+    belt on (the default). Captures a fresh snapshot of the destination
+    BEFORE the Replace runs so the operator has a rollback point. The
+    snapshot is registered in ``snapshots.db`` with a ``[pre-replace
+    safety]`` prefix in its name so it's distinguishable in the
+    Snapshots tab.
+
+    Scope: every library on the destination, every data type the
+    upcoming Replace will touch (matches the restore's include_*
+    flags). The captured payload is what the operator would need to
+    restore back to the pre-Replace state, so capturing exactly the
+    types about to be overwritten is the right contract.
+
+    Returns the registered snapshot's id on success. **Raises on
+    failure** - the caller MUST abort the Replace, since proceeding
+    without a recovery point is what the safety belt is supposed to
+    prevent. The exception's message is suitable to surface on
+    ``rec.error`` directly.
+
+    State handling: this helper restamps ``state._run_timestamp`` to a
+    pre-Replace slug, builds its own log subdir, runs the engine
+    pipeline, and writes the snapshot artifacts. The caller is then
+    free to re-stamp the timestamp + build its own logger for the
+    restore phase - the engine's ``reset_run_state`` at the top of
+    ``run_restore`` clears the per-run accumulators this helper
+    populated.
+    """
+    log = logging.getLogger("plexmigrate.server.jobs")
+    log.info(
+        "Pre-Replace safety belt: capturing destination snapshot of %r before Replace.",
+        dest_server_name,
+    )
+
+    # Build a dedicated sub-log-dir for the pre-snapshot so its runtime/
+    # errors/media files don't interleave with the upcoming restore's.
+    # Lives under <log_dir>/pre_replace_<slug>_<ts>/ when run_logging
+    # is enabled; an empty run_log_dir on the engine's books means the
+    # operator turned logging off globally - that's fine, the pre-snapshot
+    # still runs.
+    parent_log_dir = settings.get("log_dir") or "./plex_logs"
+    pre_log_root = str(Path(parent_log_dir) / "pre_replace")
+    pre_logger, pre_run_log_dir = _build_logger(
+        pre_log_root, bool(settings.get("verbose") or False),
+    )
+
+    # Distinct run-timestamp slug so the pre-snapshot's filename and
+    # run-log directory don't clash with the restore's. The restore
+    # phase below re-stamps when it builds its own logger.
+    pre_slug = f"{safe_server_name(dest_server_name)}_pre_replace"
+    _set_run_timestamp(pre_slug, libraries=None)
+
+    # Engine state setup. MAX_WORKERS / SCROBBLE_WORKERS / _session
+    # are already configured by the caller - the pre-snapshot reuses
+    # them. We do switch _snapshot_server_id and _run_trigger so the
+    # capture's audit row records the right server + provenance.
+    prev_trigger = getattr(state, "_run_trigger", "") or ""
+    prev_schedule = getattr(state, "_run_schedule_name", "") or ""
+    prev_snapshot_server_id = getattr(state, "_snapshot_server_id", "") or ""
+    state._snapshot_server_id = dest_server_id
+    state._run_trigger = "pre_replace_safety_belt"
+    state._run_schedule_name = ""
+
+    # The pre-snapshot covers every library on the destination - we
+    # don't know which subset the Replace payload covers without
+    # parsing the input files, so being inclusive is the right
+    # default. Data-type filter mirrors the Replace so the rollback
+    # captures exactly what's about to change.
+    all_sections = list(dest_server.library.sections())
+
+    include_wh = bool(settings.get("include_watch_history", True))
+    include_ra = bool(settings.get("include_ratings", True))
+    include_pl = bool(settings.get("include_playlists", True))
+    include_co = bool(settings.get("include_collections", True))
+
+    # Synthetic rec-shaped object so _capture_snapshot_after_run can
+    # read the include_* flags and stamp errors without polluting the
+    # parent restore's JobRecord. ``error`` writes are captured here
+    # and re-raised below; ``params`` carries the include_* gating.
+    pre_job_id = f"{job_id}:pre-replace"
+
+    class _PreSnapshotRec:
+        job_id = pre_job_id
+        params: Dict[str, Any] = {
+            "include_watch_history": include_wh,
+            "include_ratings": include_ra,
+            "include_playlists": include_pl,
+            "include_collections": include_co,
+            # Never auto-render the JSON sidecar for pre-Replace
+            # snapshots. The operator wants the .db on disk; the
+            # JSON copy is on-demand via the Exports tab if they
+            # ever need it.
+            "prebuild_json_sidecar": False,
+        }
+        error: Optional[str] = None
+        run_log_dir: str = pre_run_log_dir
+
+    pre_rec = _PreSnapshotRec()
+    output_dir = settings.get("output_dir") or "./snapshots"
+
+    # Push an activity-feed entry so the dashboard tells the operator
+    # what's happening (otherwise the UI would look stuck while the
+    # pre-snapshot runs against a large destination).
+    if state.get_dashboard() is not None:
+        try:
+            state.get_dashboard().push_activity(
+                "phase", "-",
+                f"Pre-Replace safety belt: snapshotting {dest_server_name!r}",
+            )
+            state.get_dashboard().set_finalizing("capturing pre-Replace safety snapshot")
+        except Exception:
+            pass
+
+    try:
+        run_snapshot(
+            dest_server,
+            all_sections,
+            output_dir,
+            pre_logger,
+            pre_run_log_dir,
+            dest_url,
+            include_watch_history=include_wh,
+            include_ratings=include_ra,
+            include_playlists=include_pl,
+            include_collections=include_co,
+        )
+        _close_logger(pre_logger, pre_run_log_dir)
+        _finalise_run_dir(pre_run_log_dir)
+
+        snapshot_id = _capture_snapshot_after_run(
+            rec=pre_rec,  # type: ignore[arg-type]
+            server_id=dest_server_id,
+            server_name=dest_server_name,
+            output_dir=output_dir,
+            server_slug=pre_slug,
+            libraries=[s.title for s in all_sections],
+            snapshot_name_prefix="[pre-replace safety]",
+        )
+    finally:
+        # Restore the parent run's trigger / schedule / server-id so
+        # the restore phase's audit attribution is correct. The
+        # _run_timestamp re-stamp happens in the caller, not here.
+        state._run_trigger = prev_trigger
+        state._run_schedule_name = prev_schedule
+        state._snapshot_server_id = prev_snapshot_server_id
+
+    if not snapshot_id:
+        # Either payload was empty (engine never produced output) or
+        # snapshot_id wasn't returned. Either way the rollback point
+        # is not viable - refuse to proceed.
+        err = pre_rec.error or "pre-Replace snapshot produced no registered artifact"
+        raise RuntimeError(
+            f"Pre-Replace safety snapshot failed: {err}. "
+            "Replace aborted to prevent data loss without a recovery point. "
+            "Re-run with auto-capture disabled to bypass (NOT recommended)."
+        )
+
+    log.info(
+        "Pre-Replace safety belt: captured snapshot %s for %r (rollback point).",
+        snapshot_id, dest_server_name,
+    )
+    return snapshot_id
+
+
 def _capture_snapshot_after_run(
     *,
     rec: JobRecord,
@@ -1359,7 +1848,8 @@ def _capture_snapshot_after_run(
     output_dir: str,
     server_slug: str,
     libraries: List[str],
-) -> None:
+    snapshot_name_prefix: str = "",
+) -> Optional[str]:
     """
     PR-13 snapshot capture (Rule 1 - payload-direct edition).
 
@@ -1389,14 +1879,14 @@ def _capture_snapshot_after_run(
         msg = "Snapshot artifact capture skipped: no registered server_id."
         rec.error = msg
         log.warning("%s job=%r", msg, rec.job_id)
-        return
+        return None
 
     run_ts = state._run_timestamp or ""
     if not run_ts:
         msg = "Snapshot artifact capture skipped: state._run_timestamp empty."
         rec.error = msg
         log.warning("%s job=%r", msg, rec.job_id)
-        return
+        return None
 
     from server import snapshot_capture, snapshot_registry
     # Compose a friendly snapshot_name from the registry fields the
@@ -1411,6 +1901,13 @@ def _capture_snapshot_after_run(
         libraries=libraries,
         captured_at=captured_at_ts,
     )
+    # v0.13.x: optional prefix lets callers tag auto-captured snapshots
+    # so the Snapshots tab shows them distinctly from manual runs. The
+    # pre-Replace safety belt uses "[pre-replace safety]" to mark its
+    # rollback points - operators can find them by name when they need
+    # to recover from a bad Replace.
+    if snapshot_name_prefix:
+        snapshot_name = f"{snapshot_name_prefix} {snapshot_name}"
 
     # Capture-time include_* flags drive BOTH the registry's
     # captured_types_json field AND the per-table copy scope inside
@@ -1477,7 +1974,7 @@ def _capture_snapshot_after_run(
         )
         rec.error = msg
         log.warning("%s job=%r", msg, rec.job_id)
-        return
+        return None
     try:
         capture_counts = snapshot_capture.build_snapshot_db_from_payloads(
             snapshot_path=snapshot_db_path,
@@ -1502,6 +1999,16 @@ def _capture_snapshot_after_run(
 
     row_counts = {k: v for k, v in capture_counts.items() if k != "file_size"}
     file_size = int(capture_counts.get("file_size") or 0)
+
+    # v0.13.x: granular finalize labels so the dashboard reports each
+    # post-engine step. Pre-fix, the only post-100% signal was a single
+    # "writing snapshot to database" label set before the heavy build
+    # ran - everything else was silent. Now: build_db -> registry insert
+    # -> optional sidecar render each get their own labelled phase, and
+    # the operator sees progress all the way to STATE_COMPLETED.
+    _dash_finalize = state.get_dashboard()
+    if _dash_finalize is not None:
+        _dash_finalize.set_finalizing("registering snapshot")
 
     try:
         registered = snapshot_registry.register(
@@ -1535,6 +2042,8 @@ def _capture_snapshot_after_run(
         # the first Download click is instant. Off by default - this
         # is the legacy v0.11-era behaviour brought back as a checkbox.
         if rec.params.get("prebuild_json_sidecar"):
+            if _dash_finalize is not None:
+                _dash_finalize.set_finalizing("building JSON sidecar")
             t0 = time.time()
             sidecar = snapshot_registry.materialise_sidecar(registered["id"])
             if sidecar:
@@ -1555,6 +2064,12 @@ def _capture_snapshot_after_run(
         log.exception("snapshot_registry.register failed for %s", snapshot_db_path)
         raise
 
+    # v0.13.x: surface the snapshot id back to the caller. The
+    # pre-Replace safety belt path stashes it on rec.summary so the
+    # operator can recover the pre-restore state if the Replace
+    # turned out to be wrong. Regular snapshot jobs ignore the return.
+    return str(registered["id"]) if isinstance(registered, dict) and registered.get("id") else None
+
 
 def _finalise_run_dir(run_log_dir: str) -> None:
     """
@@ -1563,6 +2078,9 @@ def _finalise_run_dir(run_log_dir: str) -> None:
     run does. Best-effort: a rename failure on a locked file is logged
     and ignored - the logs themselves are still readable.
     """
+    # Run-logging-disabled path: no run dir to rename.
+    if not run_log_dir:
+        return
     p = Path(run_log_dir)
     if not p.exists():
         return

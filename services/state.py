@@ -174,6 +174,18 @@ _run_timestamp_var: contextvars.ContextVar = contextvars.ContextVar(
     # context anyway.
     default="",
 )
+# v0.13.x: MDC-style destination context for fan-out logging. Set at
+# the top of each fan-out destination worker so every log record
+# emitted in that worker's thread carries an identifying tag. The
+# DestinationContextFilter in services/logging_ops.py stamps records
+# from this ContextVar; per-destination FileHandlers filter on the
+# stamp to route their records into per-destination files without the
+# cross-contamination caveat that the prior shared-handler design had.
+# Empty default = "not in fan-out" - records emitted in single-job
+# mode get an empty destination tag and land in the normal run log.
+_destination_var: contextvars.ContextVar = contextvars.ContextVar(
+    "plexmigrate_destination", default="",
+)
 # v0.9.7 Item 4: gate for the dashboard's ``current_user`` field.
 # True only during a direct-transfer run with a non-empty
 # ``user_filter`` (i.e. the operator explicitly narrowed the run to
@@ -213,6 +225,17 @@ _resolver_allow_filepath_var: contextvars.ContextVar = contextvars.ContextVar(
 )
 _resolver_allow_fuzzy_var: contextvars.ContextVar = contextvars.ContextVar(
     "plexmigrate_resolver_allow_fuzzy", default=True,
+)
+
+# Per-job watch+ratings filter strategy override. Set by the job
+# runner at run start from the JobIn / ScheduleIn payload; cleared on
+# finally. ``""`` (the default) means "inherit from per-server / global
+# / built-in default" — same semantics as the empty radio option in
+# the JobFormPanel UI. Valid non-empty values: "smart", "force_bulk",
+# "force_server_side". Read by
+# ``services.snapshotter._resolve_watch_ratings_strategy``.
+_watch_ratings_strategy_override_var: contextvars.ContextVar = contextvars.ContextVar(
+    "plexmigrate_watch_ratings_strategy_override", default="",
 )
 
 # Per-snapshot-run in-memory payload collector.
@@ -345,6 +368,7 @@ _TLS_BACKED: Dict[str, contextvars.ContextVar] = {
     "_failure_categories": _failure_categories_var,
     "_resolver_allow_filepath": _resolver_allow_filepath_var,
     "_resolver_allow_fuzzy": _resolver_allow_fuzzy_var,
+    "_destination": _destination_var,
 }
 
 
@@ -713,6 +737,14 @@ def reset_run_state() -> None:
     # next ``_run_direct`` call sets this True iff a user filter is
     # active; standard snapshot / import always leaves it False.
     _current_user_visible_var.set(False)
+    # v0.13.x note: ``_destination`` is intentionally NOT reset here.
+    # Fan-out workers set it BEFORE the engine entrypoint runs, and
+    # the engine entrypoint calls reset_run_state at its top; clearing
+    # ``_destination`` would wipe the worker's MDC tag. Single-job
+    # mode never sets ``_destination`` so it stays at its default
+    # empty string anyway, and a fresh ContextVar context (every
+    # fan-out worker gets one) inherits the empty default until the
+    # worker sets its own value.
     # v0.9.6: wipe HTTP telemetry on the dashboard. The dashboard
     # instance is owned by the next-run setup; if one is already
     # attached (server mode reuses placeholders) clear its state too.
