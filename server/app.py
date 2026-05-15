@@ -55,6 +55,7 @@ from server.models import (
     RestoreJobIn,
     RestoreFromSnapshotIn,
     JobStatusOut,
+    PinPreflightIn,
     ScheduleIn,
     ServerIn,
     TestUnsavedIn,
@@ -72,6 +73,148 @@ runtime_patches.enable_headless_mode()
 
 
 log = logging.getLogger("plexmigrate.server")
+
+
+# ── media.db boot-time auto-archive (v0.15) ─────────────────────────────────
+#
+# The v0.15 schema break introduced ``library_sections`` as a NOT NULL
+# anchor referenced by every per-server row. Older media.db files cannot
+# be migrated in place because the original library identity is gone -
+# the rows were written without a section_key column, so there is no
+# safe value to backfill with. The right behaviour is to retire the old
+# database and let the next snapshot run rebuild it from live Plex
+# data; existing snapshot .db files are not affected (they remain
+# readable until the operator chooses to re-capture).
+#
+# This function runs ONCE per process at boot, BEFORE
+# ``media_db.init_media_db()``. It is deliberately a top-level module
+# function (not nested inside ``create_app``) so the boot sequence is
+# easy to read in stack traces and so operators inspecting startup can
+# see the archive step by name.
+
+
+def _archive_old_media_db_if_needed(logger: logging.Logger) -> None:
+    """
+    Inspect the on-disk ``media.db`` file. If its highest applied
+    schema_version is below :data:`server.media_db.CURRENT_SCHEMA_VERSION`,
+    rename the file (and any ``-wal`` / ``-shm`` sidecars) to a
+    timestamped ``.pre-vN.bak`` so the subsequent ``init_media_db()``
+    call builds a fresh database.
+
+    No-op when:
+      * ``media.db`` does not exist (first-ever boot).
+      * The file's schema_version is already at or above the
+        current build's requirement.
+      * The file is unreadable as SQLite (corruption) - we log
+        and leave it alone so the operator can recover manually.
+    """
+    import sqlite3
+    import time
+
+    # Lazy import: we MUST NOT call ``init_media_db`` from here, but
+    # the path helper + version constant are safe to read.
+    from server import media_db
+
+    db_path = media_db._db_path()
+    if not db_path.is_file():
+        logger.info(
+            "media.db not present at %s; will be created fresh on init.",
+            db_path,
+        )
+        return
+
+    # Read-only probe via URI form so an interrupted previous boot's
+    # journal can't be auto-played here.
+    try:
+        probe = sqlite3.connect(
+            f"file:{db_path}?mode=ro", uri=True, timeout=5.0,
+        )
+    except sqlite3.OperationalError:
+        logger.warning(
+            "media.db at %s exists but cannot be opened read-only for "
+            "the schema-version probe; leaving in place. init_media_db "
+            "will raise loudly if the file is incompatible.",
+            db_path,
+        )
+        return
+
+    try:
+        try:
+            row = probe.execute(
+                "SELECT MAX(version) AS v FROM schema_version"
+            ).fetchone()
+            observed = int(row[0] or 0) if row else 0
+        except sqlite3.OperationalError:
+            # No schema_version table - the file is pre-v0.12.0 (which
+            # introduced media.db) or otherwise unidentifiable. Treat
+            # as version 0 and archive.
+            observed = 0
+    finally:
+        try:
+            probe.close()
+        except Exception:
+            pass
+
+    required = int(media_db.CURRENT_SCHEMA_VERSION)
+    if observed >= required:
+        logger.info(
+            "media.db schema_version=%d is current (required >=%d); no archive needed.",
+            observed, required,
+        )
+        return
+
+    # Compose the archive suffix. Timestamp guards against multiple
+    # archives in the same upgrade cycle (e.g. operator restarts the
+    # container mid-upgrade).
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    archive_suffix = f".pre-v{required}-{ts}.bak"
+    archive_path = db_path.with_suffix(db_path.suffix + archive_suffix)
+    wal_path = db_path.with_name(db_path.name + "-wal")
+    shm_path = db_path.with_name(db_path.name + "-shm")
+
+    # Rename the main file first. If that fails, abort the archive
+    # entirely - half-renamed sidecars without the main DB would leave
+    # init_media_db confused. The rename is atomic on POSIX; on Windows
+    # a target-exists check is required, but our timestamped suffix
+    # makes a collision improbable.
+    try:
+        if archive_path.exists():
+            # Should not happen given the timestamp, but be defensive.
+            raise FileExistsError(
+                f"archive target already exists: {archive_path}"
+            )
+        db_path.rename(archive_path)
+    except OSError as exc:
+        logger.error(
+            "Could not archive outdated media.db (%s, schema_version=%d, "
+            "required>=%d): %s. init_media_db will run against the "
+            "existing file and likely raise.",
+            db_path, observed, required, exc,
+        )
+        return
+
+    # Best-effort sidecar moves: WAL / SHM are coordination files for
+    # the active connection only; if the move fails they will be
+    # recreated by the next open. Don't fail the boot for these.
+    for sidecar in (wal_path, shm_path):
+        if not sidecar.exists():
+            continue
+        try:
+            sidecar.rename(
+                sidecar.with_name(sidecar.name + archive_suffix)
+            )
+        except OSError:
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+
+    logger.warning(
+        "Archived outdated media.db (schema_version=%d, required>=%d) to %s. "
+        "A fresh database will be initialised; existing snapshot .db files "
+        "are unaffected and will continue to function until re-captured.",
+        observed, required, archive_path,
+    )
 
 
 # ── App factory ──────────────────────────────────────────────────────────────
@@ -355,10 +498,77 @@ def _register_lifecycle(app: FastAPI) -> None:
         except Exception:  # pragma: no cover (defensive)
             log.exception("Refresh-token cleanup init failed; continuing.")
 
+        # v0.13.x: stale-sidecar housekeeping. Generated
+        # ``.plexexport.json`` sidecars live next to their snapshot
+        # ``.db`` and are re-materialisable on demand, so we don't
+        # need to hold them on disk after the download window. The
+        # TTL is operator-tunable (default 5 min); ``0`` disables.
+        # Sweep cadence is a fixed 60 s tick so a 5-minute TTL is
+        # honoured within 6 minutes worst-case. Matches the
+        # refresh-token cleanup pattern: one startup sweep + a daemon
+        # thread that loops on a sleep.
+        try:
+            from server import snapshot_registry as _sr_for_reap
+            import threading as _t_reap
+
+            # Startup sweep: catch anything that lingered across a
+            # restart or container reboot.
+            try:
+                stats = _sr_for_reap.reap_stale_sidecars()
+                if stats.get("reaped") or stats.get("missing"):
+                    log.info(
+                        "Sidecar sweep at startup: reaped=%d missing=%d skipped=%d errors=%d",
+                        stats["reaped"], stats["missing"],
+                        stats["skipped"], stats["errors"],
+                    )
+            except Exception:
+                log.exception("Sidecar startup sweep failed.")
+
+            def _sidecar_sweep_loop() -> None:
+                while True:
+                    # Sleep first so a quick reboot/test cycle doesn't
+                    # double-sweep on top of the startup pass above.
+                    import time as _time_inner
+                    _time_inner.sleep(60)
+                    try:
+                        n = _sr_for_reap.reap_stale_sidecars()
+                        if n.get("reaped") or n.get("missing"):
+                            log.info(
+                                "Sidecar sweep: reaped=%d missing=%d skipped=%d errors=%d",
+                                n["reaped"], n["missing"],
+                                n["skipped"], n["errors"],
+                            )
+                    except Exception:
+                        log.exception("Sidecar sweep tick failed.")
+
+            _t_reap.Thread(
+                target=_sidecar_sweep_loop,
+                name="sidecar-sweep",
+                daemon=True,
+            ).start()
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("Sidecar sweep init failed; continuing.")
+
         # v0.12.0: initialise the media-state database (creates
         # media.db on first boot, runs pending migrations on every
         # boot). Always runs - the DB is the v0.12.x+ data layer
         # foundation regardless of whether auth is enabled.
+        #
+        # v0.15: BEFORE init runs, retire any media.db whose
+        # schema_version is below CURRENT_SCHEMA_VERSION. The v0.15
+        # break introduced library_sections as a NOT NULL anchor on
+        # every per-server row, which cannot be backfilled - the
+        # original library identity is gone once the row was written
+        # without it. Retiring rather than migrating means the next
+        # snapshot run rebuilds media.db cleanly from live Plex data.
+        try:
+            _archive_old_media_db_if_needed(log)
+        except Exception:  # pragma: no cover (defensive)
+            log.exception(
+                "media.db pre-init archive check failed; init will "
+                "still run and may fail loudly if the schema is "
+                "incompatible."
+            )
         try:
             from server import media_db
             media_db.init_media_db()
@@ -452,13 +662,20 @@ def _register_lifecycle(app: FastAPI) -> None:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _auto_sync_managed_users(server_id: str) -> None:
+def _auto_sync_managed_users(server_id: str, *, force_capture: bool = False) -> None:
     """
-    PR-11 - fire a best-effort managed-users sync for one server.
-    Used by the server-connect hooks (create / update / test) so the
-    DB stays warm without operator action. Swallows all exceptions:
-    sync failures must NOT block the surrounding server-registry call
-    from succeeding.
+    PR-11 - fire a best-effort managed-users metadata sync for one
+    server, then PR-12 fires a best-effort per-user token capture for
+    the same server. Used by the server-connect hooks (create / update
+    / test) so the DB stays warm without operator action. Swallows
+    all exceptions: sync or capture failures must NOT block the
+    surrounding server-registry call from succeeding.
+
+    PR-12 - the token-capture half is rate-limited per server (see
+    ``user_token_capture_throttle_per_hour`` in settings). When this
+    function is called by an explicit operator action that should
+    bypass the throttle (e.g. a "Refresh users" button), pass
+    ``force_capture=True``.
     """
     try:
         from server import media_db
@@ -478,6 +695,58 @@ def _auto_sync_managed_users(server_id: str) -> None:
             "Auto-sync managed users failed unexpectedly for server %r",
             server_id,
         )
+
+    # PR-12 - per-user token capture, throttled per server. PIN-protected
+    # users without a stored PIN are silently skipped here; the
+    # preflight check surfaces them to the operator before each job.
+    try:
+        from server import user_capture
+        cap = user_capture.capture_managed_user_tokens(
+            server_id, force=force_capture, logger=log,
+        )
+        if cap.get("throttled"):
+            log.debug(
+                "User-token capture throttled for server %r (default 4/hour/server)",
+                server_id,
+            )
+        elif cap.get("captured"):
+            log.info(
+                "Captured %d per-user auth token(s) for server %r",
+                cap["captured"], server_id,
+            )
+        for err in (cap.get("errors") or []):
+            log.debug("user_capture %r: %s", server_id, err)
+    except Exception:  # pragma: no cover (defensive)
+        log.exception(
+            "Auto-capture user tokens failed unexpectedly for server %r",
+            server_id,
+        )
+
+
+# ── PR-12: preflight acknowledgement re-mapping ─────────────────────────────
+
+def _apply_preflight_ack(params: Dict[str, Any]) -> None:
+    """
+    Map the public ``pin_preflight_acknowledged`` / ``pin_preflight_at_risk``
+    fields a job-submit body may carry onto the underscore-prefixed
+    synthetic params the engine expects on a JobRecord. Called by every
+    job endpoint after ``body.model_dump`` so the convention is uniform.
+
+    No-op when the operator never saw the modal: the flags default to
+    False/None on the model, get stripped by ``exclude_none=True``,
+    and we drop the False ack defensively.
+    """
+    ack = bool(params.pop("pin_preflight_acknowledged", False))
+    at_risk_raw = params.pop("pin_preflight_at_risk", None)
+    if not ack:
+        return
+    params["_pin_preflight_acknowledged"] = True
+    if isinstance(at_risk_raw, list):
+        params["_pin_preflight_at_risk"] = [
+            str(x) for x in at_risk_raw if isinstance(x, str)
+        ]
+    else:
+        params["_pin_preflight_at_risk"] = []
 
 
 # ── Routes ───────────────────────────────────────────────────────────────────
@@ -1088,6 +1357,27 @@ def _register_routes(app: FastAPI) -> None:
             })
         return out
 
+    @app.post("/api/job/preflight-pin-check")
+    def post_job_preflight_pin_check(body: PinPreflightIn) -> Dict[str, Any]:
+        """
+        PR-12 preflight. Returns the list of managed users in the
+        about-to-submit job's scope who have neither a stored auth
+        token nor a stored Plex Home PIN in media.db. The frontend
+        renders a warning modal when the response contains at-risk
+        users and submits with ``pin_preflight_acknowledged=true`` if
+        the operator clicks Continue anyway.
+
+        Read-only: no side effects, no mutation of any store. Any
+        logged-in operator can call it.
+        """
+        from server import preflight
+        return preflight.compute_pin_preflight(
+            mode=body.mode,
+            source_server_name=body.source_server_name,
+            dest_server_names=body.dest_server_names,
+            user_filter=body.user_filter,
+        )
+
     @app.post("/api/job/snapshot")
     def post_job_export(body: SnapshotJobIn) -> Dict[str, Any]:
         """
@@ -1109,6 +1399,7 @@ def _register_routes(app: FastAPI) -> None:
         # Snapshots tab in the GUI) can distinguish it from scheduler
         # fires.
         params["_trigger"] = "manual"
+        _apply_preflight_ack(params)
         rec = get_queue().submit_snapshot(params)
         return {"job_id": rec.job_id, "state": rec.state, "mode": rec.mode}
 
@@ -1128,6 +1419,7 @@ def _register_routes(app: FastAPI) -> None:
                 persistence.validate_container_path(params["log_dir"], "Log directory")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        _apply_preflight_ack(params)
         rec = get_queue().submit_restore(params)
         return {"job_id": rec.job_id, "state": rec.state, "mode": rec.mode}
 
@@ -1164,6 +1456,7 @@ def _register_routes(app: FastAPI) -> None:
         params.pop("snapshot_id", None)
         params["input_files"] = [sidecar]
         params["_imported_from_snapshot_id"] = body.snapshot_id
+        _apply_preflight_ack(params)
         rec = get_queue().submit_restore(params)
         return {"job_id": rec.job_id, "state": rec.state, "mode": rec.mode}
 
@@ -1174,7 +1467,9 @@ def _register_routes(app: FastAPI) -> None:
         ``source_server_name`` and ``dest_server_name`` are required
         and must resolve to different registered servers.
         """
-        rec = get_queue().submit_direct(body.model_dump(exclude_none=True))
+        params = body.model_dump(exclude_none=True)
+        _apply_preflight_ack(params)
+        rec = get_queue().submit_direct(params)
         return {"job_id": rec.job_id, "state": rec.state, "mode": rec.mode}
 
     @app.post("/api/job/stop")
@@ -1459,7 +1754,7 @@ def _register_routes(app: FastAPI) -> None:
             { "users": [ { "kind", "plex_id", "raw_name", "display_name" }, ... ] }
 
         ``kind`` is derived from the table's ``is_owner`` flag.
-        ``plex_id`` mirrors ``user_handle`` (the canonical join key —
+        ``plex_id`` mirrors ``user_handle`` (the canonical join key -
         owner email for owner rows, managed-user username for the
         rest). The Restore form uses this to render the intersection
         picker (snapshot ∩ destination) with a "no destination user"
@@ -1494,7 +1789,7 @@ def _register_routes(app: FastAPI) -> None:
                         "FROM snapshot_users ORDER BY is_owner DESC, user_handle ASC"
                     ).fetchall()
                 except sqlite3.OperationalError:
-                    # Older snapshot files (pre-snapshot_users) — no
+                    # Older snapshot files (pre-snapshot_users) - no
                     # table to read. Return an empty list rather than
                     # raise; the UI handles the empty case as
                     # "user filter unavailable for this snapshot."
@@ -1521,7 +1816,7 @@ def _register_routes(app: FastAPI) -> None:
             )
             raise HTTPException(
                 status_code=500,
-                detail="Could not read snapshot users — see the run log for details.",
+                detail="Could not read snapshot users - see the run log for details.",
             )
 
     @app.get("/api/snapshots/{snapshot_id}/download-db")

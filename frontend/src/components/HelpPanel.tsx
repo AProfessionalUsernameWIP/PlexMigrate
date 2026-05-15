@@ -857,7 +857,7 @@ function ActivityStatusesPage() {
                 amber threshold, and red once it crosses red. Operators
                 tune the threshold scale via
                 Settings ▸ General Settings ▸ Dashboard Stall Colours. */}
-            <h3 style={{ marginTop: 24 }}>Stall escalation — when a phase tag changes colour</h3>
+            <h3 style={{ marginTop: 24 }}>Stall escalation - when a phase tag changes colour</h3>
             <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
               Each phase has an <strong>amber</strong> threshold and a <strong>red</strong>{' '}
               threshold (in seconds). If a worker stays in one phase past the amber
@@ -1622,7 +1622,7 @@ const DB_DOCS: DbDoc[] = [
     intro_short:
       "The cumulative store. Every snapshot job writes a side-effect copy of its live-fetch payload here so future runs can use it as a fast resolver cache. Keyed by GUID at the item level, by (item, server) at the per-server level.",
     intro_long:
-      "media.db is the longest-lived SQLite file the app owns. It accumulates state from every snapshot, restore, and direct-transfer run, so on the second run of the same source server the resolver can skip the slow GUID-lookup round-trip and go straight to the cached ratingKey. The schema is split into four concerns: a GUID-keyed item pool that's shared across every server the app has ever talked to; per-(item, server) join tables that pin each item's local identity on each server; the v0.13.0 identity layer in server_users that names the people who own / have access to each server (with role + multi-backend tag); and per-server activity tables (watch events, ratings, playlist members, collection members) that record what each user on each server has done with each item.\n\nThe split matters because Plex's `ratingKey` is a per-server identifier: the same movie has different ratingKeys on Server A and Server B, but the same `imdb://` GUID on both. We key the items table by GUID so cross-server matching is structural rather than discovered each run.\n\nThe v0.13.0 identity layer (server_users) replaced an earlier convention where the server owner was an implicit sentinel — an empty-string `user_handle` on every activity row. That worked while we only spoke to Plex, but Jellyfin and Emby have first-class owner / admin / managed concepts that don't fit an empty-string-is-the-owner trick. Lifting identity into its own table with a role column and a backend tag means the engine drives the same CRUD path for every backend, and the schema absorbs multi-admin servers (Jellyfin) without another migration.",
+      "media.db is the longest-lived SQLite file the app owns. It accumulates state from every snapshot, restore, and direct-transfer run, so on the second run of the same source server the resolver can skip the slow GUID-lookup round-trip and go straight to the cached ratingKey. The schema is split into four concerns: a GUID-keyed item pool that's shared across every server the app has ever talked to; per-(item, server) join tables that pin each item's local identity on each server; the v0.13.0 identity layer in server_users that names the people who own / have access to each server (with role + multi-backend tag); and per-server activity tables (watch events, ratings, playlist members, collection members) that record what each user on each server has done with each item.\n\nThe split matters because Plex's `ratingKey` is a per-server identifier: the same movie has different ratingKeys on Server A and Server B, but the same `imdb://` GUID on both. We key the items table by GUID so cross-server matching is structural rather than discovered each run.\n\nThe v0.13.0 identity layer (server_users) replaced an earlier convention where the server owner was an implicit sentinel - an empty-string `user_handle` on every activity row. That worked while we only spoke to Plex, but Jellyfin and Emby have first-class owner / admin / managed concepts that don't fit an empty-string-is-the-owner trick. Lifting identity into its own table with a role column and a backend tag means the engine drives the same CRUD path for every backend, and the schema absorbs multi-admin servers (Jellyfin) without another migration.",
     tables: [
       {
         name: 'schema_version',
@@ -1686,7 +1686,7 @@ const DB_DOCS: DbDoc[] = [
       },
       {
         name: 'server_users',
-        purpose: 'Per-server identity layer (v0.13.0). One row per known user on a server — owner or managed — with role, display name, and a backend tag so the engine can drive Plex / Jellyfin / Emby uniformly.',
+        purpose: 'Per-server identity layer (v0.13.0). One row per known user on a server - owner or managed - with role, display name, and a backend tag so the engine can drive Plex / Jellyfin / Emby uniformly.',
         key_columns: ['server_id', 'user_handle', 'role', 'backend', 'display_name'],
         columns: [
           { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id. Referenced by server_user_id on every wide table (watch_events / ratings / playlists / collections).' },
@@ -1700,7 +1700,7 @@ const DB_DOCS: DbDoc[] = [
           { name: 'last_seen_at', type: 'REAL', note: 'Bumped on every CRUD touch via get_or_create_server_user.' },
         ],
         design_note:
-          "Replaces the legacy 'user_handle = \"\"' owner sentinel that ran through every wide table pre-v0.13.0. The owner is now a first-class row with role='owner', queryable directly; managed users are role='managed'. The backend column makes the schema multi-backend without a migration when Jellyfin / Emby support lands — Plex's one-owner-per-server model and Jellyfin's multiple-admins model both fit because role + backend are independent. Separate from managed_users (credentials, Fernet-encrypted, host-bound); server_users is identity metadata and is safe to copy into a portable snapshot .db file. UNIQUE(server_id, user_handle) prevents duplicate identity rows; cascading deletes on server purge are handled in order in server/media_db.py :: purge_server_data.",
+          "Replaces the legacy 'user_handle = \"\"' owner sentinel that ran through every wide table pre-v0.13.0. The owner is now a first-class row with role='owner', queryable directly; managed users are role='managed'. The backend column makes the schema multi-backend without a migration when Jellyfin / Emby support lands - Plex's one-owner-per-server model and Jellyfin's multiple-admins model both fit because role + backend are independent. Separate from managed_users (credentials, Fernet-encrypted, host-bound); server_users is identity metadata and is safe to copy into a portable snapshot .db file. UNIQUE(server_id, user_handle) prevents duplicate identity rows; cascading deletes on server purge are handled in order in server/media_db.py :: purge_server_data.",
       },
       {
         name: 'watch_events',

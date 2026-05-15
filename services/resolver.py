@@ -57,7 +57,7 @@ def _disable_autoreload(*objs) -> None:
     this function becomes a no-op so vanilla plexapi behaviour
     returns. Default false (autoreload disabled). Use only for
     diagnostic / recovery scenarios where a bulk response is genuinely
-    missing data — accepting the per-item reload cost knowingly.
+    missing data - accepting the per-item reload cost knowingly.
     """
     # Tunable check up front. ``True`` = leave autoreload alone (no-op).
     # Lazy import keeps this module loadable in CLI-only checkouts.
@@ -67,7 +67,7 @@ def _disable_autoreload(*objs) -> None:
             return
     except Exception:
         # Tunables unavailable (CLI bootstrap, missing settings.json):
-        # fall through and disable autoreload — matches historical
+        # fall through and disable autoreload - matches historical
         # behaviour before the tunable existed.
         pass
     for obj in objs:

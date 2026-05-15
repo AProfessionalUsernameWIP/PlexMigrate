@@ -99,12 +99,12 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     # per-job toggle override at job-fire time.
     "prebuild_json_sidecar_default": False,
     # Owner-phase watch+ratings capture strategy.
-    #   "smart" (default) — bulk-fetch the library once when BOTH
+    #   "smart" (default) - bulk-fetch the library once when BOTH
     #       watch-history and ratings are wanted on the owner phase,
     #       filter locally; server-side filter when only one is wanted.
-    #   "force_bulk" — always bulk-fetch + local filter, even for
+    #   "force_bulk" - always bulk-fetch + local filter, even for
     #       single-type runs (best for rate-limited Plex servers).
-    #   "force_server_side" — always use server-side filter scans, no
+    #   "force_server_side" - always use server-side filter scans, no
     #       shared prefetch (best when bandwidth back from the server
     #       is the constraint).
     # Per-server override accepted under
@@ -191,6 +191,16 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
         "interval_seconds": 86400,
         "stale_threshold_days": 7,
     },
+    # PR-12: per-server rate limit for the user-token capture
+    # ``server.user_capture.capture_managed_user_tokens`` fires on
+    # every server add / update / reconnect. Each capture attempt hits
+    # plex.tv (``account.users()`` plus ``user.get_token`` /
+    # ``signInHomeUser`` per user), so a chatty operator clicking Test
+    # Connection in a tight loop could trip plex.tv's rate limiter.
+    # Default 4/hour/server (one attempt every 15 minutes). Floored at
+    # 1/hour by the gate. Operator-triggered "Refresh users" bypasses
+    # the throttle.
+    "user_token_capture_throttle_per_hour": 4,
     # System Tunables nested map. Empty by default; the
     # ``services.tunables`` module owns the source-of-truth defaults
     # so callers always read a value even when this map is empty.
@@ -322,7 +332,7 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
             from services.auth import invalidate_sessions
             invalidate_sessions()
             log.info(
-                "save_settings: HTTP tunables changed — rebuilt %s live session(s).",
+                "save_settings: HTTP tunables changed - rebuilt %s live session(s).",
                 "all",
             )
         except Exception:  # pragma: no cover (defensive)

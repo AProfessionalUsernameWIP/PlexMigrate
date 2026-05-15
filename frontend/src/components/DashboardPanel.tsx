@@ -53,7 +53,7 @@ export function DashboardPanel({
         const m = (s as { etr_color_multiplier?: number }).etr_color_multiplier;
         if (typeof m === 'number' && Number.isFinite(m)) setEtrColorMultiplier(m);
       })
-      .catch(() => { /* non-fatal — keep the default 1.0 */ });
+      .catch(() => { /* non-fatal - keep the default 1.0 */ });
   }, []);
 
   const dash = snapshot?.dashboard ?? null;
@@ -319,7 +319,7 @@ function FuzzyTierWarning({
         fontSize: 13,
       }}
     >
-      <strong>Fuzzy title match used ({fuzzy})</strong> — Tier 3 produced{' '}
+      <strong>Fuzzy title match used ({fuzzy})</strong> - Tier 3 produced{' '}
       {fuzzy === 1 ? 'a match' : 'matches'} for this transfer. Tier 3 can
       pair items by title alone and may produce incorrect matches; review
       recommended.
@@ -350,7 +350,7 @@ function ContainerSummary({
       <h2>Restoration Summary</h2>
       <SectionHint>
         Per-container restore results. Items not available on the
-        destination are skipped, not failed — the container is still
+        destination are skipped, not failed - the container is still
         created with whatever resolved.
       </SectionHint>
       {playlists.length > 0 && (
@@ -414,7 +414,7 @@ function ContainerSummaryRow({
         ? 'var(--ok, #16a34a)'
         : 'var(--warn, #d97706)';
   const statusLabel = row.smart
-    ? 'Smart playlist — manual'
+    ? 'Smart playlist - manual'
     : isFullyRestored
       ? 'Fully restored'
       : isWhollyMissing
@@ -437,9 +437,9 @@ function ContainerSummaryRow({
           )}
           {row.name}
         </td>
-        <td style={{ padding: '4px 6px', color: 'var(--text-dim)' }}>{row.library || '—'}</td>
+        <td style={{ padding: '4px 6px', color: 'var(--text-dim)' }}>{row.library || '-'}</td>
         <td style={{ padding: '4px 6px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
-          {row.smart ? '—' : `${row.restored} / ${row.total}`}
+          {row.smart ? '-' : `${row.restored} / ${row.total}`}
         </td>
         <td style={{ padding: '4px 6px', color: statusColor }}>{statusLabel}</td>
       </tr>
@@ -464,7 +464,7 @@ function ContainerSummaryRow({
                     <li key={i}>
                       <strong>{item.title}</strong>
                       {item.type ? ` (${item.type})` : ''}
-                      {item.reason ? ` — ${item.reason}` : ''}
+                      {item.reason ? ` - ${item.reason}` : ''}
                     </li>
                   ))}
                 </ul>
@@ -1368,7 +1368,7 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
     // ``finalizing`` is set we show the finalize sub-step instead of
     // an ETR - the work isn't estimable and the point is just to
     // tell the operator it's still going.
-    if (dash.finalizing) return `Finalizing — ${dash.finalizing}…`;
+    if (dash.finalizing) return `Finalizing - ${dash.finalizing}…`;
     const rolling = dash.rolling_etr_seconds;
     if (rolling !== null && rolling !== undefined && isFinite(rolling) && rolling >= 0) {
       if (rolling < 5) return 'Almost done';

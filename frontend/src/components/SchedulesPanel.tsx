@@ -201,7 +201,7 @@ function ScheduleEditor(props: {
   const [perRunOpen, setPerRunOpen] = useState(false);
   const [perRunSubTab, setPerRunSubTab] = useState<'general' | 'advanced'>('general');
 
-  // v0.14 — Source server user list for the per-schedule user picker.
+  // v0.14 - Source server user list for the per-schedule user picker.
   // Refetched whenever the schedule's source_server_name changes;
   // ``null`` while loading, ``[]`` if the fetch failed or the server
   // has no users to report.
@@ -248,11 +248,11 @@ function ScheduleEditor(props: {
     set('user_filter', []);
   };
   const resetUsersToAll = () => {
-    // null means "all" — clears any saved subset.
+    // null means "all" - clears any saved subset.
     set('user_filter', null);
   };
 
-  // v0.14 — Fast Collection Detection version gating. When the
+  // v0.14 - Fast Collection Detection version gating. When the
   // schedule's source server is at Plex ≥ 1.32, default the toggle
   // ON; below 1.32 (or unknown version) force it OFF and disable
   // the input. Re-runs every time the source server changes so
@@ -446,7 +446,7 @@ function ScheduleEditor(props: {
         </label>
       </fieldset>
 
-      {/* v0.14 — Per-schedule user filter. Mirrors the Run-Job
+      {/* v0.14 - Per-schedule user filter. Mirrors the Run-Job
           form's user picker but is simpler (no destination side):
           when set, every scheduled fire captures only the listed
           users; when ``null`` the schedule captures every user the
@@ -456,7 +456,7 @@ function ScheduleEditor(props: {
         <span className="help" style={{ marginTop: 0 }}>
           Pick which users' data this schedule captures. Leave at "all" (default) and the
           schedule captures everyone the source server reports at fire time. Owner row is
-          checkable too — unchecking it skips owner-level (library-wide) data.
+          checkable too - unchecking it skips owner-level (library-wide) data.
         </span>
         {!schedule.source_server_name ? (
           <div className="empty" style={{ fontSize: 12 }}>Pick a source server above to load its users.</div>
@@ -507,7 +507,7 @@ function ScheduleEditor(props: {
         )}
       </fieldset>
 
-      {/* v0.14 — Per-Run Settings on schedules. Mirrors the Run-Job
+      {/* v0.14 - Per-Run Settings on schedules. Mirrors the Run-Job
           form's collapsible panel with the same General / Advanced
           sub-tab split. Each saved field overrides the corresponding
           global / per-server value when this schedule fires. */}
@@ -624,10 +624,10 @@ function ScheduleEditor(props: {
                   style={{ opacity: fastSupported ? 1 : 0.55 }}
                   title={
                     fastSupported
-                      ? `Plex ${fastSupportVersion} supports librarySectionUserID — fast detection is available.`
+                      ? `Plex ${fastSupportVersion} supports librarySectionUserID - fast detection is available.`
                       : fastSupportVersion
                         ? `Requires Plex Media Server ≥ 1.32. Source server reports ${fastSupportVersion}.`
-                        : 'Plex version unknown for this server — refresh it from the Servers tab to enable this option.'
+                        : 'Plex version unknown for this server - refresh it from the Servers tab to enable this option.'
                   }
                 >
                   <input
@@ -676,7 +676,7 @@ function ScheduleEditor(props: {
                       checked={schedule.watch_ratings_filter_strategy === 'smart'}
                       onChange={() => set('watch_ratings_filter_strategy', 'smart')}
                     />
-                    <span>Smart — engine picks per library</span>
+                    <span>Smart - engine picks per library</span>
                   </label>
                   <label className="switch">
                     <input
@@ -685,7 +685,7 @@ function ScheduleEditor(props: {
                       checked={schedule.watch_ratings_filter_strategy === 'force_bulk'}
                       onChange={() => set('watch_ratings_filter_strategy', 'force_bulk')}
                     />
-                    <span>Force bulk — fewer API calls (rate-limited servers)</span>
+                    <span>Force bulk - fewer API calls (rate-limited servers)</span>
                   </label>
                   <label className="switch">
                     <input
@@ -694,7 +694,7 @@ function ScheduleEditor(props: {
                       checked={schedule.watch_ratings_filter_strategy === 'force_server_side'}
                       onChange={() => set('watch_ratings_filter_strategy', 'force_server_side')}
                     />
-                    <span>Force server-side — smaller payloads, more API calls</span>
+                    <span>Force server-side - smaller payloads, more API calls</span>
                   </label>
                 </fieldset>
               </div>

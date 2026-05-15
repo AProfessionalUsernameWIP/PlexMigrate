@@ -201,7 +201,7 @@ export function ServerAdvancedSettingsPanel() {
     setOk(null);
     setSaving(true);
     try {
-      // v0.14 — normalise fast_collection_detection on save. If the
+      // v0.14 - normalise fast_collection_detection on save. If the
       // row's server doesn't support Plex's ``librarySectionUserID``
       // (< 1.32 or unknown version), drop any saved override on this
       // field. The UI already shows the toggle as locked-off; the
@@ -313,12 +313,12 @@ export function ServerAdvancedSettingsPanel() {
                     {COLUMNS.map((col) => {
                       const row = overrides[s.id] || {};
                       const value = row[col.field];
-                      // v0.14 — per-row version gate on
+                      // v0.14 - per-row version gate on
                       // ``fast_collection_detection``. Plex < 1.32
                       // doesn't expose ``librarySectionUserID`` so
                       // enabling the override there silently
                       // degrades. Render the toggle as a locked
-                      // "off — unsupported" pill with a tooltip
+                      // "off - unsupported" pill with a tooltip
                       // instead of letting the operator pick a
                       // value that does nothing.
                       const isFastCol = col.field === 'fast_collection_detection';
@@ -328,7 +328,7 @@ export function ServerAdvancedSettingsPanel() {
                       const disabledReason = colDisabled
                         ? (ver
                             ? `Requires Plex Media Server ≥ 1.32. ${s.name} reports ${ver}.`
-                            : `Plex version unknown for ${s.name} — refresh it from the Servers tab.`)
+                            : `Plex version unknown for ${s.name} - refresh it from the Servers tab.`)
                         : undefined;
                       return (
                         <td key={col.field}>
@@ -408,9 +408,9 @@ export function ServerAdvancedSettingsPanel() {
                         }}
                       >
                         <option value="">Inherit (global default)</option>
-                        <option value="smart">Smart — engine picks</option>
-                        <option value="force_bulk">Force bulk — fewer API calls</option>
-                        <option value="force_server_side">Force server-side — smaller payloads</option>
+                        <option value="smart">Smart - engine picks</option>
+                        <option value="force_bulk">Force bulk - fewer API calls</option>
+                        <option value="force_server_side">Force server-side - smaller payloads</option>
                       </select>
                     </td>
                   </tr>
@@ -453,8 +453,8 @@ function TriStateToggle({
   value: boolean | undefined;
   inheritedLabel: string;
   onChange: (v: boolean | undefined) => void;
-  // v0.14 — when true (e.g. version-gated features against an
-  // unsupported PMS), the toggle renders as a single "off — <reason>"
+  // v0.14 - when true (e.g. version-gated features against an
+  // unsupported PMS), the toggle renders as a single "off - <reason>"
   // pill that the operator can't interact with. The value is
   // assumed to be ``false`` by the caller in that state.
   disabled?: boolean;
@@ -467,7 +467,7 @@ function TriStateToggle({
         style={{ fontSize: 11, fontWeight: 600 }}
         title={disabledReason || 'Feature not supported on this server.'}
       >
-        off — {disabledReason ? 'unsupported' : 'locked'}
+        off - {disabledReason ? 'unsupported' : 'locked'}
       </span>
     );
   }

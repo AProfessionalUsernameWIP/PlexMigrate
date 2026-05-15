@@ -291,7 +291,7 @@ class Scheduler:
                 _wr = row.get("watch_ratings_filter_strategy")
                 if isinstance(_wr, str) and _wr.strip() in ("smart", "force_bulk", "force_server_side"):
                     params["watch_ratings_filter_strategy"] = _wr.strip()
-                # v0.14 — forward the per-schedule user_filter. None /
+                # v0.14 - forward the per-schedule user_filter. None /
                 # missing = capture every user the source server
                 # reports (historical default). The snapshot engine
                 # filters home_users + derives owner_included.

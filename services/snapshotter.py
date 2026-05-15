@@ -72,9 +72,9 @@ def _log_serialize_diag(
         http_delta = state.get_http_count() - loop_http0
         ratio = (http_delta / item_count) if item_count else 0.0
         verdict = (
-            " — PER-ITEM RELOAD (N+1): every item is a blocking HTTP round-trip"
+            " - PER-ITEM RELOAD (N+1): every item is a blocking HTTP round-trip"
             if ratio >= 0.5
-            else " — items pre-populated, loop is CPU-bound (threading won't help)"
+            else " - items pre-populated, loop is CPU-bound (threading won't help)"
             if item_count
             else ""
         )
@@ -109,7 +109,7 @@ def _should_cache_payload_to_media_db(
          populate the resolver Tier 0 GUID cache).
       3. Tunable false AND server already has rows → skip the ingest.
 
-    Failures of either lookup are treated as "skip" — we never want
+    Failures of either lookup are treated as "skip" - we never want
     to accidentally cache a run when the configured state is unclear.
     """
     try:
@@ -134,7 +134,7 @@ def _should_cache_payload_to_media_db(
 
     if not seeded:
         logger.info(
-            "[%s] media.db caching: AUTO-SEED (first run for server %r — "
+            "[%s] media.db caching: AUTO-SEED (first run for server %r - "
             "ingesting to populate the resolver Tier 0 cache; subsequent "
             "runs will skip unless the operator flips the tunable on)",
             lib_name, server_id,
@@ -156,7 +156,7 @@ def _resolve_watch_ratings_strategy(
     Resolution chain (first match wins):
 
       0. Per-job override from
-         ``state._watch_ratings_strategy_override_var`` — set by the
+         ``state._watch_ratings_strategy_override_var`` - set by the
          job runner from the JobIn / ScheduleIn payload when the
          operator picked something other than "Inherit" on the
          Per-Run Settings ▸ Advanced sub-tab.
@@ -251,7 +251,7 @@ def _bulk_fetch_for_filters(
     # ``userRating`` on an unwatched / unrated item would otherwise
     # trip ``PlexPartialObject.__getattribute__``'s auto-reload, which
     # bundles ``includeMarkers + includeChapters`` and triggers Plex
-    # intro/chapter analysis on shows that haven't been analysed —
+    # intro/chapter analysis on shows that haven't been analysed -
     # potentially 20-30s per item. On a 6 000-episode library with
     # mostly-unrated content that's hours, not seconds.
     #
@@ -1087,7 +1087,7 @@ def snapshot_library(
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
     run_lazy_caches: Optional[Dict[int, List[Tuple[Any, List]]]] = None,
-    # v0.14 — when False, the owner-phase gather pool is skipped
+    # v0.14 - when False, the owner-phase gather pool is skipped
     # entirely and only home-user data is captured. ``run_snapshot``
     # derives this from the user_filter (False when owner email is
     # absent from the filter list). Default True preserves historical
@@ -1170,12 +1170,12 @@ def snapshot_library(
     # Perf #2: watch+ratings capture strategy. Resolves
     # per-server override → global default → "smart".
     #
-    #   "smart"             — bulk-fetch when BOTH watch+ratings wanted,
+    #   "smart"             - bulk-fetch when BOTH watch+ratings wanted,
     #                         server-side filter when only one wanted.
-    #   "force_bulk"        — always bulk-fetch + local filter, even
+    #   "force_bulk"        - always bulk-fetch + local filter, even
     #                         for single-type runs (best when Plex is
     #                         rate-limited / hits 429s).
-    #   "force_server_side" — always server-side filter (no shared
+    #   "force_server_side" - always server-side filter (no shared
     #                         prefetch). Best when wire-traffic back
     #                         from the server is the constraint.
     strategy = _resolve_watch_ratings_strategy(server_id=server_id, logger=logger)
@@ -1184,7 +1184,7 @@ def snapshot_library(
         # per-task server-side-filter path.
         shared_prefetch: Optional[Dict[str, Any]] = None
         logger.info(
-            "[%s] watch+ratings strategy=force_server_side — skipping shared bulk-fetch",
+            "[%s] watch+ratings strategy=force_server_side - skipping shared bulk-fetch",
             lib_name,
         )
     else:
@@ -1197,7 +1197,7 @@ def snapshot_library(
             # Only show libraries need the show-level container in
             # addition to episodes; artist/movie ratings live on the
             # same leaf list watch-history reads. For force_bulk we
-            # still bulk-fetch even when only one type is wanted —
+            # still bulk-fetch even when only one type is wanted -
             # the user opted into the API-call-saving trade-off.
             _want_shows = (section.type == "show")
             shared_prefetch = _bulk_fetch_for_filters(
@@ -1428,7 +1428,7 @@ def snapshot_library(
     #   collections need the owner's collection set computed from
     #   Phase 1's output, so Phase 2 can't start until Phase 1 ends.
     #
-    # v0.14 — when ``owner_included`` is False (the operator excluded
+    # v0.14 - when ``owner_included`` is False (the operator excluded
     # the owner via user_filter), Phase 1 is skipped entirely. Phase
     # 2 still fires for every managed user that survived the filter.
     if owner_included:
@@ -1445,7 +1445,7 @@ def snapshot_library(
                     logger.error(f"Error in owner gather thread for {lib_name}: {exc}")
     else:
         logger.info(
-            "[%s] Owner excluded by user_filter — skipping Phase 1 (library-wide gather). "
+            "[%s] Owner excluded by user_filter - skipping Phase 1 (library-wide gather). "
             "Phase 2 (per-user) will still fire for the %d included managed user(s).",
             lib_name, len(home_users or []),
         )
@@ -1522,8 +1522,15 @@ def snapshot_library(
             "collections":   u_block.get("collections", []),
         }
 
+    # v0.15 integrity-anchor contract: every per-library payload MUST
+    # carry library_section_id (Plex's numeric section key) and
+    # library_section_type. ``ingest_snapshot_payload`` asserts on
+    # these and refuses to write rows without them. See
+    # ``server/media_db.py`` schema migration v8 for the rationale.
     export_data = {
         "library": lib_name,
+        "library_section_id": int(getattr(section, "key", 0) or 0),
+        "library_section_type": str(getattr(section, "type", "") or ""),
         "captured_at": datetime.now().isoformat(),
         # v0.13.0: server identity + run provenance consolidated into
         # snapshot_meta to match the serializer's shape. ``backend``
@@ -1589,7 +1596,7 @@ def snapshot_library(
         logger.error("media_db import failed: %s; cannot persist snapshot", e)
         return ""
 
-    # v0.14 — media.db caching is now opt-in via the
+    # v0.14 - media.db caching is now opt-in via the
     # ``cache_snapshot_payloads_to_media_db`` tunable, with a one-shot
     # auto-seed for any server that hasn't been ingested yet. See
     # ``_should_cache_payload_to_media_db`` for the resolution rule.
@@ -1611,7 +1618,7 @@ def snapshot_library(
         counters = {}
         logger.info(
             "[%s] media.db caching skipped (cache_snapshot_payloads_to_media_db=false, "
-            "server already seeded) — snapshot.db + JSON sidecar are unaffected.",
+            "server already seeded) - snapshot.db + JSON sidecar are unaffected.",
             lib_name,
         )
 
@@ -1634,19 +1641,33 @@ def snapshot_library(
     sink = state._snapshot_payloads if payload_sink is None else payload_sink
     sink.append(export_data)
 
-    logger.info(
-        "Snapshot[%s]: %d watched, %d playlists, %d collections -> "
-        "media.db (items=%d, watch_events=%d, ratings=%d, playlists=%d, collections=%d)",
-        lib_name,
-        export_data["stats"]["total_watched"],
-        export_data["stats"]["total_playlists"],
-        export_data["stats"]["total_collections"],
-        counters.get("items", 0),
-        counters.get("watch_events", 0),
-        counters.get("ratings", 0),
-        counters.get("playlists", 0),
-        counters.get("collections", 0),
-    )
+    # The "-> media.db" tail only makes sense when we actually wrote
+    # to media.db. When the cache-decision short-circuited (counters
+    # is empty), report the payload collection without the misleading
+    # "items=0, ..." breakdown.
+    if counters:
+        logger.info(
+            "Snapshot[%s]: %d watched, %d playlists, %d collections -> "
+            "media.db (items=%d, watch_events=%d, ratings=%d, playlists=%d, collections=%d)",
+            lib_name,
+            export_data["stats"]["total_watched"],
+            export_data["stats"]["total_playlists"],
+            export_data["stats"]["total_collections"],
+            counters.get("items", 0),
+            counters.get("watch_events", 0),
+            counters.get("ratings", 0),
+            counters.get("playlists", 0),
+            counters.get("collections", 0),
+        )
+    else:
+        logger.info(
+            "Snapshot[%s]: %d watched, %d playlists, %d collections "
+            "(payload captured to snapshot.db; media.db caching skipped)",
+            lib_name,
+            export_data["stats"]["total_watched"],
+            export_data["stats"]["total_playlists"],
+            export_data["stats"]["total_collections"],
+        )
     # Returning the library name keeps the contract "non-empty string
     # means success" for the few callers that test the return value;
     # ``out_path`` no longer exists since nothing was written.
@@ -1673,12 +1694,12 @@ def run_snapshot(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
-    # v0.14 — per-job user filter. None = capture every user the
+    # v0.14 - per-job user filter. None = capture every user the
     # source server reports (historical default). When supplied, the
     # owner email being absent excludes owner-level data (library-
     # wide watch / playlists / collections); managed usernames
     # absent excludes those users' data. Empty list excludes
-    # everyone — legal but unusual.
+    # everyone - legal but unusual.
     user_filter: Optional[List[str]] = None,
     # v0.13.x: library-level concurrency cap, decoupled from the
     # per-library HTTP worker pool (``state.MAX_WORKERS``). ``0``
@@ -1746,9 +1767,9 @@ def run_snapshot(
     )
 
     home_users = get_home_users(server, base_url, logger)
-    # v0.14 — apply the operator's user filter. The owner is handled
+    # v0.14 - apply the operator's user filter. The owner is handled
     # by ``owner_included`` below (it isn't in home_users to begin
-    # with — owner-level data flows through the library-wide gather
+    # with - owner-level data flows through the library-wide gather
     # paths). When user_filter is None, every user on the server is
     # included (historical default). When it's a list, only managed
     # usernames present in the list survive.
@@ -1968,7 +1989,7 @@ def run_snapshot(
                                 # "Snapshot complete" message fires from the
                                 # job runner once every library finishes (see
                                 # the console.print at end of run_snapshot
-                                # and the run-level finalize phase) — here
+                                # and the run-level finalize phase) - here
                                 # we say "Library failed" so the feed
                                 # reflects what actually finished.
                                 state.get_dashboard().push_activity("error", lib, "Library failed")

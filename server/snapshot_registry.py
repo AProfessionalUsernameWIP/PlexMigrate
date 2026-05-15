@@ -852,6 +852,151 @@ def materialise_sidecar(snapshot_id: str) -> Optional[str]:
     return str(sidecar_path)
 
 
+def reap_stale_sidecars(*, ttl_seconds: Optional[int] = None, now: Optional[float] = None) -> Dict[str, int]:
+    """
+    v0.13.x: sweep the registry for ``prebuilt_json_path`` sidecars
+    older than the configured TTL and delete them from disk, clearing
+    the column on the matching row.
+
+    Generated sidecars are re-materialisable from the snapshot ``.db``
+    at any time (the download endpoint regenerates on first miss),
+    so reaping a stale one is non-destructive - the operator's next
+    Download click rebuilds it. The point of the TTL is to avoid
+    holding the rendered JSON on disk indefinitely; pre-built or
+    just-downloaded sidecars are intentionally short-lived caches.
+
+    Args:
+        ttl_seconds: seconds-since-mtime threshold for reaping. When
+            ``None`` (the default), reads the live tunable. ``0``
+            disables the sweep entirely (returns immediately with
+            zeroed counters).
+        now: epoch-seconds reference for "is this file old?" Defaults
+            to ``time.time()``; the parameter exists so tests can pin
+            the clock without monkey-patching ``time``.
+
+    Returns counter dict:
+        ``{"reaped": N, "missing": N, "skipped": N, "errors": N}``
+        where ``reaped`` is the count of sidecar files actually
+        deleted, ``missing`` is rows whose file was already gone (we
+        still clear the column), ``skipped`` is rows whose file is
+        younger than the TTL, ``errors`` is rows where deletion or
+        the UPDATE failed.
+    """
+    counters: Dict[str, int] = {"reaped": 0, "missing": 0, "skipped": 0, "errors": 0}
+
+    if ttl_seconds is None:
+        try:
+            from services import tunables
+            ttl_seconds = tunables.snapshot_sidecar_ttl_seconds()
+        except Exception:
+            # Defence in depth: if the tunable can't be read for any
+            # reason, default to the project-wide default (5 min)
+            # rather than disabling the sweep silently.
+            ttl_seconds = 300
+    if ttl_seconds <= 0:
+        # Operator-disabled. Caller may still want a structured
+        # response so the loop can log "sweep disabled" once.
+        return counters
+
+    init_registry()
+    now_ts = float(now) if now is not None else time.time()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, prebuilt_json_path FROM snapshots "
+            "WHERE prebuilt_json_path IS NOT NULL AND prebuilt_json_path != ''"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for r in rows:
+        sid = r["id"]
+        path_str = r["prebuilt_json_path"] or ""
+        if not path_str:
+            continue
+        path = Path(path_str)
+        # File-gone branch: clear the column so the next download
+        # round-trips through ``materialise_sidecar`` cleanly instead
+        # of returning the stale path.
+        if not path.is_file():
+            try:
+                conn = _connect()
+                try:
+                    conn.execute(
+                        "UPDATE snapshots SET prebuilt_json_path = NULL WHERE id = ?",
+                        (sid,),
+                    )
+                finally:
+                    conn.close()
+                counters["missing"] += 1
+            except Exception:
+                log.exception("reap: failed clearing column for snapshot %s", sid)
+                counters["errors"] += 1
+            continue
+
+        try:
+            age = now_ts - path.stat().st_mtime
+        except OSError:
+            counters["errors"] += 1
+            continue
+
+        if age < float(ttl_seconds):
+            counters["skipped"] += 1
+            continue
+
+        # Stale: delete the file, then clear the column. Order matters
+        # only for crash-safety: if we delete first and the UPDATE
+        # fails, the next sweep finds the now-orphaned column and
+        # routes to the file-gone branch above. The inverse order
+        # would leave a stale sidecar pointing at a column we just
+        # nulled.
+        try:
+            path.unlink()
+            counters["reaped"] += 1
+        except OSError:
+            log.exception(
+                "reap: could not delete stale sidecar %s for snapshot %s",
+                path, sid,
+            )
+            counters["errors"] += 1
+            continue
+
+        try:
+            conn = _connect()
+            try:
+                conn.execute(
+                    "UPDATE snapshots SET prebuilt_json_path = NULL WHERE id = ?",
+                    (sid,),
+                )
+            finally:
+                conn.close()
+        except Exception:
+            log.exception("reap: failed clearing column after delete for %s", sid)
+            counters["errors"] += 1
+
+    # Audit trail: a sweep that actually reaped files is a noteworthy
+    # write surface. Skip when nothing happened to avoid log noise.
+    if counters["reaped"] or counters["missing"]:
+        try:
+            from services import db_access_log
+            db_access_log.log_write(
+                table="snapshots.db:snapshots",
+                where={"column": "prebuilt_json_path", "reason": "sidecar_ttl_sweep"},
+                affected_rows=counters["reaped"] + counters["missing"],
+                intent=(
+                    f"reap stale sidecars (ttl={ttl_seconds}s): "
+                    f"reaped={counters['reaped']} "
+                    f"missing={counters['missing']} "
+                    f"skipped={counters['skipped']} "
+                    f"errors={counters['errors']}"
+                ),
+            )
+        except Exception:
+            pass
+
+    return counters
+
+
 def delete(snapshot_id: str, *, keep_json: bool = False) -> Dict[str, Any]:
     """
     Remove the registry row and the on-disk ``.db``. By default the

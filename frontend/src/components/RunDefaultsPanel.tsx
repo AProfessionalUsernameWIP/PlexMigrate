@@ -21,7 +21,7 @@ export function RunDefaultsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
 
-  // Local form mirror — typed before save.
+  // Local form mirror - typed before save.
   const [outputDir, setOutputDir] = useState('');
   const [logDir, setLogDir] = useState('');
   const [workers, setWorkers] = useState(16);
@@ -230,7 +230,7 @@ export function RunDefaultsPanel() {
               />
               <span>Smart <em>(default)</em></span>
               <span className="help">
-                Engine picks per library — bulk when both watch+ratings wanted, server-side filter when only one. Recommended.
+                Engine picks per library - bulk when both watch+ratings wanted, server-side filter when only one. Recommended.
               </span>
             </label>
             <label
@@ -271,7 +271,7 @@ export function RunDefaultsPanel() {
         <h2>Restore Defaults</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
           Default restoration mode for restore + direct-transfer jobs. The per-job
-          form (Run Job, Schedules) and per-server overrides take precedence — this
+          form (Run Job, Schedules) and per-server overrides take precedence - this
           is the bottom-of-chain fallback. <strong>Merge</strong> is additive and
           safe to re-run; <strong>Replace</strong> overwrites the destination to
           match the snapshot exactly and requires typed-REPLACE confirmation on
@@ -304,7 +304,7 @@ export function RunDefaultsPanel() {
           <span className="label">Snapshot: libraries in parallel</span>
           <span className="help">
             How many libraries the snapshot pipeline gathers at once.{' '}
-            <strong>0</strong> (default) inherits from <em>Worker threads</em> above —
+            <strong>0</strong> (default) inherits from <em>Worker threads</em> above -
             today's coupled behavior preserved on upgrade. A positive value caps
             libraries-in-parallel <em>independently</em> of the per-library HTTP
             worker count, so you can serialise snapshot libraries (<strong>1</strong>)
@@ -323,7 +323,7 @@ export function RunDefaultsPanel() {
           <span className="help">
             How many libraries the file-mediated restore processes at once.
             Default <strong>3</strong> (the legacy hardcoded ceiling). Set to{' '}
-            <strong>1</strong> to serialise libraries one at a time — useful when
+            <strong>1</strong> to serialise libraries one at a time - useful when
             Plex returns 429s during multi-library restores. Capped at the actual
             library count, so higher values have no effect beyond that.
           </span>
@@ -339,10 +339,10 @@ export function RunDefaultsPanel() {
           <span className="label">Fan-out: destinations in parallel</span>
           <span className="help">
             How many fan-out destinations run at once. <strong>0</strong> (default) =
-            no cap — one worker per destination, current behavior. <strong>1</strong>{' '}
+            no cap - one worker per destination, current behavior. <strong>1</strong>{' '}
             serialises destinations (use when all destinations share a network
             bottleneck or the source Plex is the constraint). Independent of the
-            libraries-in-parallel value above — each destination uses its own
+            libraries-in-parallel value above - each destination uses its own
             within-job library concurrency separately.
           </span>
           <input
@@ -370,7 +370,7 @@ export function RunDefaultsPanel() {
           <span>Allow filepath suffix fallback (Tier 2)</span>
           <span className="help">
             When Tiers 0/1 (DB cache + live GUID lookup) miss, fall back to matching by the last
-            N components of the file path. Default <strong>on</strong> — safe for most catalogues.
+            N components of the file path. Default <strong>on</strong> - safe for most catalogues.
           </span>
         </label>
         <label className="switch">
@@ -381,7 +381,7 @@ export function RunDefaultsPanel() {
           />
           <span>Allow fuzzy title fallback (Tier 3)</span>
           <span className="help">
-            Last-resort match by fuzzy title. Default <strong>off</strong> — can produce
+            Last-resort match by fuzzy title. Default <strong>off</strong> - can produce
             incorrect matches; enable only when you've verified your catalogue tolerates it.
           </span>
         </label>
@@ -392,7 +392,7 @@ export function RunDefaultsPanel() {
         <div className="banner info" style={{ fontSize: 12, marginBottom: 12 }}>
           Global ceiling for the number of snapshots kept per server. Per-server overrides
           (set on the <strong>Advanced Settings</strong> tab) apply only when strictly lower
-          than this value — the global is a ceiling, never a floor.
+          than this value - the global is a ceiling, never a floor.
         </div>
         <label className="field">
           <span className="label">Keep at most</span>

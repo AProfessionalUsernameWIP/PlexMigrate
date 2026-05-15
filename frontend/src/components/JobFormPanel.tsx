@@ -18,6 +18,7 @@ import { api, ExportArchive, LibraryDescriptor, PingResult, ServerManagedUser, S
 import { serverSupportsFastCollections } from '../utils/plexVersion';
 import { RestoreModeSelector, RestoreMode, MergeWatchStrategy } from './RestoreModeSelector';
 import { ReplaceConfirmModal } from './ReplaceConfirmModal';
+import { PinPreflightModal } from './PinPreflightModal';
 
 // v0.9.1: live status indicator polling cadence for the server pickers.
 const PING_INTERVAL_MS = 30_000;
@@ -132,6 +133,13 @@ export function JobFormPanel({ snapshot }: Props) {
   // operator hits Submit with mode=replace; the modal's onConfirm
   // calls ``submitConfirmed()`` which actually fires the API request.
   const [replaceModalOpen, setReplaceModalOpen] = useState(false);
+  // PR-12: PIN preflight modal state. Filled by ``submit()`` from the
+  // ``/api/job/preflight-pin-check`` response; ``pinPreflightAck`` is
+  // set when the operator clicks Continue anyway and is stamped onto
+  // the next ``api.submit*`` payload via ``stampPreflight``.
+  const [pinPreflightOpen, setPinPreflightOpen] = useState(false);
+  const [pinPreflightAtRisk, setPinPreflightAtRisk] = useState<string[]>([]);
+  const [pinPreflightAck, setPinPreflightAck] = useState(false);
   // PR-3 / Phase D - four-flag data-type filter. Replaces the two old
   // skip_* checkboxes (skip_collections / skip_playlists). Applies to
   // every job mode (snapshot / import / direct) so the operator can
@@ -221,7 +229,7 @@ export function JobFormPanel({ snapshot }: Props) {
   // (workers, scrobble_workers, strict_match, sidecar toggle, verbose);
   // ``advanced`` holds the deeper / migration-specific knobs
   // (output_dir, log_dir, path remap, skip prebuild, fast collection
-  // detection, watch+ratings strategy override). Workspace state —
+  // detection, watch+ratings strategy override). Workspace state -
   // not persisted across submissions.
   const [perRunSubTab, setPerRunSubTab] = useState<'general' | 'advanced'>('general');
 
@@ -365,7 +373,7 @@ export function JobFormPanel({ snapshot }: Props) {
     if (typeof o.fast_collection_detection === 'boolean') setFastCollectionDetection(o.fast_collection_detection);
   }, [sourceServerName, perServerSnapshotDefaults, servers, mode]);
 
-  // v0.14 — Fast Collection Detection auto-defaulting based on Plex
+  // v0.14 - Fast Collection Detection auto-defaulting based on Plex
   // version. Runs after the per-server-override effect above so an
   // explicit per-server value wins. When the source server's
   // ``plex_version`` is >= 1.32, default the toggle ON; otherwise
@@ -373,7 +381,7 @@ export function JobFormPanel({ snapshot }: Props) {
   // surfacing the forced-off state in the UI is clearer than letting
   // operators tick a box that silently does nothing).
   //
-  // Re-runs every time the source server changes — switching from a
+  // Re-runs every time the source server changes - switching from a
   // supported server to an unsupported one drops the flag back to
   // OFF automatically, so a stale "on" can't leak into a job aimed
   // at an old Plex. There's no separate "user touched it" guard:
@@ -385,7 +393,7 @@ export function JobFormPanel({ snapshot }: Props) {
     if (!sourceServerName) return;
     const srv = servers.find((s) => s.name === sourceServerName);
     if (!srv) return;
-    // Per-server explicit override on this field wins outright —
+    // Per-server explicit override on this field wins outright -
     // don't touch the toggle in that case (the previous effect
     // already applied it). Skip rule mirrors the override effect's
     // ``typeof === 'boolean'`` test exactly.
@@ -440,7 +448,7 @@ export function JobFormPanel({ snapshot }: Props) {
     setDestUsers(null);
     setIncludedUsers(new Set());
     setUsersError(null);
-    // v0.14 — Snapshot mode loads ONLY the source server's users
+    // v0.14 - Snapshot mode loads ONLY the source server's users
     // (no intersection needed; snapshot is one-way capture). We treat
     // ``destUsers`` as a mirror of ``sourceUsers`` so the shared
     // ``DirectUsersPanel`` renders the source list as "transferable"
@@ -520,7 +528,7 @@ export function JobFormPanel({ snapshot }: Props) {
     return () => { cancelled = true; };
   }, [mode, sourceServerName, destNamesKey, servers]);
 
-  // v0.14 — Restore mode user picker. Loads the snapshot's user list
+  // v0.14 - Restore mode user picker. Loads the snapshot's user list
   // (from snapshot_users in the .db) plus every destination's user
   // list, intersects them, and exposes the result through the same
   // ``sourceUsers`` / ``destUsers`` state the rest of the form reads.
@@ -538,7 +546,7 @@ export function JobFormPanel({ snapshot }: Props) {
   //
   // Only fires when restoring from a registered snapshot. File-based
   // restore (loose .plexexport.json picks) doesn't get a user picker
-  // — the file would need to be parsed; we treat that as a future
+  // - the file would need to be parsed; we treat that as a future
   // refinement and leave the filter empty (= all users).
   useEffect(() => {
     if (mode !== 'restore') return;
@@ -613,7 +621,21 @@ export function JobFormPanel({ snapshot }: Props) {
   //   - submitConfirmed() is what the modal's onConfirm calls (and
   //     what snapshot/Merge submissions flow through directly). It
   //     does the actual API work.
-  const submit = async () => {
+  // PR-12: stamp the operator's preflight acknowledgement onto a
+  // submission payload. No-op if the operator did not see the modal.
+  // Captured as a closure so each ``api.submit*`` call site only
+  // needs ``stampPreflight(payload)`` right before it fires.
+  const stampPreflight = (payload: Record<string, unknown>) => {
+    if (pinPreflightAck) {
+      payload.pin_preflight_acknowledged = true;
+      payload.pin_preflight_at_risk = pinPreflightAtRisk;
+    }
+  };
+
+  // PR-12: the post-preflight continuation. Replicates the prior
+  // ``submit()`` body so the Replace modal still pops at the right
+  // moment when the preflight is clear (or after Continue anyway).
+  const afterPreflight = async () => {
     if ((mode === 'restore' || mode === 'direct') && restoreMode === 'replace') {
       setSubmitError(null);
       setSubmitOk(null);
@@ -621,6 +643,40 @@ export function JobFormPanel({ snapshot }: Props) {
       return;
     }
     await submitConfirmed();
+  };
+
+  const submit = async () => {
+    // PR-12: ask the backend whether any in-scope managed user is
+    // PIN-protected with no credentials on file. ``restore`` mode
+    // always returns ``checked: false`` so this naturally skips the
+    // modal for file-mediated runs. Preflight network failure is
+    // soft: we proceed without the modal rather than blocking the
+    // submit (the engine still falls back to admin-token
+    // impersonation, same as before PR-12 landed).
+    let atRisk: string[] = [];
+    try {
+      const r = await api.preflightPinCheck({
+        mode,
+        source_server_name: sourceServerName || null,
+        dest_server_names: Array.from(destServerNames),
+        user_filter: includedUsers.size > 0 ? Array.from(includedUsers) : null,
+      });
+      if (r.checked && r.at_risk_users.length > 0) {
+        atRisk = r.at_risk_users;
+      }
+    } catch {
+      // Graceful degrade: the operator can still submit, the engine
+      // handles missing creds at the per-user level as before.
+    }
+
+    if (atRisk.length > 0) {
+      setPinPreflightAtRisk(atRisk);
+      setPinPreflightAck(false);
+      setPinPreflightOpen(true);
+      return;
+    }
+
+    await afterPreflight();
   };
 
   const submitConfirmed = async () => {
@@ -654,7 +710,7 @@ export function JobFormPanel({ snapshot }: Props) {
         // chain). Empty string means "inherit" → omit field so backend
         // falls through to per-server / global / default.
         if (watchRatingsStrategy) payload.watch_ratings_filter_strategy = watchRatingsStrategy;
-        // v0.14 — per-snapshot user filter. Send the explicit list
+        // v0.14 - per-snapshot user filter. Send the explicit list
         // when the operator has picked a subset; omit entirely when
         // every available user is checked (= historical "all users"
         // default at the backend).
@@ -665,6 +721,7 @@ export function JobFormPanel({ snapshot }: Props) {
             payload.user_filter = Array.from(includedUsers);
           }
         }
+        stampPreflight(payload);
         const r = await api.submitSnapshot(payload);
         setSubmitOk(`Snapshot job ${r.job_id} queued.`);
       } else if (mode === 'restore') {
@@ -691,9 +748,9 @@ export function JobFormPanel({ snapshot }: Props) {
         payload.include_ratings = includeRatings;
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
-        // v0.14 — per-restore user filter. Only applicable to the
+        // v0.14 - per-restore user filter. Only applicable to the
         // snapshot-based restore path (file-based restore doesn't
-        // surface a user picker yet — would require parsing the
+        // surface a user picker yet - would require parsing the
         // file). Send the explicit list when the operator picked a
         // subset; omit entirely when every intersectable user is
         // selected (= historical "all users" default at the backend).
@@ -713,10 +770,12 @@ export function JobFormPanel({ snapshot }: Props) {
         if (restoreSource === 'snapshot') {
           if (!selectedSnapshotId) throw new Error('Pick a registered snapshot first.');
           payload.snapshot_id = selectedSnapshotId;
+          stampPreflight(payload);
           r = await api.submitRestoreFromSnapshot(payload);
         } else {
           if (selectedFiles.size === 0) throw new Error('Pick at least one export file.');
           payload.input_files = Array.from(selectedFiles);
+          stampPreflight(payload);
           r = await api.submitRestore(payload);
         }
         setSubmitOk(
@@ -771,6 +830,7 @@ export function JobFormPanel({ snapshot }: Props) {
             payload.user_filter = Array.from(includedUsers);
           }
         }
+        stampPreflight(payload);
         const r = await api.submitDirect(payload);
         setSubmitOk(
           destList.length > 1
@@ -782,6 +842,10 @@ export function JobFormPanel({ snapshot }: Props) {
       setSubmitError(String(e));
     } finally {
       setSubmitting(false);
+      // PR-12: clear the ack so the next Run click triggers a fresh
+      // preflight check. Without this, a re-submit after a failure
+      // would silently re-use the prior acknowledgement.
+      setPinPreflightAck(false);
     }
   };
 
@@ -1201,7 +1265,7 @@ export function JobFormPanel({ snapshot }: Props) {
             logging - things the average operator never touches. The
             section starts collapsed; clicking the header toggles it.
             Renamed from "Advanced options" to "Per-Run Settings" with
-            General / Advanced sub-tabs in v0.14 — the new layout
+            General / Advanced sub-tabs in v0.14 - the new layout
             separates common operator-level knobs (workers, strict
             match, sidecar) from migration-specific deep knobs
             (output dir, path remap, engine tuning, watch+ratings
@@ -1225,14 +1289,14 @@ export function JobFormPanel({ snapshot }: Props) {
         </button>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
           Override what's set under <strong>Servers ▸ Run Defaults</strong> for this one
-          run only. Defaults are right for most operators — start here only if a run
+          run only. Defaults are right for most operators - start here only if a run
           misbehaves, you need cross-platform path translation, or you're tuning
           per-job for an unusual server.
         </span>
 
         {advancedOpen && (
           <div style={{ marginTop: 12 }}>
-            {/* Sub-tab strip. Switching tabs is workspace state only —
+            {/* Sub-tab strip. Switching tabs is workspace state only -
                 doesn't reset any field values. */}
             <nav className="tabs sub-tabs" style={{ marginBottom: 12 }}>
               <button
@@ -1401,9 +1465,9 @@ export function JobFormPanel({ snapshot }: Props) {
                           title={
                             disabled
                               ? unknown
-                                ? 'Plex version unknown for this server — refresh it from the Servers tab to enable this option.'
+                                ? 'Plex version unknown for this server - refresh it from the Servers tab to enable this option.'
                                 : `Requires Plex Media Server ≥ 1.32. Source server reports ${ver}.`
-                              : `Plex ${ver} supports librarySectionUserID — fast detection is available.`
+                              : `Plex ${ver} supports librarySectionUserID - fast detection is available.`
                           }
                         >
                           <input
@@ -1453,12 +1517,12 @@ export function JobFormPanel({ snapshot }: Props) {
                         <span>Inherit <em>(recommended)</em></span>
                         <span className="help">Use the per-server override from Servers ▸ Advanced Settings, or the global default from Run Defaults.</span>
                       </label>
-                      <label className="switch" title="Engine picks per library — bulk-fetch when both watch+ratings wanted, server-side filter when only one.">
+                      <label className="switch" title="Engine picks per library - bulk-fetch when both watch+ratings wanted, server-side filter when only one.">
                         <input type="radio" name="wr-strategy-job" checked={watchRatingsStrategy === 'smart'} onChange={() => setWatchRatingsStrategy('smart')} />
                         <span>Smart</span>
                         <span className="help">Engine picks per library. Equivalent to the global default behaviour.</span>
                       </label>
-                      <label className="switch" title="Always fetch the full library and filter locally. Best for rate-limited Plex servers — fewer API calls, larger payloads.">
+                      <label className="switch" title="Always fetch the full library and filter locally. Best for rate-limited Plex servers - fewer API calls, larger payloads.">
                         <input type="radio" name="wr-strategy-job" checked={watchRatingsStrategy === 'force_bulk'} onChange={() => setWatchRatingsStrategy('force_bulk')} />
                         <span>Force bulk</span>
                         <span className="help">Always bulk-fetch + filter locally. Best for rate-limited / 429-prone Plex servers.</span>
@@ -1476,6 +1540,40 @@ export function JobFormPanel({ snapshot }: Props) {
           </div>
         )}
       </div>
+
+      {/* v0.13.x: non-idempotency warning for Merge "sum" mode. Only
+          surfaces on restore + direct (snapshot has no restore-mode
+          sub-toggle) and only when the operator has picked Combine
+          totals. The deeper explainer lives behind the InfoTip in
+          RestoreModeSelector; this banner is the can't-miss surface
+          right above Submit so the operator can't accidentally
+          schedule / re-run this without seeing the warning. */}
+      {(mode === 'restore' || mode === 'direct') &&
+        restoreMode === 'merge' &&
+        mergeWatchStrategy === 'sum' && (
+          <div
+            className="banner"
+            style={{
+              background: 'rgba(245, 166, 35, 0.10)',
+              border: '1px solid var(--warn, #f5a623)',
+              color: 'var(--text, inherit)',
+              marginTop: 8,
+            }}
+          >
+            <strong style={{ color: 'var(--warn, #f5a623)' }}>
+              Combine totals is not idempotent.
+            </strong>{' '}
+            This job adds the snapshot's watch counts on top of the
+            destination's current counts. Running the <em>same</em>{' '}
+            snapshot twice will double-count; three times triples; etc.
+            Use this for a one-shot consolidation (e.g. folding a
+            retired server's history into an active one). For any job
+            you might re-run or schedule, switch the sub-toggle to{' '}
+            <strong>Higher value</strong>, which is idempotent
+            (destination ends at max(stored, current); re-runs are
+            no-ops).
+          </div>
+        )}
 
       <div className="panel">
         <div className="row-buttons">
@@ -1510,6 +1608,24 @@ export function JobFormPanel({ snapshot }: Props) {
         onConfirm={() => {
           setReplaceModalOpen(false);
           void submitConfirmed();
+        }}
+      />
+
+      {/* PR-12: PIN preflight warning. Sits between submit() and the
+          Replace modal / submitConfirmed() so the operator confirms
+          before any commit. Cancel aborts; Continue anyway stamps the
+          ack on the next payload and proceeds to ``afterPreflight``. */}
+      <PinPreflightModal
+        open={pinPreflightOpen}
+        atRiskUsers={pinPreflightAtRisk}
+        onCancel={() => {
+          setPinPreflightOpen(false);
+          setPinPreflightAtRisk([]);
+        }}
+        onContinue={() => {
+          setPinPreflightOpen(false);
+          setPinPreflightAck(true);
+          void afterPreflight();
         }}
       />
     </>
@@ -1805,7 +1921,7 @@ function ServerPicker(props: ServerPickerProps) {
 // either side" line to make that explicit.
 
 function DirectUsersPanel(props: {
-  // v0.14 — same picker, three contexts. The mode drives copy + the
+  // v0.14 - same picker, three contexts. The mode drives copy + the
   // "source only" panel's wording (the user picker re-uses the same
   // intersection logic regardless of which side is source vs dest).
   mode?: 'direct' | 'snapshot' | 'restore';
@@ -1840,7 +1956,7 @@ function DirectUsersPanel(props: {
     }
     if (mode === 'restore') {
       return {
-        help: "Pick which users' data to restore. Users present in the snapshot but not on the destination are greyed out — invite them to Plex Home on the destination to enable restore.",
+        help: "Pick which users' data to restore. Users present in the snapshot but not on the destination are greyed out - invite them to Plex Home on the destination to enable restore.",
         missingLabel: 'Not on destination',
         missingTitle: 'No matching account on the destination server.',
       };

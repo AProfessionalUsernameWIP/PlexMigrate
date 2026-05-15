@@ -121,7 +121,7 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # its own friendly name (set inside Plex's own settings).
     "machine_identifier": "",
     "friendly_name": "",
-    # v0.14 — Plex Media Server software version (e.g. "1.32.5.7349").
+    # v0.14 - Plex Media Server software version (e.g. "1.32.5.7349").
     # Captured at probe / refresh time from plexapi's ``PlexServer.version``
     # attribute. Used by the frontend to gate features that require a
     # minimum Plex version (currently: Fast Collection Detection
@@ -562,7 +562,7 @@ def probe_unsaved(
     owner = str(getattr(server, "myPlexUsername", "") or "Plex Owner")
     friendly = str(getattr(server, "friendlyName", "") or "")
     machine_id = str(getattr(server, "machineIdentifier", "") or "")
-    # PMS version string (e.g. "1.32.5.7349-abcdef") — captured so the
+    # PMS version string (e.g. "1.32.5.7349-abcdef") - captured so the
     # UI can gate version-locked features without an extra round-trip.
     plex_version = str(getattr(server, "version", "") or "")
 

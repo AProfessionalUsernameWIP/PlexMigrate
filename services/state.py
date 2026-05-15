@@ -230,7 +230,7 @@ _resolver_allow_fuzzy_var: contextvars.ContextVar = contextvars.ContextVar(
 # Per-job watch+ratings filter strategy override. Set by the job
 # runner at run start from the JobIn / ScheduleIn payload; cleared on
 # finally. ``""`` (the default) means "inherit from per-server / global
-# / built-in default" — same semantics as the empty radio option in
+# / built-in default" - same semantics as the empty radio option in
 # the JobFormPanel UI. Valid non-empty values: "smart", "force_bulk",
 # "force_server_side". Read by
 # ``services.snapshotter._resolve_watch_ratings_strategy``.
@@ -682,12 +682,12 @@ def reset_run_state() -> None:
 
     Fan-out (v0.10.0): each destination thread runs ``reset_run_state``
     in its own context, which resets THAT context's accumulators only.
-    Sibling destinations are unaffected — **for the ContextVar-backed
+    Sibling destinations are unaffected - **for the ContextVar-backed
     fields**: ``_lib_successes``, ``_lib_failures``,
     ``_failure_categories``, and the resolver flags.
 
     L2 caveat: ``_snapshot_payloads`` and ``_lib_task_ids`` are NOT
-    ContextVars — they are plain process-global containers, and the
+    ContextVars - they are plain process-global containers, and the
     two lines below mutate them in place. Under fan-out, N destination
     threads clear these same globals concurrently. This is harmless
     *only* because neither is written on the server-mode fan-out

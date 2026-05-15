@@ -403,7 +403,7 @@ def run_fan_out_restore(
     # means no cap - one worker per destination, current behavior.
     # ``1`` serialises destinations.
     destination_workers: int = 0,
-    # v0.14 — per-job user filter. Forwarded verbatim to each
+    # v0.14 - per-job user filter. Forwarded verbatim to each
     # destination's _run_one_import_destination.
     user_filter: Optional[List[str]] = None,
 ) -> FanOutResult:
@@ -701,7 +701,7 @@ def _run_one_import_destination(
     merge_watch_strategy: str = "higher",
     # v0.13.x: see _run_one_direct_destination for the contract.
     pre_replace_settings: Optional[Dict[str, Any]] = None,
-    # v0.14 — per-job user filter. Each destination applies the same
+    # v0.14 - per-job user filter. Each destination applies the same
     # operator-selected user list; the restore engine drops payload
     # users not on this destination automatically (no user lookup),
     # so a destination missing a user just no-ops for that user.

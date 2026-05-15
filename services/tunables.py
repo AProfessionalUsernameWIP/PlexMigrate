@@ -41,20 +41,20 @@ log = logging.getLogger("plexmigrate.services.tunables")
 
 _DEFAULTS: Dict[str, Any] = {
     # ── Networking & Retry ──────────────────────────────────────────
-    # Plex connect timeout — used by library_walk on long-running scans
+    # Plex connect timeout - used by library_walk on long-running scans
     # (was timeout=120 at server/library_walk.py).
     "plex_connect_timeout_seconds": 120,
-    # urllib3.Retry total budget — how many retry attempts before
+    # urllib3.Retry total budget - how many retry attempts before
     # giving up on a Plex HTTP call. Was total=4 in services/auth.py
     # (v0.9.6 bumped from 2→4 to absorb Plex 429s).
     "plex_retry_total_budget": 4,
-    # urllib3.Retry backoff factor — exponential delay multiplier
+    # urllib3.Retry backoff factor - exponential delay multiplier
     # between retries. Was 0.5 in services/auth.py.
     "plex_retry_backoff_factor": 0.5,
     # Server "Test Connection" + ping endpoint timeouts.
     "server_ping_timeout_seconds": 10,
     "server_probe_timeout_seconds": 15,
-    # Scrobble read/write timeouts — direct-transfer hot path.
+    # Scrobble read/write timeouts - direct-transfer hot path.
     "scrobble_get_timeout_seconds": 10,
     "scrobble_put_timeout_seconds": 15,
 
@@ -76,11 +76,11 @@ _DEFAULTS: Dict[str, Any] = {
     # intro/chapter analysis (20-30s per item on shows). For our
     # bulk-fetched filter paths (snapshot_watch_history,
     # snapshot_ratings) this is catastrophic on libraries where most
-    # items lack viewCount or userRating — every unrated episode
+    # items lack viewCount or userRating - every unrated episode
     # would trigger a per-item reload during the local filter.
     #
     # Default false (disabled). Operators flip true ONLY as a
-    # diagnostic / recovery escape hatch — e.g. if a future plexapi
+    # diagnostic / recovery escape hatch - e.g. if a future plexapi
     # or Plex version genuinely needs reload to surface data the
     # bulk response omits. Wrong value = ratings-takes-hours.
     "plexapi_autoreload_enabled": False,
@@ -88,7 +88,7 @@ _DEFAULTS: Dict[str, Any] = {
     # false (default), the engine's payload-direct snapshot writer
     # (Rule 1) and direct-transfer's in-memory pipeline both run
     # without ingesting payloads into media.db. The .db snapshot file
-    # and JSON sidecar are unaffected — they're built from the live
+    # and JSON sidecar are unaffected - they're built from the live
     # payloads.
     #
     # Auto-seed exception: when the operator hasn't opted in (tunable
@@ -104,7 +104,7 @@ _DEFAULTS: Dict[str, Any] = {
     # The auto-seed lives at the resolution boundary (see
     # ``services.snapshotter._should_cache_payload_to_media_db``)
     # rather than in this tunable's value, so settings.json stays a
-    # clean reflection of operator intent — auto-seed is a one-shot
+    # clean reflection of operator intent - auto-seed is a one-shot
     # behaviour, not a stored state.
     "cache_snapshot_payloads_to_media_db": False,
 
@@ -117,6 +117,16 @@ _DEFAULTS: Dict[str, Any] = {
     "scheduler_tick_seconds": 30,
     # How often the auth_db sweeps expired refresh tokens.
     "refresh_token_cleanup_interval_seconds": 3600,
+    # v0.13.x: how long a generated/prebuilt ``.plexexport.json`` sidecar
+    # is kept on disk before the background sweep reaps it. The sidecar
+    # is rendered on demand from the snapshot ``.db`` (or pre-built on
+    # the snapshot job when the operator opts in); after the download
+    # window, holding it on disk just consumes space. Default 300s
+    # (5 min). Lower for an aggressive cleanup; raise if operators
+    # download infrequently and want first-click-instant for longer.
+    # Set to 0 to disable the sweep entirely - sidecars then persist
+    # until manually deleted or until the snapshot row is removed.
+    "snapshot_sidecar_ttl_seconds": 300,
 
     # ── Limits ──────────────────────────────────────────────────────
     # Seed for snapshot_retention_global (a separate top-level setting).
@@ -148,7 +158,7 @@ _DEFAULTS: Dict[str, Any] = {
     "http_pool_maxsize_cap": 10,
 
     # NOTE: ``watch_ratings_filter_strategy`` is intentionally NOT a
-    # tunable — it's a snapshot run-behaviour choice that operators
+    # tunable - it's a snapshot run-behaviour choice that operators
     # tuning a migration may want to flip without root_admin
     # escalation. It lives at the top level of settings.json next to
     # ``prebuild_json_sidecar_default``, surfaced under
@@ -336,7 +346,7 @@ def viewcount_increment_cap(server_id: Optional[str] = None) -> int:
 def plexapi_autoreload_enabled() -> bool:
     """
     True iff plexapi's implicit per-item auto-reload should stay
-    enabled on objects we touch. Default false (disabled) — when
+    enabled on objects we touch. Default false (disabled) - when
     false, ``services.resolver._disable_autoreload`` actively turns
     ``_autoReload`` off on every object passed to it; when true, the
     helper is a no-op and vanilla plexapi behaviour returns.
@@ -349,7 +359,7 @@ def cache_snapshot_payloads_to_media_db() -> bool:
     """
     True iff the operator has explicitly opted into ingesting
     snapshot / direct-transfer payloads into media.db on every run.
-    Default false — the .db snapshot artifact and JSON sidecar are
+    Default false - the .db snapshot artifact and JSON sidecar are
     payload-direct (Rule 1) and don't need media.db. See the
     ``_should_cache_payload_to_media_db`` resolver in snapshotter for
     the first-run auto-seed exception layered on top of this value.
@@ -369,6 +379,16 @@ def scheduler_tick_seconds() -> int:
 
 def refresh_token_cleanup_interval_seconds() -> int:
     return int(get("refresh_token_cleanup_interval_seconds"))
+
+
+def snapshot_sidecar_ttl_seconds() -> int:
+    """
+    How long a generated ``.plexexport.json`` sidecar is kept on disk
+    before the background sweep reaps it. ``0`` disables the sweep
+    (sidecars persist until the snapshot row is removed). Read on
+    every sweep tick - changes take effect within one cadence.
+    """
+    return int(get("snapshot_sidecar_ttl_seconds"))
 
 
 # Limits

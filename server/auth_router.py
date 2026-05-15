@@ -313,7 +313,7 @@ ALL_PERMISSIONS = (
     "settings.edit",
     # ``settings.tunables`` gates the System Tunables page (infrastructure
     # knobs that used to be hardcoded literals). Held by root_admin
-    # ONLY — even ``admin`` can't toggle JWT TTLs, HTTP pool sizes,
+    # ONLY - even ``admin`` can't toggle JWT TTLs, HTTP pool sizes,
     # SQLite busy timeouts, etc., because those values can lock every
     # user out of the system if set wrong. The frontend hides the
     # Tunables sub-tab when this perm is absent; the backend will
@@ -325,7 +325,7 @@ ALL_PERMISSIONS = (
     "sync.edit",
 )
 
-# Permission bundle for ``admin`` — everything except settings.tunables.
+# Permission bundle for ``admin`` - everything except settings.tunables.
 # Built once at module import; if you add a new entry to ALL_PERMISSIONS
 # and it should be admin-visible too, no code change here is needed.
 _ADMIN_PERMS: List[str] = [p for p in ALL_PERMISSIONS if p != "settings.tunables"]
@@ -340,7 +340,7 @@ def effective_permissions_for(username: str, role: str) -> List[str]:
     removes them.
 
     Safety rules:
-      * ``root_admin`` is **immune to revokes** — the role always
+      * ``root_admin`` is **immune to revokes** - the role always
         resolves to the full ``ALL_PERMISSIONS`` set so an accidental
         revoke can't lock the only restore path out of the system.
       * Unknown permissions in either list are ignored silently
@@ -348,7 +348,7 @@ def effective_permissions_for(username: str, role: str) -> List[str]:
       * Empty / missing username → role baseline only.
       * ``effective_role`` (post View Mode drop) is what the caller
         usually passes, so a root_admin in viewer view-mode resolves
-        to viewer's baseline — view-mode trumps grants.
+        to viewer's baseline - view-mode trumps grants.
     """
     if role == "root_admin":
         # Always full; ignore revokes so root admin can't be
@@ -379,7 +379,7 @@ ROLE_PERMISSIONS: Dict[str, List[str]] = {
     "manager":    ["dashboard.view", "servers.view", "logs.view", "exports.view",
                    "jobs.start", "jobs.stop", "schedules.view", "schedules.edit",
                    "sync.view"],
-    # ``admin`` carries every permission EXCEPT settings.tunables — the
+    # ``admin`` carries every permission EXCEPT settings.tunables - the
     # infrastructure-knob bundle is root_admin-exclusive (see
     # ALL_PERMISSIONS comment). Per-row guards via ``can_modify_user``
     # still prevent admin from touching the root_admin row.
@@ -1268,7 +1268,7 @@ def auth_get_user_permissions(
     role baseline so the Access Control UI can render each permission's
     current state without a second round-trip.
 
-    Root-admin only — admin can't view or edit these.
+    Root-admin only - admin can't view or edit these.
     """
     target = auth_db.get_user(username)
     if target is None:
@@ -1321,7 +1321,7 @@ def auth_set_user_permissions(
     row up front so the UI doesn't pretend the value stuck.
 
     A grant or revoke that would be a no-op (granting a baseline
-    permission, revoking a non-baseline one) is accepted silently —
+    permission, revoking a non-baseline one) is accepted silently -
     the effective set is what matters, and the UI may surface those
     as "redundant" badges later.
     """
@@ -1341,7 +1341,7 @@ def auth_set_user_permissions(
             detail=f"Unknown permission(s): {sorted(set(unknown))!r}",
         )
     # Revokes against a root_admin row are pointless (the resolver
-    # ignores them) and would be confusing — reject explicitly.
+    # ignores them) and would be confusing - reject explicitly.
     if target["role"] == "root_admin" and body.revoked:
         raise HTTPException(
             status_code=400,

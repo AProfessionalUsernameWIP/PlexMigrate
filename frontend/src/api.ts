@@ -100,7 +100,7 @@ export interface DashboardState {
   // snapshot-DB capture) - the window where every library row already
   // reads "Done" but the job hasn't flipped to COMPLETED. ``null`` /
   // absent = not finalizing; a string is the current sub-step, shown
-  // as "Finalizing — <label>".
+  // as "Finalizing - <label>".
   finalizing?: string | null;
 }
 
@@ -323,7 +323,7 @@ export interface SettingsView {
   tunables?: Record<string, number | string>;
   // Per-server tunable overrides (root_admin only). Only meaningful
   // for the small set of tunables that have a sensible per-server
-  // interpretation — currently plex_connect_timeout_seconds and
+  // interpretation - currently plex_connect_timeout_seconds and
   // viewcount_increment_cap. Map: server_id → {key: value}.
   tunables_per_server?: Record<string, Record<string, number>>;
   // ETR colour multiplier for the dashboard stall thresholds (Phase 4).
@@ -357,7 +357,7 @@ export interface SettingsView {
     interval_seconds?: number;
     stale_threshold_days?: number;
   };
-  // v0.13.x — Restore-side run defaults (Merge / Replace). Per-run +
+  // v0.13.x - Restore-side run defaults (Merge / Replace). Per-run +
   // per-server overrides take precedence; this is the bottom-of-chain
   // fallback. Defaults: {"mode": "merge", "auto_capture_before_replace": true}.
   restore_defaults?: {
@@ -375,12 +375,12 @@ export interface SettingsView {
   // is still serial in this release - this knob does not apply there.
   restore_library_workers?: number;
   // v0.13.x: per-fan-out destination concurrency cap. 0 (default)
-  // means no cap — one thread per destination, today's behavior. A
+  // means no cap - one thread per destination, today's behavior. A
   // positive integer caps the destination pool. Independent of
   // restore_library_workers (the two axes are orthogonal).
   fan_out_destination_workers?: number;
   // v0.13.x: library-level concurrency cap for snapshot. 0 (default)
-  // inherits ``workers`` (today's coupled behavior — preserved on
+  // inherits ``workers`` (today's coupled behavior - preserved on
   // upgrade); a positive value caps libraries-in-parallel without
   // affecting the per-library HTTP worker count.
   snapshot_library_workers?: number;
@@ -478,11 +478,11 @@ export interface ServerView {
   // refreshed yet.
   machine_identifier?: string;
   friendly_name?: string;
-  // v0.14 — Plex Media Server software version (e.g. "1.32.5.7349").
+  // v0.14 - Plex Media Server software version (e.g. "1.32.5.7349").
   // Captured at probe / refresh time. Used by the JobForm + Schedule
   // forms to gate Fast Collection Detection (which requires Plex ≥1.32).
   // Empty string when the row pre-dates this field or hasn't been
-  // refreshed yet — treat unknown as "unsupported" so we never enable
+  // refreshed yet - treat unknown as "unsupported" so we never enable
   // a feature against an unverified server.
   plex_version?: string;
   // Timing-spec inputs. Server-wide counts the ETR estimator needs.
@@ -604,7 +604,7 @@ export interface Schedule {
   include_collections?: boolean;
   prebuild_json_sidecar?: boolean;
   // v0.14 Per-Run Settings on schedules. Mirrors the same per-job
-  // knobs the Run Job form exposes — when set, each scheduled fire
+  // knobs the Run Job form exposes - when set, each scheduled fire
   // forwards them to the snapshot job request as overrides on the
   // global / per-server defaults.
   workers?: number | null;
@@ -614,7 +614,7 @@ export interface Schedule {
   skip_playlist_prebuild?: boolean;
   fast_collection_detection?: boolean;
   watch_ratings_filter_strategy?: 'smart' | 'force_bulk' | 'force_server_side' | '';
-  // v0.14 — per-schedule user filter. List of Plex identifiers (owner
+  // v0.14 - per-schedule user filter. List of Plex identifiers (owner
   // email + managed usernames). null / undefined = capture every user
   // the source server reports.
   user_filter?: string[] | null;
@@ -885,7 +885,7 @@ export interface ManagedUser {
   created_at: number;
 }
 
-// Access Control — per-user permission grant/revoke layer. Returned
+// Access Control - per-user permission grant/revoke layer. Returned
 // by GET /api/auth/users/{username}/permissions and the corresponding
 // PATCH. ``baseline`` = role's normal permission set; ``extra`` =
 // granted on top; ``revoked`` = removed from baseline; ``effective``
@@ -898,7 +898,7 @@ export interface UserPermissionsResponse {
   revoked: Permission[];
   effective: Permission[];
   all_permissions: Permission[];
-  // True when this row is root_admin — revokes are ignored by the
+  // True when this row is root_admin - revokes are ignored by the
   // resolver so the UI can grey out the revoke toggles.
   root_admin_immune_to_revokes?: boolean;
 }
@@ -1291,7 +1291,7 @@ export const api = {
   // call to systemAccounts() - one round-trip per visit, no caching.
   listServerUsers: (id: string) =>
     http<ServerUsersResponse>(`/api/servers/${encodeURIComponent(id)}/users`),
-  // v0.14 — list users captured inside a snapshot .db. Reads the
+  // v0.14 - list users captured inside a snapshot .db. Reads the
   // snapshot_users table. Returns the same ServerUser shape so the
   // Restore form can intersect snapshot users with destination users
   // by ``plex_id`` (managed) and ``kind === "owner"`` (owner).
@@ -1332,6 +1332,27 @@ export const api = {
     }),
   submitDirect: (params: Record<string, unknown>) =>
     http<{ job_id: string; state: string; mode: string }>('/api/job/direct', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }),
+  // PR-12 preflight. Returns the at-risk managed-user list (empty
+  // when the modal should be skipped: restore mode, or every user is
+  // already credentialed). The frontend renders the warning modal
+  // when ``checked && at_risk_users.length > 0`` and stamps
+  // ``pin_preflight_acknowledged: true`` on the next submit when the
+  // operator clicks Continue anyway.
+  preflightPinCheck: (params: {
+    mode: 'snapshot' | 'restore' | 'direct';
+    source_server_name?: string | null;
+    dest_server_names?: string[] | null;
+    user_filter?: string[] | null;
+  }) =>
+    http<{
+      mode: string;
+      checked: boolean;
+      at_risk_users: string[];
+      servers_checked: string[];
+    }>('/api/job/preflight-pin-check', {
       method: 'POST',
       body: JSON.stringify(params),
     }),

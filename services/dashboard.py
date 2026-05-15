@@ -45,7 +45,7 @@ class ActivityEntry:
     The deque holding these entries is sized to keep enough history
     for the operator to scroll through a full snapshot run's events
     (see ``DashboardState.__init__`` for the maxlen). Pre-v0.14 the
-    cap was 8 — only the most recent events stayed visible — which
+    cap was 8 - only the most recent events stayed visible - which
     matched the dashboard's old 8-line text widget but lost detail on
     longer runs. The frontend's ``.feed`` panel already caps its
     rendered height at 240px with ``overflow-y: auto``, so a larger
@@ -203,7 +203,7 @@ class DashboardState:
         self._lock = threading.Lock()
         self.libraries: Dict[str, LibraryProgress] = {}
         self._lib_order: List[str] = []
-        # v0.14 — keep enough activity history for the operator to
+        # v0.14 - keep enough activity history for the operator to
         # scroll through a full run's events. Pre-v0.14 this was
         # ``maxlen=8`` which matched the CLI's 8-line activity widget
         # but lost detail on longer runs. The web UI's ``.feed`` panel
@@ -350,7 +350,7 @@ class DashboardState:
         # are still running. The engine's per-library rows all read
         # "Done" by then, so without this the dashboard looks frozen
         # at 100%. ``None`` = not finalizing; a string = the current
-        # finalize sub-step, shown by the frontend as "Finalizing — …".
+        # finalize sub-step, shown by the frontend as "Finalizing - …".
         self.finalizing: Optional[str] = None
 
     def add_library(self, name: str, total: int) -> None:
@@ -377,7 +377,7 @@ class DashboardState:
         Set (or clear, with ``None``) the run-level finalize phase.
 
         Called by the job runner in the post-engine gap so the
-        dashboard shows "Finalizing — <label>" instead of looking
+        dashboard shows "Finalizing - <label>" instead of looking
         frozen at 100% while close-logger / run-dir finalize /
         snapshot-DB capture finish. Cleared isn't strictly required -
         the JobRecord flips to COMPLETED right after the last call -

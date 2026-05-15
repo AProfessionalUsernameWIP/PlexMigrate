@@ -208,7 +208,7 @@ class SettingsIn(BaseModel):
         default=None,
         description=(
             "Strategy for fetching watch-history + ratings on the owner "
-            "phase. One of: \"smart\" (default — bulk-fetch when both "
+            "phase. One of: \"smart\" (default - bulk-fetch when both "
             "wanted, server-side filter when only one), \"force_bulk\" "
             "(always bulk-fetch + local filter; best for rate-limited "
             "Plex servers), \"force_server_side\" (always server-side "
@@ -288,7 +288,23 @@ class SettingsIn(BaseModel):
             "value of the Prune Missing Items day-threshold slider)."
         ),
     )
-    # System Tunables — infrastructure-level knobs that used to be
+    # PR-12: per-server rate limit for user-token capture. See the
+    # ``user_token_capture_throttle_per_hour`` entry in
+    # ``server.persistence._DEFAULT_SETTINGS`` for the full rationale.
+    user_token_capture_throttle_per_hour: Optional[int] = Field(
+        default=None, ge=1, le=240,
+        description=(
+            "Per-server cap on user-token capture attempts. Each "
+            "server add / update / reconnect fires one attempt; the "
+            "gate skips the call when fewer than ``3600 / value`` "
+            "seconds have elapsed since the last attempt for that "
+            "server. Default 4 (one attempt every 15 minutes per "
+            "server). Operator-triggered Refresh actions bypass the "
+            "throttle. Ceiling 240 (every 15 seconds) is a sanity "
+            "limit, not a recommended value."
+        ),
+    )
+    # System Tunables - infrastructure-level knobs that used to be
     # hardcoded literals (HTTP timeouts, retry budgets, JWT TTLs,
     # SQLite busy timeouts, pool sizes, etc.). Free-form dict because
     # the list of recognised keys grows over time and the
@@ -374,9 +390,38 @@ class SettingsIn(BaseModel):
     )
 
 
+# ── PR-12 preflight acknowledgement (shared by every job-input model) ───────
+
+class _PinPreflightAckFields(BaseModel):
+    """
+    Fields the frontend stamps onto a job submission when the operator
+    has cleared the PR-12 PIN-preflight warning modal.
+
+    The job endpoints re-map these to underscore-prefixed synthetic
+    params on the JobRecord (see ``server.app._apply_preflight_ack``)
+    so the engine reads them via the same ``rec.params["_..."]``
+    convention as ``_trigger`` / ``_actor_username``.
+    """
+    pin_preflight_acknowledged: bool = Field(
+        default=False,
+        description=(
+            "True if the operator clicked Continue anyway on the "
+            "preflight modal. False (default) means the modal either "
+            "did not surface or the operator did not need to clear it."
+        ),
+    )
+    pin_preflight_at_risk: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "The list of usernames the preflight flagged. Optional "
+            "audit trail surfaced in the run log."
+        ),
+    )
+
+
 # ── Job requests ─────────────────────────────────────────────────────────────
 
-class SnapshotJobIn(BaseModel):
+class SnapshotJobIn(_PinPreflightAckFields):
     """
     Body of ``POST /api/job/snapshot``. Every flag from the CLI snapshot
     side is mirrored here. Anything left blank falls back to the
@@ -471,11 +516,11 @@ class SnapshotJobIn(BaseModel):
             "default on Settings ▸ Run Defaults."
         ),
     )
-    # Per-job user filter — mirrors DirectTransferIn.user_filter so the
+    # Per-job user filter - mirrors DirectTransferIn.user_filter so the
     # operator can scope a snapshot to a subset of the source server's
     # users (owner + managed). Matching is by raw Plex identifier
     # (email for owner, username for managed). ``None`` (or omitted)
-    # means "include every user the source server reports" — the
+    # means "include every user the source server reports" - the
     # historical default. Empty list ``[]`` excludes ALL users and is
     # honoured as such (rare but legal). When the list contains the
     # owner email, owner-level data is captured; otherwise the snapshot
@@ -495,7 +540,7 @@ class SnapshotJobIn(BaseModel):
         return _apply_legacy_skip_flags(values)
 
 
-class RestoreJobIn(BaseModel):
+class RestoreJobIn(_PinPreflightAckFields):
     """
     Body of ``POST /api/job/restore``. Mirrors the restore side of the CLI.
 
@@ -655,7 +700,7 @@ class RestoreJobIn(BaseModel):
             "current. Ignored when mode == 'replace'."
         ),
     )
-    # Per-job user filter — mirrors the snapshot + direct-transfer
+    # Per-job user filter - mirrors the snapshot + direct-transfer
     # fields. Matching is by raw Plex identifier (email for owner,
     # username for managed). The list is the OPERATOR'S explicit
     # selection from the intersection of (users present in the
@@ -700,9 +745,9 @@ class RestoreJobIn(BaseModel):
         wanting Replace mode must do the same explicitly. Submitting
         ``mode == "replace"`` without the flag is a 422 from Pydantic.
         Reason this lives on the model (not the route handler): every
-        caller that builds a RestoreJobIn is gated identically — restore
+        caller that builds a RestoreJobIn is gated identically - restore
         from file, restore from snapshot, scheduled restores, internal
-        re-runs — so the rule belongs with the data, not at one endpoint.
+        re-runs - so the rule belongs with the data, not at one endpoint.
         """
         if self.mode == "replace" and not self.confirm_replace:
             raise ValueError(
@@ -820,7 +865,7 @@ class ScheduleIn(BaseModel):
             "the end of the run. Off by default to keep scheduled runs fast."
         ),
     )
-    # v0.14 Per-Run Settings on schedules. All optional — None means
+    # v0.14 Per-Run Settings on schedules. All optional - None means
     # "inherit the global / per-server value at fire time," matching the
     # blank-input convention from the Run-Job form. Each non-None value
     # is forwarded into the snapshot JobRequest the scheduler builds.
@@ -866,7 +911,7 @@ class ScheduleIn(BaseModel):
             "None or empty string = inherit per-server or global default."
         ),
     )
-    # Per-schedule user filter — same semantics as SnapshotJobIn.user_filter.
+    # Per-schedule user filter - same semantics as SnapshotJobIn.user_filter.
     # Set when the operator wants the schedule to capture only a
     # subset of the source server's users. None = include all.
     user_filter: Optional[List[str]] = Field(
@@ -877,6 +922,50 @@ class ScheduleIn(BaseModel):
         ),
     )
 
+    @model_validator(mode="after")
+    def _block_non_idempotent_merge_on_schedules(self) -> "ScheduleIn":
+        """
+        v0.13.x: defensive guard against ``merge_watch_strategy="sum"``
+        on a schedule.
+
+        ScheduleIn is snapshot-only today (no ``mode`` / ``merge_watch_strategy``
+        fields), so this validator is a no-op on every existing payload.
+        It exists ahead of the roadmap's scheduled-restore feature: the
+        moment those fields are added to ScheduleIn, this guard kicks in
+        without the implementer having to remember to add it.
+
+        Why ``sum`` is unsafe on a schedule
+        -----------------------------------
+        Merge "sum" mode adds the snapshot's view count on top of the
+        destination's current count. The math is deliberate for
+        one-shot operator-driven jobs (e.g. consolidating plays from a
+        retired server). But a schedule re-fires on every tick, and
+        each fire would re-add the same stored counts, so the
+        destination's view count grows linearly with the number of
+        schedule fires - a silent corruption that's hard to recover
+        from without the operator noticing.
+
+        The "higher" strategy IS idempotent (max(stored, current)) and
+        is the right choice for any automated re-run. The schedule
+        creator must either pick "higher" or use Replace mode (which
+        is gated by typed-REPLACE and the auto-capture safety belt).
+        """
+        # Use getattr so the validator stays correct whether or not
+        # ScheduleIn carries restore-mode fields yet. Once those fields
+        # exist this becomes an active gate; today both reads return
+        # None and the early-out fires.
+        mode = getattr(self, "mode", None)
+        strategy = getattr(self, "merge_watch_strategy", None)
+        if mode == "merge" and strategy == "sum":
+            raise ValueError(
+                "Schedules cannot use merge_watch_strategy='sum': it adds "
+                "stored counts on top of current counts on every fire, "
+                "which silently double-counts (then triple-counts, etc.) "
+                "on each scheduled run. Use 'higher' for idempotent "
+                "scheduled restores, or pick Replace mode."
+            )
+        return self
+
 
 # ── Outbound shapes ──────────────────────────────────────────────────────────
 # We return plain dicts from most endpoints rather than typing every
@@ -885,7 +974,7 @@ class ScheduleIn(BaseModel):
 # evolves. The TypeScript frontend has its own narrow types in
 # ``frontend/src/api.ts`` for the fields it actually reads.
 
-class DirectTransferIn(BaseModel):
+class DirectTransferIn(_PinPreflightAckFields):
     """
     Body of ``POST /api/job/direct``.
 
@@ -1071,6 +1160,38 @@ class DirectTransferIn(BaseModel):
                 "destructive semantics."
             )
         return self
+
+
+# ── PR-12 preflight ──────────────────────────────────────────────────────────
+
+class PinPreflightIn(BaseModel):
+    """
+    Body of ``POST /api/job/preflight-pin-check``.
+
+    The frontend posts the same scope it is about to use for the
+    actual job submit so the backend can compute the at-risk
+    managed-user list against the User Management database.
+    ``mode`` determines whether the check applies (snapshot / direct
+    yes, restore no).
+    """
+    mode: str = Field(
+        description="snapshot | restore | direct",
+    )
+    source_server_name: Optional[str] = Field(
+        default=None,
+        description="Friendly name of the source server. Required for snapshot and direct.",
+    )
+    dest_server_names: Optional[List[str]] = Field(
+        default=None,
+        description="Direct-mode destination names (also fan-out targets).",
+    )
+    user_filter: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional narrow scope, mirroring DirectTransferIn.user_filter. "
+            "None = every managed user on the relevant server(s) is in scope."
+        ),
+    )
 
 
 class ServerIn(BaseModel):

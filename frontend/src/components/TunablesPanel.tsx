@@ -1,18 +1,18 @@
 // Settings ▸ Tunables sub-tab.
 //
 // Root-admin-only infrastructure knobs that used to be hardcoded
-// literals. Every value is hot-reloadable — services/tunables.py
+// literals. Every value is hot-reloadable - services/tunables.py
 // mtime-caches the settings.json read, so a save is picked up on the
 // next call. The HTTP-related tunables additionally trigger
 // services.auth.invalidate_sessions() so the live requests Sessions
 // rebuild their adapters without a restart.
 //
 // Sections:
-//   * Networking & Retry — HTTP timeouts, retry budget
-//   * Performance Caps — worker ceilings, viewcount increment cap
-//   * Polling & Maintenance — ping/scheduler/cleanup intervals
-//   * Limits — retention defaults, JWT/refresh TTLs, log read cap
-//   * Danger Zone (collapsed) — SQLite busy timeouts, HTTP pool sizes
+//   * Networking & Retry - HTTP timeouts, retry budget
+//   * Performance Caps - worker ceilings, viewcount increment cap
+//   * Polling & Maintenance - ping/scheduler/cleanup intervals
+//   * Limits - retention defaults, JWT/refresh TTLs, log read cap
+//   * Danger Zone (collapsed) - SQLite busy timeouts, HTTP pool sizes
 //
 // The Danger Zone section requires the "I understand" checkbox before
 // the Save button enables. Wrong values can break Plex connectivity or
@@ -39,13 +39,13 @@ interface TunablesShape {
   import_user_workers_cap?: number;
   import_library_workers_cap?: number;
   viewcount_increment_cap?: number;
-  // Boolean — plexapi autoreload escape hatch. Default false (the
+  // Boolean - plexapi autoreload escape hatch. Default false (the
   // bulk-fetch + serialize paths actively disable plexapi's per-item
   // auto-reload). True returns vanilla plexapi behaviour at the cost
   // of catastrophic slowdowns on unmatched / unrated items.
   plexapi_autoreload_enabled?: boolean;
   // Cache snapshot / direct-transfer payloads into media.db on every
-  // run. Default false — the snapshot .db file + JSON sidecar are
+  // run. Default false - the snapshot .db file + JSON sidecar are
   // payload-direct (Rule 1) and don't need media.db. The engine
   // automatically seeds media.db on the first run for an unseeded
   // server regardless of this value, so the resolver Tier 0 GUID
@@ -55,6 +55,10 @@ interface TunablesShape {
   frontend_server_ping_interval_ms?: number;
   scheduler_tick_seconds?: number;
   refresh_token_cleanup_interval_seconds?: number;
+  // v0.13.x: TTL for the generated ``.plexexport.json`` sidecar.
+  // 0 disables the sweep; positive values are seconds-since-mtime
+  // after which the background reap deletes the file.
+  snapshot_sidecar_ttl_seconds?: number;
   // Limits
   snapshot_retention_global_default?: number;
   refresh_token_ttl_seconds?: number;
@@ -88,6 +92,7 @@ const DEFAULTS: Required<TunablesShape> = {
   frontend_server_ping_interval_ms: 30000,
   scheduler_tick_seconds: 30,
   refresh_token_cleanup_interval_seconds: 3600,
+  snapshot_sidecar_ttl_seconds: 300,
   snapshot_retention_global_default: 30,
   refresh_token_ttl_seconds: 7 * 24 * 60 * 60,
   jwt_access_token_ttl_seconds: 30 * 60,
@@ -130,8 +135,9 @@ const PERFORMANCE_FIELDS: FieldDef[] = [
 
 const POLLING_FIELDS: FieldDef[] = [
   { key: 'frontend_server_ping_interval_ms', label: 'Frontend server ping interval', unit: 'ms', help: 'How often the Servers panel pings registered servers for live status. Picked up on next ServersPanel mount.', min: 1000, step: 500 },
-  { key: 'scheduler_tick_seconds', label: 'Scheduler tick', unit: 's', help: 'How often the scheduler loop checks for due jobs. Re-read at top of every iteration — change takes effect within one tick.', min: 1, step: 1 },
+  { key: 'scheduler_tick_seconds', label: 'Scheduler tick', unit: 's', help: 'How often the scheduler loop checks for due jobs. Re-read at top of every iteration - change takes effect within one tick.', min: 1, step: 1 },
   { key: 'refresh_token_cleanup_interval_seconds', label: 'Refresh-token cleanup cadence', unit: 's', help: 'How often the background sweep purges expired refresh tokens from auth.db.', min: 60, step: 60 },
+  { key: 'snapshot_sidecar_ttl_seconds', label: 'Snapshot sidecar TTL', unit: 's', help: 'How long a generated .plexexport.json sidecar is kept on disk before the background sweep reaps it. The sweep runs once a minute, so the actual cutoff is TTL + up to 60 s. Sidecars are regenerated on demand from the snapshot .db, so reaping is non-destructive. Default 300 (5 min). Set to 0 to disable the sweep entirely (sidecars then persist until the snapshot row is removed).', min: 0, step: 30 },
 ];
 
 const LIMITS_FIELDS: FieldDef[] = [
@@ -144,8 +150,8 @@ const LIMITS_FIELDS: FieldDef[] = [
 const DANGER_FIELDS: FieldDef[] = [
   { key: 'sqlite_busy_timeout_main_seconds', label: 'SQLite busy timeout (main pool)', unit: 's', help: 'How long a write call waits for a held SQLite lock before raising. Too short = transient write failures under load; too long = stuck connections.', min: 1, step: 1, danger: true },
   { key: 'sqlite_busy_timeout_short_seconds', label: 'SQLite busy timeout (short-lived conns)', unit: 's', help: 'Lower-latency timeout for the short-lived read connections snapshot_registry uses for get-style queries.', min: 1, step: 1, danger: true },
-  { key: 'http_pool_connections', label: 'HTTP pool connections', unit: 'pools', help: 'requests.adapters.HTTPAdapter pool_connections — how many distinct host pools the Session keeps. Wrong values waste FDs or starve concurrent Plex calls.', min: 1, step: 1, danger: true },
-  { key: 'http_pool_maxsize_cap', label: 'HTTP pool max-size cap', unit: 'connections', help: 'requests.adapters.HTTPAdapter pool_maxsize — how many simultaneous connections fit in one host pool.', min: 1, step: 1, danger: true },
+  { key: 'http_pool_connections', label: 'HTTP pool connections', unit: 'pools', help: 'requests.adapters.HTTPAdapter pool_connections - how many distinct host pools the Session keeps. Wrong values waste FDs or starve concurrent Plex calls.', min: 1, step: 1, danger: true },
+  { key: 'http_pool_maxsize_cap', label: 'HTTP pool max-size cap', unit: 'connections', help: 'requests.adapters.HTTPAdapter pool_maxsize - how many simultaneous connections fit in one host pool.', min: 1, step: 1, danger: true },
 ];
 
 
@@ -284,7 +290,7 @@ export function TunablesPanel() {
   const [dangerAck, setDangerAck] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // Per-server tunable overrides (root_admin only — gated by the same
+  // Per-server tunable overrides (root_admin only - gated by the same
   // settings.tunables perm the rest of this panel uses). Loaded
   // alongside the global tunables block.
   const [servers, setServers] = useState<ServerView[]>([]);
@@ -396,7 +402,7 @@ export function TunablesPanel() {
       {ok && <div className="banner good">{ok}</div>}
 
       <div className="banner info" style={{ fontSize: 13 }}>
-        <strong>Root admin only.</strong> Every tunable here is hot-reloadable — a save
+        <strong>Root admin only.</strong> Every tunable here is hot-reloadable - a save
         flushes the in-memory cache and (for HTTP-related values) rebuilds live Plex
         sessions on the next request. No restart required.
       </div>
@@ -419,7 +425,7 @@ export function TunablesPanel() {
           Caps section conceptually but uses a checkbox (boolean) so
           it's rendered as its own small panel rather than retrofitted
           into FieldRow's numeric input. Default false (autoreload
-          disabled — the right answer in 99% of cases). Flip true only
+          disabled - the right answer in 99% of cases). Flip true only
           as a diagnostic, knowing it can multiply snapshot wall-time
           by 100x on libraries with lots of unmatched / unrated items. */}
       <div className="panel">
@@ -450,7 +456,7 @@ export function TunablesPanel() {
                 auto-reload on bulk-fetched lists and serialised items. This keeps snapshot runs
                 fast even on libraries where most items are unmatched, unwatched, or unrated.
                 When <strong>on</strong>, plexapi will reload partial objects the moment you read
-                an attribute whose value is <code>None</code> — bundling <code>includeMarkers</code>
+                an attribute whose value is <code>None</code> - bundling <code>includeMarkers</code>
                 + <code>includeChapters</code> which can trigger Plex intro/chapter analysis at
                 <strong> 20–30 seconds per item</strong>. Only flip this on as a diagnostic if a
                 bulk response is genuinely missing data you expect to be present.
@@ -460,7 +466,7 @@ export function TunablesPanel() {
         })()}
       </div>
 
-      {/* media.db caching toggle. Default off — the snapshot .db file +
+      {/* media.db caching toggle. Default off - the snapshot .db file +
           JSON sidecar are payload-direct (Rule 1) and don't need
           media.db. First-run auto-seed kicks in regardless of this
           value so the resolver Tier 0 GUID cache gets populated once
@@ -491,7 +497,7 @@ export function TunablesPanel() {
               <span className="help">
                 When <strong>off</strong> (default), snapshot + direct-transfer runs do <strong>not</strong> ingest
                 payloads into <code>media.db</code>. The snapshot <code>.db</code> file and JSON
-                sidecar are unaffected — they're built directly from the live payloads (Rule 1).
+                sidecar are unaffected - they're built directly from the live payloads (Rule 1).
                 A <strong>one-shot auto-seed</strong> still ingests the first run for any unseeded
                 server so the resolver Tier 0 GUID cache gets populated; subsequent runs skip the
                 write until you flip this on. Turn on to keep <code>media.db</code> in sync on
@@ -520,12 +526,12 @@ export function TunablesPanel() {
 
       {/* Per-server overrides for the "Both" tunables. Two fields only
           today (plex_connect_timeout_seconds, viewcount_increment_cap)
-          — the global value lives in the sections above; per-server
+          - the global value lives in the sections above; per-server
           rows below apply only when set. */}
       <div className="panel">
         <h2>Per-server tunable overrides</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
-          A handful of tunables benefit from per-server values — a slow remote Plex
+          A handful of tunables benefit from per-server values - a slow remote Plex
           server gets a higher connect timeout than a fast LAN server; a weaker server
           gets a lower viewcount batch cap. Blank cells inherit the global value above.
         </span>
@@ -601,7 +607,7 @@ export function TunablesPanel() {
         )}
       </div>
 
-      {/* Danger Zone — collapsed by default. Warning banner + the
+      {/* Danger Zone - collapsed by default. Warning banner + the
           "I understand" gate inside. */}
       <div className="panel" style={{
         border: '1px solid var(--warn, #d97706)',
@@ -640,7 +646,7 @@ export function TunablesPanel() {
                   checked={dangerAck}
                   onChange={(e) => setDangerAck(e.target.checked)}
                 />
-                <span><strong>I understand the risks</strong> — Danger Zone values may cause SQLite lock contention or break HTTP pooling. Save is blocked until this is checked.</span>
+                <span><strong>I understand the risks</strong> - Danger Zone values may cause SQLite lock contention or break HTTP pooling. Save is blocked until this is checked.</span>
               </label>
             )}
           </div>

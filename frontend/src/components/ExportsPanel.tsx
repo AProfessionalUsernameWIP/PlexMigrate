@@ -46,6 +46,13 @@ export function ExportsPanel() {
   const [info, setInfo] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingDestructive | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
+  // v0.14 - per-server sub-tab. Mirrors the pattern on Servers ▸ User
+  // Management: a tab strip with one button per server that has
+  // snapshots; clicking shows that server's snapshots only. ``null``
+  // = no selection yet (initial mount before refresh resolves, or
+  // every server's snapshots have been deleted). After refresh we
+  // auto-select the first server with rows.
+  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   // Tick counter for the animated "Generating…" label. Increments
   // every GENERATING_FRAME_MS while ``downloading`` is non-null and
   // resets to 0 between clicks. Module-level frame index is
@@ -76,7 +83,20 @@ export function ExportsPanel() {
         api.listLegacySnapshots(),
       ]);
       if (snapsResult.status === 'fulfilled') {
-        setSnapshots(snapsResult.value.snapshots);
+        const list = snapsResult.value.snapshots;
+        setSnapshots(list);
+        // Auto-select first server with snapshots after a refresh,
+        // BUT only when the operator hasn't already picked one OR
+        // the currently-selected server no longer has snapshots
+        // (e.g. they just got cleared). Mirrors UserManagementPanel's
+        // pattern.
+        const firstServerId =
+          list.find((s) => s.server_id)?.server_id || null;
+        setSelectedServerId((prev) => {
+          if (!prev) return firstServerId;
+          const stillExists = list.some((s) => s.server_id === prev);
+          return stillExists ? prev : firstServerId;
+        });
       } else {
         setError(String(snapsResult.reason));
       }
@@ -238,48 +258,68 @@ export function ExportsPanel() {
             <code> .plexexport.json</code> files.
           </div>
         ) : (
-          groupKeys.map((sid) => (
-            <ServerGroup
-              key={sid}
-              serverId={sid}
-              serverName={grouped[sid].server_name}
-              rows={grouped[sid].rows}
-              downloadingUrl={downloading}
-              generatingTick={generatingTick}
-              onDownloadJson={(snap) =>
-                void downloadBlob(
-                  api.snapshotDownloadUrl(snap.id),
-                  `${snap.snapshot_name}.plexexport.json`,
-                )
-              }
-              onDownloadDb={(snap) =>
-                void downloadBlob(
-                  api.snapshotDbDownloadUrl(snap.id),
-                  `${snap.snapshot_name}.db`,
-                )
-              }
-              onDelete={(snap) =>
-                setPending({
-                  kind: 'delete_snapshot',
-                  id: snap.id,
-                  name: snap.snapshot_name,
-                  // Keep-JSON is only offered when the .db is still
-                  // on disk - otherwise there's nothing to render
-                  // from. Dead rows already disable the Delete button
-                  // via the row-level guard above (Remove entry path).
-                  canKeepJson: snap.available,
-                })
-              }
-              onClearAll={() =>
-                setPending({
-                  kind: 'clear_server',
-                  server_id: sid,
-                  server_name: grouped[sid].server_name,
-                  count: grouped[sid].rows.length,
-                })
-              }
+          <>
+            {/* v0.14 - per-server sub-tab strip. One button per server
+                that has snapshots, with the count in parens for at-a-
+                glance distribution. Mirrors the strip used on Servers
+                ▸ User Management and Servers ▸ Overview so operators
+                see a consistent navigation pattern when they're
+                drilling into a single server. */}
+            <SnapshotServerSelector
+              groupKeys={groupKeys}
+              grouped={grouped}
+              selectedId={selectedServerId}
+              onSelect={setSelectedServerId}
             />
-          ))
+            {selectedServerId && grouped[selectedServerId] ? (
+              <ServerGroup
+                key={selectedServerId}
+                serverId={selectedServerId}
+                serverName={grouped[selectedServerId].server_name}
+                rows={grouped[selectedServerId].rows}
+                downloadingUrl={downloading}
+                generatingTick={generatingTick}
+                onDownloadJson={(snap) =>
+                  void downloadBlob(
+                    api.snapshotDownloadUrl(snap.id),
+                    `${snap.snapshot_name}.plexexport.json`,
+                  )
+                }
+                onDownloadDb={(snap) =>
+                  void downloadBlob(
+                    api.snapshotDbDownloadUrl(snap.id),
+                    `${snap.snapshot_name}.db`,
+                  )
+                }
+                onDelete={(snap) =>
+                  setPending({
+                    kind: 'delete_snapshot',
+                    id: snap.id,
+                    name: snap.snapshot_name,
+                    // Keep-JSON is only offered when the .db is still
+                    // on disk - otherwise there's nothing to render
+                    // from. Dead rows already disable the Delete button
+                    // via the row-level guard above (Remove entry path).
+                    canKeepJson: snap.available,
+                  })
+                }
+                onClearAll={() =>
+                  setPending({
+                    kind: 'clear_server',
+                    server_id: selectedServerId,
+                    server_name: grouped[selectedServerId].server_name,
+                    count: grouped[selectedServerId].rows.length,
+                  })
+                }
+              />
+            ) : (
+              <div className="empty">
+                {groupKeys.length > 0
+                  ? 'Pick a server above to see its snapshots.'
+                  : 'No snapshots match a registered server. Older orphan files appear below under Legacy.'}
+              </div>
+            )}
+          </>
         )}
       </div>
 
@@ -313,6 +353,54 @@ export function ExportsPanel() {
         />
       )}
     </>
+  );
+}
+
+
+// ── Per-server sub-tab strip ────────────────────────────────────────────────
+//
+// One button per server that owns at least one snapshot. Labels carry
+// the snapshot count in parens for at-a-glance distribution
+// (``Plex1 (12)``). Mirrors the Servers ▸ User Management strip so
+// operators get a consistent "drill into one server" affordance.
+
+function SnapshotServerSelector({
+  groupKeys,
+  grouped,
+  selectedId,
+  onSelect,
+}: {
+  groupKeys: string[];
+  grouped: Record<string, { server_name: string; rows: Snapshot[] }>;
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  if (groupKeys.length === 0) return null;
+  return (
+    <nav className="tabs sub-tabs" style={{ marginTop: 12, marginBottom: 12 }}>
+      {groupKeys.map((sid) => {
+        const g = grouped[sid];
+        const isUnknown = sid === '__unknown__';
+        return (
+          <button
+            key={sid}
+            type="button"
+            className={sid === selectedId ? 'active' : ''}
+            onClick={() => onSelect(sid)}
+            title={
+              isUnknown
+                ? 'Snapshots whose server_id no longer maps to a registered server (orphans).'
+                : g.server_name
+            }
+          >
+            {g.server_name}{' '}
+            <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
+              ({g.rows.length})
+            </span>
+          </button>
+        );
+      })}
+    </nav>
   );
 }
 

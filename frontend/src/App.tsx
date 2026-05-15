@@ -76,10 +76,10 @@ type AccountSubTab = 'account' | 'account_management';
 type SettingsSubTab = 'settings' | 'tunables' | 'logs' | 'help';
 
 // Inner nav inside the Account Management sub-tab. Three pages:
-//   db_admin       — Database Admin Account credential (db_admin.access)
-//   user_accounts  — User Accounts explorer (users.manage)
-//   access_control — Access Control (per-user permission grants/revokes;
-//                    root_admin only — gated by canManageAccessControl)
+//   db_admin       - Database Admin Account credential (db_admin.access)
+//   user_accounts  - User Accounts explorer (users.manage)
+//   access_control - Access Control (per-user permission grants/revokes;
+//                    root_admin only - gated by canManageAccessControl)
 type AccountMgmtPage = 'db_admin' | 'user_accounts' | 'access_control';
 
 // Connection states surfaced in the topbar dot. "connecting" is the
@@ -357,7 +357,7 @@ function Main({
   const canAccessDbAdmin = usePermission('db_admin.access');
   const canViewLogs = usePermission('logs.view');
   const canViewExports = usePermission('exports.view');
-  // Access Control is the most sensitive admin surface in the app —
+  // Access Control is the most sensitive admin surface in the app -
   // it edits every other user's permission set. Gated to root_admin
   // only at both the UI (here) and backend (require_role("root_admin")
   // on the /api/auth/users/{u}/permissions routes). View-mode-aware:
@@ -748,7 +748,7 @@ function Main({
           {canStartJobs && (
             <button className={serversSubTab === 'users' ? 'active' : ''} onClick={() => setServersSubTab('users')}>User Management</button>
           )}
-          {/* Run Defaults — moved here from Settings ▸ General Settings.
+          {/* Run Defaults - moved here from Settings ▸ General Settings.
               These are the run-level knobs (paths, performance, snapshot
               defaults, transfer resolution, retention ceiling) that
               describe HOW snapshots and direct transfers operate
@@ -805,7 +805,7 @@ function Main({
           {canEditSettings && (
             <button className={settingsSubTab === 'settings' ? 'active' : ''} onClick={() => setSettingsSubTab('settings')}>General Settings</button>
           )}
-          {/* System Tunables — root_admin only. Infrastructure-level
+          {/* System Tunables - root_admin only. Infrastructure-level
               knobs (HTTP timeouts, JWT TTL, SQLite busy timeout, etc.)
               that used to be hardcoded literals. */}
           {canManageTunables && (
@@ -901,7 +901,7 @@ function Main({
               >
                 User Accounts
               </button>
-              {/* Access Control — root_admin only. Per-user permission
+              {/* Access Control - root_admin only. Per-user permission
                   grant/revoke layered on top of the role baseline. */}
               {canManageAccessControl && (
                 <button

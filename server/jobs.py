@@ -557,6 +557,7 @@ class JobQueue:
         _set_run_timestamp(server_slug, libraries=_wanted_libs)
         logger, run_log_dir = _build_logger(settings["log_dir"], settings["verbose"])
         rec.run_log_dir = run_log_dir
+        _log_pin_preflight_ack(rec, logger)
         state.MAX_WORKERS = int(settings["workers"])
         state.SCROBBLE_WORKERS = int(settings["scrobble_workers"])
         state._session = _make_session()
@@ -652,7 +653,7 @@ class JobQueue:
                 include_ratings=bool(settings.get("include_ratings", True)),
                 include_playlists=bool(settings.get("include_playlists", True)),
                 include_collections=bool(settings.get("include_collections", True)),
-                # v0.14 — per-job user filter. None / missing = include
+                # v0.14 - per-job user filter. None / missing = include
                 # every user the source server reports (the historical
                 # default). When provided, run_snapshot filters
                 # home_users + derives owner_included internally.
@@ -811,6 +812,7 @@ class JobQueue:
         _set_run_timestamp(server_slug, libraries=_restore_libs)
         logger, run_log_dir = _build_logger(settings["log_dir"], settings["verbose"])
         rec.run_log_dir = run_log_dir
+        _log_pin_preflight_ack(rec, logger)
         state.MAX_WORKERS = int(settings["workers"])
         state.SCROBBLE_WORKERS = int(settings["scrobble_workers"])
         state._session = _make_session()
@@ -883,7 +885,7 @@ class JobQueue:
             include_collections=bool(settings.get("include_collections", True)),
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
-            # v0.14 — per-job user filter for restore. None = restore
+            # v0.14 - per-job user filter for restore. None = restore
             # every user from the payload that also exists on the
             # destination (historical default). When provided, the
             # importer drops managed users whose handle isn't in the list.
@@ -988,6 +990,7 @@ class JobQueue:
 
         logger, run_log_dir = _build_logger(settings["log_dir"], settings["verbose"])
         rec.run_log_dir = run_log_dir
+        _log_pin_preflight_ack(rec, logger)
         state.MAX_WORKERS = int(settings["workers"])
         state.SCROBBLE_WORKERS = int(settings["scrobble_workers"])
         state._session = _make_session()
@@ -1283,7 +1286,7 @@ class JobQueue:
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
             pre_replace_settings=_build_pre_replace_settings(settings),
-            # v0.14 — per-job user filter forwarded to each
+            # v0.14 - per-job user filter forwarded to each
             # destination in the fan-out. The fan-out helper passes
             # it straight to run_restore.
             user_filter=settings.get("user_filter"),
@@ -1303,6 +1306,31 @@ class JobQueue:
 
 class _JobCancelled(Exception):
     """Raised when stop_event is set before the engine call completes."""
+
+
+def _log_pin_preflight_ack(rec: JobRecord, logger: logging.Logger) -> None:
+    """
+    PR-12 - write the operator-acknowledged at-risk user list to the
+    per-run logger so the audit trail lives in the run's ``runtime.log``
+    alongside the engine's own output. No-op when the operator did
+    not see the preflight modal (the flag is False/absent).
+
+    The flag is stamped onto ``rec.params`` by
+    :func:`server.app._apply_preflight_ack` at job-submit time and is
+    purely informational here: the engine does not change behaviour
+    based on it. Visibility is the whole point.
+    """
+    if not rec.params.get("_pin_preflight_acknowledged"):
+        return
+    at_risk = rec.params.get("_pin_preflight_at_risk") or []
+    at_risk_str = ", ".join(at_risk) if at_risk else "(none specified)"
+    logger.warning(
+        "PR-12 preflight acknowledged by operator: %d at-risk user(s): %s. "
+        "These users have no stored auth token or PIN; the engine will "
+        "fall back to admin-token impersonation for them, which may "
+        "return incomplete data for PIN-scoped content.",
+        len(at_risk), at_risk_str,
+    )
 
 
 def _resolve_dest_names(settings: Dict[str, Any]) -> List[str]:

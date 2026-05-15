@@ -1,7 +1,7 @@
 // Settings panel - PlexMigrate app behaviour (Bucket B).
 //
 // As of the Phase-2 Settings/Servers reorg, this panel holds only the
-// settings that describe how the PlexMigrate app itself behaves —
+// settings that describe how the PlexMigrate app itself behaves -
 // distinct from the run-level defaults that describe how snapshots
 // and direct transfers operate against Plex (those moved to
 // Servers ▸ Run Defaults).
@@ -21,7 +21,7 @@
 //
 // What moved to Settings ▸ Tunables:
 //   * Root-admin-only infrastructure knobs (HTTP timeouts, JWT TTL,
-//     SQLite busy timeouts, etc.) — populated in Phase 3.
+//     SQLite busy timeouts, etc.) - populated in Phase 3.
 
 import { useEffect, useState } from 'react';
 import { api, PrunePreview, PruneResult, SettingsView } from '../api';
@@ -143,7 +143,7 @@ export function SettingsPanel() {
         <h2>Logging</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
           Operational log files vs the forensic audit log. The first is
-          your convenience — turn it off and the engine still runs and
+          your convenience - turn it off and the engine still runs and
           the dashboard still updates, you just don't get per-run files
           on disk. The second is the security audit trail; toggling it
           requires the database-admin credential and the transition is
@@ -158,7 +158,7 @@ export function SettingsPanel() {
           <span>Write per-run log files (<code>runtime.log</code> / <code>errors.log</code> / <code>media.log</code>)</span>
           <span className="help">
             Default on. When off, the engine and dashboard still run
-            and update normally — only the per-run files on disk are
+            and update normally - only the per-run files on disk are
             suppressed. Console output is unaffected.
           </span>
         </label>
@@ -172,7 +172,7 @@ export function SettingsPanel() {
           <span className="help">
             Records every read / write the engine performs against
             <code> media.db</code>, <code>auth.db</code>, and{' '}
-            <code>snapshots.db</code>. Forensic control — toggling it
+            <code>snapshots.db</code>. Forensic control - toggling it
             requires the database-admin credential. The transition
             is logged in the audit file itself so the trail always
             shows it was intentionally disabled and by whom.
@@ -193,7 +193,7 @@ export function SettingsPanel() {
           last-seen timestamp on every item the server still reports.
           Items not seen in a while become candidates for the
           <strong> Prune Missing Items</strong> action below. <em>Pruning never
-          runs automatically</em> — the operator picks the day threshold
+          runs automatically</em> - the operator picks the day threshold
           and confirms each sweep with database-admin credentials.
         </span>
         <label className="switch">
@@ -219,7 +219,7 @@ export function SettingsPanel() {
           </label>
           <label className="field" style={{ maxWidth: 240 }}>
             <span className="label">Stale threshold (days)</span>
-            <span className="help">Default value for the Prune Missing Items slider — operators can override per sweep.</span>
+            <span className="help">Default value for the Prune Missing Items slider - operators can override per sweep.</span>
             <input
               type="number"
               min={1}
@@ -233,7 +233,7 @@ export function SettingsPanel() {
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
           Pick a registered server, preview the items it hasn't reported
           recently, and (after a db-admin confirm) remove their cache
-          rows. Snapshots are never touched — they're historical records
+          rows. Snapshots are never touched - they're historical records
           of what existed at capture time.
         </span>
         {servers.length === 0 ? (
@@ -302,7 +302,7 @@ export function SettingsPanel() {
           </div>
         </label>
         {/* Live preview at the current multiplier. Each row renders
-            the phase name three ways — as the normal tag the
+            the phase name three ways - as the normal tag the
             Dashboard's Currently Processing table uses (left column),
             then the stall-amber and stall-red variants the same phase
             transitions into once its age crosses the thresholds. The
@@ -431,12 +431,12 @@ function PruneMissingItemsModal({
         }}
         onClick={(e) => e.stopPropagation()}
       >
-        <h2>Prune Missing Items — {serverName}</h2>
+        <h2>Prune Missing Items - {serverName}</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
           Items a library walk last confirmed present <em>before</em> the
           threshold below will have their watch / rating /
           playlist-member / collection-member rows removed for this
-          server. Items never confirmed by a walk are left alone — a
+          server. Items never confirmed by a walk are left alone - a
           missing <code>last_seen_at</code> is not evidence the item is
           gone. Items shared with other registered servers stay intact.
           Snapshots are never touched.
@@ -494,7 +494,7 @@ function PruneMissingItemsModal({
                       <li key={`${it.rating_key}-${it.item_id}`}>
                         <strong>{it.title}</strong>
                         {it.year ? ` (${it.year})` : ''}
-                        {' — '}
+                        {' - '}
                         <span style={{ color: 'var(--text-dim)' }}>
                           {it.last_seen_at
                             ? `last seen ${new Date(it.last_seen_at * 1000).toLocaleDateString()}`
@@ -638,8 +638,8 @@ function AuditLogToggleModal({
             tombstone changes) will <strong>succeed without leaving a record</strong> of
             who did it or when. The audit trail will resume only when an
             admin explicitly re-enables it through this dialog. The act
-            of turning it off is itself logged as the final entry — under
-            your db-admin username below — so the off period is always
+            of turning it off is itself logged as the final entry - under
+            your db-admin username below - so the off period is always
             attributable. Continue only if you understand the
             accountability trade-off.
           </div>

@@ -1,6 +1,6 @@
 // Helpers for working with Plex Media Server version strings.
 //
-// PMS reports its version as a string like "1.32.5.7349-abcdef" — a
+// PMS reports its version as a string like "1.32.5.7349-abcdef" - a
 // dotted-numeric prefix followed by an optional build-hash suffix.
 // The parser below extracts the leading numeric tuple and tolerates
 // any trailing junk; absent / unparseable inputs return null.
@@ -47,7 +47,7 @@ export function compareVersions(a: PlexVersionTuple, b: PlexVersionTuple): numbe
 /**
  * Returns true iff this PMS supports Fast Collection Detection.
  *
- * Feature requires Plex Media Server ≥ 1.32 — that's where the
+ * Feature requires Plex Media Server ≥ 1.32 - that's where the
  * ``librarySectionUserID`` attribute on collection objects landed.
  * Older servers don't expose it and the engine would auto-fall-back
  * to the slower rating-key dedup; we explicitly gate the toggle off

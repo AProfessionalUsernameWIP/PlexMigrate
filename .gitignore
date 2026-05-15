@@ -104,9 +104,10 @@ docker-compose.override.yml
 dev_docs/
 
 # Root-level Markdown is local-only working/dev docs (design notes,
-# etc.) EXCEPT the three shipped docs. Add a new doc at the repo root
+# etc.) EXCEPT the shipped docs. Add a new doc at the repo root
 # and it stays local unless it's explicitly un-ignored below.
 /*.md
 !/README.md
 !/SOURCES.md
 !/QUICKSTART.md
+!/OVERVIEW.md

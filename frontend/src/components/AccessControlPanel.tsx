@@ -13,7 +13,7 @@
 // UX shape:
 //   * Left rail: user picker (every non-db_admin row). Selecting a
 //     row loads its current grant/revoke state.
-//   * Right pane: one row per permission with two toggles —
+//   * Right pane: one row per permission with two toggles -
 //     "From role baseline" and "Granted/Revoked override". Three
 //     visual states per permission: baseline-on (no override),
 //     baseline-on-but-revoked (red strikethrough), baseline-off-but-granted
@@ -26,7 +26,7 @@ import { PERMISSION_LABELS } from '../contexts/AuthContext';
 
 
 // State of one permission row in the table. Pure derivation from
-// (baseline, extra, revoked) — kept local so the row JSX stays simple.
+// (baseline, extra, revoked) - kept local so the row JSX stays simple.
 type PermState = 'baseline_on' | 'baseline_off' | 'granted' | 'revoked';
 
 function permState(
@@ -96,7 +96,7 @@ export function AccessControlPanel() {
   const isRootAdmin = data?.role === 'root_admin';
 
   // Live recomputation of the effective set as the operator toggles
-  // — no need to wait for save to see what it'll look like.
+  // - no need to wait for save to see what it'll look like.
   const effectivePreview = useMemo(() => {
     if (!data) return new Set<Permission>();
     if (isRootAdmin) return new Set(data.all_permissions);
@@ -182,7 +182,7 @@ export function AccessControlPanel() {
       setData(result);
       setExtra(new Set(result.extra));
       setRevoked(new Set(result.revoked));
-      setOk(`Saved — ${result.effective.length} effective permission(s).`);
+      setOk(`Saved - ${result.effective.length} effective permission(s).`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -209,7 +209,7 @@ export function AccessControlPanel() {
 
       <div className="banner info" style={{ fontSize: 13 }}>
         <strong>Root admin only.</strong> Grant or revoke individual permissions on top
-        of each user's role. Saves are immediate — the affected user's next request
+        of each user's role. Saves are immediate - the affected user's next request
         picks up the new permission set; no re-login required.
         Root admin is immune to revokes (always full permissions) so the recovery
         path can't be locked out.
@@ -274,7 +274,7 @@ export function AccessControlPanel() {
                       Effective: {effectivePreview.size} of {allPermissions.length} permission(s)
                       {isRootAdmin && (
                         <span style={{ marginLeft: 8, color: 'var(--warn, #d97706)' }}>
-                          (root admin — revokes ignored)
+                          (root admin - revokes ignored)
                         </span>
                       )}
                     </div>

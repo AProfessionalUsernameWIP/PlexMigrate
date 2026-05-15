@@ -168,7 +168,7 @@ def init_auth_db() -> None:
 def _migrate_permission_columns(conn: sqlite3.Connection) -> None:
     """
     Add ``extra_permissions`` and ``revoked_permissions`` TEXT columns
-    to ``app_users`` if they're not already present. Idempotent —
+    to ``app_users`` if they're not already present. Idempotent -
     ``ALTER TABLE ADD COLUMN`` raises ``OperationalError: duplicate
     column name`` when the column already exists, which we catch.
 
@@ -570,7 +570,7 @@ def get_user_permission_grants(username: str) -> Dict[str, List[str]]:
     Return the per-user grant + revoke lists for ``username``.
 
     Shape: ``{"extra": [...], "revoked": [...]}``. Missing user returns
-    empty lists for both — callers blend these with the role baseline
+    empty lists for both - callers blend these with the role baseline
     via ``effective_permissions_for`` and shouldn't treat "missing
     user" as an error here.
     """
@@ -608,7 +608,7 @@ def set_user_permission_grants(
     root_admin before reaching here). This function trusts both lists
     to be already-dedup'd lists of valid permission strings.
 
-    Raises ``ValueError`` if the user doesn't exist — silent no-op
+    Raises ``ValueError`` if the user doesn't exist - silent no-op
     would mask a typo in the username arg.
     """
     import json

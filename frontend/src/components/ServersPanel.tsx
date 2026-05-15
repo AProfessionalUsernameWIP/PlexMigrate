@@ -92,7 +92,7 @@ export function ServersPanel() {
           setPingIntervalMs(v);
         }
       })
-      .catch(() => { /* non-fatal — fall back to the default */ });
+      .catch(() => { /* non-fatal - fall back to the default */ });
   }, []);
 
   const refresh = async () => {
@@ -492,11 +492,38 @@ function UsersForServer({
     );
   }
   if ('error' in payload && !('users' in payload)) {
-    // Total fetch failure (e.g. 502 - server unreachable).
+    // Total fetch failure (e.g. 502 - server unreachable). The backend
+    // error message points at URL / token, but a previously-working
+    // server failing usually means the Plex Server itself is down,
+    // restarting, or otherwise unreachable from this host - the
+    // ConnectionError catch-all in server_registry.sync_managed_users_from_live
+    // can't distinguish bad credentials from network failure. Show a
+    // short hint inline and a richer diagnostic list on hover so the
+    // operator knows where else to look.
+    const diagnosticHint =
+      'Things to check:\n' +
+      '  1. Plex Media Server is running on the host (open its web UI directly).\n' +
+      '  2. The host is reachable from this backend (DNS, IP, port forwarding).\n' +
+      '  3. URL + token in the Servers tab match the live server.\n' +
+      '  4. Plex token has not been revoked under plex.tv > Authorized Devices.\n' +
+      '  5. Docker / firewall rules between this backend and the Plex host.';
     return (
       <div className="col" style={{ minWidth: 280 }}>
         <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{server.name}</h3>
-        <div className="banner error" style={{ fontSize: 12 }}>{payload.error}</div>
+        <div
+          className="banner error"
+          style={{ fontSize: 12, cursor: 'help' }}
+          title={diagnosticHint}
+        >
+          {payload.error}
+        </div>
+        <div
+          style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}
+          title={diagnosticHint}
+        >
+          If the URL and token are correct, verify the Plex Server itself is
+          running and reachable from this host. Hover for a full checklist.
+        </div>
       </div>
     );
   }

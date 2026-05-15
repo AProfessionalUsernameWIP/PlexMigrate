@@ -153,7 +153,7 @@ def _filter_to_dominant_playlist_type(
     the items belonging to the dominant Plex playlist family and
     ``dropped`` are any off-type items.
 
-    Plex playlists are strictly single-type — a mixed member list must
+    Plex playlists are strictly single-type - a mixed member list must
     never reach a create/append call, or Plex rejects the whole batch
     with "Can not mix media types when building a playlist". A mixed
     list at the write boundary is an *upstream bug* (a wrong-type
@@ -164,7 +164,7 @@ def _filter_to_dominant_playlist_type(
     Items whose ``.type`` is unrecognised are kept (consistent with
     ``_plex_playlist_type_for_items`` choosing to proceed on unknown
     future Plex types rather than false-positive). ``family`` is ``""``
-    only when no item carries a recognisable type — caller leaves the
+    only when no item carries a recognisable type - caller leaves the
     list untouched in that case.
     """
     family = _plex_playlist_type_for_items(items)
@@ -839,7 +839,7 @@ def restore_playlists(
                 # the run log line is unambiguous and survives without
                 # log-level filtering.
                 logger.info(
-                    "[%s] %s — smart playlist, requires manual recreation on destination "
+                    "[%s] %s - smart playlist, requires manual recreation on destination "
                     "(filter URL: %s)",
                     lib_name, pl_name, smart_content or "unavailable",
                 )
@@ -857,7 +857,7 @@ def restore_playlists(
                         total=0,
                         restored=0,
                         smart=True,
-                        reason="Smart playlist — requires manual recreation on destination",
+                        reason="Smart playlist - requires manual recreation on destination",
                     )
                 continue
 
@@ -872,7 +872,7 @@ def restore_playlists(
 
             # Plex playlists are strictly single-type. A resolved item
             # list that spans media families must never reach a
-            # create/append call — Plex rejects the whole batch with
+            # create/append call - Plex rejects the whole batch with
             # "Can not mix media types when building a playlist". A
             # mixed list here is an upstream bug (a wrong-type resolver
             # match, or a snapshot read with mixed members), so drop the
@@ -886,7 +886,7 @@ def restore_playlists(
                     for d in _dropped_offtype[:10]
                 )
                 logger.error(
-                    "[%s] %s — %d off-type item(s) dropped before write "
+                    "[%s] %s - %d off-type item(s) dropped before write "
                     "(playlist family=%r). This indicates a wrong-type "
                     "resolver match or a mixed-type snapshot read upstream. "
                     "Dropped: %s%s",
@@ -899,7 +899,7 @@ def restore_playlists(
                         "title": getattr(d, "title", "(unknown)"),
                         "type": getattr(d, "type", ""),
                         "reason": (
-                            f"off-type for {_family} playlist — dropped to "
+                            f"off-type for {_family} playlist - dropped to "
                             f"avoid Plex media-type mix rejection"
                         ),
                     }
@@ -908,7 +908,7 @@ def restore_playlists(
 
             if not resolved_items:
                 logger.warning(
-                    "[%s] %s — 0/%d items restored (no members resolved on destination)",
+                    "[%s] %s - 0/%d items restored (no members resolved on destination)",
                     lib_name, pl_name, total_members,
                 )
                 if state.get_dashboard():
@@ -1087,7 +1087,7 @@ def restore_playlists(
             restored_count = len(resolved_items)
             if total_members != restored_count:
                 logger.info(
-                    "[%s] %s — %d/%d items restored (%d not available on destination)",
+                    "[%s] %s - %d/%d items restored (%d not available on destination)",
                     lib_name, pl_name, restored_count, total_members,
                     total_members - restored_count,
                 )
@@ -1216,7 +1216,7 @@ def restore_collections(
 
         if not resolved_items:
             logger.warning(
-                "[%s] %s — 0/%d members restored (no members resolved on destination)",
+                "[%s] %s - 0/%d members restored (no members resolved on destination)",
                 lib_name, coll_name, total_members,
             )
             if state.get_dashboard():
@@ -1337,7 +1337,7 @@ def restore_collections(
         restored_count = len(resolved_items)
         if total_members != restored_count:
             logger.info(
-                "[%s] %s — %d/%d members restored (%d not available on destination)",
+                "[%s] %s - %d/%d members restored (%d not available on destination)",
                 lib_name, coll_name, restored_count, total_members,
                 total_members - restored_count,
             )
@@ -1566,16 +1566,25 @@ def restore_export_file(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
-    # Reconstructed-snapshot support: the payload from
-    # ``snapshot_serializer.build_payload_from_db`` collapses all
-    # libraries into one virtual entry with library name
-    # "All Libraries (reconstructed from snapshot DB)". That label is
-    # not a real section, so the standard ``s.title == lib_name``
-    # lookup fails. When this override is set, the importer uses the
-    # supplied real section title for the lookup and accumulator key;
-    # the payload's own "library" field is ignored. ``run_restore``
-    # detects ``snapshot_meta.reconstructed_from_db`` on the payload
-    # and submits one task per target section with this set.
+    # v0.15: per-library section selector for reconstructed payloads.
+    # A reconstructed payload (from ``snapshot_serializer.build_payload_from_db``)
+    # carries a top-level ``libraries`` array - one entry per library
+    # section the snapshot captured, each shaped like a normal flat
+    # per-library export. When ``library_section_id`` is supplied,
+    # ``restore_export_file`` finds the matching entry by
+    # ``library_section_id`` and uses it as the per-library payload for
+    # the rest of the function. ``run_restore`` emits one task per
+    # library entry with its real section_id and resolved target name.
+    #
+    # Legacy single-library files (``library`` + ``users`` at the top
+    # level, no ``libraries`` array) ignore this argument and use the
+    # flat shape directly.
+    library_section_id: Optional[int] = None,
+    # Optional target-name override. When supplied, takes precedence
+    # over the picked entry's ``library`` field for destination
+    # routing - the operator may have renamed the library on the
+    # destination. ``run_restore`` resolves this against the live
+    # destination section list before submitting the task.
     target_section_name_override: Optional[str] = None,
     # v0.13.x restore mode. "merge" = legacy additive behaviour (never
     # destroys data); "replace" = true point-in-time, overwrites view
@@ -1587,9 +1596,9 @@ def restore_export_file(
     # destination ends at current + stored. Ignored when mode=="replace"
     # since Replace overwrites unconditionally. See restore_watch_history.
     merge_watch_strategy: str = "higher",
-    # v0.14 — per-job user filter. None = import every user the
+    # v0.14 - per-job user filter. None = import every user the
     # payload carries that also exists on the destination (historical
-    # default). When supplied (set of Plex identifiers — owner email
+    # default). When supplied (set of Plex identifiers - owner email
     # + managed usernames), the importer drops payload users whose
     # handle isn't in the set BEFORE running their per-user restore.
     user_filter: Optional[List[str]] = None,
@@ -1623,15 +1632,38 @@ def restore_export_file(
         with open(export_path, encoding="utf-8") as f:
             data = json.load(f)
 
-    # When the payload was reconstructed from a snapshot .db, the
-    # serializer emits a single virtual library entry. The override
-    # (set by run_restore once per target section) is what makes the
-    # one payload import correctly across every real target library.
+    # v0.15: if the payload is a reconstructed multi-library wrapper
+    # (``libraries`` array at the top level), select the entry matching
+    # the supplied ``library_section_id`` and treat THAT as ``data`` for
+    # the rest of the function. The entry's shape is identical to a
+    # legacy flat per-library export, so every downstream read
+    # (``data["users"]`` etc.) continues to work without changes.
+    wrapper_libraries = data.get("libraries")
+    if isinstance(wrapper_libraries, list) and library_section_id is not None:
+        picked: Optional[Dict[str, Any]] = None
+        for entry in wrapper_libraries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                if int(entry.get("library_section_id") or 0) == int(library_section_id):
+                    picked = entry
+                    break
+            except (TypeError, ValueError):
+                continue
+        if picked is None:
+            logger.error(
+                "restore_export_file: wrapper payload %s has no entry with "
+                "library_section_id=%s; aborting this task.",
+                export_path, library_section_id,
+            )
+            return
+        data = picked
+
     if target_section_name_override:
         lib_name = target_section_name_override
         logger.info(
-            f"Importing from {export_path} → reconstructed payload, "
-            f"target library: {lib_name}"
+            f"Importing from {export_path} → reconstructed payload "
+            f"(section_id={library_section_id}), target library: {lib_name}"
         )
     else:
         lib_name = data.get("library", "Unknown")
@@ -1839,11 +1871,11 @@ def restore_export_file(
         and isinstance(ub, dict)
         and ub.get("role") != "owner"
     }
-    # v0.14 — per-job user filter. When the operator picked a subset
+    # v0.14 - per-job user filter. When the operator picked a subset
     # of users on the Restore form, drop everyone else here BEFORE the
     # per-user fan-out. The owner row was already handled by the role
     # lookup above; the matching filter for owner is the email
-    # check in run_restore (managed_filter setup) — at this point the
+    # check in run_restore (managed_filter setup) - at this point the
     # filter list only matters for managed users.
     if user_filter is not None:
         filter_set = {str(s).strip() for s in user_filter if str(s).strip()}
@@ -2020,7 +2052,7 @@ def run_restore(
     # restore_export_file → restore_watch_history. Ignored when
     # mode == "replace".
     merge_watch_strategy: str = "higher",
-    # v0.14 — per-job user filter (intersection of snapshot users and
+    # v0.14 - per-job user filter (intersection of snapshot users and
     # destination users). None = restore every user from the payload
     # that also exists on the destination (historical default). When
     # supplied, only Plex identifiers (owner email + managed
@@ -2141,16 +2173,15 @@ def run_restore(
     # will re-open and load the file when its turn comes (it supports
     # this path natively via preloaded_data=None). Peak resident set
     # is now ~n_lib_workers files instead of len(export_files) files.
-    def _peek_metadata(data: dict) -> Tuple[str, int, Set[str], bool]:
+    def _peek_one_library(udata_map: Dict[str, Any]) -> Tuple[int, Set[str], bool]:
         # v0.13.0: unified users map. Walk every user and accumulate
         # totals; the owner (role='owner') is always counted (we always
         # restore the owner block), managed users only count when the
         # target server actually has them.
-        users_map = data.get("users") or {}
         total = 0
         has_playlists = False
         managed_keys: Set[str] = set()
-        for handle, udata in users_map.items():
+        for handle, udata in udata_map.items():
             if not isinstance(udata, dict):
                 continue
             role = udata.get("role") or ("owner" if handle == "" else "managed")
@@ -2170,22 +2201,41 @@ def run_restore(
                     total += sum(len(pl.get("items", [])) for pl in udata.get("playlists", []))
                     total += len(udata.get("playlists", []))
                     total += len(udata.get("ratings", []))
-        return data.get("library", ""), total, managed_keys, has_playlists
+        return total, managed_keys, has_playlists
 
-    # Task = one (export_file, section_override) pair. Non-reconstructed
-    # payloads produce one task with override=None (uses the file's own
-    # ``library`` field). Reconstructed payloads (from snapshot .db) produce
-    # one task per target section so the resolver can find items in
-    # whichever real library they live in.
-    ImportTask = Tuple[str, Optional[str]]
+    # v0.15: Task = (export_file, library_section_id, lib_name).
+    #   * Legacy / engine flat payload (one library per file):
+    #       section_id=None, lib_name=data["library"]
+    #   * Reconstructed wrapper payload (v0.15 multi-library):
+    #       one task per entry in data["libraries"], with the entry's
+    #       library_section_id and resolved destination lib_name.
+    # The fan-out + divide-by-N hack the pre-v15 code used for
+    # reconstructed payloads is gone - every task carries the EXACT
+    # per-library total computed from that library's own users block.
+    ImportTask = Tuple[str, Optional[int], str]
     lib_names: Dict[ImportTask, str] = {}
     lib_totals: Dict[ImportTask, int] = {}
     export_users: Set[str] = set()
     readable_tasks: List[ImportTask] = []
     any_payload_has_playlists = False
-    # Cache the section titles once - hitting the live API again per
-    # export file would slow startup linearly.
-    _target_section_titles: Optional[List[str]] = None
+    # Cache the destination section titles once - hitting the live API
+    # again per export file would slow startup linearly.
+    _target_section_titles: Optional[Set[str]] = None
+
+    def _dest_section_titles() -> Set[str]:
+        nonlocal _target_section_titles
+        if _target_section_titles is None:
+            try:
+                _target_section_titles = {
+                    s.title for s in server.library.sections()
+                }
+            except Exception as exc:
+                logger.error(
+                    f"Could not enumerate target server libraries: {exc}; "
+                    "reconstructed payloads will be skipped."
+                )
+                _target_section_titles = set()
+        return _target_section_titles
 
     for bf in export_files:
         try:
@@ -2194,102 +2244,72 @@ def run_restore(
         except Exception as e:
             logger.error(f"Could not read export file {bf}: {e}")
             continue
-        name, total, users, has_playlists = _peek_metadata(data)
-        export_users.update(users)
-        if has_playlists:
-            any_payload_has_playlists = True
 
-        reconstructed = bool(
-            (data.get("snapshot_meta") or {}).get("reconstructed_from_db")
-        )
-        if reconstructed:
-            if _target_section_titles is None:
-                try:
-                    _target_section_titles = [
-                        s.title for s in server.library.sections()
-                    ]
-                except Exception as e:
-                    logger.error(
-                        f"Could not enumerate target server libraries: {e}; "
-                        "skipping reconstructed payload."
-                    )
-                    _target_section_titles = []
-            if not _target_section_titles:
+        wrapper_libraries = data.get("libraries")
+        is_wrapper = isinstance(wrapper_libraries, list) and bool(wrapper_libraries)
+
+        if is_wrapper:
+            # v0.15 reconstructed payload. Emit one task per entry,
+            # each with its real per-library total. The destination
+            # must have a section with the same title; case-sensitive
+            # (renaming on either side is the operator's contract).
+            dest_titles = _dest_section_titles()
+            if not dest_titles:
                 logger.error(
                     f"Reconstructed payload {bf}: target server has no "
                     "visible libraries; nothing to import into."
                 )
                 continue
 
-            # Scope the fan-out to ONLY the source libraries the
-            # snapshot was captured from. The reconstructed .db
-            # carries that list in ``snapshot_meta.libraries`` (added
-            # by the post-Steps-1-3 capture pipeline); we match those
-            # names against the destination's section list.
-            #
-            # Older snapshots that pre-date the meta table fall back
-            # to "fan out to every destination section" so a legacy
-            # archive still imports (with the same wasted work the
-            # pre-fix code did - acceptable for the migration tail).
-            source_libs = (data.get("snapshot_meta") or {}).get("libraries") or []
-            if isinstance(source_libs, list) and source_libs:
-                # Case-sensitive match against destination section
-                # titles. The operator's library name is the contract;
-                # mismatches mean they renamed it on one side and
-                # should fix that explicitly rather than silently
-                # cross-match on case folding.
-                scoped_titles = [
-                    t for t in _target_section_titles if t in set(source_libs)
-                ]
-                missing = [n for n in source_libs if n not in _target_section_titles]
-                if not scoped_titles:
+            for entry in wrapper_libraries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_name = str(entry.get("library") or "")
+                try:
+                    sec_id = int(entry.get("library_section_id") or 0)
+                except (TypeError, ValueError):
+                    sec_id = 0
+                if not entry_name or sec_id <= 0:
                     logger.error(
-                        "Reconstructed payload %s: source libraries %r have no "
-                        "matching section on the destination (destination has: "
-                        "%r). Skipping this payload. Rename the destination "
-                        "library to match, or restore into a different server.",
-                        bf, source_libs, _target_section_titles,
+                        "Reconstructed payload %s contains a malformed entry "
+                        "(library=%r, library_section_id=%r); skipping.",
+                        bf, entry.get("library"), entry.get("library_section_id"),
                     )
                     continue
-                if missing:
+                if entry_name not in dest_titles:
                     logger.warning(
-                        "Reconstructed payload %s: source libraries %r have no "
-                        "destination counterpart and will be skipped. Matched: %r.",
-                        bf, missing, scoped_titles,
+                        "Reconstructed payload %s: source library %r has no "
+                        "destination counterpart (destination has: %r). "
+                        "Skipping this library; rename it on the destination "
+                        "to match, or restore into a different server.",
+                        bf, entry_name, sorted(dest_titles),
                     )
-                target_titles_for_payload = scoped_titles
-                logger.info(
-                    "Reconstructed payload %s scoped to source libraries %r "
-                    "(destination sections: %r).",
-                    bf, source_libs, scoped_titles,
-                )
-            else:
-                # Legacy snapshot without snapshot_meta.libraries. Fan
-                # out to every section as before.
-                target_titles_for_payload = list(_target_section_titles)
-                logger.info(
-                    "Reconstructed payload %s has no snapshot_meta.libraries "
-                    "(legacy snapshot); fanning out to all %d destination "
-                    "sections: %r.",
-                    bf, len(target_titles_for_payload), target_titles_for_payload,
-                )
+                    continue
 
-            # Split the per-payload total across the targeted sections
-            # so the dashboard's per-library ETA isn't N x inflated.
-            # Approximate; the resolver will only succeed for items
-            # that actually live in each section.
-            per_section_total = max(
-                1, total // max(1, len(target_titles_for_payload))
-            )
-            for title in target_titles_for_payload:
-                task: ImportTask = (bf, title)
-                lib_names[task] = title
-                lib_totals[task] = per_section_total
+                entry_total, entry_users, entry_has_pl = _peek_one_library(
+                    entry.get("users") or {}
+                )
+                export_users.update(entry_users)
+                if entry_has_pl:
+                    any_payload_has_playlists = True
+
+                task: ImportTask = (bf, sec_id, entry_name)
+                lib_names[task] = entry_name
+                lib_totals[task] = entry_total
                 readable_tasks.append(task)
         else:
-            task = (bf, None)
-            lib_names[task] = name or bf
-            lib_totals[task] = total
+            # Legacy / engine flat per-library file. One library per file.
+            lib_name = str(data.get("library") or "")
+            entry_total, entry_users, entry_has_pl = _peek_one_library(
+                data.get("users") or {}
+            )
+            export_users.update(entry_users)
+            if entry_has_pl:
+                any_payload_has_playlists = True
+
+            task = (bf, None, lib_name or bf)
+            lib_names[task] = lib_name or bf
+            lib_totals[task] = entry_total
             readable_tasks.append(task)
         # `data` falls out of scope here and is collectable.
 
@@ -2350,7 +2370,13 @@ def run_restore(
     def _submit_all(lib_pool):
         fmap: Dict[Any, str] = {}
         for task in readable_tasks:
-            bf, section_override = task
+            bf, section_id, target_name = task
+            # For wrapper-shape (v0.15 reconstructed) payloads, both
+            # library_section_id (picks the entry) and the target name
+            # (the destination section title) are required. For legacy
+            # flat per-library files, both stay None and the function
+            # uses data["library"] directly.
+            override_name = target_name if section_id is not None else None
             # Skip submissions queued after stop was requested.
             # Already-running futures continue until their
             # restore_export_file's per-phase stop check fires.
@@ -2367,7 +2393,8 @@ def run_restore(
                 include_watch_history,
                 include_ratings,
                 include_collections,
-                section_override,
+                section_id,        # library_section_id
+                override_name,     # target_section_name_override
                 mode,
                 merge_watch_strategy,
                 user_filter,

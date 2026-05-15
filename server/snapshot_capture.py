@@ -55,7 +55,7 @@ import logging
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 log = logging.getLogger("plexmigrate.server.snapshot_capture")
@@ -387,10 +387,29 @@ def _copy_rows(
 
 def _create_meta_tables(dst: sqlite3.Connection) -> None:
     """
-    Create ``snapshot_meta`` + ``snapshot_users`` in the destination.
-    Always runs - both tables are part of every snapshot's schema
-    regardless of which metrics were captured. Idempotent CREATE IF
-    NOT EXISTS so a recovered orphan getting re-stamped is harmless.
+    Create ``snapshot_meta`` + ``snapshot_users`` + ``library_sections``
+    in the destination snapshot DB. Always runs - these tables are
+    part of every snapshot's schema regardless of which metrics were
+    captured. Idempotent CREATE IF NOT EXISTS so a recovered orphan
+    getting re-stamped is harmless.
+
+    Schema version contract (v0.15+):
+
+    Each snapshot .db carries a ``schema_version`` column on
+    ``snapshot_meta`` so the restore path can refuse files written by
+    older / mismatched builds with a clear error. The current build's
+    version comes from :data:`SNAPSHOT_SCHEMA_VERSION`. Older
+    snapshots that pre-date this column (column missing entirely)
+    are treated as ``schema_version = 0`` and refused at restore.
+
+    ``library_sections`` is the integrity anchor for library identity:
+    every per-server row (server_items, watch_events, ratings,
+    playlists, collections) references it via ``section_key``. Unlike
+    media.db this table CAN be FK-enforced safely because the snapshot
+    DB is written once in a single transaction and never updated;
+    referential integrity is checked at commit time and a missing
+    parent fails the whole snapshot atomically (the right behaviour -
+    a partial / inconsistent .db on disk is worse than a re-run).
     """
     dst.executescript("""
         CREATE TABLE IF NOT EXISTS snapshot_meta (
@@ -400,15 +419,37 @@ def _create_meta_tables(dst: sqlite3.Connection) -> None:
             captured_at     REAL NOT NULL,
             libraries_json  TEXT NOT NULL,
             metrics_json    TEXT NOT NULL,
-            created_by      TEXT
+            created_by      TEXT,
+            schema_version  INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS snapshot_users (
             user_handle     TEXT PRIMARY KEY,
             display_name    TEXT,
             is_owner        INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS library_sections (
+            server_id      TEXT NOT NULL,
+            section_key    INTEGER NOT NULL,
+            section_title  TEXT NOT NULL,
+            section_type   TEXT NOT NULL,
+            first_seen_at  REAL NOT NULL,
+            last_seen_at   REAL NOT NULL,
+            PRIMARY KEY (server_id, section_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_sections_title
+            ON library_sections(server_id, section_title);
     """)
     dst.commit()
+
+
+# Snapshot file schema version. Bumped whenever the on-disk shape
+# changes in a way that requires re-capture (not just additive). The
+# restore-side reader refuses files where snapshot_meta.schema_version
+# is less than this constant; the error message tells the operator
+# which version they have and which is required. v15 introduced the
+# library_sections anchor and made section_key required on every
+# per-server row.
+SNAPSHOT_SCHEMA_VERSION = 15
 
 
 def _write_snapshot_meta(
@@ -432,12 +473,13 @@ def _write_snapshot_meta(
         """
         INSERT INTO snapshot_meta (
             snapshot_id, server_id, server_name, captured_at,
-            libraries_json, metrics_json, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            libraries_json, metrics_json, created_by, schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             snapshot_id, server_id, server_name, captured_at,
             json.dumps(libraries), json.dumps(metrics), created_by,
+            SNAPSHOT_SCHEMA_VERSION,
         ),
     )
     # No commit here: this function is called from two paths, and the
@@ -582,28 +624,44 @@ def build_snapshot_db_from_payloads(
     if snapshot_path.exists():
         snapshot_path.unlink()
 
-    # 1. Get schema DDL from media.db (RO). We only read sqlite_master;
-    #    no row data crosses the boundary.
+    # 1. Get schema DDL from media.db.
+    #
+    # We REUSE the shared media_db connection rather than opening a
+    # fresh ``mode=ro`` URI connection. Pre-v0.14 we opened a second
+    # connection with ``file:.../media.db?mode=ro``; that path
+    # surfaced ``sqlite3.OperationalError: unable to open database
+    # file`` on the first query because media.db is open in WAL mode
+    # with chmod 0o600 (see media_db.init_media_db) and a read-only
+    # URI connection refuses to create/access the ``-shm`` coordination
+    # file SQLite needs to bridge readers and the live writer. Routing
+    # through the existing shared autocommit connection sidesteps the
+    # issue entirely - same process, same UID, no second open. We only
+    # read ``sqlite_master`` (and one row from ``servers`` later), so
+    # the dedup/concurrency story is unchanged.
     from server import media_db as _media_db
     src_path = _media_db._db_path()
     if not src_path.is_file():
         raise RuntimeError(
             f"media.db not found at {src_path}; cannot borrow snapshot schema."
         )
-    src_uri = f"file:{src_path}?mode=ro"
-    src_conn = sqlite3.connect(src_uri, uri=True, timeout=30.0)
+    src_conn = _media_db._require_conn()
     src_conn.row_factory = sqlite3.Row
 
     dst_conn = sqlite3.connect(str(snapshot_path), timeout=30.0, isolation_level=None)
     dst_conn.execute("PRAGMA journal_mode=WAL")
     dst_conn.execute("PRAGMA synchronous=NORMAL")
+    # v0.15: enforce FK on the snapshot DB. Unlike media.db (where FK
+    # enforcement is off for bulk-insert perf), the snapshot file is
+    # written once in a single transaction and never updated, so
+    # referential integrity violations need to fail the snapshot
+    # atomically rather than leave an inconsistent file on disk. A
+    # write referencing a missing ``library_sections`` row will
+    # raise ``sqlite3.IntegrityError`` at COMMIT time.
+    dst_conn.execute("PRAGMA foreign_keys=ON")
     dst_conn.row_factory = sqlite3.Row
 
-    try:
-        _copy_schema(src_conn, dst_conn)
-        _create_meta_tables(dst_conn)
-    finally:
-        src_conn.close()
+    _copy_schema(src_conn, dst_conn)
+    _create_meta_tables(dst_conn)
 
     # v0.13.x: wrap every row write below in a single explicit
     # transaction. Pre-fix, the connection was opened with
@@ -624,14 +682,13 @@ def build_snapshot_db_from_payloads(
     # 2. Write the one-row ``servers`` entry. Pull the live row from
     #    media.db so url / machine_id stay consistent with the
     #    registry. Falls back to a minimal row when no media.db entry
-    #    exists yet (very early first-run edge case).
+    #    exists yet (very early first-run edge case). Reuses the
+    #    shared media_db connection - same WAL-mode-with-restricted-
+    #    perms reasoning as step 1 above.
     try:
-        src_conn = sqlite3.connect(src_uri, uri=True, timeout=10.0)
-        src_conn.row_factory = sqlite3.Row
         row = src_conn.execute(
             "SELECT * FROM servers WHERE id = ?", (server_id,),
         ).fetchone()
-        src_conn.close()
         if row is not None:
             dst_conn.execute(
                 "INSERT INTO servers (id, name, service, url, machine_id, added_at) "
@@ -740,22 +797,27 @@ def build_snapshot_db_from_payloads(
             items_by_guid.setdefault(g, iid)
         return iid
 
-    def _record_server_item(item_id: int, rating_key: Any) -> None:
+    def _record_server_item(item_id: int, rating_key: Any, section_key: int) -> None:
         if rating_key is None:
             return
         try:
             rk_int = int(rating_key)
         except (TypeError, ValueError):
             return
+        if not isinstance(section_key, int) or section_key <= 0:
+            raise ValueError(
+                f"_record_server_item: section_key required (got {section_key!r}). "
+                "See v0.15 schema-anchor invariant."
+            )
         key = (item_id, rk_int)
         if key in server_items_seen:
             return
         try:
             dst_conn.execute(
                 "INSERT OR REPLACE INTO server_items "
-                "(item_id, server_id, rating_key, updated_at) "
-                "VALUES (?, ?, ?, ?)",
-                (item_id, server_id, rk_int, captured_at_resolved),
+                "(item_id, server_id, rating_key, section_key, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (item_id, server_id, rk_int, int(section_key), captured_at_resolved),
             )
             server_items_seen.add(key)
             rk_to_item_id[rk_int] = item_id
@@ -786,29 +848,98 @@ def build_snapshot_db_from_payloads(
                 out.append(iid)
         return out
 
+    # v0.15: extract per-payload library identity. The capture path
+    # in services.snapshotter populates these fields on every payload;
+    # we refuse to write a snapshot if any payload is missing them.
+    # See the v0.15 schema-anchor invariant.
+    def _payload_section_info(p: Dict[str, Any]) -> Tuple[int, str, str]:
+        sec_id = p.get("library_section_id")
+        sec_title = str(p.get("library") or "")
+        sec_type = str(p.get("library_section_type") or "")
+        if sec_id is None:
+            raise ValueError(
+                f"build_snapshot_db_from_payloads: payload missing "
+                f"library_section_id (library={sec_title!r}). The capture "
+                "path must populate this; see v0.15 schema-anchor invariant."
+            )
+        try:
+            sec_id_int = int(sec_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"build_snapshot_db_from_payloads: library_section_id must be int "
+                f"(got {sec_id!r}): {exc}"
+            )
+        if sec_id_int <= 0:
+            raise ValueError(
+                f"build_snapshot_db_from_payloads: library_section_id must be > 0 "
+                f"(got {sec_id_int}, library={sec_title!r}). 0 is the 'unknown' "
+                "sentinel and never appears in a valid payload."
+            )
+        if not sec_title:
+            raise ValueError(
+                "build_snapshot_db_from_payloads: payload missing 'library' (section title)"
+            )
+        if not sec_type:
+            raise ValueError(
+                f"build_snapshot_db_from_payloads: payload missing "
+                f"library_section_type (library={sec_title!r})"
+            )
+        return sec_id_int, sec_title, sec_type
+
+    # Pre-pass: validate every payload and upsert the library_sections
+    # dimension rows BEFORE any per-server-table writes. Doing this
+    # first means FK enforcement on the snapshot.db catches a missing
+    # parent the moment a write attempts to reference it.
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        sec_id_int, sec_title, sec_type = _payload_section_info(payload)
+        try:
+            dst_conn.execute(
+                """
+                INSERT INTO library_sections (
+                    server_id, section_key, section_title, section_type,
+                    first_seen_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_id, section_key) DO UPDATE SET
+                    section_title = excluded.section_title,
+                    section_type  = excluded.section_type,
+                    last_seen_at  = excluded.last_seen_at
+                """,
+                (server_id, sec_id_int, sec_title, sec_type,
+                 captured_at_resolved, captured_at_resolved),
+            )
+        except sqlite3.OperationalError as exc:
+            raise RuntimeError(
+                f"Could not write library_sections row for {sec_title!r} "
+                f"(section_key={sec_id_int}): {exc}"
+            )
+
     # ── Walk every payload ──────────────────────────────────────────
     # Pass 1: ingest every record into items + server_items so the
     # rating_key → items.id map is fully populated before we resolve
-    # playlist / collection memberships in Pass 2.
-    def _walk_item_records(block: Dict[str, Any]) -> None:
+    # playlist / collection memberships in Pass 2. Each call carries
+    # the payload's section_key forward so server_items rows are
+    # stamped with library identity at insert time.
+    def _walk_item_records(block: Dict[str, Any], section_key: int) -> None:
         for rec in (block.get("watch_history") or []):
             iid = _upsert_item(rec)
             if iid is not None:
-                _record_server_item(iid, rec.get("rating_key"))
+                _record_server_item(iid, rec.get("rating_key"), section_key)
         for rec in (block.get("ratings") or []):
             iid = _upsert_item(rec)
             if iid is not None:
-                _record_server_item(iid, rec.get("rating_key"))
+                _record_server_item(iid, rec.get("rating_key"), section_key)
         for pl in (block.get("playlists") or []):
             for rec in (pl.get("items") or []):
                 iid = _upsert_item(rec)
                 if iid is not None:
-                    _record_server_item(iid, rec.get("rating_key"))
+                    _record_server_item(iid, rec.get("rating_key"), section_key)
         for col in (block.get("collections") or []):
             for rec in (col.get("items") or []):
                 iid = _upsert_item(rec)
                 if iid is not None:
-                    _record_server_item(iid, rec.get("rating_key"))
+                    _record_server_item(iid, rec.get("rating_key"), section_key)
 
     # v0.13.0: unified users map. Owner is the role='owner' block;
     # the legacy empty-handle convention is the fallback for mid-
@@ -816,9 +947,10 @@ def build_snapshot_db_from_payloads(
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
+        sec_id_int, _, _ = _payload_section_info(payload)
         for udata in (payload.get("users") or {}).values():
             if isinstance(udata, dict):
-                _walk_item_records(udata)
+                _walk_item_records(udata, sec_id_int)
 
     # Pass 2: watch_events, ratings, playlists (with members),
     # collections (with members). Library-level data uses
@@ -866,7 +998,8 @@ def build_snapshot_db_from_payloads(
                 except (TypeError, ValueError):
                     pass
 
-    def _write_watch_events(user_handle: str, records: List[Dict[str, Any]]) -> None:
+    def _write_watch_events(user_handle: str, records: List[Dict[str, Any]],
+                            section_key: int) -> None:
         if "watch_events" not in wanted_metric_tables:
             return
         for rec in records or []:
@@ -882,10 +1015,10 @@ def build_snapshot_db_from_payloads(
             try:
                 dst_conn.execute(
                     "INSERT OR REPLACE INTO watch_events "
-                    "(item_id, server_id, user_handle, view_count, view_offset, "
-                    " last_viewed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(item_id, server_id, user_handle, section_key, view_count, view_offset, "
+                    " last_viewed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        iid, server_id, user_handle,
+                        iid, server_id, user_handle, int(section_key),
                         int(rec.get("view_count") or 0),
                         int(rec.get("view_offset") or 0),
                         rec.get("last_viewed_at"),
@@ -896,7 +1029,8 @@ def build_snapshot_db_from_payloads(
             except sqlite3.OperationalError:
                 continue
 
-    def _write_ratings(user_handle: str, records: List[Dict[str, Any]]) -> None:
+    def _write_ratings(user_handle: str, records: List[Dict[str, Any]],
+                       section_key: int) -> None:
         if "ratings" not in wanted_metric_tables:
             return
         for rec in records or []:
@@ -913,15 +1047,17 @@ def build_snapshot_db_from_payloads(
             try:
                 dst_conn.execute(
                     "INSERT OR REPLACE INTO ratings "
-                    "(item_id, server_id, user_handle, rating, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (iid, server_id, user_handle, rating_val, captured_at_resolved),
+                    "(item_id, server_id, user_handle, section_key, rating, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (iid, server_id, user_handle, int(section_key),
+                     rating_val, captured_at_resolved),
                 )
                 counters["ratings"] += 1
             except sqlite3.OperationalError:
                 continue
 
-    def _write_playlist_row(user_handle: str, pl: Dict[str, Any]) -> None:
+    def _write_playlist_row(user_handle: str, pl: Dict[str, Any],
+                            section_key: int) -> None:
         if "playlists" not in wanted_metric_tables:
             return
         name = str(pl.get("name") or pl.get("title") or "")
@@ -931,11 +1067,11 @@ def build_snapshot_db_from_payloads(
         try:
             dst_conn.execute(
                 "INSERT OR REPLACE INTO playlists "
-                "(server_id, user_handle, name, description, is_smart, "
+                "(server_id, user_handle, section_key, name, description, is_smart, "
                 " smart_filter_json, item_ids_json, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    server_id, user_handle, name,
+                    server_id, user_handle, int(section_key), name,
                     pl.get("description"),
                     1 if bool(pl.get("smart")) else 0,
                     pl.get("smart_content"),
@@ -947,7 +1083,8 @@ def build_snapshot_db_from_payloads(
         except sqlite3.OperationalError:
             pass
 
-    def _write_collection_row(user_handle: str, col: Dict[str, Any]) -> None:
+    def _write_collection_row(user_handle: str, col: Dict[str, Any],
+                              section_key: int) -> None:
         if "collections" not in wanted_metric_tables:
             return
         name = str(col.get("name") or col.get("title") or "")
@@ -957,10 +1094,10 @@ def build_snapshot_db_from_payloads(
         try:
             dst_conn.execute(
                 "INSERT OR REPLACE INTO collections "
-                "(server_id, user_handle, name, item_ids_json, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
+                "(server_id, user_handle, section_key, name, item_ids_json, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    server_id, user_handle, name,
+                    server_id, user_handle, int(section_key), name,
                     json.dumps(item_ids),
                     captured_at_resolved,
                 ),
@@ -995,6 +1132,11 @@ def build_snapshot_db_from_payloads(
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
+        # v0.15: every payload carries its library identity. The
+        # pre-pass above validated + wrote the dimension row; here
+        # we just extract the section_key for forwarding into every
+        # per-row write.
+        sec_id_int, _, _ = _payload_section_info(payload)
         owner_block = _find_owner_block(payload)
         # Owner identity row + owner / server-wide records under
         # user_handle="" (the legacy DB sentinel kept for one release
@@ -1005,12 +1147,12 @@ def build_snapshot_db_from_payloads(
                 owner_block.get("display_name"),
                 backend_user_id=owner_block.get("backend_user_id"),
             )
-        _write_watch_events("", owner_block.get("watch_history") or [])
-        _write_ratings("", owner_block.get("ratings") or [])
+        _write_watch_events("", owner_block.get("watch_history") or [], sec_id_int)
+        _write_ratings("", owner_block.get("ratings") or [], sec_id_int)
         for pl in (owner_block.get("playlists") or []):
-            _write_playlist_row("", pl)
+            _write_playlist_row("", pl, sec_id_int)
         for col in (owner_block.get("collections") or []):
-            _write_collection_row("", col)
+            _write_collection_row("", col, sec_id_int)
 
         # Per-user blocks: dedup playlists / collections against the
         # owner-side rating_key sets so a library-wide entry doesn't
@@ -1025,8 +1167,8 @@ def build_snapshot_db_from_payloads(
                 udata.get("display_name") or handle,
                 backend_user_id=udata.get("backend_user_id"),
             )
-            _write_watch_events(handle, udata.get("watch_history") or [])
-            _write_ratings(handle, udata.get("ratings") or [])
+            _write_watch_events(handle, udata.get("watch_history") or [], sec_id_int)
+            _write_ratings(handle, udata.get("ratings") or [], sec_id_int)
             for pl in (udata.get("playlists") or []):
                 rk = pl.get("rating_key")
                 if rk is not None:
@@ -1035,7 +1177,7 @@ def build_snapshot_db_from_payloads(
                             continue
                     except (TypeError, ValueError):
                         pass
-                _write_playlist_row(handle, pl)
+                _write_playlist_row(handle, pl, sec_id_int)
             for col in (udata.get("collections") or []):
                 rk = col.get("rating_key")
                 if rk is not None:
@@ -1044,7 +1186,7 @@ def build_snapshot_db_from_payloads(
                             continue
                     except (TypeError, ValueError):
                         pass
-                _write_collection_row(handle, col)
+                _write_collection_row(handle, col, sec_id_int)
 
     # 4. Meta tables (snapshot_meta + snapshot_users).
     _write_snapshot_meta(

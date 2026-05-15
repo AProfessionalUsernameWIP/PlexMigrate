@@ -22,7 +22,7 @@ export const ALL_PERMISSIONS: Permission[] = [
   'sync.view', 'sync.edit',
 ];
 
-// Permission bundle for ``admin`` — everything except settings.tunables.
+// Permission bundle for ``admin`` - everything except settings.tunables.
 // Mirrors the backend's ``_ADMIN_PERMS`` in server/auth_router.py:
 // admin can edit normal settings but cannot touch the System Tunables
 // page (HTTP timeouts, JWT TTL, SQLite busy timeouts, etc.) because
@@ -95,7 +95,7 @@ export const PERMISSION_LABELS: Record<Permission, string> = {
   'logs.view':       'Browse run logs',
   'exports.view':    'Browse and download export files',
   'settings.edit':   'Edit system settings (paths, workers, defaults)',
-  'settings.tunables': 'Edit infrastructure tunables (HTTP timeouts, JWT TTL, SQLite busy timeouts, etc.) — root admin only',
+  'settings.tunables': 'Edit infrastructure tunables (HTTP timeouts, JWT TTL, SQLite busy timeouts, etc.) - root admin only',
   'users.manage':    'Create, edit, and delete other user accounts',
   'db_admin.access': 'Access the Database Admin Account credential',
   'sync.view':       'View the Sync tab',
@@ -172,7 +172,7 @@ export interface AuthProviderProps {
 
 export function AuthProvider(props: AuthProviderProps) {
   const value = useMemo<AuthContextValue>(() => {
-    // Backend-provided effective permissions take precedence — they
+    // Backend-provided effective permissions take precedence - they
     // already incorporate per-user grants and revokes from the new
     // Access Control feature. Fall back to the role baseline only
     // when /me returns an empty list (e.g. an older backend that

@@ -438,7 +438,104 @@ _MIGRATIONS: List[Tuple[int, str]] = [
               AND su.user_handle = collections.user_handle
         ) WHERE server_user_id IS NULL;
     """),
+    # v0.15 - library section identity as the integrity anchor for
+    # snapshot/restore. See module docstring for the
+    # invariant. ``library_sections`` is the per-server dimension
+    # table; every per-server row in server_items / watch_events /
+    # ratings / playlists / collections carries ``section_key``
+    # referencing it.
+    #
+    # No legacy data fits this schema - a pre-v0.15 media.db with
+    # existing rows would hit the DEFAULT 0 sentinel on ALTER. The
+    # boot path in server/app.py auto-archives any media.db at
+    # schema_version < 8 BEFORE this migration runs, so the ALTER
+    # always operates on empty tables. ``DEFAULT 0`` is just there
+    # to satisfy SQLite's ALTER TABLE ADD COLUMN NOT NULL syntactic
+    # requirement; the 0 value is treated as the "invalid / pre-v0.15"
+    # sentinel by every read path and never legitimately appears.
+    #
+    # Foreign keys: NOT declared at the SQLite level on media.db.
+    # ``library_sections`` has a composite primary key (server_id,
+    # section_key); SQLite requires a single-column FK target to be
+    # UNIQUE on its own, and section_key alone is not (the same
+    # numeric key can legitimately appear on multiple servers). An
+    # ALTER TABLE ADD COLUMN also cannot syntactically declare a
+    # multi-column FK, so the only way to get DB-level FK enforcement
+    # on media.db would be to recreate every per-server table - too
+    # invasive for the gain. Enforcement lives in Python:
+    # ``ingest_snapshot_payload`` upserts the library_sections row
+    # before any per-server-table write, and ``record_server_item`` /
+    # ``record_watch_event`` / ``upsert_rating`` / ``upsert_playlist`` /
+    # ``upsert_collection`` each raise ``ValueError`` on a missing or
+    # zero section_key. The snapshot .db file IS FK-enforced (its
+    # parallel library_sections table has a single-column PK and
+    # ``PRAGMA foreign_keys=ON``), so the on-disk artefact stays
+    # atomically correct even if a future regression slipped past the
+    # Python guards.
+    #
+    # See ``databasechanges.md`` for the rationale and the
+    # pre-release decision to drop the broken REFERENCES clause that
+    # was originally in this migration.
+    (8, """
+        CREATE TABLE IF NOT EXISTS library_sections (
+            server_id      TEXT NOT NULL,
+            section_key    INTEGER NOT NULL,
+            section_title  TEXT NOT NULL,
+            section_type   TEXT NOT NULL,
+            first_seen_at  REAL NOT NULL,
+            last_seen_at   REAL NOT NULL,
+            PRIMARY KEY (server_id, section_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_library_sections_title
+            ON library_sections(server_id, section_title);
+
+        ALTER TABLE server_items
+            ADD COLUMN section_key INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE watch_events
+            ADD COLUMN section_key INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE ratings
+            ADD COLUMN section_key INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE playlists
+            ADD COLUMN section_key INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE collections
+            ADD COLUMN section_key INTEGER NOT NULL DEFAULT 0;
+
+        CREATE INDEX IF NOT EXISTS idx_server_items_section
+            ON server_items(server_id, section_key);
+        CREATE INDEX IF NOT EXISTS idx_watch_events_section
+            ON watch_events(server_id, section_key);
+        CREATE INDEX IF NOT EXISTS idx_ratings_section
+            ON ratings(server_id, section_key);
+        CREATE INDEX IF NOT EXISTS idx_playlists_section
+            ON playlists(server_id, section_key);
+        CREATE INDEX IF NOT EXISTS idx_collections_section
+            ON collections(server_id, section_key);
+    """),
 ]
+
+
+# ── Schema version contract ──────────────────────────────────────────────────
+#
+# CURRENT_SCHEMA_VERSION is the version this build expects. The boot
+# path in server/app.py reads the version of any existing media.db
+# BEFORE migrations run and auto-archives older databases (see
+# ``server.app._archive_old_media_db_if_needed``). After that, the
+# migration runner brings a freshly-created DB up to this version.
+#
+# Bumping this constant is the trigger for the auto-archive behaviour
+# on every operator's next start. Change it only when the schema
+# break is significant enough that backfill is infeasible - adding a
+# nullable column doesn't require a bump; adding a NOT NULL anchor
+# column does.
+CURRENT_SCHEMA_VERSION = 8
+
+
+# Sentinel value for section_key on rows written before this build
+# could populate library identity. Restore-time validation refuses to
+# act on rows where section_key == _UNKNOWN_SECTION_KEY. In production
+# the auto-archive ensures no row ever carries this value, but tests
+# and edge cases can detect it explicitly.
+_UNKNOWN_SECTION_KEY = 0
 
 
 # ── Init + migration ─────────────────────────────────────────────────────────
@@ -807,6 +904,7 @@ def record_watch_event(
     server_id: str,
     user_handle: str,
     view_count: int,
+    section_key: int,
     view_offset: int = 0,
     last_viewed_at: Optional[float] = None,
     role: Optional[str] = None,
@@ -823,7 +921,17 @@ def record_watch_event(
     first sight. Callers that only have a handle (legacy code paths
     during the transition) can omit them - the row is created with
     NULL display_name and inferred role.
+
+    ``section_key`` is required (v0.15+). Watch events without library
+    identity break restore (items can't be matched to the correct
+    destination library); the function refuses to write rather than
+    silently produce data that restore will mishandle.
     """
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"record_watch_event: section_key must be a positive int "
+            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
+        )
     server_user_id = get_or_create_server_user(
         server_id=server_id,
         user_handle=user_handle,
@@ -837,17 +945,18 @@ def record_watch_event(
         conn.execute(
             """
             INSERT INTO watch_events (
-                item_id, server_id, user_handle, server_user_id,
+                item_id, server_id, user_handle, server_user_id, section_key,
                 view_count, view_offset, last_viewed_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, server_id, user_handle) DO UPDATE SET
                 server_user_id = excluded.server_user_id,
+                section_key    = excluded.section_key,
                 view_count     = excluded.view_count,
                 view_offset    = excluded.view_offset,
                 last_viewed_at = COALESCE(excluded.last_viewed_at, watch_events.last_viewed_at),
                 updated_at     = excluded.updated_at
             """,
-            (item_id, server_id, user_handle or "", server_user_id,
+            (item_id, server_id, user_handle or "", server_user_id, int(section_key),
              int(view_count), int(view_offset), last_viewed_at, now),
         )
 
@@ -858,12 +967,22 @@ def upsert_rating(
     server_id: str,
     user_handle: str,
     rating: float,
+    section_key: int,
     role: Optional[str] = None,
     display_name: Optional[str] = None,
     backend_user_id: Optional[str] = None,
 ) -> None:
     """Upsert one star-rating row. See :func:`record_watch_event` for the
-    role / display_name / backend_user_id forwarding semantics."""
+    role / display_name / backend_user_id forwarding semantics.
+
+    ``section_key`` is required (v0.15+) - see record_watch_event for
+    the integrity-anchor rationale.
+    """
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"upsert_rating: section_key must be a positive int "
+            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
+        )
     server_user_id = get_or_create_server_user(
         server_id=server_id,
         user_handle=user_handle,
@@ -877,15 +996,16 @@ def upsert_rating(
         conn.execute(
             """
             INSERT INTO ratings (
-                item_id, server_id, user_handle, server_user_id,
+                item_id, server_id, user_handle, server_user_id, section_key,
                 rating, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, server_id, user_handle) DO UPDATE SET
                 server_user_id = excluded.server_user_id,
+                section_key    = excluded.section_key,
                 rating         = excluded.rating,
                 updated_at     = excluded.updated_at
             """,
-            (item_id, server_id, user_handle or "", server_user_id,
+            (item_id, server_id, user_handle or "", server_user_id, int(section_key),
              float(rating), now),
         )
 
@@ -898,6 +1018,7 @@ def upsert_playlist(
     is_smart: bool,
     smart_filter: Optional[str],
     item_ids: List[int],
+    section_key: int,
     description: Optional[str] = None,
 ) -> int:
     """
@@ -927,7 +1048,19 @@ def upsert_playlist(
 
     :func:`ingest_snapshot_payload` below applies this discipline
     automatically when callers feed it a full snapshot payload.
+
+    ``section_key`` (v0.15+, required): the primary library section
+    this playlist belongs to. Plex audio playlists can technically
+    span multiple sections, but we anchor each playlist row to its
+    primary section for restore matching. Cross-section membership
+    is still preserved through the items list - each member item's
+    own section_key in server_items remains accurate.
     """
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"upsert_playlist: section_key must be a positive int "
+            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
+        )
     server_user_id = get_or_create_server_user(
         server_id=server_id, user_handle=user_handle,
     )
@@ -937,11 +1070,12 @@ def upsert_playlist(
         conn.execute(
             """
             INSERT INTO playlists (
-                server_id, user_handle, server_user_id, name, description,
+                server_id, user_handle, server_user_id, section_key, name, description,
                 is_smart, smart_filter_json, item_ids_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(server_id, user_handle, name) DO UPDATE SET
                 server_user_id    = excluded.server_user_id,
+                section_key       = excluded.section_key,
                 description       = excluded.description,
                 is_smart          = excluded.is_smart,
                 smart_filter_json = excluded.smart_filter_json,
@@ -949,7 +1083,8 @@ def upsert_playlist(
                 updated_at        = excluded.updated_at
             """,
             (
-                server_id, user_handle or "", server_user_id, name, description,
+                server_id, user_handle or "", server_user_id, int(section_key),
+                name, description,
                 1 if is_smart else 0,
                 smart_filter,
                 json.dumps(list(item_ids or [])),
@@ -969,6 +1104,7 @@ def upsert_collection(
     user_handle: str,
     name: str,
     item_ids: List[int],
+    section_key: int,
 ) -> int:
     """
     Upsert one collection row. Same shape as :func:`upsert_playlist`.
@@ -991,7 +1127,17 @@ def upsert_collection(
 
     :func:`ingest_snapshot_payload` below applies this discipline
     automatically when callers feed it a full snapshot payload.
+
+    ``section_key`` (v0.15+, required): the library section this
+    collection belongs to. Plex collections are typically scoped to
+    one library (a Movies collection lives in Movies); see
+    upsert_playlist for the rationale on per-row anchoring.
     """
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"upsert_collection: section_key must be a positive int "
+            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
+        )
     server_user_id = get_or_create_server_user(
         server_id=server_id, user_handle=user_handle,
     )
@@ -1001,15 +1147,16 @@ def upsert_collection(
         conn.execute(
             """
             INSERT INTO collections (
-                server_id, user_handle, server_user_id, name,
+                server_id, user_handle, server_user_id, section_key, name,
                 item_ids_json, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(server_id, user_handle, name) DO UPDATE SET
                 server_user_id = excluded.server_user_id,
+                section_key    = excluded.section_key,
                 item_ids_json  = excluded.item_ids_json,
                 updated_at     = excluded.updated_at
             """,
-            (server_id, user_handle or "", server_user_id, name,
+            (server_id, user_handle or "", server_user_id, int(section_key), name,
              json.dumps(list(item_ids or [])), now),
         )
         row = conn.execute(
@@ -1540,7 +1687,73 @@ def prune_stale_items(
 
 # ── server_items: per-server rating_key cache (v0.12.1) ─────────────────────
 
-def record_server_item(*, item_id: int, server_id: str, rating_key: int) -> None:
+def upsert_library_section(
+    *,
+    server_id: str,
+    section_key: int,
+    section_title: str,
+    section_type: str,
+) -> None:
+    """
+    Upsert the (server_id, section_key) row in ``library_sections``.
+
+    This is the integrity anchor row that every per-server table's
+    ``section_key`` column references. The function is called by
+    ``ingest_snapshot_payload`` at the top of every snapshot ingest,
+    BEFORE any server_items / watch_events / ratings / playlists /
+    collections rows are written that reference this section.
+
+    ``first_seen_at`` is preserved across re-ingests; only
+    ``last_seen_at`` and the human-readable title/type update.
+    Audited via ``db_access_log.log_write``.
+    """
+    if not server_id:
+        raise ValueError("upsert_library_section: server_id required")
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"upsert_library_section: section_key must be a positive int "
+            f"(got {section_key!r}). Use _UNKNOWN_SECTION_KEY constant "
+            "if you have a legitimate sentinel reason - but no production "
+            "path should ever pass 0."
+        )
+    if not section_title:
+        raise ValueError("upsert_library_section: section_title required")
+    if not section_type:
+        raise ValueError("upsert_library_section: section_type required")
+    conn = _require_conn()
+    now = time.time()
+    with _DB_LOCK:
+        conn.execute(
+            """
+            INSERT INTO library_sections (
+                server_id, section_key, section_title, section_type,
+                first_seen_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(server_id, section_key) DO UPDATE SET
+                section_title = excluded.section_title,
+                section_type  = excluded.section_type,
+                last_seen_at  = excluded.last_seen_at
+            """,
+            (server_id, int(section_key), section_title, section_type, now, now),
+        )
+    # Audit: dimension-table writes are operator-meaningful state
+    # changes. Volume is low (one per library per snapshot run) so the
+    # audit log doesn't bloat.
+    try:
+        from services import db_access_log
+        db_access_log.log_write(
+            table="media.db:library_sections",
+            where={"server_id": server_id, "section_key": int(section_key)},
+            affected_rows=1,
+            intent=f"upsert library {section_title!r} (type={section_type})",
+        )
+    except Exception:
+        pass
+
+
+def record_server_item(
+    *, item_id: int, server_id: str, rating_key: int, section_key: int,
+) -> None:
     """
     Cache the ``ratingKey`` an ``items.id`` resolves to on one
     specific server. Used by the snapshotter as it walks a library -
@@ -1571,16 +1784,24 @@ def record_server_item(*, item_id: int, server_id: str, rating_key: int) -> None
     a cache rebuilt from each snapshot run, so dropping a stale
     binding is exactly the intent.
     """
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"record_server_item: section_key must be a positive int "
+            f"(got {section_key!r}). The caller (typically "
+            "ingest_snapshot_payload) is responsible for guaranteeing "
+            "this; no row may enter server_items without library "
+            "identity. See v0.15 schema-anchor invariant."
+        )
     conn = _require_conn()
     now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
             INSERT OR REPLACE INTO server_items
-                (item_id, server_id, rating_key, updated_at)
-            VALUES (?, ?, ?, ?)
+                (item_id, server_id, rating_key, section_key, updated_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (int(item_id), server_id, int(rating_key), now),
+            (int(item_id), server_id, int(rating_key), int(section_key), now),
         )
 
 
@@ -1711,6 +1932,54 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
         return counters
     library_name = str(payload.get("library") or "")
 
+    # v0.15 integrity-anchor contract: every payload MUST carry
+    # library_section_id (Plex's numeric section key) and
+    # library_section_type. This is what makes per-library restore
+    # correct on the other side.
+    section_key_raw = payload.get("library_section_id")
+    section_type = str(payload.get("library_section_type") or "")
+    if section_key_raw is None:
+        raise ValueError(
+            "ingest_snapshot_payload: payload missing library_section_id. "
+            "Every per-library payload must carry the Plex section key as "
+            "the integrity anchor for restore. The capture path in "
+            "services.snapshotter.snapshot_library is responsible for "
+            "supplying it; see v0.15 schema-anchor invariant."
+        )
+    try:
+        section_key = int(section_key_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"ingest_snapshot_payload: library_section_id must be an int "
+            f"(got {section_key_raw!r}): {exc}"
+        )
+    if section_key <= 0:
+        raise ValueError(
+            f"ingest_snapshot_payload: library_section_id must be > 0 "
+            f"(got {section_key}). Plex section keys start at 1; 0 is the "
+            "sentinel for 'unknown / pre-v0.15' rows and never appears in "
+            "a valid payload."
+        )
+    if not section_type:
+        raise ValueError(
+            "ingest_snapshot_payload: payload missing library_section_type "
+            "(movie / show / artist / etc). Required for the library_sections "
+            "dimension row."
+        )
+    if not library_name:
+        raise ValueError("ingest_snapshot_payload: payload missing 'library' (section title)")
+
+    # Upsert the dimension row BEFORE any per-server-table writes so
+    # the FK target exists. media.db doesn't enforce FKs at SQLite
+    # level (perf) but snapshot.db does, and we want the same ordering
+    # everywhere for consistency.
+    upsert_library_section(
+        server_id=server_id,
+        section_key=section_key,
+        section_title=library_name,
+        section_type=section_type,
+    )
+
     # ── Pass 1: items + server_items ────────────────────────────────
     def _ingest_item_record(rec: Dict[str, Any]) -> Optional[int]:
         """Upsert one item and cache its server rating_key."""
@@ -1743,7 +2012,9 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
         if rating_key is not None:
             try:
                 record_server_item(
-                    item_id=iid, server_id=server_id, rating_key=int(rating_key),
+                    item_id=iid, server_id=server_id,
+                    rating_key=int(rating_key),
+                    section_key=section_key,
                 )
                 counters["server_items"] += 1
             except (TypeError, ValueError):
@@ -1889,6 +2160,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 smart_filter=pl.get("smart_content"),
                 description=pl.get("description"),
                 item_ids=_resolve_member_ids(pl.get("items") or []),
+                section_key=section_key,
             )
             counters["playlists"] += 1
         except Exception:
@@ -1900,6 +2172,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 user_handle="",
                 name=str(col.get("name") or col.get("title") or ""),
                 item_ids=_resolve_member_ids(col.get("items") or []),
+                section_key=section_key,
             )
             counters["collections"] += 1
         except Exception:
@@ -1925,6 +2198,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 view_count=int(rec.get("view_count") or 0),
                 view_offset=int(rec.get("view_offset") or 0),
                 last_viewed_at=rec.get("last_viewed_at"),
+                section_key=section_key,
             )
             counters["watch_events"] += 1
         except Exception:
@@ -1947,6 +2221,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                 role="owner", display_name=owner_display,
                 backend_user_id=owner_backend_id,
                 rating=rating_val,
+                section_key=section_key,
             )
             counters["ratings"] += 1
         except Exception:
@@ -1989,6 +2264,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                     view_count=int(rec.get("view_count") or 0),
                     view_offset=int(rec.get("view_offset") or 0),
                     last_viewed_at=rec.get("last_viewed_at"),
+                    section_key=section_key,
                 )
                 counters["watch_events"] += 1
             except Exception:
@@ -2012,6 +2288,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                     user_handle=str(username), rating=rating_val,
                     role="managed", display_name=u_display,
                     backend_user_id=u_backend_id,
+                    section_key=section_key,
                 )
                 counters["ratings"] += 1
             except Exception:
@@ -2031,6 +2308,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                     smart_filter=pl.get("smart_content"),
                     description=pl.get("description"),
                     item_ids=_resolve_member_ids(pl.get("items") or []),
+                    section_key=section_key,
                 )
                 counters["playlists"] += 1
             except Exception:
@@ -2047,6 +2325,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
                     user_handle=str(username),
                     name=str(col.get("name") or col.get("title") or ""),
                     item_ids=_resolve_member_ids(col.get("items") or []),
+                    section_key=section_key,
                 )
                 counters["collections"] += 1
             except Exception:
