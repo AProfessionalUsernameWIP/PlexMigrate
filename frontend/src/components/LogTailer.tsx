@@ -44,7 +44,7 @@ export function LogTailer({
   // render the raw text blob (current behaviour, zero performance
   // regression on idle viewing). Non-empty = split into lines and
   // filter case-insensitively. The cost of per-line rendering is
-  // only paid when the operator is actively filtering.
+  // only paid when the end user is actively filtering.
   const [filter, setFilter] = useState<string>('');
 
   const offsetRef = useRef<number>(0);
@@ -146,7 +146,7 @@ export function LogTailer({
     if (!filter) return null;
     const needle = filter.toLowerCase();
     const out: string[] = [];
-    // Split-on-newline only happens when the operator types into
+    // Split-on-newline only happens when the end user types into
     // the filter input; otherwise the raw body renders unchanged.
     for (const line of body.split('\n')) {
       if (line.toLowerCase().includes(needle)) out.push(line);
@@ -240,7 +240,7 @@ export function LogTailer({
 
 // Escape a string so it can be embedded in a RegExp literal without
 // interpreting special characters. The filter input is a plain
-// substring - operators don't expect regex semantics from typing
+// substring - end users don't expect regex semantics from typing
 // e.g. "(error)" into the box.
 function escapeForRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

@@ -5,10 +5,10 @@
 //   * ``server`` - server-side wall-clock, default. Tracks the
 //     backend's timezone (set via TZ env var in docker-compose).
 //     This is the existing behaviour pre-2026-05-12.
-//   * ``local``  - the operator's device clock, in the browser's
-//     local timezone. Useful when the operator is on the road and
+//   * ``local``  - the end user's device clock, in the browser's
+//     local timezone. Useful when the end user is on the road and
 //     the server is in a different zone.
-//   * ``custom`` - a user-set offset from server time. The operator
+//   * ``custom`` - a user-set offset from server time. The end user
 //     types a HH:MM they want "right now" to show as; the panel
 //     records the offset and applies it on every render.
 //
@@ -109,7 +109,7 @@ export function ClockProvider({ children }: { children: ReactNode }) {
     resolveDisplay,
   }), [pref.mode, pref.customOffsetMs, setMode, setCustomOffsetMs, resolveDisplay]);
 
-  // Cross-tab sync - if the operator changes the preference in
+  // Cross-tab sync - if the end user changes the preference in
   // another tab, pull the new value here too. Storage events fire
   // only in OTHER tabs, not the one that wrote them, so this is
   // safe to listen for without an echo loop.

@@ -24,7 +24,8 @@
 //     SQLite busy timeouts, etc.) - populated in Phase 3.
 
 import { useEffect, useState } from 'react';
-import { api, PrunePreview, PruneResult, SettingsView } from '../api';
+import { api, EtaTrainingStatus, PrunePreview, PruneResult, RecentRunRow, SettingsView } from '../api';
+import { InfoTip } from './InfoTip';
 
 export function SettingsPanel() {
   const [view, setView] = useState<SettingsView | null>(null);
@@ -52,6 +53,27 @@ export function SettingsPanel() {
   // sooner; >1.0 is more lenient. Clamped to [0.5, 2.0] at the
   // backend read boundary too.
   const [etrMultiplier, setEtrMultiplier] = useState<number>(1.0);
+
+  // ETA training: bucket inventory + flush controls. Mounts lazily;
+  // null until the first fetch completes. Refresh button refetches
+  // on demand; the flush button is gated by a typed confirmation
+  // shown in a modal.
+  const [trainingStatus, setTrainingStatus] = useState<EtaTrainingStatus | null>(null);
+  const [trainingLoading, setTrainingLoading] = useState<boolean>(false);
+  const [flushOpen, setFlushOpen] = useState<boolean>(false);
+
+  // Run History subtab state. activeTab toggles which top-level
+  // panel set renders. recentRuns is the run_history listing; the
+  // end user-facing inspection surface for past job runs (snapshot
+  // / restore / direct). repairBusy + backfillBusy are inline
+  // spinners on the recovery actions.
+  const [activeTab, setActiveTab] = useState<'settings' | 'history' | 'databases'>('settings');
+  const [recentRuns, setRecentRuns] = useState<RecentRunRow[]>([]);
+  const [runsLoading, setRunsLoading] = useState<boolean>(false);
+  const [repairBusy, setRepairBusy] = useState<boolean>(false);
+  const [repairResult, setRepairResult] = useState<{ updated: number; still_orphan: number } | null>(null);
+  const [backfillBusy, setBackfillBusy] = useState<boolean>(false);
+  const [backfillResult, setBackfillResult] = useState<{ entries_read: number; buckets_touched: number } | null>(null);
 
   const load = async () => {
     try {
@@ -95,6 +117,60 @@ export function SettingsPanel() {
       .catch(() => { /* non-fatal; prune action falls back to manual id */ });
   }, []);
 
+  const refreshTrainingStatus = async () => {
+    setTrainingLoading(true);
+    try {
+      const s = await api.etaTrainingStatus();
+      setTrainingStatus(s);
+    } catch {
+      setTrainingStatus(null);
+    } finally {
+      setTrainingLoading(false);
+    }
+  };
+  useEffect(() => { void refreshTrainingStatus(); }, []);
+
+  const refreshRecentRuns = async () => {
+    setRunsLoading(true);
+    try {
+      const r = await api.listRecentRunHistory({ limit: 100 });
+      setRecentRuns(r.runs);
+    } catch {
+      setRecentRuns([]);
+    } finally {
+      setRunsLoading(false);
+    }
+  };
+  useEffect(() => { void refreshRecentRuns(); }, []);
+
+  const doRepair = async () => {
+    setRepairBusy(true);
+    try {
+      const r = await api.etaRepairServerIds();
+      setRepairResult(r);
+      // Refresh training status so the end user can see the new
+      // bucket inventory once they also run the backfill.
+      await refreshTrainingStatus();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRepairBusy(false);
+    }
+  };
+
+  const doBackfill = async (resetFirst: boolean) => {
+    setBackfillBusy(true);
+    try {
+      const r = await api.backfillEtaWeights(resetFirst);
+      setBackfillResult(r);
+      await refreshTrainingStatus();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBackfillBusy(false);
+    }
+  };
+
   const save = async () => {
     setError(null);
     setOk(null);
@@ -133,6 +209,35 @@ export function SettingsPanel() {
       {error && <div className="banner error">{error}</div>}
       {ok && <div className="banner good">{ok}</div>}
 
+      {/* Settings subtab nav. App Settings (logging, library walk,
+          ETR multiplier) vs Run History (recent jobs + ETA training
+          inventory + recovery actions). */}
+      <div className="panel" style={{ padding: '6px 8px', marginBottom: 8 }}>
+        <div className="row-buttons" style={{ display: 'flex', gap: 4 }}>
+          <button
+            className={activeTab === 'settings' ? 'primary' : ''}
+            onClick={() => setActiveTab('settings')}
+          >
+            App Settings
+          </button>
+          <button
+            className={activeTab === 'history' ? 'primary' : ''}
+            onClick={() => setActiveTab('history')}
+          >
+            Run History
+          </button>
+          <button
+            className={activeTab === 'databases' ? 'primary' : ''}
+            onClick={() => setActiveTab('databases')}
+          >
+            Databases
+          </button>
+        </div>
+      </div>
+
+      {activeTab === 'settings' && (
+        <>
+
       <div className="banner info" style={{ fontSize: 12 }}>
         Run-level defaults (paths, performance, snapshot defaults, transfer resolution,
         retention ceiling) moved to <strong>Servers ▸ Run Defaults</strong>. Root-admin
@@ -155,11 +260,12 @@ export function SettingsPanel() {
             checked={runLoggingEnabled}
             onChange={(e) => setRunLoggingEnabled(e.target.checked)}
           />
-          <span>Write per-run log files (<code>runtime.log</code> / <code>errors.log</code> / <code>media.log</code>)</span>
+          <span>
+            Write per-run log files (<code>runtime.log</code> / <code>errors.log</code> / <code>media.log</code>)
+            <InfoTip topicId="run-logging" />
+          </span>
           <span className="help">
-            Default on. When off, the engine and dashboard still run
-            and update normally - only the per-run files on disk are
-            suppressed. Console output is unaffected.
+            Default on. When off, engine + dashboard run; only the on-disk per-run files are suppressed.
           </span>
         </label>
         <div className="field" style={{ marginTop: 12 }}>
@@ -168,14 +274,10 @@ export function SettingsPanel() {
             <span className={`tag ${auditLogEnabled ? 'done' : 'failed'}`} style={{ marginLeft: 6 }}>
               {auditLogEnabled ? 'enabled' : 'DISABLED'}
             </span>
+            <InfoTip topicId="audit-log" />
           </span>
           <span className="help">
-            Records every read / write the engine performs against
-            <code> media.db</code>, <code>auth.db</code>, and{' '}
-            <code>snapshots.db</code>. Forensic control - toggling it
-            requires the database-admin credential. The transition
-            is logged in the audit file itself so the trail always
-            shows it was intentionally disabled and by whom.
+            Forensic record of every DB mutation. Toggling requires the db_admin credential.
           </span>
           <div style={{ marginTop: 6 }}>
             <button type="button" onClick={() => setAuditToggleOpen(true)}>
@@ -349,7 +451,323 @@ export function SettingsPanel() {
       <div className="panel">
         <button className="primary" onClick={save}>Save Settings</button>
       </div>
+        </>
+      )}
+
+      {activeTab === 'history' && (
+        <>
+      <div className="panel">
+        <h2>Recent Runs</h2>
+        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
+          Every snapshot, restore, and direct-transfer job appears here
+          with its server, library scope, duration, and final state.
+          Sourced from <code>server_data/run_timings.db</code> /
+          <code>run_history</code>; survives docker rebuilds via the
+          bind mount in docker-compose.yml.
+        </p>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+          <button onClick={() => void refreshRecentRuns()} disabled={runsLoading}>
+            {runsLoading ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
+        {recentRuns.length === 0 ? (
+          <div className="empty" style={{ marginTop: 12 }}>
+            {runsLoading ? 'Loading…' : 'No runs recorded yet.'}
+          </div>
+        ) : (
+          <table className="list" style={{ width: '100%', fontSize: 12, marginTop: 12 }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: 'left' }}>Started</th>
+                <th style={{ textAlign: 'left' }}>Type</th>
+                <th style={{ textAlign: 'left' }}>Server</th>
+                <th style={{ textAlign: 'left' }}>Libraries</th>
+                <th style={{ textAlign: 'right' }}>Users</th>
+                <th style={{ textAlign: 'right' }}>Duration</th>
+                <th style={{ textAlign: 'left' }}>State</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recentRuns.map((r) => {
+                const stateColor = r.state === 'completed' ? 'var(--success, #16a34a)'
+                  : r.state === 'failed' ? 'var(--danger, #dc2626)'
+                  : 'var(--text-dim)';
+                const durSec = (r.duration_ms || 0) / 1000;
+                const durStr = durSec >= 3600
+                  ? `${Math.floor(durSec/3600)}h ${Math.round((durSec%3600)/60)}m`
+                  : durSec >= 90
+                  ? `${Math.round(durSec/60)} min`
+                  : `${Math.round(durSec)} sec`;
+                const libs = (r.libraries || []).join(', ');
+                return (
+                  <tr key={r.run_id}>
+                    <td title={r.run_id}>{new Date((r.started_at || 0) * 1000).toLocaleString()}</td>
+                    <td>{r.job_type}</td>
+                    <td>{r.server_name || <em style={{ color: 'var(--text-dim)' }}>-</em>}</td>
+                    <td title={libs} style={{ maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {libs || <em style={{ color: 'var(--text-dim)' }}>-</em>}
+                    </td>
+                    <td style={{ textAlign: 'right' }}>{r.users_affected}</td>
+                    <td style={{ textAlign: 'right' }}>{durStr}</td>
+                    <td style={{ color: stateColor }}>{r.state}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Recovery actions panel. The legacy snapshot_library bug left
+          ~99% of historical run_timings entries with server_id=NULL,
+          so the trainer couldn't bucketize them. Repair + reset-
+          backfill recovers that data; the flush button at the bottom
+          is the nuclear reset. */}
+      <div className="panel">
+        <h2>Training data recovery</h2>
+        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
+          Two recovery actions for the ETA training data. Earlier runs
+          may have telemetry entries that are missing their server
+          identifier, which prevents the trainer from using them. Step
+          1 fills those in by matching against the job history; step 2
+          reads everything through the trainer to rebuild the bucket
+          store from scratch.
+        </p>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+          <button onClick={() => void doRepair()} disabled={repairBusy}>
+            {repairBusy ? 'Repairing…' : '1. Repair missing server identifiers'}
+          </button>
+          <button onClick={() => void doBackfill(true)} disabled={backfillBusy}>
+            {backfillBusy ? 'Rebuilding…' : '2. Rebuild training store'}
+          </button>
+        </div>
+        {repairResult && (
+          <div className="banner good" style={{ marginTop: 8, fontSize: 12 }}>
+            Repaired {repairResult.updated} run_timings row(s); {repairResult.still_orphan} still orphaned
+            (no matching run_history row - typically pre-2026-05 runs that predate the run_history table).
+          </div>
+        )}
+        {backfillResult && (
+          <div className="banner good" style={{ marginTop: 8, fontSize: 12 }}>
+            Backfilled {backfillResult.entries_read} entries into {backfillResult.buckets_touched} bucket(s).
+            Estimates on the Run Job form will now reflect this data.
+          </div>
+        )}
+      </div>
+
+      {/* ETA Training inspector + flush. Bucket inventory survives
+          docker rebuilds via the server_data/ bind mount (see
+          docker-compose.yml). The flush button is the end user's
+          escape hatch to restart training from zero - confirms the
+          run_timings table optionally goes with it. */}
+      <div className="panel">
+        <h2>ETA Training</h2>
+        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
+          Per-server, per-operation training buckets. Each row tracks
+          one combination of (server, operation, library type, bulk strategy).
+          Tier 1 fires at {trainingStatus?.by_server[0]?.summary.min_samples_for_tier_one ?? 5}+
+          samples (tight confidence bands); anchor mode uses fewer
+          samples with wider bands. Training data persists in{' '}
+          <code>server_data/run_timings.db</code> and survives docker
+          rebuilds.
+        </p>
+
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
+          <button onClick={() => void refreshTrainingStatus()} disabled={trainingLoading}>
+            {trainingLoading ? 'Refreshing…' : 'Refresh'}
+          </button>
+          <button
+            className="danger"
+            onClick={() => setFlushOpen(true)}
+            disabled={trainingLoading}
+          >
+            Flush all training data…
+          </button>
+        </div>
+
+        {!trainingStatus || trainingStatus.by_server.length === 0 ? (
+          <div className="empty" style={{ marginTop: 12 }}>
+            {trainingLoading ? 'Loading…' : 'No training data on any server yet.'}
+          </div>
+        ) : (
+          trainingStatus.by_server.map((srv) => {
+            const serverName = servers.find((s) => s.id === srv.server_id)?.name || srv.server_id;
+            return (
+              <div key={srv.server_id} style={{ marginTop: 12 }}>
+                <h3 style={{ fontSize: 14, margin: '8px 0' }}>{serverName}</h3>
+                <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 6 }}>
+                  {srv.summary.tier_one_count} of {srv.summary.total_buckets} buckets
+                  at tier 1 (confident);{' '}
+                  {srv.summary.anchor_count} in anchor mode (training).
+                </div>
+                <table className="list" style={{ width: '100%', fontSize: 12 }}>
+                  <thead>
+                    <tr>
+                      <th style={{ textAlign: 'left' }}>Label</th>
+                      <th style={{ textAlign: 'left' }}>Type</th>
+                      <th style={{ textAlign: 'left' }}>Strategy</th>
+                      <th style={{ textAlign: 'right' }}>Samples</th>
+                      <th style={{ textAlign: 'left' }}>Status</th>
+                      <th style={{ textAlign: 'right' }}>Mean obs (s)</th>
+                      <th style={{ textAlign: 'right' }}>Ping</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {srv.buckets.map((b, i) => {
+                      let status = 'untrained';
+                      let color = 'var(--text-dim)';
+                      if (b.tier_one_ready) {
+                        status = 'tier 1';
+                        color = 'var(--success, #16a34a)';
+                      } else if (b.anchor_ready) {
+                        status = 'anchor';
+                        color = 'var(--warning, #d97706)';
+                      }
+                      return (
+                        <tr key={`${b.label}-${b.library_type}-${b.bulk_strategy}-${i}`}>
+                          <td>{b.label}</td>
+                          <td>{b.library_type || '-'}</td>
+                          <td>{b.bulk_strategy || '-'}</td>
+                          <td style={{ textAlign: 'right' }}>{b.samples}</td>
+                          <td style={{ color }}>{status}</td>
+                          <td style={{ textAlign: 'right' }}>
+                            {b.predicted_at_xbar_seconds.toFixed(1)}
+                          </td>
+                          <td style={{ textAlign: 'right' }}>
+                            {b.ping_ema_ms != null ? `${b.ping_ema_ms.toFixed(0)} ms` : '-'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            );
+          })
+        )}
+      </div>
+
+        </>
+      )}
+
+      {activeTab === 'databases' && (
+        <DatabasePanel servers={servers} />
+      )}
+
+      {flushOpen && (
+        <EtaFlushModal
+          onClose={() => setFlushOpen(false)}
+          onDone={() => { setFlushOpen(false); void refreshTrainingStatus(); }}
+        />
+      )}
     </>
+  );
+}
+
+// ETA flush confirmation modal. End user types FLUSH verbatim and
+// optionally opts to also wipe run_timings (a true zero-state reset;
+// without that, the auto-backfill on next boot just rebuilds the
+// buckets from history).
+function EtaFlushModal({ onClose, onDone }: {
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [confirm, setConfirm] = useState<string>('');
+  const [includeRunTimings, setIncludeRunTimings] = useState<boolean>(false);
+  const [submitting, setSubmitting] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    in_memory_buckets_cleared: number;
+    eta_buckets_rows_deleted: number;
+    run_timings_rows_deleted: number;
+  } | null>(null);
+
+  const submit = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const r = await api.etaFlushAll(includeRunTimings);
+      setResult(r);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="panel"
+        style={{ maxWidth: 480, width: '90%', maxHeight: '90vh', overflowY: 'auto' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2>Flush ETA training data</h2>
+        {result ? (
+          <>
+            <div className="banner success" style={{ marginTop: 12 }}>
+              Flushed {result.in_memory_buckets_cleared} in-memory bucket(s),
+              {' '}{result.eta_buckets_rows_deleted} eta_buckets rows
+              {result.run_timings_rows_deleted > 0
+                ? `, ${result.run_timings_rows_deleted} run_timings rows`
+                : ''}.
+            </div>
+            <div className="row-buttons" style={{ marginTop: 16 }}>
+              <button className="primary" onClick={onDone}>Close</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
+              Wipes every learned ETA bucket. Future predictions fall
+              back to hardcoded defaults until the predictor retrains
+              from new runs.
+            </p>
+            <label className="switch" style={{ marginTop: 8 }}>
+              <input
+                type="checkbox"
+                checked={includeRunTimings}
+                onChange={(e) => setIncludeRunTimings(e.target.checked)}
+              />
+              <span>
+                Also wipe <code>run_timings</code> history.{' '}
+                <em>Recommended only if you suspect the prior run telemetry is corrupt.</em>{' '}
+                Without this, the auto-backfill on next boot will repopulate buckets from history.
+              </span>
+            </label>
+            <label className="field" style={{ marginTop: 12 }}>
+              <span className="label">Type FLUSH to confirm</span>
+              <input
+                type="text"
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+                placeholder="FLUSH"
+                autoFocus
+              />
+            </label>
+            {error && (
+              <div className="banner error" style={{ marginTop: 8 }}>{error}</div>
+            )}
+            <div className="row-buttons" style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+              <button onClick={onClose} disabled={submitting}>Cancel</button>
+              <button
+                className="danger"
+                onClick={() => void submit()}
+                disabled={submitting || confirm.trim() !== 'FLUSH'}
+              >
+                {submitting ? 'Flushing…' : 'Flush'}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -581,7 +999,7 @@ function AuditLogToggleModal({
   const [error, setError] = useState<string | null>(null);
 
   // The "target state" is the opposite of the current state - the
-  // operator clicked the button to flip it.
+  // end user clicked the button to flip it.
   const targetEnabled = !currentlyEnabled;
   const disabling = currentlyEnabled;  // we're about to turn it off
 
@@ -708,6 +1126,419 @@ function AuditLogToggleModal({
               : (disabling ? 'Disable audit log' : 'Re-enable audit log')}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+
+// Database export / import panel under Settings > Run History.
+// Exposes every operational table (run_timings, eta_buckets,
+// run_history, snapshots, media.db tables) as a JSON dump for
+// backup + interop, and accepts replace-only imports behind a
+// typed REPLACE confirmation. Includes a per-server pivot that
+// filters identity-related tables (servers, server_users,
+// managed_users, user_identity_map, etc.) by server_id so the
+// end user can inspect or archive one server's state in isolation.
+function DatabasePanel({ servers }: { servers: { id: string; name: string }[] }) {
+  const [tables, setTables] = useState<Array<{
+    table_id: string;
+    db_file: string;
+    table_name: string;
+    row_count: number | null;
+    available: boolean;
+    per_server: boolean;
+  }>>([]);
+  const [tablesLoading, setTablesLoading] = useState(false);
+  const [perServerId, setPerServerId] = useState<string>('');
+  const [perServerTables, setPerServerTables] = useState<Array<{
+    table_id: string;
+    db_file: string;
+    table_name: string;
+    row_count: number;
+  }>>([]);
+  const [perServerLoading, setPerServerLoading] = useState(false);
+  const [importOpen, setImportOpen] = useState<null | { kind: 'table'; tableId: string } | { kind: 'archive' }>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+
+  const refresh = async () => {
+    setTablesLoading(true);
+    try {
+      const r = await api.listDatabaseTables();
+      setTables(r.tables);
+    } catch {
+      setTables([]);
+    } finally {
+      setTablesLoading(false);
+    }
+  };
+  useEffect(() => { void refresh(); }, []);
+
+  useEffect(() => {
+    if (!perServerId) {
+      setPerServerTables([]);
+      return;
+    }
+    let cancelled = false;
+    setPerServerLoading(true);
+    api.listDatabasePerServer(perServerId)
+      .then((r) => { if (!cancelled) setPerServerTables(r.tables); })
+      .catch(() => { if (!cancelled) setPerServerTables([]); })
+      .finally(() => { if (!cancelled) setPerServerLoading(false); });
+    return () => { cancelled = true; };
+  }, [perServerId]);
+
+  const downloadJson = (obj: Record<string, unknown>, filename: string) => {
+    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const tsStamp = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}_${String(d.getHours()).padStart(2, '0')}-${String(d.getMinutes()).padStart(2, '0')}`;
+  };
+
+  const exportTable = async (tableId: string) => {
+    setBusy(true);
+    setActionMsg(null);
+    try {
+      const payload = await api.exportDatabaseTable(tableId);
+      downloadJson(payload, `plexbackup_${tableId}_${tsStamp()}.json`);
+      setActionMsg(`Exported ${tableId} → plexbackup_${tableId}_${tsStamp()}.json`);
+    } catch (e) {
+      setActionMsg(`Export failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportArchive = async () => {
+    setBusy(true);
+    setActionMsg(null);
+    try {
+      const payload = await api.exportDatabaseArchive();
+      downloadJson(payload, `plexbackup_archive_${tsStamp()}.json`);
+      setActionMsg(`Exported full archive → plexbackup_archive_${tsStamp()}.json`);
+    } catch (e) {
+      setActionMsg(`Export failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const exportPerServer = async () => {
+    if (!perServerId) return;
+    setBusy(true);
+    setActionMsg(null);
+    try {
+      const payload = await api.exportDatabasePerServer(perServerId);
+      downloadJson(payload, `plexbackup_server_${perServerId}_${tsStamp()}.json`);
+      setActionMsg(`Exported ${perServerId} archive`);
+    } catch (e) {
+      setActionMsg(`Export failed: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="panel">
+        <h2>Operational databases</h2>
+        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
+          Per-table JSON export for every operational SQLite DB
+          (run_timings, snapshots, media). Use Export to back up;
+          use Import to restore from a previous export. Import is
+          replace-only (the target table is wiped first) and gated
+          by a typed REPLACE confirmation. The auth DB and keyfile
+          are intentionally excluded.
+        </p>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+          <button onClick={() => void refresh()} disabled={tablesLoading}>
+            {tablesLoading ? 'Refreshing…' : 'Refresh'}
+          </button>
+          <button onClick={() => void exportArchive()} disabled={busy}>
+            Download full archive
+          </button>
+          <button
+            className="danger"
+            onClick={() => setImportOpen({ kind: 'archive' })}
+            disabled={busy}
+          >
+            Restore from archive…
+          </button>
+        </div>
+        {actionMsg && (
+          <div className="banner info" style={{ marginTop: 8, fontSize: 12 }}>
+            {actionMsg}
+          </div>
+        )}
+        <table className="list" style={{ width: '100%', fontSize: 12, marginTop: 12 }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left' }}>Table</th>
+              <th style={{ textAlign: 'left' }}>DB file</th>
+              <th style={{ textAlign: 'right' }}>Rows</th>
+              <th style={{ textAlign: 'left' }}>Per-server</th>
+              <th style={{ textAlign: 'right' }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tables.map((t) => (
+              <tr key={t.table_id}>
+                <td style={{ fontWeight: 600 }}>{t.table_id}</td>
+                <td><code>{t.db_file}</code></td>
+                <td style={{ textAlign: 'right' }}>
+                  {t.row_count != null ? t.row_count.toLocaleString() : <em>-</em>}
+                </td>
+                <td>{t.per_server ? '✓' : ''}</td>
+                <td style={{ textAlign: 'right' }}>
+                  <button
+                    style={{ marginRight: 4 }}
+                    onClick={() => void exportTable(t.table_id)}
+                    disabled={busy || !t.available}
+                    title={t.available ? 'Download as JSON' : 'DB file missing'}
+                  >
+                    Export
+                  </button>
+                  <button
+                    className="danger"
+                    onClick={() => setImportOpen({ kind: 'table', tableId: t.table_id })}
+                    disabled={busy}
+                  >
+                    Import
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel">
+        <h2>Per-server identity DB pivot</h2>
+        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
+          Inspect or archive one server's identity-related rows
+          across every operational table that carries a{' '}
+          <code>server_id</code> column (servers, server_users,
+          managed_users, user_identity_map, server_items,
+          watch_events, ratings, library_sections, run_history,
+          ETA buckets, snapshot registry, etc.). Pick a server to
+          see its row counts; use Download per-server archive to
+          dump everything filtered to that server.
+        </p>
+        <div style={{ display: 'flex', gap: 8, marginTop: 8, alignItems: 'center' }}>
+          <label style={{ fontSize: 12 }}>Server:</label>
+          <select
+            value={perServerId}
+            onChange={(e) => setPerServerId(e.target.value)}
+            style={{ minWidth: 200 }}
+          >
+            <option value="">(select a server)</option>
+            {servers.map((s) => (
+              <option key={s.id} value={s.id}>{s.name} ({s.id})</option>
+            ))}
+          </select>
+          <button
+            onClick={() => void exportPerServer()}
+            disabled={busy || !perServerId}
+          >
+            Download per-server archive
+          </button>
+        </div>
+        {perServerId && (perServerLoading ? (
+          <div className="empty" style={{ marginTop: 12 }}>Loading…</div>
+        ) : (
+          <table className="list" style={{ width: '100%', fontSize: 12, marginTop: 12 }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: 'left' }}>Table</th>
+                <th style={{ textAlign: 'left' }}>DB file</th>
+                <th style={{ textAlign: 'right' }}>Rows for this server</th>
+              </tr>
+            </thead>
+            <tbody>
+              {perServerTables.length === 0 ? (
+                <tr><td colSpan={3} style={{ color: 'var(--text-dim)' }}>No filterable tables, or this server has zero rows in every operational table.</td></tr>
+              ) : (
+                perServerTables.map((t) => (
+                  <tr key={t.table_id}>
+                    <td style={{ fontWeight: 600 }}>{t.table_id}</td>
+                    <td><code>{t.db_file}</code></td>
+                    <td style={{ textAlign: 'right' }}>{t.row_count.toLocaleString()}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        ))}
+      </div>
+
+      {importOpen && (
+        <DbImportModal
+          target={importOpen}
+          onClose={() => setImportOpen(null)}
+          onDone={() => { setImportOpen(null); void refresh(); }}
+        />
+      )}
+    </>
+  );
+}
+
+
+// Replace-only import dialog. Operator pastes (or pastes-from-file)
+// the JSON they previously exported, types REPLACE to confirm,
+// and the target table is wiped + repopulated atomically.
+function DbImportModal({
+  target,
+  onClose,
+  onDone,
+}: {
+  target: { kind: 'table'; tableId: string } | { kind: 'archive' };
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [text, setText] = useState<string>('');
+  const [confirm, setConfirm] = useState<string>('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<null | {
+    table_id?: string;
+    deleted?: number;
+    inserted?: number;
+    per_table?: Record<string, { deleted?: number; inserted?: number; error?: string }>;
+    total_deleted?: number;
+    total_inserted?: number;
+    errors?: string[];
+  }>(null);
+
+  const onFile = (file: File) => {
+    file.text().then(setText).catch((e) => setError(String(e)));
+  };
+
+  const submit = async () => {
+    setSubmitting(true);
+    setError(null);
+    try {
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(text);
+      } catch (e) {
+        setError(`Invalid JSON: ${e}`);
+        setSubmitting(false);
+        return;
+      }
+      let r: ReturnType<typeof Promise.resolve> extends Promise<infer _> ? _ : never;
+      if (target.kind === 'table') {
+        r = await api.importDatabaseTable(target.tableId, payload);
+      } else {
+        r = await api.importDatabaseArchive(payload);
+      }
+      setResult(r as any);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="panel"
+        style={{ maxWidth: 640, width: '90%', maxHeight: '90vh', overflowY: 'auto' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2>
+          {target.kind === 'table'
+            ? `Restore ${target.tableId} from JSON`
+            : 'Restore full archive from JSON'}
+        </h2>
+        {result ? (
+          <>
+            {target.kind === 'table' && result.table_id ? (
+              <div className="banner success" style={{ marginTop: 12 }}>
+                Replaced {result.deleted} row(s) with {result.inserted} from the import.
+              </div>
+            ) : (
+              <div className="banner success" style={{ marginTop: 12 }}>
+                Archive restore: {result.total_deleted} rows replaced with{' '}
+                {result.total_inserted} across {Object.keys(result.per_table || {}).length} table(s).
+                {result.errors && result.errors.length > 0 && (
+                  <div style={{ marginTop: 6, color: 'var(--warning, #d97706)' }}>
+                    Errors: {result.errors.join('; ')}
+                  </div>
+                )}
+              </div>
+            )}
+            <div className="row-buttons" style={{ marginTop: 16 }}>
+              <button className="primary" onClick={onDone}>Close</button>
+            </div>
+          </>
+        ) : (
+          <>
+            <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
+              Replace-only restore. The target {target.kind === 'table' ? 'table' : 'tables'} will be wiped before the supplied rows are inserted.
+            </p>
+            <label className="field" style={{ marginTop: 8 }}>
+              <span className="label">Load JSON file:</span>
+              <input
+                type="file"
+                accept="application/json,.json"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) onFile(f);
+                }}
+              />
+            </label>
+            <label className="field" style={{ marginTop: 8 }}>
+              <span className="label">Or paste JSON:</span>
+              <textarea
+                rows={6}
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+                placeholder='{"format": "plexbackup.dbexport.v1", ...}'
+                style={{ fontFamily: 'monospace', fontSize: 11 }}
+              />
+            </label>
+            <label className="field" style={{ marginTop: 8 }}>
+              <span className="label">Type REPLACE to confirm</span>
+              <input
+                type="text"
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+                placeholder="REPLACE"
+              />
+            </label>
+            {error && (
+              <div className="banner error" style={{ marginTop: 8 }}>{error}</div>
+            )}
+            <div className="row-buttons" style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+              <button onClick={onClose} disabled={submitting}>Cancel</button>
+              <button
+                className="danger"
+                onClick={() => void submit()}
+                disabled={submitting || confirm.trim() !== 'REPLACE' || !text.trim()}
+              >
+                {submitting ? 'Restoring…' : 'Restore'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

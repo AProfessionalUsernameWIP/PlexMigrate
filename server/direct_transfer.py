@@ -120,6 +120,13 @@ def run_direct_transfer(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric filter. Forwarded into both the in-memory transfer path
+    # (_transfer_one_library) and the chained-fallback path
+    # (_chained_fallback_library) so library_metrics applies end-to-
+    # end. Keys are library names; values are dicts with the four
+    # boolean fields.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
     # v0.13.x: restore mode forwarded into restore_export_file by both
     # the in-memory path (_transfer_one_library) and the chained-
     # fallback path (_chained_fallback_library). Default "merge" =
@@ -129,7 +136,7 @@ def run_direct_transfer(
     mode: str = "merge",
     # v0.13.x: Merge sub-strategy for watch-count math. "higher" =
     # destination ends at max(stored, current) (legacy); "sum" =
-    # destination ends at current + stored (operator opt-in). Ignored
+    # destination ends at current + stored (end user opt-in). Ignored
     # when mode=="replace".
     merge_watch_strategy: str = "higher",
 ) -> None:
@@ -188,7 +195,7 @@ def run_direct_transfer(
     # scoped to this transfer only - reset_run_state() restores
     # permissive defaults afterward, leaving snapshot/import paths
     # unaffected. The default for fuzzy here is FALSE (opt-in), the
-    # opposite of the snapshot/import default - per the operator-set
+    # opposite of the snapshot/import default - per the end user-set
     # spec, fuzzy matches in a destination-writing path are too risky
     # to enable by default.
     try:
@@ -239,7 +246,7 @@ def run_direct_transfer(
 
     # One-line summary of which data types this run will transfer. The
     # per-library skip notices are DEBUG; this is the only INFO line
-    # confirming the operator's filter choices for the direct path.
+    # confirming the end user's filter choices for the direct path.
     _included = [
         n for n, v in (
             ("watch_history", include_watch_history),
@@ -274,14 +281,14 @@ def run_direct_transfer(
     # transfer was owner-only; we now propagate managed-user data when
     # the same managed username exists on both source and destination,
     # AND the owner is a first-class filter target (v0.9.7) - when
-    # the operator unchecks the owner the engine skips the entire
+    # the end user unchecks the owner the engine skips the entire
     # library-level ``payload["items"]`` block (watch_history,
     # playlists, library-level collections, ratings) for that run.
     #
     # Inputs:
     #   - source_home_users : (uname, src_token, src_user_server) tuples
     #   - dest_home_users   : (uname, dst_token, dst_user_server) tuples
-    #   - user_filter       : operator's checked-list of raw Plex
+    #   - user_filter       : end user's checked-list of raw Plex
     #                         identifiers. None = include every
     #                         transferable user including the owner;
     #                         explicit list = only the ones named.
@@ -296,7 +303,7 @@ def run_direct_transfer(
 
     # v0.12.3 - owner is NEVER a home user in Plex's API model
     # (account.users() returns managed + linked accounts only).
-    # The operator's filter list ships with the owner's email
+    # The end user's filter list ships with the owner's email
     # inline alongside managed usernames because the Run Job form
     # presents them as one checkbox grid - but the backend must
     # treat them as two separate concepts:
@@ -305,7 +312,7 @@ def run_direct_transfer(
     #     comes along with the base library calls (no separate
     #     authentication path), so "include the owner" means
     #     "process the library's own items[] block." When the
-    #     operator unchecks the owner, we skip that block. That's
+    #     end user unchecks the owner, we skip that block. That's
     #     it - no API lookup involved.
     #
     #   * ``user_filter`` is a list of MANAGED-USER IDENTIFIERS
@@ -332,7 +339,7 @@ def run_direct_transfer(
         # Local-admin tokens / Plex.tv unreachable - fall back to
         # whatever state may have populated (CLI mode does it).
         # If state is also empty, treat as "owner email unknown"
-        # and the operator's box stays the source of truth: an
+        # and the end user's box stays the source of truth: an
         # explicit empty user_filter is the only way to exclude
         # the owner, and any list-of-managed-users is treated
         # as "owner included" since we can't verify otherwise.
@@ -380,7 +387,7 @@ def run_direct_transfer(
         owner_included = owner_in_raw_filter
     else:
         # Owner email unknown - be permissive: assume owner is
-        # included unless the operator sent an explicit empty
+        # included unless the end user sent an explicit empty
         # ``user_filter = []`` (which already means "no one").
         owner_included = (user_filter is None) or bool(user_filter)
 
@@ -389,7 +396,7 @@ def run_direct_transfer(
     effective_dst_home = [dst_users_by_name[n] for n in sorted(included)]
 
     # v0.9.7 Item 7: actionable run-log line when the owner is
-    # unchecked, so the operator sees exactly what they're skipping.
+    # unchecked, so the end user sees exactly what they're skipping.
     # Verbatim from the spec.
     if not owner_included:
         logger.info(
@@ -398,7 +405,7 @@ def run_direct_transfer(
             "included users will transfer normally.",
         )
 
-    # One INFO line at transfer start so the operator can audit what
+    # One INFO line at transfer start so the end user can audit what
     # went where straight from the run log. v0.12.3 - was previously
     # hardcoded to say "owner always included" even when the owner
     # was excluded, contradicting the "Owner excluded" line above. Now
@@ -481,6 +488,8 @@ def run_direct_transfer(
                     include_collections=include_collections,
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
+                    # Phase C: per-library metric override map.
+                    library_metrics=library_metrics,
                 )
             except DirectTransferUnavailable as exc:
                 logger.warning(
@@ -517,6 +526,8 @@ def run_direct_transfer(
                     include_collections=include_collections,
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
+                    # Phase C: per-library metric override map.
+                    library_metrics=library_metrics,
                 )
             except Exception as exc:
                 # Any unexpected exception in the direct path: log and
@@ -557,6 +568,8 @@ def run_direct_transfer(
                     include_collections=include_collections,
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
+                    # Phase C: per-library metric override map.
+                    library_metrics=library_metrics,
                 )
             state.get_dashboard().finish_library(lib_name)
     finally:
@@ -739,11 +752,31 @@ def _transfer_one_library(
     # restore_export_file when this function calls it below.
     mode: str = "merge",
     merge_watch_strategy: str = "higher",
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric map. When this library has an entry, the entry's flags
+    # override the include_* booleans for this library only.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
 ) -> None:
     """
     Transfer a single library source→dest. See :func:`run_direct_transfer`
     for the high-level contract.
     """
+    # Phase C: per-library metric override. Same pattern as in the
+    # snapshotter / restorer entry points - apply the map once at the
+    # top of the function so every downstream local include_* read
+    # gets the per-library value automatically.
+    if library_metrics and lib_name in library_metrics:
+        _lm_row = library_metrics[lib_name]
+        if isinstance(_lm_row, dict):
+            include_watch_history = bool(_lm_row.get("watch_history", include_watch_history))
+            include_ratings = bool(_lm_row.get("ratings", include_ratings))
+            include_playlists = bool(_lm_row.get("playlists", include_playlists))
+            include_collections = bool(_lm_row.get("collections", include_collections))
+            logger.info(
+                "Per-library metric override (direct) for %r: "
+                "watch_history=%s ratings=%s playlists=%s collections=%s",
+                lib_name, include_watch_history, include_ratings, include_playlists, include_collections,
+            )
     state.get_dashboard().set_library_status(lib_name, "active")
     state.get_dashboard().set_library_phase(lib_name, "Reading source…")
     state.get_dashboard().push_activity(
@@ -763,7 +796,7 @@ def _transfer_one_library(
     # snapshotter functions to label each item.
     saved_owner = state._plex_owner_name
     state._plex_owner_name = source_owner
-    # v0.9.7 Item 7: gate the owner-side gather on the operator's
+    # v0.9.7 Item 7: gate the owner-side gather on the end user's
     # filter choice. When the owner is unchecked we still advance the
     # phase counter (the per-library dashboard total reserves 4 ticks
     # for the snapshot side) but skip the four export_* calls - the
@@ -881,6 +914,16 @@ def _transfer_one_library(
 
     payload: Dict[str, Any] = {
         "library": lib_name,
+        # v0.15 library-section identity anchor. ``ingest_snapshot_payload``
+        # asserts on these fields and refuses to write rows without them;
+        # the snapshotter populates them on every per-library payload,
+        # and direct-transfer must do the same so the source-side media.db
+        # seeding below doesn't raise ValueError and silently skip the
+        # cache write. ``src_section`` is the live Plex section object
+        # (see the function signature); ``.key`` and ``.type`` are cached
+        # attributes (no autoreload trip).
+        "library_section_id": int(getattr(src_section, "key", 0) or 0),
+        "library_section_type": str(getattr(src_section, "type", "") or ""),
         "captured_at": datetime.now().isoformat(),
         "snapshot_meta": {
             "server_name": getattr(source_server, "friendlyName", "") or "",
@@ -1013,8 +1056,8 @@ def sweep_stale_tmp_exports(
 
     These are chained-fallback payloads that a failed import left
     behind on purpose (see :func:`_chained_fallback_library`, Phase 4)
-    so the operator can re-import them manually. Once they're old
-    enough the operator has either recovered them or moved on, and
+    so the end user can re-import them manually. Once they're old
+    enough the end user has either recovered them or moved on, and
     they're sensitive (every user's watch history / ratings) - so we
     sweep them at startup. Returns the count removed. Best-effort:
     never raises.
@@ -1072,6 +1115,11 @@ def _chained_fallback_library(
     # end of the chained-fallback flow.
     mode: str = "merge",
     merge_watch_strategy: str = "higher",
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric map. Forwarded to restore_export_file at the end of the
+    # chained-fallback so the per-library choice applies on the
+    # restore phase of the fallback.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
 ) -> None:
     """
     Fallback path used by :func:`run_direct_transfer` when the
@@ -1100,7 +1148,7 @@ def _chained_fallback_library(
     state.get_dashboard().set_library_phase(lib_name, "Chained: gathering from source…")
 
     # ── Phase 1: gather from source into a dict (same as direct) ──────
-    # v0.9.7 Item 7: gate the owner-side gather on the operator's
+    # v0.9.7 Item 7: gate the owner-side gather on the end user's
     # filter choice, identical to the in-memory path.
     saved_owner = state._plex_owner_name
     state._plex_owner_name = source_owner
@@ -1138,7 +1186,7 @@ def _chained_fallback_library(
 
     # Per-user gather mirrors the in-memory path so the chained
     # fallback produces an equivalent .plexexport.json - the
-    # operator's filter choice is honoured no matter which route
+    # end user's filter choice is honoured no matter which route
     # the engine ends up taking for this library. Same owner-set
     # dedupe so library-level collections don't surface in every
     # user's personal block.
@@ -1192,6 +1240,12 @@ def _chained_fallback_library(
 
     payload: Dict[str, Any] = {
         "library": lib_name,
+        # v0.15 library-section identity anchor. See the matching block
+        # in ``_transfer_one_library`` for the rationale; this chained-
+        # fallback path must populate the same fields so the source-side
+        # media.db seeding below succeeds.
+        "library_section_id": int(getattr(src_section, "key", 0) or 0),
+        "library_section_type": str(getattr(src_section, "type", "") or ""),
         "captured_at": datetime.now().isoformat(),
         "snapshot_meta": {
             "server_name": getattr(source_server, "friendlyName", "") or "",
@@ -1302,7 +1356,7 @@ def _chained_fallback_library(
     except Exception as exc:
         # M2: the import failed, so Phase 4's unlink is never reached -
         # the temp file is deliberately left on disk for manual
-        # re-import. Make sure the operator is explicitly told it
+        # re-import. Make sure the end user is explicitly told it
         # exists and where, rather than relying on them noticing the
         # ``.tmp`` marker. Re-raise so the job still fails, but with
         # the leftover path baked into the error the job record shows.

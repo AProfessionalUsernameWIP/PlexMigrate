@@ -16,15 +16,16 @@
 
 import { useEffect, useState } from 'react';
 import { api } from '../api';
+import { getHelpTopicsByCategory } from '../help_content';
 
-type HelpPage = 'how_to_use' | 'reference' | 'activity_and_phases' | 'api_usage' | 'db_schema' | 'run_logs' | 'troubleshooting';
+type HelpPage = 'how_to_use' | 'reference' | 'features' | 'topics' | 'activity_and_phases' | 'api_usage' | 'db_schema' | 'run_logs' | 'troubleshooting' | 'dev_notes' | 'users_and_roles';
 
 
 export function HelpPanel() {
-  // "How to Use" is the first stop for a new operator. Open it by
+  // "How to Use" is the first stop for a new end user. Open it by
   // default so the strip's leftmost tab is what the page actually
   // shows when this tab is selected (rather than the deeper Reference
-  // page that operators land on after they already know what they're
+  // page that end users land on after they already know what they're
   // doing).
   const [page, setPage] = useState<HelpPage>('how_to_use');
   return (
@@ -41,6 +42,18 @@ export function HelpPanel() {
           onClick={() => setPage('reference')}
         >
           Reference
+        </button>
+        <button
+          className={page === 'features' ? 'active' : ''}
+          onClick={() => setPage('features')}
+        >
+          Features
+        </button>
+        <button
+          className={page === 'topics' ? 'active' : ''}
+          onClick={() => setPage('topics')}
+        >
+          Topics
         </button>
         <button
           className={page === 'activity_and_phases' ? 'active' : ''}
@@ -72,14 +85,30 @@ export function HelpPanel() {
         >
           Troubleshooting
         </button>
+        <button
+          className={page === 'dev_notes' ? 'active' : ''}
+          onClick={() => setPage('dev_notes')}
+        >
+          Dev Notes
+        </button>
+        <button
+          className={page === 'users_and_roles' ? 'active' : ''}
+          onClick={() => setPage('users_and_roles')}
+        >
+          Users &amp; Roles
+        </button>
       </nav>
       {page === 'how_to_use' && <HowToUsePage />}
       {page === 'reference' && <ReferencePage />}
+      {page === 'features' && <FeaturesPage />}
+      {page === 'topics' && <TopicsPage />}
       {page === 'activity_and_phases' && <ActivityStatusesPage />}
       {page === 'api_usage' && <ApiUsagePage />}
       {page === 'db_schema' && <DbSchemaPage />}
       {page === 'run_logs' && <RunLogsPage />}
       {page === 'troubleshooting' && <TroubleshootingPage />}
+      {page === 'dev_notes' && <DevNotesPage />}
+      {page === 'users_and_roles' && <UsersAndRolesPage />}
     </>
   );
 }
@@ -87,7 +116,7 @@ export function HelpPanel() {
 
 // ── How to Use (v0.13.x) ─────────────────────────────────────────────────────
 //
-// First-stop orientation page for new operators. Walks through what
+// First-stop orientation page for new end users. Walks through what
 // each job mode is for, when to pick it, and (for Restore) what the
 // Merge / Replace distinction actually does to a destination. The
 // Pros/Cons table is the source-of-truth for the warning copy that
@@ -692,7 +721,7 @@ const STATUS_ROWS: StatusRow[] = [
 function ActivityStatusesPage() {
   // Nested sub-tab inside the "label reference" panel. Same UX as
   // Account Management → (Database Admin Account | User Accounts):
-  // the panel header + the table both swap when the operator clicks
+  // the panel header + the table both swap when the end user clicks
   // between Activity Statuses and Processing Phases.
   const [labelView, setLabelView] = useState<'activity' | 'phase' | 'thread'>('activity');
   return (
@@ -854,7 +883,7 @@ function ActivityStatusesPage() {
 
             {/* Stall escalation reference. The dashboard re-colors a
                 phase tag amber once its age crosses the per-phase
-                amber threshold, and red once it crosses red. Operators
+                amber threshold, and red once it crosses red. End users
                 tune the threshold scale via
                 Settings ▸ General Settings ▸ Dashboard Stall Colours. */}
             <h3 style={{ marginTop: 24 }}>Stall escalation - when a phase tag changes colour</h3>
@@ -1148,12 +1177,19 @@ Home User   × 1    restoring one managed user's data`}
 
 const _PLEXAPI = 'https://python-plexapi.readthedocs.io/en/latest/';
 const _COMMUNITY = 'https://plexapi.dev/';
+// Jellyfin / Emby reference docs. The official-rest sources publish
+// OpenAPI; we link to the section root rather than a specific path so
+// links keep working when the API version is bumped.
+const _JELLYFIN_API = 'https://api.jellyfin.org/';
+const _JELLYFIN_WEBHOOK = 'https://github.com/jellyfin/jellyfin-plugin-webhook';
+const _EMBY_API = 'https://swagger.emby.media/';
+const _EMBY_WEBHOOK = 'https://github.com/MediaBrowser/Emby/wiki/Webhooks';
 
 interface ApiCall {
   name: string;       // python-plexapi method name OR HTTP endpoint path
   href: string;       // documentation URL
-  source: 'plexapi' | 'community';
-  what: string;       // plain-English "what it does on the Plex side"
+  source: 'plexapi' | 'community' | 'official-rest' | 'plugin';
+  what: string;       // plain-English "what it does on the server side"
   why: string;        // why we use it / where it fires in our codebase
   note?: string;      // optional design-decision callout
 }
@@ -1444,31 +1480,670 @@ function ApiUsagePage() {
       </div>
 
       {service === 'plex' && <PlexApiSection />}
-      {service === 'emby' && <ServiceWipPlaceholder name="Emby" />}
-      {service === 'jellyfin' && <ServiceWipPlaceholder name="Jellyfin" />}
+      {service === 'jellyfin' && <JellyfinApiSection />}
+      {service === 'emby' && <EmbyApiSection />}
     </>
   );
 }
 
-function ServiceWipPlaceholder({ name }: { name: string }) {
+
+// ── Adapter-status banner used by both Jellyfin and Emby sections.
+//
+// The endpoints in those sections describe what the corresponding
+// adapter WILL call once the PR-D adapter implementation lands per
+// Plan[MULTI-BACKEND]-2026-05-15.md section 9. Until then, the
+// registry refuses to save servers whose service field is anything
+// other than ``plex``, so no calls actually fire. Keeping the
+// catalogue visible in advance gives the operator a way to audit the
+// design and surface concerns before code lands.
+function AdapterUnderDevelopmentBanner({ name }: { name: string }) {
   return (
-    <div className="panel">
-      <h2 style={{ marginTop: 0 }}>{name}: Work in progress</h2>
-      <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
-        {name} integration is on the roadmap. When it ships, this tab
-        will document every {name}-side call the app makes the same
-        way the Plex tab does today: method or endpoint names,
-        descriptions of what they do on the {name} side, and the
-        reasoning behind each call's place in the snapshot / restore
-        / direct-transfer pipelines.
+    <div className="panel" style={{ borderLeft: '3px solid var(--color-warn, #d4a72c)' }}>
+      <h2 style={{ marginTop: 0 }}>{name} adapter under development</h2>
+      <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 0 }}>
+        The endpoints below describe what the {name} adapter will call once
+        the multi-backend PR ships. Today the server registry refuses to
+        save a server whose service field is anything other than{' '}
+        <code>plex</code>, so no {name} calls fire from this app yet. The
+        catalogue is published in advance so the operator can audit the
+        plan and flag concerns.
       </p>
-      <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 12 }}>
-        No {name} calls are made by the app today. Job forms reject
-        unregistered {name} servers, and the registry refuses to
-        save servers whose service field is anything other than
-        <code> plex</code>.
+      <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 8 }}>
+        A few design decisions that affect what some of these endpoints
+        will be called with (rating mapping, user identifier choice,
+        collection scope, owner identity) are still open; the help text
+        below stays neutral on those decisions instead of pre-committing
+        to a recommendation.
       </p>
     </div>
+  );
+}
+
+
+// ── Jellyfin API catalogue ──────────────────────────────────────────────────
+//
+// Ten groups: eight that mirror the Plex section's structure call-for-call
+// so the three tabs read as siblings, plus two Jellyfin-specific groups
+// covering user management (no Plex analogue) and webhooks (Feature 5
+// foundation).
+//
+// Sources confirmed against api.jellyfin.org (the OpenAPI reference) and
+// the jellyfin-plugin-webhook repo for webhook endpoints. Per the
+// authoring rules in the outline, the ``why`` line on each entry names
+// the adapter method or pipeline step it implements so a reader can
+// grep for it once the adapter ships.
+
+const JELLYFIN_API_GROUPS: ApiGroup[] = [
+  {
+    title: 'Connecting & identifying servers',
+    intro:
+      "Jellyfin servers expose a REST API at the operator-configured URL. Authentication is done with an admin API key (created in the dashboard) and carried on every request via a structured Authorization header. The adapter opens one requests.Session per server connection and reuses it for the run, sharing the existing retry adapter that the Plex code path uses today.",
+    calls: [
+      {
+        name: 'POST /Users/AuthenticateByName',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Authenticates a username / password pair and returns an AccessToken plus the user's UUID. The AccessToken is then reused on subsequent requests in the same session.",
+        why: "Used when the operator registers a Jellyfin server using a per-user login rather than a pre-issued API key. The adapter caches the returned token in the encrypted credential store the same way Plex tokens are cached today.",
+      },
+      {
+        name: 'Authorization: MediaBrowser Token="...", Client="...", DeviceId="...", Version="..."',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Structured Authorization header carried on every authenticated request. Jellyfin also accepts the legacy X-Emby-Token header, but the MediaBrowser scheme is the documented preferred form.',
+        why: "The adapter builds this header once when the connection opens and lets requests.Session attach it to every call, matching the way the Plex code path attaches X-Plex-Token implicitly through plexapi.",
+        note: "Client / DeviceId / Version are required identification fields, not optional. The adapter passes a stable per-install DeviceId so Jellyfin's session list doesn't show a fresh entry for every PlexBackUp run.",
+      },
+      {
+        name: 'GET /System/Info',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Returns the server's stable Id (the machineIdentifier equivalent), Name, Version, and OperatingSystem.",
+        why: "Drives the same registry keying we already use for Plex: the server's Id is the foreign key in media.db, so renaming the server in Jellyfin's dashboard doesn't look like a brand-new server to PlexBackUp.",
+      },
+      {
+        name: 'GET /System/Ping',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Lightweight liveness check; returns 200 with a short string body when the server is reachable and not in a startup state.',
+        why: 'Used by the Servers panel reachability indicator and as a fast preflight before any large run, so a server that is down at submit time fails the job up front rather than midway through capture.',
+      },
+    ],
+  },
+  {
+    title: 'Reading users on a server',
+    intro:
+      "Jellyfin and Emby differ materially from Plex here: every user is server-local (there is no plex.tv-style external account graph), and an admin token can write on behalf of any user via UserId in the URL path. The adapter enumerates users with one call and does not need to round-trip per-user tokens for read or write paths.",
+    calls: [
+      {
+        name: 'GET /Users',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Returns the full UserDto array for every account known to this server (administrators and ordinary users alike).",
+        why: "Powers the snapshot user-enumeration step. Replaces the Plex-side combination of server.systemAccounts() + account.users() with a single call; there is no plex.tv hop because Jellyfin's user list is purely server-local.",
+      },
+      {
+        name: 'GET /Users/{userId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Returns one UserDto, including the user policy (admin flag, enabled-libraries list, parental rating limits).',
+        why: 'Used during the preflight user-diff so the create-user-on-destination modal can show the operator each missing user with the source\'s policy as a starting point.',
+      },
+    ],
+  },
+  {
+    title: 'Browsing the library',
+    intro:
+      "Libraries are addressed by GUID Ids (not the numeric keys Plex uses); item listings are paginated and require explicit StartIndex / Limit. The adapter takes care of pagination internally so the snapshotter sees the same list-of-items return shape it gets from the Plex code path.",
+    calls: [
+      {
+        name: 'GET /Library/MediaFolders',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Lists every library on the server (admin context). Each entry carries an Id (GUID), a Name, and a CollectionType in the {movies, tvshows, music, mixed, playlists, ...} set.",
+        why: "Powers the library picker on Run Job and Schedules forms when a Jellyfin server is selected. Library identity is the GUID so a rename does not invalidate the per-server library_sections row.",
+      },
+      {
+        name: 'GET /Users/{userId}/Views',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Lists the libraries one particular user has access to. Same response shape as MediaFolders but already filtered by the user policy.',
+        why: 'Used when the operator has scoped a job to one managed user, so the library picker shows only libraries that user actually sees.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?ParentId={libraryId}&Recursive=true&IncludeItemTypes=Movie,Episode,Audio&Fields=ProviderIds,Path,MediaSources,UserData&StartIndex=N&Limit=N',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Recursive leaf-level item walk inside one library. Returns Movies / Episodes / Tracks directly (the playable leaves) rather than parent Show / Artist containers. The Fields list opts into the GUID providers (Imdb, Tmdb, Tvdb, MusicBrainz) and per-user state in one round trip.",
+        why: 'This is the workhorse of snapshot capture on a Jellyfin source. Equivalent to Plex section.searchTracks / searchEpisodes / search at the same logical level: leaves-with-metadata in one call.',
+        note: 'Pagination is operator-invisible: the adapter loops StartIndex internally until the response is shorter than the page size, then yields the joined result. Page size matches the operator-tunable smart_bulk_threshold_items default of 5000.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?... &Filters=IsPlayed',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Server-side filter returning only items the user has marked played at least once.',
+        why: 'The Jellyfin analogue of section.search(viewCount__gt=0). Used by the Smart watch+ratings strategy to fetch just the played items when the operator does not want a full library walk.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?... &Filters=IsFavorite',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Server-side filter returning only items the user has marked favorite.',
+        why: "Jellyfin's rating model is split into a binary favorite flag (always exposed) and a numeric rating on UserData (newer builds). The favorite filter is the cheap path when the destination only needs to know which items are bookmarked.",
+        note: "Plex has one rating concept (0.5-10 stars). Mapping between Plex stars and Jellyfin's split favorite + numeric model is an open design decision.",
+      },
+    ],
+  },
+  {
+    title: 'Finding the same item on a different server',
+    intro:
+      "Cross-server matching reuses the same GUID-keyed strategy PlexBackUp already uses for Plex source-to-Plex destination runs. Jellyfin items carry their external provider GUIDs on UserItemDataDto.ProviderIds (Imdb, Tmdb, Tvdb, MusicBrainz), which feed straight into services/guid_translator.py.",
+    calls: [
+      {
+        name: 'GET /Users/{userId}/Items/{itemId}?Fields=ProviderIds,Path,UserData',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Single-item fetch by per-server Id (the ratingKey equivalent). One round trip, no search.",
+        why: 'Tier 0 of the resolver. After a successful GUID match on the first run, the adapter writes the (item, server, jellyfin_id) tuple into server_items the same way the Plex adapter writes (item, server, rating_key), so the second run on the same server pair goes straight to this call.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?Recursive=true&Filters=...&AnyProviderIdEquals={scheme}.{id}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Searches the server for an item that carries the supplied external GUID (Imdb.tt0133093 etc.).",
+        why: "Tier 1 of the resolver. Used the first time a snapshot item is restored to a destination, when server_items has no cached mapping. The result is then cached so the next run hits Tier 0.",
+        note: "Per-server item IDs are stored as TEXT (rather than INTEGER) because Jellyfin item IDs are GUID strings, not integers.",
+      },
+    ],
+  },
+  {
+    title: 'Playlists',
+    intro:
+      "Jellyfin playlists are first-class items with their own Id; the read paths are the same recursive Items query used elsewhere, narrowed by IncludeItemTypes=Playlist. Add / create take a comma-separated Ids list in one call, so the URL-length chunking workaround the Plex adapter applies is not needed here.",
+    calls: [
+      {
+        name: 'GET /Users/{userId}/Items?IncludeItemTypes=Playlist&Recursive=true',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Lists all playlists visible to one user.',
+        why: 'Powers snapshot enumeration of per-user playlists during capture.',
+      },
+      {
+        name: 'GET /Playlists/{playlistId}/Items?UserId={userId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Returns the ordered member list of one playlist as seen by the supplied user.',
+        why: 'Drives per-playlist member capture. Ordering is preserved on serialise so the destination ends up with the same sequence.',
+      },
+      {
+        name: 'POST /Playlists?Name={name}&Ids={a,b,c}&UserId={userId}&MediaType={Audio|Video}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Creates a new playlist owned by the supplied user, optionally pre-populated with a comma-separated Ids list.',
+        why: "Used by the restorer when a destination is missing a playlist the snapshot recorded. MediaType is required at create time because Jellyfin playlists are typed (audio vs video).",
+        note: "Plex's create flow returns the new ratingKey; Jellyfin returns the Id in the response body. The adapter normalises both into a single playlist_id string the rest of the engine consumes.",
+      },
+      {
+        name: 'POST /Playlists/{playlistId}/Items?Ids={a,b,c}&UserId={userId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Appends one or more items to an existing playlist in a single call.',
+        why: 'Used to top up an existing destination playlist when the snapshot adds new members. No 100-item chunking is needed (the Plex 100-cap exists because of URL-length, not API limits).',
+      },
+    ],
+  },
+  {
+    title: 'Collections',
+    intro:
+      "Jellyfin and Emby BoxSets are server-wide rather than library-scoped (Plex collections are scoped to one library). PlexBackUp surfaces this as a divergence on cross-scope writes; the collection-scope behaviour is an open design decision and is not pre-committed here.",
+    calls: [
+      {
+        name: 'GET /Users/{userId}/Items?IncludeItemTypes=BoxSet&Recursive=true',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Lists every BoxSet (Jellyfin collection) on the server visible to the user.',
+        why: 'Snapshot enumeration of collections during capture. Server-wide scope means the adapter does not need a per-library loop here.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?ParentId={boxSetId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Returns the member list of one BoxSet.',
+        why: 'Per-collection member capture, the same way section.collections + collection.items composes on the Plex side.',
+      },
+      {
+        name: 'POST /Collections?Name={name}&Ids={a,b,c}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Creates a new BoxSet, optionally pre-populated. No library binding (BoxSets are server-wide).',
+        why: 'Used when the restorer needs to create a destination BoxSet that does not yet exist.',
+      },
+      {
+        name: 'POST /Collections/{collectionId}/Items?Ids={a,b,c}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Appends items to an existing BoxSet in a single call.',
+        why: 'Used to top up an existing destination BoxSet when the snapshot adds new members.',
+      },
+    ],
+  },
+  {
+    title: 'Writing back to the server (watch, rating, favorite, resume)',
+    intro:
+      "Jellyfin exposes dedicated endpoints for each write concern. Crucially, an admin token can write on behalf of any user via UserId in the URL, so the per-user-token round-trip the Plex adapter performs is not needed. Position values are in 100-nanosecond ticks (10,000 ticks = 1 ms); the adapter converts to and from milliseconds at the boundary.",
+    calls: [
+      {
+        name: 'POST /Users/{userId}/PlayedItems/{itemId}?DatePlayed={ISO8601}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Marks an item played for the supplied user; increments PlayCount; sets LastPlayedDate to the supplied timestamp. Returns the updated UserItemDataDto.',
+        why: 'Powers the restorer\'s "mark as watched" step. The response carries the resulting PlayCount, but the merge-strategy decision (higher / sum / replace) is made client-side; the adapter exposes a set_watched(count) primitive that loops this call when an increment-style write is needed.',
+      },
+      {
+        name: 'DELETE /Users/{userId}/PlayedItems/{itemId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Clears the played flag on an item for one user; resets PlayCount and LastPlayedDate.',
+        why: 'Used by the Replace restore mode when the snapshot records the item as unwatched but the destination has it marked played. No Plex equivalent: Plex does not expose an unwatched-flip endpoint, so the Replace mode there has a documented gap that does not apply on Jellyfin.',
+      },
+      {
+        name: 'POST /Users/{userId}/Items/{itemId}/UserData',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Sets one or more user-data fields in a single call: Played, PlayCount, PlaybackPositionTicks, IsFavorite, Rating.',
+        why: 'The adapter\'s combined-write fast path. Used when a single item has multiple changes in one snapshot (e.g. mark watched + set rating); avoids three round trips.',
+        note: 'PlaybackPositionTicks is in 100-nanosecond units; the adapter multiplies milliseconds by 10000 on write and divides on read.',
+      },
+      {
+        name: 'POST /Sessions/Playing/Progress',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Posts a play-progress update with PositionTicks, ItemId, SessionId. Mirrors a live client reporting playback progress.',
+        why: 'Alternative resume-position write path. Used when the operator needs the destination to behave as if the user had just paused (e.g. for handoff scenarios). The UserData path is the simpler write for static resume points.',
+      },
+      {
+        name: 'POST /Users/{userId}/Items/{itemId}/Rating?Likes={true|false}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: "Sets the binary favorite-style rating on an item.",
+        why: "One of two rating-write paths. The numeric Rating field is set via the UserData endpoint instead. Which is used per item depends on the rating-mapping behaviour, which is still an open design decision.",
+      },
+      {
+        name: 'POST /Users/{userId}/FavoriteItems/{itemId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Marks an item as favorite for one user. DELETE clears the favorite flag.',
+        why: 'Distinct from the rating endpoint: favorite is a binary flag independent of numeric rating. Snapshot captures both; restore applies both.',
+      },
+    ],
+  },
+  {
+    title: 'Library refresh (after writes)',
+    intro:
+      "Jellyfin updates UserData immediately on the writes above, so the post-restore refresh step the Plex adapter sometimes triggers is not generally required. The adapter still exposes refresh endpoints for the operator-opt-in path when the run summary suggests a refresh is wanted.",
+    calls: [
+      {
+        name: 'POST /Items/{itemId}/Refresh',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Forces Jellyfin to re-scan and re-match the metadata for one item.',
+        why: 'Operator-opt-in only. The adapter does not call this by default; mass-refresh during a multi-thousand-item restore can leave the destination UI sluggish for minutes.',
+      },
+      {
+        name: 'POST /Library/Refresh',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Triggers a full library scan on the server.',
+        why: 'Reserved for operator-initiated maintenance. PlexBackUp never fires this from a run.',
+      },
+    ],
+  },
+  {
+    title: 'User management (no Plex equivalent)',
+    intro:
+      "Plex sharing happens through plex.tv UI; PlexBackUp cannot create or delete Plex users. Jellyfin and Emby expose first-class user-management endpoints, which is what enables the create-users-on-destination flow during direct transfer. That flow is on the roadmap and not yet shipped.",
+    calls: [
+      {
+        name: 'POST /Users/New',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Creates a new user with the supplied Name and Password. Returns the new UserDto including the assigned Id.',
+        why: "Used during direct transfer when the source has a user the destination does not. The operator confirms each new user in the preflight modal; the adapter then issues this call per row and persists the resulting Id in the per-job mapping (schema delta SD-3).",
+      },
+      {
+        name: 'POST /Users/{userId}/Password',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Changes an existing user\'s password. Takes CurrentPw and NewPw, or ResetPassword=true to clear without knowing the current.',
+        why: 'Used by the operator-initiated password rotation in the User Management panel after a transfer. Not required by the create flow itself (POST /Users/New takes the initial password).',
+      },
+      {
+        name: 'POST /Users/{userId}/Policy',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Updates a user\'s policy: IsAdministrator, IsDisabled, EnableAllFolders, EnabledFolders, parental rating limits.',
+        why: 'Applied during user creation to mirror the source user\'s library-access policy onto the destination. The operator can edit the proposed policy in the preflight modal before submit.',
+      },
+      {
+        name: 'DELETE /Users/{userId}',
+        href: _JELLYFIN_API,
+        source: 'official-rest',
+        what: 'Permanently deletes a user account on the server.',
+        why: 'Exposed by the adapter for completeness; PlexBackUp does not call DELETE during any automated run. Reserved for operator-initiated cleanup through the User Management panel, behind a typed-confirmation gate.',
+      },
+    ],
+  },
+  {
+    title: 'Webhooks (Feature 5 foundation)',
+    intro:
+      "The Jellyfin webhook plugin installs from the plugin catalog and fires application/json payloads to PlexBackUp's webhook receiver. The event types listed here are the ones PlexBackUp's sync normaliser cares about; the plugin itself emits more events that PlexBackUp ignores. Implementation is on the roadmap and not yet shipped.",
+    calls: [
+      {
+        name: 'PlaybackStart / PlaybackProgress / PlaybackStop',
+        href: _JELLYFIN_WEBHOOK,
+        source: 'plugin',
+        what: 'Fired by the webhook plugin when a session enters / progresses through / leaves a play state. Payload carries UserId, ServerId, ItemId, and ProviderIds.',
+        why: 'Drives live watch sync. PlaybackStop with a sufficiently-watched threshold maps to a scrobble on every linked destination through services/sync_normalizer.py.',
+      },
+      {
+        name: 'UserDataSaved',
+        href: _JELLYFIN_WEBHOOK,
+        source: 'plugin',
+        what: 'Fired when a UserData write happens (rating change, favorite flip, played flag change).',
+        why: 'The Jellyfin-side trigger for rating sync and favorite sync. Plex does not have an analogous webhook event, so cross-backend rating sync is one-way from Jellyfin / Emby to Plex unless the operator wires a polling loop.',
+      },
+      {
+        name: 'ItemAdded',
+        href: _JELLYFIN_WEBHOOK,
+        source: 'plugin',
+        what: 'Fired when the library scanner adds a new item.',
+        why: 'Used by the targeted-scan endpoint to refresh PlexBackUp\'s cached item identity for one new item without a full library walk.',
+      },
+    ],
+  },
+];
+
+
+// ── Emby API catalogue ─────────────────────────────────────────────────────
+//
+// Emby shares its REST ancestry with Jellyfin (the projects forked from a
+// common base) so the endpoint paths overlap substantially. The catalogue
+// below documents only the endpoints that diverge from Jellyfin or that
+// PlexBackUp's Emby adapter calls in a materially different way. For
+// shared endpoints the Jellyfin tab is authoritative; the Emby tab
+// cross-references it rather than duplicating the row.
+
+const EMBY_API_GROUPS: ApiGroup[] = [
+  {
+    title: 'Connecting & identifying servers',
+    intro:
+      "Emby's REST API mirrors Jellyfin's at the path level for most discovery endpoints, but the Authorization header uses an Emby scheme rather than Jellyfin's MediaBrowser scheme. The adapter builds the header once per connection and reuses one requests.Session for the run, the same shape as the Jellyfin and Plex adapters.",
+    calls: [
+      {
+        name: 'POST /Users/AuthenticateByName',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Authenticates a username / password and returns AccessToken + User.Id. Identical request shape to Jellyfin; the response is read the same way.",
+        why: 'Used when an Emby server is registered with credentials rather than a pre-issued API key. Caching follows the same encrypted credential store pattern as the Plex and Jellyfin adapters.',
+      },
+      {
+        name: 'Authorization: Emby UserId="...", Token="...", Client="...", DeviceId="...", Version="..."',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Structured Authorization header carried on every authenticated request. Emby also accepts X-Emby-Token as a legacy alternative; the structured form is the documented preferred path.',
+        why: "The single material divergence from Jellyfin at the auth layer: the scheme name is 'Emby' rather than 'MediaBrowser'. The shared HTTP-adapter mixin parameterises this so the rest of the request-construction code is shared between Jellyfin and Emby.",
+      },
+      {
+        name: 'GET /System/Info',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Same payload shape as Jellyfin: server Id, Name, Version, OperatingSystem.",
+        why: 'Same use as on the Jellyfin tab: stable foreign key for media.db, detects renames without invalidating cached identity.',
+      },
+      {
+        name: 'GET /System/Ping',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Liveness check; returns 200 with a short body when the server is reachable.',
+        why: 'Used by the Servers panel reachability indicator and the preflight gate before large runs.',
+      },
+    ],
+  },
+  {
+    title: 'Reading users on a server',
+    intro:
+      "User enumeration is identical to Jellyfin: GET /Users returns the full UserDto array, and admin tokens can write on behalf of any user via UserId in the URL path. The adapter shares this code path with the Jellyfin adapter through the _HttpMediaAdapter mixin.",
+    calls: [
+      {
+        name: 'GET /Users  ·  GET /Users/{userId}',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Same response shape as the Jellyfin endpoints of the same name. See the Jellyfin tab for the full description.",
+        why: "Shared code path with the Jellyfin adapter; documented separately here only so the Emby tab is browseable on its own.",
+      },
+    ],
+  },
+  {
+    title: 'Browsing the library',
+    intro:
+      "Library and item endpoints mirror Jellyfin's at the path level. Two material divergences worth flagging: Emby exposes a MinUserRating filter (Jellyfin uses Filters=IsFavorite as the favorite-only filter), and Emby's CollectionType enum has a slightly different vocabulary in older builds.",
+    calls: [
+      {
+        name: 'GET /Library/MediaFolders  ·  GET /Users/{userId}/Views',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Same response shape as the Jellyfin endpoints of the same name.',
+        why: 'Same use: library picker, per-user scoping. See the Jellyfin tab.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?ParentId={libraryId}&Recursive=true&IncludeItemTypes=Movie,Episode,Audio&Fields=ProviderIds,Path,MediaSources,UserData&StartIndex=N&Limit=N',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Recursive leaf-level item walk inside one library. Same path and parameter set as Jellyfin.',
+        why: 'Workhorse of snapshot capture on an Emby source. Shared code path with the Jellyfin adapter.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?... &Filters=IsPlayed',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Server-side filter for items the user has marked played. Same semantics as Jellyfin.",
+        why: 'Used by the Smart strategy on Emby sources.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?... &MinUserRating=1',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Server-side filter returning items with a numeric rating at or above the supplied value. Emby's preferred analogue of Jellyfin's binary IsFavorite filter when the operator wants numeric thresholding.",
+        why: "Emby's rating model exposes both the binary favorite and a numeric rating; PlexBackUp picks the filter at run time. The rating-mapping behaviour is still an open design decision.",
+      },
+    ],
+  },
+  {
+    title: 'Finding the same item on a different server',
+    intro:
+      "Cross-server identity uses the same ProviderIds-on-UserItemDataDto path as Jellyfin. Schema delta SD-1 (storing per-server item IDs as TEXT instead of INTEGER) applies to Emby for the same reason it applies to Jellyfin: Emby item IDs are GUID strings.",
+    calls: [
+      {
+        name: 'GET /Users/{userId}/Items/{itemId}?Fields=ProviderIds,Path,UserData',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Single-item fetch by per-server Id. Same payload shape as Jellyfin.",
+        why: 'Tier 0 of the resolver, same way as the Jellyfin adapter writes through server_items.',
+      },
+      {
+        name: 'GET /Users/{userId}/Items?Recursive=true&AnyProviderIdEquals={scheme}.{id}',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Searches by external GUID. Same parameter shape as Jellyfin.',
+        why: 'Tier 1 of the resolver. Result is cached into server_items so the second run hits Tier 0.',
+      },
+    ],
+  },
+  {
+    title: 'Playlists',
+    intro:
+      "Playlist read and write paths are identical to Jellyfin (POST /Playlists with comma-separated Ids, POST /Playlists/{id}/Items for appends). The adapter shares this code path with the Jellyfin adapter.",
+    calls: [
+      {
+        name: 'GET /Users/{userId}/Items?IncludeItemTypes=Playlist&Recursive=true  ·  GET /Playlists/{id}/Items  ·  POST /Playlists  ·  POST /Playlists/{id}/Items',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: "Same payload shapes as the equivalent Jellyfin endpoints. Documented in detail on the Jellyfin tab.",
+        why: 'Shared code path with the Jellyfin adapter; documented separately here only so the Emby tab is browseable on its own.',
+      },
+    ],
+  },
+  {
+    title: 'Collections',
+    intro:
+      "Emby BoxSets are server-wide, matching Jellyfin's scope and diverging from Plex's library-scoped collections. How PlexBackUp handles this scope divergence on cross-scope writes is still an open design decision.",
+    calls: [
+      {
+        name: 'GET /Users/{userId}/Items?IncludeItemTypes=BoxSet  ·  POST /Collections  ·  POST /Collections/{id}/Items',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Same payload shapes as the equivalent Jellyfin endpoints.',
+        why: 'Shared code path with the Jellyfin adapter.',
+      },
+    ],
+  },
+  {
+    title: 'Writing back to the server (watch, rating, favorite, resume)',
+    intro:
+      "Write endpoints mirror Jellyfin's path-for-path. PlaybackPositionTicks is in 100-nanosecond units (10,000 ticks = 1 ms) on Emby too; the conversion is done in the shared _HttpMediaAdapter mixin.",
+    calls: [
+      {
+        name: 'POST /Users/{userId}/PlayedItems/{itemId}?DatePlayed={ISO8601}',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Marks an item played; increments PlayCount; sets LastPlayedDate. DELETE clears the flag.',
+        why: 'Powers the restorer\'s "mark as watched" step on Emby destinations.',
+      },
+      {
+        name: 'POST /Users/{userId}/Items/{itemId}/UserData',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Combined UserData write: Played, PlayCount, PlaybackPositionTicks, IsFavorite, Rating.',
+        why: "Adapter's combined-write fast path. Used when one item has multiple changes in one snapshot.",
+      },
+      {
+        name: 'POST /Users/{userId}/Items/{itemId}/Rating?Likes={true|false}  ·  POST /Users/{userId}/FavoriteItems/{itemId}',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Binary favorite-style rating write paths. The numeric Rating field is set through the UserData endpoint.',
+        why: "Two write paths so the adapter can match the rating-mapping decision (D-RATE) at run time.",
+      },
+    ],
+  },
+  {
+    title: 'Library refresh (after writes)',
+    intro:
+      "Emby applies UserData writes immediately, the same as Jellyfin, so post-restore refresh is not required for the writes PlexBackUp issues. The endpoints exist for operator-opt-in maintenance only.",
+    calls: [
+      {
+        name: 'POST /Items/{itemId}/Refresh  ·  POST /Library/Refresh',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Same shapes as Jellyfin.',
+        why: 'Operator-opt-in only; PlexBackUp never fires these from a run.',
+      },
+    ],
+  },
+  {
+    title: 'User management (no Plex equivalent)',
+    intro:
+      "Emby exposes the same user-management endpoints as Jellyfin (POST /Users/New, POST /Users/{id}/Password, POST /Users/{id}/Policy, DELETE /Users/{id}). The create-users-on-destination flow (on the roadmap, not yet shipped) works the same way against Emby.",
+    calls: [
+      {
+        name: 'POST /Users/New  ·  POST /Users/{id}/Password  ·  POST /Users/{id}/Policy  ·  DELETE /Users/{id}',
+        href: _EMBY_API,
+        source: 'official-rest',
+        what: 'Identical request shapes to the Jellyfin equivalents.',
+        why: 'Shared code path with the Jellyfin adapter.',
+      },
+    ],
+  },
+  {
+    title: 'Webhooks (Feature 5 foundation)',
+    intro:
+      "Emby ships a built-in Webhooks plugin (Jellyfin's is an installable add-on). The payload shape mirrors Plex's multipart-with-JSON form rather than Jellyfin's application/json, so PlexBackUp's webhook receiver keeps separate parsers per backend. Implementation is on the roadmap and not yet shipped.",
+    calls: [
+      {
+        name: 'playback.start / playback.stop',
+        href: _EMBY_WEBHOOK,
+        source: 'plugin',
+        what: 'Fired when a session starts or stops. Payload carries User.Id, Server.Id, Item.Id, Item.ProviderIds.',
+        why: 'Drives live watch sync from Emby sources; playback.stop with a sufficiently-watched threshold maps to a scrobble on every linked destination.',
+      },
+      {
+        name: 'item.markplayed',
+        href: _EMBY_WEBHOOK,
+        source: 'plugin',
+        what: 'Fired when an item is marked played outside a playback session (e.g. via the UI mark-as-watched menu).',
+        why: 'The Emby-side trigger for non-playback watch state changes. PlexBackUp\'s normaliser treats it the same as playback.stop with full watch.',
+      },
+      {
+        name: 'item.rate',
+        href: _EMBY_WEBHOOK,
+        source: 'plugin',
+        what: 'Fired when a rating or favorite flag changes on an item.',
+        why: 'The Emby-side trigger for rating sync. Cross-backend rating sync from Emby into Plex is subject to the same one-way limitation noted on the Jellyfin tab.',
+      },
+    ],
+  },
+];
+
+
+function JellyfinApiSection() {
+  return (
+    <>
+      <AdapterUnderDevelopmentBanner name="Jellyfin" />
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Jellyfin</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          Every call the {' '}
+          <strong>Jellyfin adapter</strong> will make against a Jellyfin
+          server, mirrored against the Plex tab's structure so the two
+          read as siblings. Endpoint paths link to the official OpenAPI
+          reference at api.jellyfin.org; webhook entries link to the
+          jellyfin-plugin-webhook repository.
+        </span>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 8 }}>
+          Each entry's "why" line names the adapter method or pipeline
+          step the endpoint implements so a reader can grep the codebase
+          for it once the adapter ships.
+        </span>
+      </div>
+
+      {JELLYFIN_API_GROUPS.map((group) => (
+        <ApiGroupTable key={group.title} group={group} />
+      ))}
+    </>
+  );
+}
+
+
+function EmbyApiSection() {
+  return (
+    <>
+      <AdapterUnderDevelopmentBanner name="Emby" />
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Emby</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          Endpoint catalogue for the Emby adapter. Because Emby and
+          Jellyfin share REST ancestry, only divergences from the
+          Jellyfin tab are documented in full here; for shared endpoints
+          this tab cross-references the Jellyfin entry rather than
+          duplicating the row. Endpoint paths link to the official Emby
+          Swagger reference.
+        </span>
+      </div>
+
+      {EMBY_API_GROUPS.map((group) => (
+        <ApiGroupTable key={group.title} group={group} />
+      ))}
+    </>
   );
 }
 
@@ -1494,75 +2169,90 @@ function PlexApiSection() {
       </div>
 
       {API_GROUPS.map((group) => (
-        <div key={group.title} className="panel">
-          <h2 style={{ marginTop: 0 }}>{group.title}</h2>
-          <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 0 }}>
-            {group.intro}
-          </p>
-          {group.calls.length === 0 ? (
-            <p style={{ fontSize: 12, color: 'var(--text-dim)', fontStyle: 'italic' }}>
-              No calls in this category. That is intentional. See the intro
-              above for why.
-            </p>
-          ) : (
-            <table className="list" style={{ width: '100%' }}>
-              <thead>
-                <tr>
-                  <th style={{ width: '40%' }}>Call</th>
-                  <th>What it does · Why we use it</th>
-                </tr>
-              </thead>
-              <tbody>
-                {group.calls.map((c) => (
-                  <tr key={c.name}>
-                    <td>
-                      <a
-                        href={c.href}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="mono"
-                        style={{
-                          fontSize: 12,
-                          textDecoration: 'none',
-                          color: 'var(--color-phase, #58a6ff)',
-                        }}
-                      >
-                        {c.name}
-                      </a>
-                      <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 4 }}>
-                        {c.source === 'plexapi'
-                          ? 'python-plexapi (official)'
-                          : 'community-maintained reference'}
-                      </div>
-                    </td>
-                    <td>
-                      <div style={{ fontSize: 13 }}>{c.what}</div>
-                      <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 6 }}>
-                        {c.why}
-                      </div>
-                      {c.note && (
-                        <div
-                          style={{
-                            fontSize: 11,
-                            color: 'var(--text-dim)',
-                            marginTop: 6,
-                            paddingLeft: 8,
-                            borderLeft: '2px solid var(--color-phase, #58a6ff)',
-                            fontStyle: 'italic',
-                          }}
-                        >
-                          <strong>Design note: </strong>{c.note}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+        <ApiGroupTable key={group.title} group={group} />
       ))}
     </>
+  );
+}
+
+
+function _sourceBadgeLabel(source: ApiCall['source']): string {
+  switch (source) {
+    case 'plexapi':       return 'python-plexapi (official)';
+    case 'community':     return 'community-maintained reference';
+    case 'official-rest': return 'official REST API documentation';
+    case 'plugin':        return 'plugin-shipped feature';
+  }
+}
+
+
+function ApiGroupTable({ group }: { group: ApiGroup }) {
+  return (
+    <div className="panel">
+      <h2 style={{ marginTop: 0 }}>{group.title}</h2>
+      <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 0 }}>
+        {group.intro}
+      </p>
+      {group.calls.length === 0 ? (
+        <p style={{ fontSize: 12, color: 'var(--text-dim)', fontStyle: 'italic' }}>
+          No calls in this category. That is intentional. See the intro
+          above for why.
+        </p>
+      ) : (
+        <table className="list" style={{ width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ width: '40%' }}>Call</th>
+              <th>What it does · Why we use it</th>
+            </tr>
+          </thead>
+          <tbody>
+            {group.calls.map((c) => (
+              <tr key={c.name}>
+                <td>
+                  <a
+                    href={c.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mono"
+                    style={{
+                      fontSize: 12,
+                      textDecoration: 'none',
+                      color: 'var(--color-phase, #58a6ff)',
+                    }}
+                  >
+                    {c.name}
+                  </a>
+                  <div style={{ fontSize: 10, color: 'var(--text-dim)', marginTop: 4 }}>
+                    {_sourceBadgeLabel(c.source)}
+                  </div>
+                </td>
+                <td>
+                  <div style={{ fontSize: 13 }}>{c.what}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 6 }}>
+                    {c.why}
+                  </div>
+                  {c.note && (
+                    <div
+                      style={{
+                        fontSize: 11,
+                        color: 'var(--text-dim)',
+                        marginTop: 6,
+                        paddingLeft: 8,
+                        borderLeft: '2px solid var(--color-phase, #58a6ff)',
+                        fontStyle: 'italic',
+                      }}
+                    >
+                      <strong>Design note: </strong>{c.note}
+                    </div>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
   );
 }
 
@@ -1696,11 +2386,12 @@ const DB_DOCS: DbDoc[] = [
           { name: 'role', type: "TEXT NOT NULL CHECK (role IN ('owner', 'managed'))", note: 'Server owner or managed home user. The engine routes Plex tokens by this field.' },
           { name: 'backend', type: "TEXT NOT NULL DEFAULT 'plex' CHECK (backend IN ('plex', 'emby', 'jellyfin'))", note: 'Which media-server product this row describes. Plex today; future Jellyfin / Emby adapters will write their own backend string and the engine reads them uniformly.' },
           { name: 'backend_user_id', type: 'TEXT', note: "The backend's native user id (Plex userID, Jellyfin user GUID, etc.). May be NULL on rows backfilled from pre-v0.13.0 data." },
+          { name: 'app_user_uuid', type: 'TEXT (partial UNIQUE index)', note: "v12 (USER-MGMT-IDENTITY-AUDIT). App-generated canonical identifier in the form <Service>-<HostNameSlug>-<server_uid>-<userkey>. Immutable for the row's lifetime. Generated at insert time by every writer path; legacy rows are filled by the boot-time _backfill_app_user_uuids helper. This is the validation handle the cross-server identity_map keys off." },
           { name: 'created_at', type: 'REAL NOT NULL', note: 'When the row was first inserted.' },
           { name: 'last_seen_at', type: 'REAL', note: 'Bumped on every CRUD touch via get_or_create_server_user.' },
         ],
         design_note:
-          "Replaces the legacy 'user_handle = \"\"' owner sentinel that ran through every wide table pre-v0.13.0. The owner is now a first-class row with role='owner', queryable directly; managed users are role='managed'. The backend column makes the schema multi-backend without a migration when Jellyfin / Emby support lands - Plex's one-owner-per-server model and Jellyfin's multiple-admins model both fit because role + backend are independent. Separate from managed_users (credentials, Fernet-encrypted, host-bound); server_users is identity metadata and is safe to copy into a portable snapshot .db file. UNIQUE(server_id, user_handle) prevents duplicate identity rows; cascading deletes on server purge are handled in order in server/media_db.py :: purge_server_data.",
+          "Replaces the legacy 'user_handle = \"\"' owner sentinel that ran through every wide table pre-v0.13.0. The owner is now a first-class row with role='owner', queryable directly; managed users are role='managed'. The backend column makes the schema multi-backend without a migration when Jellyfin / Emby support lands - Plex's one-owner-per-server model and Jellyfin's multiple-admins model both fit because role + backend are independent. Separate from managed_users (credentials, Fernet-encrypted, host-bound); server_users is identity metadata and is safe to copy into a portable snapshot .db file. UNIQUE(server_id, user_handle) prevents duplicate identity rows; cascading deletes on server purge are handled in order in server/media_db.py :: purge_server_data. The app_user_uuid column (v12) is the canonical anchor across servers — see the 'How users are identified across servers' topic on the Help tab for the full primer.",
       },
       {
         name: 'watch_events',
@@ -1780,12 +2471,13 @@ const DB_DOCS: DbDoc[] = [
           { name: 'plex_home_pin_enc', type: 'TEXT', note: "Encrypted Plex Home PIN." },
           { name: 'service_password_enc', type: 'TEXT', note: "Encrypted service password (for Emby / Jellyfin when those integrations land)." },
           { name: 'tombstoned', type: 'INTEGER NOT NULL DEFAULT 0', note: 'Per-server hide flag. 1 = hidden, credentials preserved.' },
+          { name: 'app_user_uuid', type: 'TEXT (partial UNIQUE index)', note: "v12 (USER-MGMT-IDENTITY-AUDIT). App-generated canonical identifier in the form <Service>-<HostNameSlug>-<server_uid>-<userkey>. Generated at insert time by upsert_managed_user; legacy rows are filled by the boot-time _backfill_app_user_uuids helper. This is the validation handle the cross-server identity_map keys off." },
           { name: 'last_seen', type: 'REAL', note: "When the user was last observed by a live API sync." },
           { name: 'created_at', type: 'REAL NOT NULL', note: 'When the row was first inserted.' },
           { name: 'updated_at', type: 'REAL NOT NULL', note: 'When the row was last written.' },
         ],
         design_note:
-          "Fernet ciphertext lives inline in the .db rather than in a separate secrets file. The decryption key lives in server_data/.keyfile, separate from media.db. A export of media.db without .keyfile is unreadable for credential cells.",
+          "Fernet ciphertext lives inline in the .db rather than in a separate secrets file. The decryption key lives in server_data/.keyfile, separate from media.db. A export of media.db without .keyfile is unreadable for credential cells. The app_user_uuid column (v12) gives every managed user a stable, app-controlled identifier — see the 'How users are identified across servers' topic on the Help tab for the full primer + format spec.",
       },
       {
         name: 'global_tombstones',
@@ -1795,6 +2487,36 @@ const DB_DOCS: DbDoc[] = [
           { name: 'username', type: 'TEXT PRIMARY KEY', note: 'A globally-tombstoned username.' },
           { name: 'tombstoned_at', type: 'REAL NOT NULL', note: 'When the global hide was applied.' },
         ],
+      },
+      {
+        name: 'library_sections',
+        purpose: "Per-server snapshot of the library list. Records each library's stable identity (section key + title + type) so the engine can detect renamed libraries and the resolver can scope queries to one library when needed.",
+        key_columns: ['server_id', 'section_key', 'section_title', 'section_type'],
+        columns: [
+          { name: 'server_id', type: 'TEXT NOT NULL', note: "Which server this library belongs to." },
+          { name: 'section_key', type: 'INTEGER NOT NULL', note: "The backend's stable numeric library id (Plex section key, Jellyfin library GUID converted, etc.). The Library-Section Identity Invariant requires section_key > 0 for every row." },
+          { name: 'section_title', type: 'TEXT NOT NULL', note: "Display name at last sync." },
+          { name: 'section_type', type: 'TEXT NOT NULL', note: "movie / show / artist / etc." },
+          { name: 'first_seen_at', type: 'REAL NOT NULL', note: "When this library was first observed." },
+          { name: 'last_seen_at', type: 'REAL NOT NULL', note: "Bumped whenever a refresh confirms the library still exists." },
+        ],
+        design_note:
+          "PRIMARY KEY (server_id, section_key) — a renamed library keeps the same key on the backend, so the row updates in place. A library removed from the backend stops getting last_seen_at refreshes; consumers can detect that.",
+      },
+      {
+        name: 'user_identity_map',
+        purpose: "Cross-server identity links. One row per ordered pair of (user_a_uuid, user_b_uuid) that the operator or auto-discovery has established as the same person. Re-keyed from (server_id, user_handle) tuples to (app_user_uuid, app_user_uuid) pairs in v12 so links survive renames + backend_user_id rotation.",
+        key_columns: ['user_a_uuid', 'user_b_uuid', 'source', 'derived_from_id'],
+        columns: [
+          { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id.' },
+          { name: 'user_a_uuid', type: 'TEXT NOT NULL', note: "app_user_uuid of the first user in the pair. References managed_users.app_user_uuid or server_users.app_user_uuid." },
+          { name: 'user_b_uuid', type: 'TEXT NOT NULL', note: "app_user_uuid of the second user in the pair." },
+          { name: 'source', type: "TEXT NOT NULL CHECK (source IN ('manual', 'auto_copy'))", note: "Origin of the link: 'manual' (User Mapping panel + cross-platform preflight modal), 'auto_copy' (auto-derived from same-(service_type, backend_user_id) pairs by the auto-link helper)." },
+          { name: 'derived_from_id', type: 'INTEGER (v13)', note: 'When non-NULL, this row was fanned-out transitively from another row (e.g., adding A↔B when A↔C and B↔C already existed). Deleting the parent cascades to children so the operator removing a manual edge cleans up the inferred edges it spawned. NULL = standalone row (manual or auto_copy by backend_user_id).' },
+          { name: 'created_at', type: 'REAL NOT NULL', note: 'When the link was first recorded.' },
+        ],
+        design_note:
+          "v12 re-keyed this table from (server_id, user_handle) tuples to (app_user_uuid, app_user_uuid) pairs. Why: handles + backend_user_ids rotate, but app_user_uuid is immutable. An operator-authored mapping like 'Crystal Jean on Jade.TV is the same human as crystal.jean on a Jellyfin server' now survives renames on either side, backend_user_id rotation, and even one of the backends being re-registered. v13 added derived_from_id + transitive-closure fanout so adding a link to an existing equivalence class joins everyone correctly. The lookup paths treat the pair symmetrically: querying for either direction returns the link. Resolution-chain priority: per-job operator override → user_identity_map lookup → backend_user_id direct match → username match → owner-role single-admin fallback. See the 'How users are identified across servers' topic for the full primer.",
       },
       {
         name: 'library_walks',
@@ -1838,6 +2560,106 @@ const DB_DOCS: DbDoc[] = [
     source_init: 'server/media_db.py :: init_media_db (around line 338)',
   },
 
+  // ── run_timings.db ──────────────────────────────────────────────
+  {
+    filename: 'run_timings.db',
+    filepath: 'server_data/run_timings.db',
+    intro_short:
+      "Operational telemetry + ETA training store. Three tables: per-operation timings (run_timings), per-job summaries (run_history), and the learned regression weights the predictor uses to estimate future job durations (eta_buckets).",
+    intro_long:
+      "run_timings.db is the observability spine of the app. Every time_operation block in the engine writes one row to run_timings; every finished job writes one row to run_history. Those two tables drive the Run History tab and the Recent Runtimes panel.\n\nThe third table, eta_buckets, holds the learned weights for the adaptive ETA predictor. Each row is the EMA-decayed sufficient statistics for one online weighted linear regression of the form duration = intercept + slope * items_count, keyed by (server, operation label, library type, bulk strategy). The trainer is fed by the same run_timings rows; running a few jobs lets the predictor walk past its cold-start defaults and into real per-server numbers.\n\nThis file is deliberately separate from media.db. The two have different lifecycles (telemetry is bounded by retention; media state grows with library size), different audit characteristics (telemetry tells you what the engine did; media tells you what the server contains), and very different blast radii (losing media.db re-runs as a backfill; losing run_timings just resets the ETA learning). Keeping them apart prevents a write-amplification path on the cumulative store and makes either DB easy to wipe independently.",
+    tables: [
+      {
+        name: 'run_timings',
+        purpose: 'One row per timed operation (snapshot of one library, gather of one user, etc.). The ETA trainer ingests these.',
+        key_columns: ['run_id', 'label', 'server_id', 'duration_seconds', 'items_processed'],
+        columns: [
+          { name: 'id', type: 'INTEGER PRIMARY KEY AUTOINCREMENT', note: 'Internal id.' },
+          { name: 'run_id', type: 'TEXT NOT NULL', note: "Groups every entry from one job together. Joined to run_history.run_id for drill-down." },
+          { name: 'scope', type: 'TEXT NOT NULL', note: "What level the operation ran at: run / library / user / batch / operation." },
+          { name: 'label', type: 'TEXT NOT NULL', note: "Operation name, e.g. snapshot_watch_history / snapshot_ratings / gather_user / build_snapshot_db_from_payloads." },
+          { name: 'server_id', type: 'TEXT', note: "Which server the operation ran against. Required for the ETA trainer to attribute the timing to a bucket." },
+          { name: 'library', type: 'TEXT', note: "Library name when the scope is library; NULL otherwise." },
+          { name: 'user_handle', type: 'TEXT', note: "User handle when the scope is per-user; NULL otherwise." },
+          { name: 'started_at', type: 'REAL NOT NULL', note: 'Unix start timestamp.' },
+          { name: 'ended_at', type: 'REAL NOT NULL', note: 'Unix end timestamp.' },
+          { name: 'duration_seconds', type: 'REAL NOT NULL', note: "perf_counter delta - monotonic, immune to NTP jumps." },
+          { name: 'items_processed', type: 'INTEGER', note: 'How many items this operation touched. The regression variable for ETA training.' },
+          { name: 'etr_at_start', type: 'REAL', note: "What the live ETR tracker said at the moment the operation began (when applicable)." },
+          { name: 'extra_json', type: 'TEXT', note: "Free-form annotations as JSON. Carries library_type, strategy, ping_ms_at_start, bulk_used, etc." },
+          { name: 'recorded_at', type: 'REAL NOT NULL', note: "When the row was inserted into the DB." },
+        ],
+        design_note:
+          "Retention is bounded: only the most recent N distinct run_ids survive (operator-tunable, default 200). That cap keeps the file small enough to scan in the dashboard without pagination but deep enough for the ETA trainer to detect drift across weeks. Older runs roll off automatically at insert time.",
+      },
+      {
+        name: 'run_history',
+        purpose: "One row per finished job (snapshot / restore / direct). Powers the Run History tab and the Recent Runtimes panel.",
+        key_columns: ['run_id', 'started_at', 'state', 'server_id', 'job_type', 'duration_ms'],
+        columns: [
+          { name: 'run_id', type: 'TEXT PRIMARY KEY', note: "Matches the run_id used in run_timings, so the UI can drill from a history row into its per-operation entries." },
+          { name: 'started_at', type: 'REAL NOT NULL', note: 'When the job started.' },
+          { name: 'finished_at', type: 'REAL NOT NULL', note: 'When the job ended (any terminal state).' },
+          { name: 'job_type', type: 'TEXT NOT NULL', note: 'snapshot / restore / direct.' },
+          { name: 'server_id', type: 'TEXT', note: 'The source server for snapshot / direct; the destination for restore.' },
+          { name: 'server_name', type: 'TEXT', note: 'Friendly name at job time, for display when the server is later renamed or removed.' },
+          { name: 'libraries', type: 'TEXT NOT NULL', note: 'JSON array of library names this job touched.' },
+          { name: 'users_affected', type: 'INTEGER NOT NULL DEFAULT 0', note: 'Distinct user count touched by this job.' },
+          { name: 'users_affected_list', type: 'TEXT', note: 'JSON array of user handles, parallel to users_affected.' },
+          { name: 'state', type: 'TEXT NOT NULL', note: 'completed / failed / cancelled.' },
+          { name: 'duration_ms', type: 'INTEGER NOT NULL', note: 'Total wall-clock duration in milliseconds.' },
+          { name: 'run_log_dir', type: 'TEXT', note: 'Pointer to the run-specific log directory under plex_logs/.' },
+          { name: 'has_settings_log', type: 'INTEGER NOT NULL DEFAULT 0', note: '1 if a run-settings.log was written.' },
+          { name: 'has_restoration_log', type: 'INTEGER NOT NULL DEFAULT 0', note: '1 if a restoration-summary.log was written.' },
+          { name: 'error_summary', type: 'TEXT', note: 'Short error string when state != completed.' },
+          { name: 'recorded_at', type: 'REAL NOT NULL', note: "When the row was inserted." },
+        ],
+        design_note:
+          "Same retention discipline as run_timings (operator-tunable, default 200). The 'why two tables when one would do?' question: run_timings is per-operation (~30 rows per job); run_history is per-job (1 row). Splitting lets the dashboard scan the small table for the list view and drill into the large one only when the operator opens a specific row.",
+      },
+      {
+        name: 'eta_buckets',
+        purpose: "Per-bucket learned regression weights for the adaptive ETA predictor. One row per (server, operation, library type, strategy).",
+        key_columns: ['server_id', 'label', 'library_type', 'bulk_strategy', 'sample_count'],
+        columns: [
+          { name: 'server_id', type: 'TEXT NOT NULL', note: "Which server's timings trained this bucket." },
+          { name: 'label', type: 'TEXT NOT NULL', note: 'The operation label (snapshot_watch_history, snapshot_ratings, etc.).' },
+          { name: 'library_type', type: 'TEXT NOT NULL', note: "movie / show / artist / etc.; empty string when the operation does not bind to a single library." },
+          { name: 'bulk_strategy', type: 'TEXT NOT NULL', note: "Which Plex watch+ratings strategy was in use (smart / force_bulk / force_server_side)." },
+          { name: 'sum_w', type: 'REAL NOT NULL', note: 'EMA-decayed effective sample count.' },
+          { name: 'sum_wx', type: 'REAL NOT NULL', note: 'EMA-decayed sum of items_count observations.' },
+          { name: 'sum_wy', type: 'REAL NOT NULL', note: 'EMA-decayed sum of duration observations.' },
+          { name: 'sum_wxx', type: 'REAL NOT NULL', note: 'EMA-decayed sum of items_count squared. Together with the others, feeds the closed-form OLS solve.' },
+          { name: 'sum_wxy', type: 'REAL NOT NULL', note: 'EMA-decayed sum of items_count × duration.' },
+          { name: 'sum_wyy', type: 'REAL NOT NULL', note: 'EMA-decayed sum of duration squared. Used for residual variance and the confidence band.' },
+          { name: 'sample_count', type: 'INTEGER NOT NULL', note: 'Raw observation count (independent of EMA weighting). Drives the display gate that hides confident bands below a threshold.' },
+          { name: 'last_observed_at', type: 'REAL NOT NULL', note: "When this bucket was last updated. Stale buckets can be aged out separately from active ones." },
+          { name: 'sum_w_ping', type: 'REAL NOT NULL DEFAULT 0', note: 'Separate EMA track for training-time ping (ms). Empty when no ping samples have been observed.' },
+          { name: 'sum_wp', type: 'REAL NOT NULL DEFAULT 0', note: 'EMA-decayed sum of ping observations. With sum_w_ping, recovers the bucket-mean ping for the latency-offset multiplier.' },
+        ],
+        design_note:
+          "The on-disk shape lets the trainer hot-restore from boot: a single SELECT * builds the in-memory model. The 8 sufficient-statistics columns let the predict path do a closed-form OLS solve without revisiting the raw observation history. PRIMARY KEY on the four dimensions means a bucket update is a single UPSERT.",
+      },
+    ],
+    write_path: [
+      { name: 'persist_entries', module: 'server/run_timings_db.py', description: 'Bulk insert from the in-memory timing buffer at end_run. Applies retention afterward.' },
+      { name: 'record_run_history', module: 'server/run_timings_db.py', description: 'One per finished job; called from the job finalization path in server/jobs.py.' },
+      { name: 'persist_eta_buckets', module: 'server/run_timings_db.py', description: 'Upserts the trainer\'s touched buckets after every batch_update at job end.' },
+      { name: 'ETATrainer.batch_update', module: 'services/eta_training.py', description: 'The trainer-side entry point: folds a job\'s timing rows into the bucket regressions, then persists.' },
+    ],
+    read_path: [
+      { name: 'list_recent_run_history', module: 'server/run_timings_db.py', description: 'Drives the Run History tab and Recent Runtimes panel.' },
+      { name: 'get_run_entries', module: 'server/run_timings_db.py', description: 'Per-run drill-down: every timing row for one run_id.' },
+      { name: 'get_label_history', module: 'server/run_timings_db.py', description: 'Per-label history; consumed by the live ETR tracker for its rolling window.' },
+      { name: 'load_all_eta_buckets', module: 'server/run_timings_db.py', description: 'One-shot load at trainer construction; populates the in-memory bucket dict.' },
+      { name: 'ETATrainer.predict_for_job', module: 'services/eta_training.py', description: "The Run Job form's ETA preview reads this. Walks the cascade, applies latency offset, returns a per-library and rolled-up estimate." },
+    ],
+    lifecycle:
+      "Created on first boot by init_db (FastAPI lifespan). Auto-backfill on first boot of a new build: if eta_buckets is empty AND run_timings has rows, the trainer replays history to repopulate. Retention runs at insert time; the file stays bounded to the configured run cap. Operators can wipe eta_buckets independently via Settings -> Run History -> Training data recovery, or flush the entire DB via the same panel's Flush button.",
+    source_schema: 'server/run_timings_db.py :: _SCHEMA',
+    source_init: 'server/run_timings_db.py :: init_db',
+  },
+
   // ── snapshots.db ────────────────────────────────────────────────
   {
     filename: 'snapshots.db',
@@ -1859,7 +2681,8 @@ const DB_DOCS: DbDoc[] = [
           { name: 'file_path', type: 'TEXT NOT NULL', note: "Absolute path to the .db file." },
           { name: 'captured_at', type: 'REAL NOT NULL', note: "Unix timestamp when the snapshot was captured." },
           { name: 'libraries_json', type: 'TEXT', note: "JSON array of library names captured in this snapshot." },
-          { name: 'user_count', type: 'INTEGER', note: "How many distinct users had data in this snapshot." },
+          { name: 'user_count', type: 'INTEGER', note: "Full roster captured: owner + every managed user the engine attempted to gather (regardless of whether they had data)." },
+          { name: 'user_count_with_data', type: 'INTEGER', note: "Subset of user_count that actually contributed rows to at least one metric table. The Exports panel renders 'N of M users' when the two differ." },
           { name: 'row_counts_json', type: 'TEXT', note: "Per-table row counts at capture time. Surfaced in the Exports panel." },
           { name: 'file_size', type: 'INTEGER', note: 'Size of the .db file in bytes.' },
           { name: 'prebuilt_json_path', type: 'TEXT', note: "Path to the cached .plexexport.json sidecar if one has been materialised. NULL when downloads stream-render on demand." },
@@ -1893,7 +2716,7 @@ const DB_DOCS: DbDoc[] = [
     intro_short:
       "Login users and refresh tokens. Independent of every other DB so a credential rotation doesn't touch any media data.",
     intro_long:
-      "auth.db lives separately from media.db on purpose. Login users and the db_admin credential are a security concern that wants its own blast radius: a corruption / restore / migration of media.db must never put credentials at risk, and vice versa. The file holds two tables: app_users for both human login users AND the special db_admin row that gates destructive operations, and refresh_tokens for JWT refresh-cookie validation.\n\nPasswords are stored as bcrypt-style hashes; we never store plaintext. Refresh tokens are stored only by their id and validity window - the JWT itself is signed with a per-process secret and isn't persisted.",
+      "auth.db lives separately from media.db on purpose. Login users and the db_admin credential are a security concern that wants its own blast radius: a corruption / restore / migration of media.db must never put credentials at risk, and vice versa. The file holds two tables: app_users for both human login users AND the special db_admin row that gates destructive operations, and refresh_tokens for JWT refresh-cookie validation.\n\nPasswords are stored as bcrypt-style hashes; we never store plaintext. Refresh tokens are stored only by their id and validity window - the JWT itself is signed with a per-process secret and isn't persisted.\n\nThis database is deliberately excluded from the export / import surface under Settings › Databases. Exporting credentials as JSON would defeat the bcrypt-at-rest discipline; the auth DB is meant to be host-bound and never travel.",
     tables: [
       {
         name: 'app_users',
@@ -1978,15 +2801,16 @@ const DB_DOCS: DbDoc[] = [
       },
       {
         name: 'snapshot_users',
-        purpose: "One row per user who actually contributed data to this snapshot.",
-        key_columns: ['user_handle', 'display_name', 'is_owner'],
+        purpose: "Full roster captured during this snapshot: the owner plus every managed user the engine attempted, with a flag for which ones actually contributed data.",
+        key_columns: ['user_handle', 'display_name', 'is_owner', 'had_data'],
         columns: [
           { name: 'user_handle', type: 'TEXT PRIMARY KEY', note: 'The raw user identifier. Empty string = server owner.' },
           { name: 'display_name', type: 'TEXT', note: "Operator-chosen friendly name at capture time. May be NULL." },
           { name: 'is_owner', type: 'INTEGER NOT NULL DEFAULT 0', note: '1 for the empty-string owner row.' },
+          { name: 'had_data', type: 'INTEGER NOT NULL DEFAULT 0', note: '1 if the user appeared in at least one populated metric table, 0 if the engine ran their gathers but no rows came back. Lets the Exports panel render "N captured / M roster" using the two counts.' },
         ],
         design_note:
-          "Derived from DISTINCT user_handle across the populated metric tables - zero-activity users on the source server never appear here. The display_name is frozen at capture so a user who's renamed in Plex later doesn't retroactively change historical snapshots.",
+          "Carries every user the engine attempted to gather, not just users with data. That way the operator sees the full snapshot scope on the Exports panel (e.g. \"3 of 9 users\" when an 8-managed-user server has 5 inactive accounts). display_name is frozen at capture so a user later renamed in Plex doesn't retroactively change historical snapshots.",
       },
     ],
     write_path: [
@@ -2007,6 +2831,12 @@ const DB_DOCS: DbDoc[] = [
 
 function DbSchemaPage() {
   const [view, setView] = useState<'quick' | 'deep' | 'sources'>('quick');
+  // Per-database subtab: each DB gets its own page within DB Schema
+  // so the end user can land on a specific database directly instead
+  // of scrolling through every one. The depth selector below picks
+  // how much detail to show for the selected DB.
+  const [selectedDbIdx, setSelectedDbIdx] = useState<number>(0);
+  const selectedDb = DB_DOCS[selectedDbIdx] || DB_DOCS[0];
   return (
     <>
       <div className="panel">
@@ -2014,9 +2844,22 @@ function DbSchemaPage() {
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
           Every SQLite database the app owns, what it stores, why it
           looks the way it does, and how it gets read and written.
-          Pick a depth level below.
+          Pick a database below, then choose a depth level. Operators
+          can also download or restore individual tables of these
+          databases under <strong>Settings &rsaquo; Databases</strong>.
         </span>
-        <nav className="tabs sub-tabs" style={{ marginTop: 12 }}>
+        <nav className="tabs sub-tabs" style={{ marginTop: 12, flexWrap: 'wrap' }}>
+          {DB_DOCS.map((db, i) => (
+            <button
+              key={db.filepath}
+              className={selectedDbIdx === i ? 'active' : ''}
+              onClick={() => setSelectedDbIdx(i)}
+            >
+              {db.filename}
+            </button>
+          ))}
+        </nav>
+        <nav className="tabs sub-tabs" style={{ marginTop: 8 }}>
           <button
             className={view === 'quick' ? 'active' : ''}
             onClick={() => setView('quick')}
@@ -2040,17 +2883,15 @@ function DbSchemaPage() {
 
       <DataFlowDiagram />
 
-      {DB_DOCS.map((db) => (
-        <div key={db.filepath} className="panel">
-          <h2 style={{ marginTop: 0 }}>{db.filename}</h2>
-          <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
-            {db.filepath}
-          </div>
-          {view === 'quick' && <QuickViewBody db={db} />}
-          {view === 'deep' && <InDepthBody db={db} />}
-          {view === 'sources' && <SourceLinksBody db={db} />}
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>{selectedDb.filename}</h2>
+        <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+          {selectedDb.filepath}
         </div>
-      ))}
+        {view === 'quick' && <QuickViewBody db={selectedDb} />}
+        {view === 'deep' && <InDepthBody db={selectedDb} />}
+        {view === 'sources' && <SourceLinksBody db={selectedDb} />}
+      </div>
 
       <SecurityPanel />
     </>
@@ -2916,6 +3757,2420 @@ function TroubleshootingPage() {
           </a>
           . You'll need a GitHub account to post. The button opens a
           new tab with the title and body pre-filled.
+        </p>
+      </div>
+    </>
+  );
+}
+
+
+// ── Features (2026-05-17) ───────────────────────────────────────────────────
+//
+// Operator-facing deep-dive on the six major features the app ships
+// today. Each entry has a title, a short label (for the filter
+// header), and a body that covers what the feature does, when to
+// use it, and the key gotcha or design rationale.
+//
+// The filter is a substring match across title + shortLabel + body
+// text (extracted from React children). Same pattern as the Topics
+// page so the two pages feel identical to use.
+//
+// Renaming note: the "Playlist Management" tab was renamed to
+// "Playlist Transfer" on 2026-05-17 per operator request. Internal
+// identifiers, API URLs (/api/playlist-mgmt/*), and Pydantic class
+// names keep the legacy "PlaylistMgmt" prefix because changing the
+// API contract was out of scope for the rename; only the
+// operator-facing label changed.
+
+interface FeatureEntry {
+  id: string;
+  title: string;
+  shortLabel: string;
+  body: React.ReactNode;
+}
+
+const FEATURE_ENTRIES: FeatureEntry[] = [
+  {
+    id: 'snapshot-job',
+    title: 'Snapshot Job (Run Job)',
+    shortLabel: 'Capture watch history, ratings, playlists, and collections from a server to a file',
+    body: (
+      <>
+        <p>
+          A snapshot job reads a Plex / Jellyfin / Emby server's
+          per-user state (watch history, ratings, playlists,
+          collections) and writes it to a portable{' '}
+          <code>.plexexport.json</code> sidecar plus a binary{' '}
+          <code>.db</code> snapshot file under{' '}
+          <code>server_data/snapshots/</code>. The sidecar is the
+          operator-readable artifact; the .db is the engine's
+          single-source-of-truth that future restores read from.
+        </p>
+        <p>
+          <strong>When to use it.</strong> Whenever you want a
+          portable record of a server's state — before a major Plex
+          version upgrade, before a library rebuild, as part of a
+          rolling weekly backup, or before any operation that could
+          touch user data. Snapshots are read-only against the source
+          server: nothing on the source is mutated.
+        </p>
+        <p>
+          <strong>What gets captured.</strong> Watch history is
+          per-(item, server, user) and includes view counts + resume
+          positions + last-played timestamps. Ratings are per-(item,
+          server, user) numeric 0-10 with the binary IsFavorite
+          mirror on backends that expose it (Jellyfin / Emby).
+          Playlists capture name + ordered member list + the
+          is_smart flag; smart playlists carry their criteria as
+          opaque JSON for the operator's reference but don't
+          restore (their criteria are server-local and not
+          portable). Collections capture name + unordered member
+          list. Every captured row carries the source server's
+          prefixed UID + the user's <code>app_user_uuid</code>, so
+          downstream cross-server identity resolution works without
+          needing the source server registered on the restoring
+          install (see the user-identity-uuid topic).
+        </p>
+        <p>
+          <strong>Per-user fan-out.</strong> When the source server
+          is linked to a Plex.tv account with Plex Home users, the
+          engine authenticates as each managed user (parallel auth
+          with the user's stored token, falling back to stored-PIN
+          sign-in if needed) and captures their data independently.
+          Users without a usable auth signal are dropped from the
+          run with a clear log line rather than silently bleeding
+          their data into the admin row.
+        </p>
+        <p>
+          <strong>Library + metric scoping.</strong> The Data to
+          Migrate panel lets the operator pick which libraries and
+          which metric types (watch_history / ratings / playlists /
+          collections) each library captures. Per-library overrides
+          beat the global include_* flags. This lets you do things
+          like "snapshot only watch history on Movies; only
+          playlists on Music" in one job.
+        </p>
+        <p>
+          <strong>Key gotcha.</strong> Snapshots are server-scoped.
+          You pick ONE server per job; multi-server captures run
+          one job per server (queue them or schedule them
+          independently). The .db file is per-server too, which
+          makes operator-readable diffs easy and means a server's
+          snapshot can be deleted without affecting any other.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'restoration-job',
+    title: 'Restoration Job (Restore)',
+    shortLabel: 'Replay a snapshot or .plexexport.json file onto a destination server',
+    body: (
+      <>
+        <p>
+          A restoration job reads a snapshot file (.plexexport.json
+          sidecar or registered .db snapshot) and writes its state
+          onto a destination server. Per-user data lands under the
+          matching destination user; resolved items go via GUID
+          match against the destination's library so the same movie
+          / track / show finds its destination row regardless of
+          backend.
+        </p>
+        <p>
+          <strong>Two modes: Merge vs Replace.</strong> Merge
+          (default, additive) writes view counts higher than the
+          destination's current value, writes ratings only when the
+          destination has none, and appends playlist / collection
+          members that aren't already present. Nothing on the
+          destination is removed. Replace (opt-in, destructive)
+          overwrites view counts unconditionally, overwrites
+          ratings, and diffs playlist membership so members in the
+          snapshot but not currently present are added AND members
+          currently present but not in the snapshot are removed.
+          Replace requires both a typed confirmation modal AND the{' '}
+          <code>confirm_replace=true</code> flag on the API payload
+          — two layers of opt-in so the destructive shape is
+          impossible to fire accidentally.
+        </p>
+        <p>
+          <strong>Cross-platform restores.</strong> When the source
+          and destination are different backends (e.g., Plex source
+          → Jellyfin destination), the engine routes through the
+          adapter-driven restore path. Items are resolved by GUID
+          (IMDb / TMDB / TVDB / MusicBrainz) rather than backend-
+          native IDs; ratings are mapped via the D-RATE rule
+          (numeric rating ≥ favorite_threshold also writes
+          IsFavorite=true on backends that expose it); collections
+          on Plex sources land as library-prefixed BoxSets on
+          Jellyfin / Emby destinations so same-named collections
+          from different libraries don't merge. The Cross-Platform
+          Preflight modal surfaces user-resolution ambiguities
+          (operator picks Drop / Map / Create / Accept per source
+          user) before the job submits so the engine never has to
+          guess at write time.
+        </p>
+        <p>
+          <strong>Per-user fan-out.</strong> Each source user's
+          payload routes to a destination user via a 5-step
+          resolution chain: per-job operator override →
+          user_identity_map lookup → backend_user_id direct match
+          within service_type → case-insensitive username match →
+          owner-role single-admin fallback. Users with no
+          destination match are skipped with an actionable log
+          line; the operator can either invite the user to the
+          destination server and re-run, or add an identity_map row
+          and re-run. See the user-identity-uuid topic for the full
+          identity story.
+        </p>
+        <p>
+          <strong>Replace mode safety belt.</strong> Before the
+          engine starts overwriting data in Replace mode, an
+          automatic pre-Replace snapshot of the destination is
+          captured. The captured snapshot's id is stamped onto the
+          job summary so the operator can find it on the Snapshots
+          tab and roll back via a Merge restore. The safety belt
+          can be disabled via the auto_capture_before_replace
+          per-run setting but is on by default.
+        </p>
+        <p>
+          <strong>Key gotcha.</strong> Items not on the destination
+          (movie missing from the library, etc.) are SKIPPED rather
+          than failed. The Restoration Summary panel on the
+          dashboard shows per-container restored/total counts and
+          lets the operator expand each container to see which
+          members didn't resolve. Smart playlists are always
+          skipped (their criteria don't port across servers).
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'direct-transfer-job',
+    title: 'Direct Transfer Job',
+    shortLabel: 'Read from one registered server and write to another without a file on disk',
+    body: (
+      <>
+        <p>
+          Direct transfer is "snapshot + restore" fused into one
+          job, with no intermediate file written to disk. The
+          engine reads source state in memory and writes it onto
+          the destination in the same run. Faster than the
+          snapshot-then-restore two-step when the operator doesn't
+          need a portable .plexexport.json artifact.
+        </p>
+        <p>
+          <strong>When to use it.</strong> Routine server-to-server
+          migrations where you don't need a snapshot file on disk.
+          Initial population of a new destination server from a
+          source you don't plan to re-export later. Same-backend
+          mirroring (Plex → Plex, Jellyfin → Jellyfin).
+        </p>
+        <p>
+          <strong>When NOT to use it.</strong> When you want a
+          historical record on disk — use a snapshot job instead,
+          then run a restoration job from the snapshot. When the
+          destination might fail mid-run and you'd want to retry
+          without re-reading the source — snapshot-then-restore is
+          more resilient because the snapshot is the resumable
+          artifact. When you're testing cross-backend resolution
+          and want to inspect what GUIDs were captured — snapshot
+          first so you can read the .plexexport.json.
+        </p>
+        <p>
+          <strong>Same engine as restore.</strong> Direct transfer
+          uses the same per-user fan-out, the same 5-step user
+          resolution chain, the same Merge / Replace mode
+          semantics, the same Replace safety belt (auto-snapshot
+          before overwrite), and the same cross-platform preflight
+          modal as a file-mediated restore. The only thing missing
+          is the disk write between read and write.
+        </p>
+        <p>
+          <strong>Per-user scope.</strong> The user_filter
+          parameter lets the operator restrict a direct transfer
+          to a subset of source users (owner only, owner + named
+          managed users, etc.). Useful when migrating just one
+          person's Plex Home account between servers.
+        </p>
+        <p>
+          <strong>Key gotcha.</strong> Both servers feel the load
+          at the same time. Halve your worker count compared to a
+          snapshot or restore against a single server — 16 workers
+          on a direct transfer means 16 source reads AND 16
+          destination writes in flight, which can overwhelm
+          smaller installs.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'fan-out-job',
+    title: 'Fan-out Job (multi-destination direct transfer)',
+    shortLabel: 'One source, many destinations — write the same state to N servers in parallel',
+    body: (
+      <>
+        <p>
+          Fan-out is a direct transfer with multiple destinations
+          in one job. The engine reads source state once, then
+          writes it to every destination in parallel. The job's
+          progress dashboard shows per-destination state so the
+          operator can see one destination succeed even if another
+          is slow or failing.
+        </p>
+        <p>
+          <strong>When to use it.</strong> Multi-server households
+          where every server should mirror the same per-user state
+          (e.g., one Plex Home shared across two Plex servers in
+          different locations, two Jellyfin instances that should
+          both reflect the operator's Plex.tv account watch
+          history). Initial bulk population of a new server fleet
+          from an existing source. Geo-distributed setups where
+          one server is the authoritative read source and N
+          destinations are the local read endpoints.
+        </p>
+        <p>
+          <strong>Per-destination result tracking.</strong> The
+          job's summary breaks out written / skipped / failed /
+          unsupported counts per destination so a partial failure
+          (3 of 4 destinations succeed) doesn't read as a total
+          failure. The job's overall state surfaces as completed
+          when every destination succeeded, partial when at least
+          one succeeded and at least one failed, failed when
+          every destination failed.
+        </p>
+        <p>
+          <strong>Cross-backend fan-out.</strong> Destinations
+          don't have to share a backend. A Plex source can
+          fan-out to one Plex + one Jellyfin + one Emby destination
+          in one job. Each per-destination write uses the
+          adapter-driven restore path with cross-platform
+          resolution (preflight modal applies per destination).
+        </p>
+        <p>
+          <strong>Key gotcha.</strong> Source read load is bounded
+          by the source's tolerance, but DESTINATION write load
+          multiplies. N destinations means N parallel write
+          streams; halve workers compared to a single-destination
+          direct transfer and start small the first time a new
+          fan-out shape runs against a fleet.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'scheduling',
+    title: 'Scheduling',
+    shortLabel: 'Recurring snapshot, restore, direct, or fan-out jobs on a cron-style schedule',
+    body: (
+      <>
+        <p>
+          Every job mode can be scheduled. The Schedules tab is a
+          mirror of the Run Job form: same source / destination
+          pickers, same library + metric scoping, same per-run
+          settings, plus a schedule-only cron expression and an
+          optional disabled flag. A scheduled job fires on its
+          cadence with the same shape it would have if the
+          operator clicked Run on the Run Job form.
+        </p>
+        <p>
+          <strong>Schedule semantics.</strong> The scheduler loop
+          checks for due jobs every 30 seconds (tunable via
+          scheduler_tick_seconds). A schedule's next_run_at
+          timestamp is computed from its cron expression and
+          stored on the row; the loop fires every schedule whose
+          next_run_at has passed and re-computes the next
+          firing. Missed firings (due during a server outage)
+          fire at most once on the next start; the scheduler
+          doesn't try to "catch up" multiple missed windows.
+        </p>
+        <p>
+          <strong>Cross-platform resolutions on schedules.</strong>{' '}
+          Schedules can carry stored cross-platform resolutions
+          (Drop / Map / Create decisions from the Cross-Platform
+          Preflight modal) so a scheduled cross-backend restore
+          fires deterministically — no operator at fire time to
+          ack ambiguities. The schedule list endpoint surfaces a
+          resolutions_status badge per row by comparing the
+          stored decisions against the current destination user
+          roster, so the operator knows when stored mappings have
+          rotted (e.g., a destination user was renamed since the
+          preflight was authored).
+        </p>
+        <p>
+          <strong>Replace-mode schedules.</strong> A schedule with
+          restore_mode='replace' must explicitly set
+          confirm_replace=true on its stored config — same two-
+          layer opt-in as a one-shot Replace job. Scheduled
+          Replace jobs auto-capture a pre-Replace safety snapshot
+          on every firing (same as the one-shot version).
+        </p>
+        <p>
+          <strong>Key gotcha.</strong> Schedules don't surface
+          "this firing has been queued but the worker is busy"
+          state visibly today. If a long-running snapshot is
+          mid-flight when a schedule fires, the new firing
+          queues behind it; the operator sees the schedule's
+          last_run_at stay stale until the queue drains.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'playlist-transfer',
+    title: 'Playlist Transfer',
+    shortLabel: 'Transfer one playlist from one user to another, preserving destination ownership',
+    body: (
+      <>
+        <p>
+          Playlist Transfer (Run Jobs ▸ Playlist Transfer) copies
+          ONE playlist from a source server's user to a
+          destination server's user — and gives the destination
+          user actual <em>ownership</em> of the new playlist, not
+          just visibility. Works for any pairing of Plex /
+          Jellyfin / Emby on either side.
+        </p>
+        <p>
+          <strong>Why we built this.</strong> The other job modes
+          (snapshot / restore / direct transfer / fan-out)
+          replicate state in bulk: every library, every user,
+          every playlist that satisfies the operator's filters.
+          That's the right shape for migrations and backups, but
+          it's the wrong shape for the everyday "I want to send
+          this one playlist to my partner's account on my
+          Jellyfin" workflow. Playlist Transfer is the surgical
+          tool for that case.
+        </p>
+        <p>
+          <strong>Why preserving destination ownership is the
+          point.</strong> The naive way to "send a playlist to
+          another user" is to have the owner / admin create a
+          playlist that the other user can see. That works on
+          paper but it sucks in practice: the destination user
+          can't rename it, can't reorder it, can't add their own
+          tracks to it, can't delete it — anything they try is
+          forbidden because the playlist isn't theirs. The
+          original goal of this feature was to make the new
+          playlist <em>belong</em> to the destination user, so
+          they can manage it the same way they'd manage a
+          playlist they created themselves. Anything less than
+          true ownership is a gift you can't unwrap.
+        </p>
+        <p>
+          <strong>Why this is hard with Plex.</strong> Plex's REST
+          API doesn't expose a "create as user X" verb the way
+          Jellyfin and Emby do (those backends let an admin token
+          create a playlist with UserId in the URL, and the
+          playlist lands owned by that user). On Plex, the only
+          token that can create a playlist owned by user X is
+          user X's own token — and Plex Home users have rotating
+          per-user tokens that aren't shared with the admin
+          token. Without the user's own token, the best the
+          admin can do is create a playlist owned by the admin
+          and share it; the destination user can see it but not
+          modify it. That's the trap the naive approach falls
+          into.
+        </p>
+        <p>
+          <strong>How we sidestep the trap.</strong> Two pieces of
+          infrastructure work together:
+        </p>
+        <ol>
+          <li>
+            <strong>Per-user token storage.</strong> The Servers ▸
+            User Management panel + the dedicated{' '}
+            <code>POST /api/managed-users/{'{server_id}'}/{'{username}'}/plex-home-token</code>{' '}
+            endpoint let the operator paste a Plex Home user's
+            X-Plex-Token (obtained from plex.tv ▸ Authorized
+            Devices). The token is Fernet-encrypted at rest using
+            the per-install <code>server_data/.keyfile</code> and
+            stored on the per-server <code>managed_users</code>{' '}
+            row.
+          </li>
+          <li>
+            <strong>The{' '}
+            <code>playlist_mgmt_plex_home_auth_mode</code> tunable
+            (Settings ▸ Tunables ▸ Playlist Transfer).</strong>{' '}
+            Two values: <code>owner_token</code> (default, legacy
+            behaviour: admin creates the playlist, destination
+            user sees but doesn't own it) and{' '}
+            <code>per_user_token</code> (the orchestrator pulls
+            the saved per-user token + builds a per-user
+            PlexServer instance + writes AS the user — the new
+            playlist lands genuinely owned by the destination
+            user). When per_user_token is on and the operator
+            hasn't saved a token for the target user, the API
+            returns <code>DEST_USER_TOKEN_MISSING</code> (HTTP
+            412) with an operator-actionable message; the UI
+            opens the per-user-token form pre-targeted at the
+            right user instead of showing a generic copy
+            failure. There's also a strict-mode flag
+            (strict_identity_resolution) that lets the operator
+            choose between "refuse to write unless we have the
+            per-user token" and "silent admin fallback when we
+            don't" — same tunable controls both the
+            identity-resolution chain elsewhere in the app.
+          </li>
+        </ol>
+        <p>
+          <strong>The identity-management overlay.</strong>{' '}
+          Playlist Transfer leans on the same{' '}
+          <code>app_user_uuid</code> + <code>user_identity_map</code>{' '}
+          infrastructure documented in the user-identity-uuid
+          topic. When the destination user picker resolves a
+          user, the orchestrator consults the resolution chain
+          (per-job override → identity_map → backend_user_id
+          direct match → username match) so a destination user
+          whose handle differs from the source still routes
+          correctly. This is why the app maintains an entire
+          identity-management schema on top of just managing the
+          user base — it's what lets one user's playlist land in
+          a different user's account on a different backend with
+          the destination user keeping full ownership.
+        </p>
+        <p>
+          <strong>The data flow.</strong> The orchestrator (1)
+          connects to the source server, (2) reads the named
+          playlist's items (cache-first when fresh, live
+          otherwise — controlled by the playlist_cache_*
+          tunables), (3) resolves each item against the
+          destination server via cross-backend GUID match, (4)
+          builds a destination UserContext using either the
+          admin token (owner_token mode) or the saved per-user
+          token (per_user_token mode), and (5) calls the
+          destination adapter's create_playlist with that
+          UserContext so the new playlist lands attributed to
+          the right user. Items the destination doesn't have are
+          skipped with a per-row reason; the UI surfaces the
+          skipped count so the operator knows the gap.
+        </p>
+        <p>
+          <strong>Mixed-media handling.</strong> Jellyfin and
+          Emby allow a single playlist to mix audio + video +
+          photos; Plex doesn't. When transferring a mixed
+          playlist to a Plex destination, the operator picks one
+          of three behaviors via the mixed_media_behavior tunable
+          (per-run override too): <code>skip</code> (default — log
+          + drop the playlist), <code>dominant</code> (write a
+          single playlist using the dominant media type's items),
+          or <code>split</code> (write N suffixed playlists, one
+          per type that's present). Per-user overrides live under
+          the cross_platform_resolutions block so different
+          source users can have different mixed-media policies in
+          the same job.
+        </p>
+        <p>
+          <strong>Caching.</strong> The Playlist Transfer surface
+          maintains its own per-(server, user) playlist cache
+          (server_data/playlist_cache.db) so re-opening the panel
+          + picking a previously-seen server doesn't fire N
+          live API calls. Cache TTLs are operator-controlled via
+          the playlist_cache_* tunables; the UI shows fresh /
+          stale / refreshing badges per user and exposes a
+          "Refresh" button that bypasses the cache. The cache
+          rows carry the user's <code>app_user_uuid</code> so
+          backend_user_id rotation doesn't orphan cache entries.
+        </p>
+        <p>
+          <strong>Key gotcha.</strong> Smart playlists are always
+          excluded from the source picker — their criteria don't
+          port across backends, and even within Plex the
+          criteria reference local library section keys that
+          aren't meaningful on another server. A "N smart
+          playlist(s) hidden" hint appears at the top of the
+          source list when any are filtered. To recreate a smart
+          playlist on the destination, the operator must
+          manually re-author it using the destination's smart-
+          filter UI.
+        </p>
+      </>
+    ),
+  },
+];
+
+
+function FeaturesPage() {
+  const [filter, setFilter] = useState('');
+  const normalizedFilter = filter.trim().toLowerCase();
+
+  const matches = (entry: FeatureEntry): boolean => {
+    if (!normalizedFilter) return true;
+    const haystack = (
+      entry.title + ' ' + entry.shortLabel + ' ' + entry.id + ' ' +
+      // Cheap body-text extraction so the filter also matches body
+      // copy. React children render with JSX.toString() noisy; we
+      // walk the tree and accumulate every string node we hit.
+      extractText(entry.body)
+    ).toLowerCase();
+    return haystack.includes(normalizedFilter);
+  };
+
+  const visible = FEATURE_ENTRIES.filter(matches);
+
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Features</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          Deep-dive on the six major features this app ships today:
+          what each one does, when to use it, and the key
+          design decision behind it. Same filter pattern as the
+          Topics page — searches titles, summaries, and the body
+          text of every feature.
+        </span>
+        <label className="field" style={{ marginTop: 12 }}>
+          <span className="label">Filter</span>
+          <input
+            type="text"
+            placeholder="Search feature titles, summaries, or body text"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+          {normalizedFilter && (
+            <span className="help" style={{ fontSize: 12 }}>
+              Showing {visible.length} of {FEATURE_ENTRIES.length} features
+              matching &ldquo;{filter}&rdquo;.
+            </span>
+          )}
+        </label>
+      </div>
+
+      {visible.map((entry) => (
+        <div key={entry.id} className="panel">
+          <h2 style={{ marginTop: 0 }}>{entry.title}</h2>
+          <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>
+            <code>{entry.id}</code> &middot; {entry.shortLabel}
+          </div>
+          <div style={{ fontSize: 14, lineHeight: 1.55 }}>{entry.body}</div>
+        </div>
+      ))}
+
+      {visible.length === 0 && (
+        <div className="panel">
+          <div className="empty">No features match the current filter.</div>
+        </div>
+      )}
+    </>
+  );
+}
+
+
+// Walk a React node tree and concatenate every string leaf for
+// substring filtering on the Features page. Cheap; runs only when
+// the filter input is non-empty.
+function extractText(node: React.ReactNode): string {
+  if (node == null || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(extractText).join(' ');
+  if (typeof node === 'object' && 'props' in node && node.props) {
+    const props = node.props as { children?: React.ReactNode };
+    return extractText(props.children);
+  }
+  return '';
+}
+
+
+// ── Topics (Item 5 of admin-management plan, 2026-05-15) ────────────────────
+//
+// Renders the help_content registry as a flat, searchable list grouped
+// by category. The same bodies appear inside InfoTip popovers next to
+// the controls they describe; this page is the canonical reference when
+// tooltips are disabled or the operator wants to read end-to-end.
+
+function TopicsPage() {
+  const [filter, setFilter] = useState('');
+  const grouped = getHelpTopicsByCategory();
+  const normalizedFilter = filter.trim().toLowerCase();
+
+  const matches = (haystack: string) =>
+    !normalizedFilter || haystack.toLowerCase().includes(normalizedFilter);
+
+  const visibleByCategory: typeof grouped = {};
+  for (const [category, topics] of Object.entries(grouped)) {
+    const kept = topics.filter(
+      (t) => matches(t.title) || matches(t.shortLabel) || matches(t.id),
+    );
+    if (kept.length > 0) visibleByCategory[category] = kept;
+  }
+  const totalVisible = Object.values(visibleByCategory).reduce(
+    (n, ts) => n + ts.length,
+    0,
+  );
+
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Topics</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          Every explanation that appears in an InfoTip popover lives here too.
+          Use this page if you have tooltips disabled, or if you want to read
+          through related topics in one place rather than chasing icons in the
+          UI. Topics are grouped by area; a filter narrows by keyword.
+        </span>
+        <label className="field" style={{ marginTop: 12 }}>
+          <span className="label">Filter</span>
+          <input
+            type="text"
+            placeholder="Search topic titles, short labels, or ids"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+          />
+          {normalizedFilter && (
+            <span className="help" style={{ fontSize: 12 }}>
+              Showing {totalVisible} topic(s) matching &ldquo;{filter}&rdquo;.
+            </span>
+          )}
+        </label>
+      </div>
+
+      {Object.entries(visibleByCategory).map(([category, topics]) => (
+        <div key={category} className="panel">
+          <h2 style={{ marginTop: 0, textTransform: 'capitalize' }}>{category}</h2>
+          {topics.map((t) => (
+            <div key={t.id} style={{ marginTop: 18 }}>
+              <h3 style={{ marginBottom: 4 }}>{t.title}</h3>
+              <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8 }}>
+                <code>{t.id}</code> &middot; {t.shortLabel}
+              </div>
+              <div style={{ fontSize: 14, lineHeight: 1.55 }}>{t.body}</div>
+            </div>
+          ))}
+        </div>
+      ))}
+
+      {totalVisible === 0 && (
+        <div className="panel">
+          <div className="empty">No topics match the current filter.</div>
+        </div>
+      )}
+    </>
+  );
+}
+
+
+// ── Dev Notes ────────────────────────────────────────────────────────────────
+//
+// Developer-facing walkthrough of the moving parts under PlexBackUp.
+// Plain English; audience is a new contributor who has read the
+// codebase tour but has not yet traced any one pixel back to a
+// function. Four nested sub-tabs:
+//
+//   * ETR        - how the dashboard's countdown is collected.
+//   * Engines    - the snapshot / restore / direct / fan-out / adapter
+//                  engines and where they live.
+//   * Databases  - every SQLite file + JSON config we keep on disk,
+//                  what's in each, and the rules for adding columns.
+//   * Live Sync  - roadmap notes for the not-yet-shipped continuous
+//                  source-to-destination sync.
+//
+// Keep this page in sync with services/timing.py,
+// services/run_timer.py, server/run_timings_db.py,
+// services/eta_training.py, services/snapshotter.py,
+// services/restorer.py, services/snapshotter_adapter.py,
+// services/restorer_adapter.py, server/direct_transfer.py,
+// server/fan_out.py, services/adapters/__init__.py, server/media_db.py,
+// server/auth_db.py, server/snapshot_registry.py, and
+// server/snapshot_capture.py when any of those move.
+
+type DevNotesSubTab = 'etr' | 'engines' | 'databases' | 'live_sync';
+
+function DevNotesPage() {
+  const [sub, setSub] = useState<DevNotesSubTab>('etr');
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Dev Notes</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          Engineering notes for contributors. Pick a topic below. Each
+          section is written for someone who is new to the codebase and
+          wants to understand the moving parts before tracing the code.
+        </span>
+        <nav className="tabs sub-tabs" style={{ marginTop: 12 }}>
+          <button
+            className={sub === 'etr' ? 'active' : ''}
+            onClick={() => setSub('etr')}
+          >
+            ETR
+          </button>
+          <button
+            className={sub === 'engines' ? 'active' : ''}
+            onClick={() => setSub('engines')}
+          >
+            Engines
+          </button>
+          <button
+            className={sub === 'databases' ? 'active' : ''}
+            onClick={() => setSub('databases')}
+          >
+            Databases
+          </button>
+          <button
+            className={sub === 'live_sync' ? 'active' : ''}
+            onClick={() => setSub('live_sync')}
+          >
+            Live Sync
+          </button>
+        </nav>
+      </div>
+
+      {sub === 'etr' && <DevNotesEtrSection />}
+      {sub === 'engines' && <DevNotesEnginesSection />}
+      {sub === 'databases' && <DevNotesDatabasesSection />}
+      {sub === 'live_sync' && <DevNotesLiveSyncSection />}
+    </>
+  );
+}
+
+
+// ── Dev Notes > ETR ─────────────────────────────────────────────────────────
+//
+// How the live "Estimated Remaining" number on the dashboard is
+// collected and computed. Pairs with services/timing.py,
+// services/run_timer.py, server/run_timings_db.py, and
+// services/eta_training.py.
+
+function DevNotesEtrSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Estimated Remaining (ETR), in plain English</h2>
+        <p>
+          When a job is running, the dashboard shows a live countdown:
+          {' '}<em>&ldquo;about 3m 12s left.&rdquo;</em> That number is
+          NOT a guess made at job start. It is a measurement that
+          updates several times per second from real progress observed
+          inside the running job. There is also a separate, longer-term
+          system that learns from past runs so future jobs can show a
+          reasonable estimate before any work has happened.
+        </p>
+        <p>
+          Two systems, two jobs:
+        </p>
+        <ul>
+          <li>
+            <strong>Live tracker</strong> answers &ldquo;based on how
+            fast the engine is working <em>right now</em>, when will
+            this finish?&rdquo;
+          </li>
+          <li>
+            <strong>Adaptive learner</strong> answers &ldquo;based on
+            every similar job we have ever recorded, how long does a
+            job like this usually take?&rdquo;
+          </li>
+        </ul>
+        <p>
+          They are separate modules. The live tracker runs inside the
+          current process and remembers nothing across runs. The
+          learner reads/writes a SQLite database
+          (<code>server_data/run_timings.db</code>) and survives
+          restarts.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The live tracker (services/timing.py)</h2>
+        <p>
+          <code>ETRTracker</code> is a small Python class. One instance
+          per &ldquo;scope&rdquo;: the top-level dashboard holds one
+          for the whole job, and each batch row (e.g. one library&apos;s
+          ratings phase) holds one of its own. They never share data
+          {' '}- each batch has its own steady rate.
+        </p>
+        <p>
+          The shape of one tracker is just three things:
+        </p>
+        <ul>
+          <li>
+            <strong><code>total</code></strong>: how many items of work
+            we expect. Starts at 0 and grows as the engine
+            <em> discovers</em> work. (We don&apos;t guess this up
+            front. Plex only tells you the real count once you ask, so
+            asking is the answer.)
+          </li>
+          <li>
+            <strong><code>completed</code></strong>: how many items
+            have actually finished.
+          </li>
+          <li>
+            <strong>A rolling window</strong>: the last 50 ticks of
+            {' '}<code>(timestamp, items_done_this_tick)</code>. The
+            engine appends to this every time something completes.
+          </li>
+        </ul>
+        <p>
+          The engine drives the tracker with three calls:
+        </p>
+        <ul>
+          <li>
+            <code>grow_total(n)</code> when more work is discovered
+            (&ldquo;this library actually has 751 rated items, not
+            zero&rdquo;).
+          </li>
+          <li>
+            <code>tick(n)</code> when n items just finished.
+          </li>
+          <li>
+            <code>etr_seconds</code> (a property) when the dashboard
+            polls.
+          </li>
+        </ul>
+        <p>
+          To produce an ETR, the tracker walks the rolling window and
+          computes a <em>weighted average rate</em>: items per second
+          across the last 50 ticks, with newer ticks weighted more
+          heavily than older ones. Then:
+        </p>
+        <pre style={{ background: 'var(--panel-bg-strong, #1c1c1c)', padding: 10, fontSize: 12, overflowX: 'auto' }}>
+{`remaining     = total - completed
+raw_etr       = remaining / weighted_rate
+displayed_etr = blend(previous_displayed, raw_etr)`}
+        </pre>
+        <p>
+          The blend (<code>_SMOOTHING_OLD = 0.9</code>,
+          {' '}<code>_SMOOTHING_NEW = 0.1</code>) is the reason the
+          number on screen does not jitter. The raw rate jumps around
+          every tick; the displayed number eases toward it. There is
+          also a per-update clamp
+          ({' '}<code>_DISPLAY_CLAMP_FRACTION = 0.25</code>) so a wild
+          raw value can&apos;t teleport the display by more than 25% in
+          a single update.
+        </p>
+        <p>
+          A few honesty rules:
+        </p>
+        <ul>
+          <li>
+            If the window has fewer than 3 samples, the property
+            returns <code>None</code> and the UI shows
+            <em> &ldquo;Calculating...&rdquo;</em>. We never publish
+            a projection from one or two data points.
+          </li>
+          <li>
+            If <code>total</code> is still 0 (we haven&apos;t finished
+            discovering work yet) or
+            {' '}<code>completed &gt; total</code> (a tick raced ahead
+            of a <code>grow_total</code>), we also return
+            {' '}<code>None</code>. Better to say
+            &ldquo;calculating&rdquo; than to falsely claim
+            &ldquo;almost done&rdquo;.
+          </li>
+          <li>
+            Below <code>ETR_FLOOR_SECONDS</code> (5 seconds) the UI
+            switches to &ldquo;Almost done&rdquo; instead of counting
+            down single digits. Flickering &ldquo;3... 2... 4... 1...
+            done&rdquo; was worse than just saying it.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel">
+        <h2>The per-operation recorder (services/run_timer.py)</h2>
+        <p>
+          While the live tracker handles the moving number, a second
+          module records every individual operation that happened
+          during the run. This is <code>run_timer.py</code> and its
+          main primitive is a context manager:
+        </p>
+        <pre style={{ background: 'var(--panel-bg-strong, #1c1c1c)', padding: 10, fontSize: 12, overflowX: 'auto' }}>
+{`with time_operation("snapshot_ratings", scope=SCOPE_LIBRARY,
+                    library="Movies", items_processed=751):
+    do_the_work()`}
+        </pre>
+        <p>
+          On exit, the manager appends a <code>TimingEntry</code> to a
+          thread-safe in-memory buffer for the current run. Each entry
+          carries: run id, scope (one of run / library / user / batch /
+          operation), label, server id, library, user, item count,
+          start / end / duration, and a free-form
+          {' '}<code>extra</code> dict for anything else.
+        </p>
+        <p>
+          When the job finishes (in <code>server/jobs.py</code>),
+          {' '}<code>end_run()</code> drains the buffer and hands it to
+          the persistence layer. Two paths run on that drain:
+        </p>
+        <ol>
+          <li>
+            The entries are written into
+            {' '}<code>server_data/run_timings.db</code> via
+            {' '}<code>server/run_timings_db.py</code>.
+          </li>
+          <li>
+            The same entries are folded into the adaptive learner via
+            {' '}<code>eta_training.get_trainer().batch_update(...)</code>.
+          </li>
+        </ol>
+        <p>
+          Both calls are best-effort: an exception in either path is
+          caught and logged. The job&apos;s success / failure is never
+          held up by a telemetry write.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The persistent timings store (server/run_timings_db.py)</h2>
+        <p>
+          A small, dedicated SQLite database
+          ({' '}<code>run_timings.db</code>, separate from
+          {' '}<code>media.db</code>) with one table:
+          {' '}<code>run_timings</code>, one row per operation we
+          recorded. Useful for two reasons:
+        </p>
+        <ul>
+          <li>
+            The dashboard&apos;s <em>Recent Runtimes</em> tab reads it
+            so the operator can audit past runs without re-running
+            anything.
+          </li>
+          <li>
+            The adaptive learner replays history out of it on boot to
+            warm its in-memory state.
+          </li>
+        </ul>
+        <p>
+          Retention is bounded: by default the most recent
+          {' '}<code>200</code> distinct <code>run_id</code> values are
+          kept, controlled by the
+          {' '}<code>run_timings_retention_count</code> tunable. A
+          value of <code>0</code> means &ldquo;unlimited&rdquo;.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The adaptive learner (services/eta_training.py)</h2>
+        <p>
+          This is the part that learns. Every operation we time gets
+          dropped into a <em>bucket</em> based on what kind of work it
+          is, and each bucket fits an online weighted linear regression
+          for{' '}<code>duration = intercept + slope * items_count</code>.
+          Recent observations dominate via an EMA-style decay on the
+          sufficient statistics, so a server that gets faster over time
+          tracks reality instead of being anchored to its old numbers.
+        </p>
+        <p>
+          The bucket key has four dimensions:
+        </p>
+        <pre style={{ background: 'var(--panel-bg-strong, #1c1c1c)', padding: 10, fontSize: 12, overflowX: 'auto' }}>
+{`BucketKey(
+    server_id      = "abc123",
+    label          = "snapshot_ratings",
+    library_type   = "movie",
+    bulk_strategy  = "smart",
+)`}
+        </pre>
+        <p>
+          Item count is <em>not</em> in the key any more; it is the
+          regression variable inside the bucket. All Movies snapshots
+          on a server, regardless of how many items the library
+          carries, train one shared model that scales with size.
+        </p>
+        <p>
+          Each new observation updates the bucket's six EMA-decayed
+          sufficient statistics (<code>sum_w, sum_wx, sum_wy, sum_wxx,
+          sum_wxy, sum_wyy</code>). The analytical OLS solve recovers
+          slope + intercept + residual variance on demand:
+        </p>
+        <pre style={{ background: 'var(--panel-bg-strong, #1c1c1c)', padding: 10, fontSize: 12, overflowX: 'auto' }}>
+{`slope     = cov_xy / var_x       (var_x > 0)
+intercept = ybar - slope * xbar
+residual  = var_y * (1 - r**2)
+point     = intercept + slope * items
+high/low  = point +/- z * sqrt(residual)`}
+        </pre>
+        <p>
+          <code>alpha</code> is the learning rate, controlled by the
+          {' '}<code>eta_alpha</code> tunable (default 0.2). Higher
+          values react faster to changes; lower values are more
+          stable. When <code>var_x</code> is degenerate (every
+          observation in the bucket has the same item count) the line
+          collapses to slope=0 and intercept=mean, which matches the
+          older EMA-only behaviour exactly.
+        </p>
+        <p>
+          When the dashboard asks &ldquo;how long should this take?&rdquo;
+          before any work has happened, the learner returns the
+          regression prediction at the queried items count with a
+          confidence band of <code>z * sqrt(residual_variance)</code>.
+          If the exact four-dim bucket has fewer than 5 samples, a
+          fallback chain widens the lookup by dropping dimensions (same
+          server + label, same label + type, same label alone) until
+          it finds a bucket with enough samples. The terminal fallback
+          is a rate-based hardcoded default per label (a fixed cost
+          plus a per-item cost) so cold-start estimates scale with
+          library size.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Putting it together: one job, end to end</h2>
+        <ol>
+          <li>
+            Operator clicks Run. <code>jobs.py</code> calls
+            {' '}<code>run_timer.start_run()</code> which creates an
+            empty in-memory buffer keyed by a fresh
+            {' '}<code>run_id</code>.
+          </li>
+          <li>
+            Inside the engine, every meaningful unit of work is
+            wrapped in a <code>time_operation(...)</code> block. On
+            exit, a <code>TimingEntry</code> lands in the buffer.
+          </li>
+          <li>
+            In parallel, an <code>ETRTracker</code> is held by the
+            dashboard for the whole job. As the engine discovers work
+            it calls <code>grow_total</code>; as items finish it calls
+            {' '}<code>tick</code>. The dashboard polls
+            {' '}<code>etr_seconds</code> a few times a second to
+            update the on-screen number.
+          </li>
+          <li>
+            Job finishes. <code>end_run()</code> drains the buffer.
+            The entries are written to
+            {' '}<code>run_timings.db</code> AND handed to
+            {' '}<code>eta_training.get_trainer().batch_update(...)</code>.
+            The trainer folds the new observations into its buckets
+            and persists the touched buckets back.
+          </li>
+          <li>
+            Next time the operator runs a similar job, the dashboard
+            can ask the learner for a pre-work estimate, then switch
+            to the live tracker&apos;s number as soon as it has three
+            real samples.
+          </li>
+        </ol>
+      </div>
+
+      <div className="panel">
+        <h2>Where to look if something is wrong</h2>
+        <ul>
+          <li>
+            <strong>UI shows &ldquo;Calculating...&rdquo; forever</strong>:
+            check the engine is actually calling
+            {' '}<code>tick()</code>. With fewer than 3 ticks in the
+            window, the tracker refuses to publish a number on purpose.
+          </li>
+          <li>
+            <strong>ETR jumps wildly between polls</strong>: the
+            smoother and the per-update clamp should prevent this;
+            check that the dashboard hasn&apos;t accidentally created
+            multiple tracker instances and is polling the wrong one.
+          </li>
+          <li>
+            <strong>Pre-work estimate is way off for a new server</strong>:
+            new servers have empty buckets. The fallback chain looks
+            for &ldquo;any server with this label&rdquo; before giving
+            up; after the first few runs the per-server bucket fills
+            in.
+          </li>
+          <li>
+            <strong>Telemetry seems to be missing</strong>: look at the
+            {' '}<code>run_timings</code> table in
+            {' '}<code>server_data/run_timings.db</code> directly with
+            {' '}<code>sqlite3</code>. If a job&apos;s rows are missing
+            entirely, the drain in <code>jobs.py</code> probably
+            errored; the persistence write is best-effort and only
+            logs.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel">
+        <h2>Files at a glance</h2>
+        <table className="list" style={{ width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ width: '32%' }}>File</th>
+              <th>Job</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>services/timing.py</code></td>
+              <td>The live, in-run ETR tracker (rolling window + smoothing).</td>
+            </tr>
+            <tr>
+              <td><code>services/run_timer.py</code></td>
+              <td>The <code>time_operation</code> context manager and the per-run buffer.</td>
+            </tr>
+            <tr>
+              <td><code>server/run_timings_db.py</code></td>
+              <td>Persistence of timing entries to <code>run_timings.db</code> + retention.</td>
+            </tr>
+            <tr>
+              <td><code>services/eta_training.py</code></td>
+              <td>Adaptive learner: EMA + variance per bucket, with a cold-start fallback chain.</td>
+            </tr>
+            <tr>
+              <td><code>server/jobs.py</code></td>
+              <td>The orchestration glue: starts the run, wraps the engine in <code>time_operation</code>, drains the buffer to both persistence and the learner at the end.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+
+// ── Dev Notes > Engines ─────────────────────────────────────────────────────
+//
+// What an "engine" means in this codebase, the five engines we ship,
+// and the adapter abstraction layer that lets non-Plex backends slot
+// in. Pairs with services/snapshotter.py, services/restorer.py,
+// services/snapshotter_adapter.py, services/restorer_adapter.py,
+// server/direct_transfer.py, server/fan_out.py, and
+// services/adapters/__init__.py.
+
+function DevNotesEnginesSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>What we mean by &ldquo;engine&rdquo;</h2>
+        <p>
+          An <strong>engine</strong> is the code path that actually
+          does the work of one job mode end to end - it reads from a
+          source, transforms, and either writes to disk or writes back
+          to a destination. Engines are NOT routers, not job
+          schedulers, not UI. They are the pipeline.
+        </p>
+        <p>
+          A submitted job in <code>server/jobs.py</code> dispatches to
+          exactly one engine based on the job&apos;s
+          {' '}<code>mode</code> and the source/destination
+          {' '}<code>service_type</code>. The router&apos;s only job
+          is to pick the right engine; the engine&apos;s only job is
+          to move the data.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The five engines, at a glance</h2>
+        <table className="list" style={{ width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ width: '24%' }}>Engine</th>
+              <th style={{ width: '14%' }}>Job mode</th>
+              <th>What it does</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>services/snapshotter.py</code></td>
+              <td>snapshot (Plex source)</td>
+              <td>Reads watch history, ratings, playlists, and collections from a live Plex server and writes them into a per-snapshot <code>.db</code> file (schema v15+) plus optional <code>.plexexport.json</code> sidecar.</td>
+            </tr>
+            <tr>
+              <td><code>services/restorer.py</code></td>
+              <td>restore (Plex destination)</td>
+              <td>Reads a snapshot payload and applies it to a Plex server. Implements Merge (additive) and Replace (destination-only members removed). All write-path safety rules live here.</td>
+            </tr>
+            <tr>
+              <td><code>server/direct_transfer.py</code></td>
+              <td>direct (Plex)</td>
+              <td>Reads from a Plex source and writes straight into a Plex destination, no intermediate <code>.db</code> on disk. Calls the same primitives as Snapshot + Restore but skips the disk hop.</td>
+            </tr>
+            <tr>
+              <td><code>services/snapshotter_adapter.py</code></td>
+              <td>snapshot (Jellyfin / Emby source)</td>
+              <td>Backend-agnostic snapshot engine. Drives the adapter ABC instead of plexapi directly. Smaller / younger than its Plex sibling; per-user fan-out and playlists/collections capture are actively being filled in.</td>
+            </tr>
+            <tr>
+              <td><code>services/restorer_adapter.py</code></td>
+              <td>restore (Jellyfin / Emby destination)</td>
+              <td>Backend-agnostic restore engine. Same payload shape as the Plex restorer consumes, so a Plex snapshot can in principle be restored to a non-Plex destination once cross-backend GUID resolution lands.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+          <code>server/fan_out.py</code> is a coordinator, not a sixth
+          engine. It wraps one of the five engines above and runs it
+          in parallel against multiple destinations. Each
+          destination gets its own thread, its own
+          {' '}<code>DashboardState</code>, its own log directory; the
+          engine itself doesn&apos;t know it&apos;s being fanned out.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The Plex / non-Plex split</h2>
+        <p>
+          You may notice we have TWO snapshotters and TWO restorers.
+          That is deliberate. Plex is the original target and the Plex
+          engines (<code>snapshotter.py</code> + <code>restorer.py</code>)
+          are tuned against plexapi&apos;s data shape, its idioms, and
+          its quirks. Moving them onto the backend-agnostic adapter
+          surface in one cut would introduce a large regression
+          window for the most-used path.
+        </p>
+        <p>
+          Instead, the multi-backend roadmap runs two engine families
+          in parallel:
+        </p>
+        <ul>
+          <li>
+            <strong>Plex engines</strong>: stay on plexapi for now.
+            Already battle-tested. No rewrite.
+          </li>
+          <li>
+            <strong>Adapter engines</strong>
+            ({' '}<code>*_adapter.py</code>): drive the
+            {' '}<code>MediaServerAdapter</code> ABC. Used today for
+            Jellyfin and Emby; could eventually subsume the Plex path
+            once the Plex adapter has full feature parity.
+          </li>
+        </ul>
+        <p>
+          The dispatch happens in <code>server/jobs.py</code> by
+          looking at the source / destination server&apos;s
+          {' '}<code>service_type</code>. Plex sources/destinations
+          route to the Plex engines; everything else routes to the
+          adapter engines.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The adapter layer (services/adapters/)</h2>
+        <p>
+          The adapter package is what makes &ldquo;backend-agnostic&rdquo;
+          actually work. It is one Python ABC
+          (<code>MediaServerAdapter</code>) plus one
+          implementation per backend:
+        </p>
+        <ul>
+          <li>
+            <code>services/adapters/plex.py</code> -
+            {' '}<code>PlexAdapter</code>. Shipped.
+          </li>
+          <li>
+            <code>services/adapters/jellyfin.py</code> -
+            {' '}<code>JellyfinAdapter</code>. ~849 lines. Shipped.
+          </li>
+          <li>
+            <code>services/adapters/emby.py</code> -
+            {' '}<code>EmbyAdapter</code>. ~98 lines, subclasses
+            JellyfinAdapter and overrides the spots where Emby&apos;s
+            API differs. Shipped.
+          </li>
+          <li>
+            <code>services/adapters/_http_base.py</code> - shared
+            httpx-based HTTP client used by the Jellyfin and Emby
+            adapters (Plex uses plexapi, which has its own session).
+          </li>
+        </ul>
+        <p>
+          The ABC&apos;s surface was derived <em>from the engine&apos;s
+          actual call sites</em>, not from a clean-sheet design. If the
+          adapter engines don&apos;t call a method today, the ABC
+          doesn&apos;t declare it. This is on purpose; over-abstraction
+          here would create churn every time a real backend quirk
+          surfaces.
+        </p>
+        <p>
+          A <code>ServerConnection</code> dataclass wraps one connected
+          adapter instance plus the credentials and base URL it was
+          built from. Engines accept a <code>ServerConnection</code>,
+          never raw plexapi objects, when running on the adapter path.
+          See <code>server/server_registry.py:connect_registered_server</code>
+          for how a saved row in <code>servers.json</code> becomes
+          a connected adapter at job start.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>End to end: a single Snapshot job</h2>
+        <ol>
+          <li>
+            UI submits Run Job. <code>server/jobs.py</code> picks the
+            mode (<code>snapshot</code>) and reads the source
+            server&apos;s <code>service_type</code> from the registry.
+          </li>
+          <li>
+            Dispatch: Plex source -&gt; call
+            {' '}<code>services.snapshotter.run_snapshot(...)</code>;
+            Jellyfin / Emby source -&gt; call
+            {' '}<code>services.snapshotter_adapter.snapshot_library_adapter(...)</code>
+            for each library.
+          </li>
+          <li>
+            The engine reads from the source (plexapi for Plex; the
+            adapter&apos;s <code>iter_items</code> /
+            {' '}<code>fetch_watch_state</code> /
+            {' '}<code>fetch_ratings</code> for non-Plex).
+          </li>
+          <li>
+            The engine writes a per-snapshot SQLite file
+            (<code>schema_version &gt;= 15</code>, with the
+            library-section identity invariant - see the Databases
+            tab) and optionally renders a
+            {' '}<code>.plexexport.json</code> sidecar.
+          </li>
+          <li>
+            <code>server/snapshot_registry.py</code> records one row
+            in <code>snapshots.db</code> with the path, byte size,
+            schema version, and per-library item counts.
+          </li>
+          <li>
+            <code>server/run_timings_db.py</code> persists the timing
+            entries and the run_history row (see the ETR tab for what
+            that buys us). The eta_training trainer folds the new
+            observations into its buckets.
+          </li>
+        </ol>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+          A Restore job follows the same shape with source / destination
+          swapped: the engine reads a snapshot payload and writes to
+          the destination&apos;s API surface. Direct Transfer skips
+          step 4-5 and pipes the in-memory dict straight from snapshot
+          to restore.
+        </p>
+      </div>
+    </>
+  );
+}
+
+
+// ── Dev Notes > Databases ───────────────────────────────────────────────────
+//
+// What lives in server_data/ and what each file is responsible for.
+// Pairs with server/auth_db.py, server/media_db.py,
+// server/snapshot_registry.py, server/snapshot_capture.py,
+// server/snapshot_serializer.py, server/run_timings_db.py,
+// server/persistence.py.
+
+function DevNotesDatabasesSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Disk layout: where state lives</h2>
+        <p>
+          Everything PlexBackUp persists across container restarts
+          lives under
+          {' '}<code>$PLEXMIGRATE_DATA_DIR/server_data/</code>. There
+          are four SQLite databases, three JSON config files, and a
+          {' '}<code>logs/</code> tree:
+        </p>
+        <pre style={{ background: 'var(--panel-bg-strong, #1c1c1c)', padding: 10, fontSize: 12, overflowX: 'auto' }}>
+{`server_data/
+├── auth.db            # operator login accounts (only if auth enabled)
+├── media.db           # primary media-state cache
+├── snapshots.db       # registry of captured snapshots
+├── run_timings.db     # per-op telemetry + ETA weights + run history
+├── settings.json      # tunables + persistent UI settings
+├── servers.json       # registered source / destination servers
+├── schedules.json     # saved scheduled-snapshot entries
+├── db_access.log      # audit log for privileged DB writes
+└── logs/              # per-run log directories`}
+        </pre>
+        <p>
+          Per-snapshot <code>.db</code> files live OUTSIDE
+          {' '}<code>server_data/</code>, under the operator-configured
+          {' '}<code>output_dir</code> (Settings &gt; Servers &gt; Run
+          Defaults). They are NOT part of <code>server_data/</code>
+          backups by default; the snapshot registry holds the
+          authoritative catalogue with full paths.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>media.db: the primary cache</h2>
+        <p>
+          The big one. Schema version 8 today
+          (<code>server.media_db.CURRENT_SCHEMA_VERSION</code>) with
+          an idempotent boot-time migration that auto-archives any
+          {' '}<code>.bak</code> of an older version. The boot path
+          refuses to run against a newer schema than it knows about.
+        </p>
+        <p>
+          Key tables:
+        </p>
+        <ul>
+          <li>
+            <strong><code>items</code></strong>: one row per logical
+            entity. Keyed by upstream metadata IDs (IMDb / TVDB /
+            TMDB / MusicBrainz), <em>not</em> by Plex&apos;s
+            {' '}<code>ratingKey</code>. The ratingKey is per-server
+            and per-install; the upstream ID is identical on every
+            server, so cross-server matching is a simple GUID
+            lookup.
+          </li>
+          <li>
+            <strong><code>server_items</code></strong>: the
+            many-to-many bridge. One row per (server, item) pair,
+            carrying that server&apos;s backend-specific item ID
+            (ratingKey for Plex; ItemId for Jellyfin / Emby).
+          </li>
+          <li>
+            <strong><code>watch_events</code></strong>: per-user
+            view counts, offsets, and last-viewed timestamps.
+          </li>
+          <li>
+            <strong><code>ratings</code></strong>: per-user star
+            ratings (0-10 internal, 1-5 displayed).
+          </li>
+          <li>
+            <strong><code>playlists</code> + <code>collections</code></strong>:
+            per-server, per-user playlists / collections. Linked
+            back to <code>items</code> via <code>server_items</code>.
+          </li>
+          <li>
+            <strong><code>library_sections</code></strong>: one row
+            per library (Movies, TV, Music, ...) on each server.
+            Every per-server row above carries a positive
+            {' '}<code>section_key</code> FK to this table. This is
+            the v0.15 identity invariant; the rules for keeping it
+            intact are documented in the project&apos;s coding
+            guidelines.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel">
+        <h2>Per-snapshot .db files (schema v15+)</h2>
+        <p>
+          When a Snapshot job runs, the engine materialises a fresh
+          SQLite file that mirrors the relevant
+          {' '}<code>media.db</code> rows filtered to one server. It
+          is NOT a byte-for-byte copy of <code>media.db</code> - the
+          sqlite online export API would drag every server&apos;s data
+          along, which is wasteful and breaks the per-server-snapshot
+          model.
+        </p>
+        <p>
+          Instead, <code>server/snapshot_capture.py</code>:
+        </p>
+        <ol>
+          <li>Reads the live <code>media.db</code> schema DDL from
+          {' '}<code>sqlite_master</code>.</li>
+          <li>Applies that schema to a fresh, empty snapshot file.</li>
+          <li>Uses <code>ATTACH DATABASE</code> to bridge source and
+          destination, then runs <code>INSERT ... SELECT</code> with
+          {' '}<code>WHERE server_id = ?</code> on the per-server
+          tables and a join through <code>server_items</code> for the
+          shared <code>items</code> table.</li>
+          <li>Writes a <code>snapshot_meta</code> row recording
+          {' '}<code>schema_version</code>, capture timestamp, and
+          source server identity.</li>
+        </ol>
+        <p>
+          The serializer
+          ({' '}<code>server/snapshot_serializer.py</code>) refuses any
+          snapshot file with
+          {' '}<code>snapshot_meta.schema_version &lt; 15</code>. The
+          v15 invariant guarantees every per-server row has a positive
+          {' '}<code>section_key</code> so the restore engine can route
+          work to the correct destination library without
+          divide-by-N approximations.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>snapshots.db: the registry, not the payload</h2>
+        <p>
+          <code>snapshots.db</code> stores metadata <em>about</em>
+          captured snapshots; it does NOT store snapshot contents.
+          One row per captured snapshot, holding the path on disk
+          (where the actual <code>.db</code> lives), byte size, the
+          schema version of the captured file, per-library item
+          counts, capture timestamp, and source server identity.
+        </p>
+        <p>
+          Lifecycle helpers in
+          {' '}<code>server/snapshot_registry.py</code>:
+          {' '}<code>register</code> on capture,
+          {' '}<code>list_snapshots</code> for the panel,
+          {' '}<code>get</code> for the download endpoint,
+          {' '}<code>delete</code> for the operator-initiated remove
+          (row + file + JSON sidecar), and
+          {' '}<code>enforce_retention</code> which trims oldest
+          rows by per-server cap. The Settings &gt; Servers &gt; Run
+          Defaults panel surfaces the cap.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>run_timings.db: telemetry, learner, and history</h2>
+        <p>
+          Despite the name, this file holds three tables, not one. All
+          three live in one file because their lifecycles are tightly
+          coupled: every completed job writes to all three at the same
+          drain point.
+        </p>
+        <ul>
+          <li>
+            <strong><code>run_timings</code></strong>: one row per
+            timed operation
+            (<code>services/run_timer.py:TimingEntry</code>). The raw
+            material the dashboard&apos;s Recent Runtimes panel reads.
+            See the ETR tab for the full story.
+          </li>
+          <li>
+            <strong><code>eta_weights</code></strong>: trained EMA +
+            variance per
+            {' '}<code>BucketKey</code> (server, label, library type,
+            bulk strategy, size bucket). The adaptive learner
+            (<code>services/eta_training.py</code>) reads on boot,
+            writes on job completion. Empty buckets are fine; the
+            cold-start fallback chain handles new servers.
+          </li>
+          <li>
+            <strong><code>run_history</code></strong>: one row per
+            completed run with mode, server, library list, start /
+            end, success/failure, item totals, and the affected-user
+            list. Added in the recent dashboard / log reorg. Drives
+            the Recent Runtimes panel.
+          </li>
+        </ul>
+        <p>
+          Retention is bounded for all three. The
+          {' '}<code>run_timings_retention_count</code> tunable
+          (default 200) caps the rolling window of preserved
+          {' '}<code>run_id</code>s; older rows are pruned at end-of-run.
+          A value of <code>0</code> means &ldquo;unlimited&rdquo;.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>auth.db: only when auth is enabled</h2>
+        <p>
+          Operator login accounts for the web UI: usernames, bcrypt
+          password hashes, display names, role flags, refresh-token
+          state. Loaded only when
+          {' '}<code>PLEXMIGRATE_AUTH_ENABLED</code> is truthy. CLI
+          runs and pre-auth installs never touch this code.
+        </p>
+        <p>
+          Kept in a separate file from <code>media.db</code>
+          deliberately. The two have completely different sensitivity
+          and lifecycle: auth is tiny + sensitive + worth frequent
+          backups; media is large + regenerable + low-sensitivity.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>JSON config files</h2>
+        <table className="list" style={{ width: '100%' }}>
+          <thead>
+            <tr>
+              <th style={{ width: '24%' }}>File</th>
+              <th>Contents</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>settings.json</code></td>
+              <td>Single document. Holds tunables (the System Tunables panel writes here), run defaults, retention caps, and persistent UI preferences. Rewritten in full on every change.</td>
+            </tr>
+            <tr>
+              <td><code>servers.json</code></td>
+              <td>List of registered source / destination servers. Each row carries id, name, URL, encrypted token, <code>service_type</code> (plex / jellyfin / emby), and per-server overrides. Edited via Settings &gt; Servers.</td>
+            </tr>
+            <tr>
+              <td><code>schedules.json</code></td>
+              <td>List of saved scheduled snapshot entries. Each row is a cron-like spec plus the job parameters that fire at trigger time.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+          All three files are read on boot, validated, and held in
+          memory; writes round-trip through the
+          {' '}<code>server/persistence.py</code> layer with file
+          locks so two writers cannot tear a JSON document.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Adding a column: the rules of the road</h2>
+        <ul>
+          <li>
+            <strong>media.db schema changes</strong>: bump
+            {' '}<code>CURRENT_SCHEMA_VERSION</code> in
+            {' '}<code>server/media_db.py</code> and add a migration
+            step in the same module. The boot path auto-archives any
+            file with a lower version into <code>.bak</code>; do NOT
+            try to silently in-place mutate.
+          </li>
+          <li>
+            <strong>Snapshot-file schema changes</strong>: bump
+            {' '}<code>SNAPSHOT_SCHEMA_VERSION</code> in
+            {' '}<code>server/snapshot_capture.py</code>. The
+            serializer refuses any snapshot below the current value,
+            so old snapshots can&apos;t be silently misread.
+          </li>
+          <li>
+            <strong>Never default section_key to 0 or make it
+            nullable</strong>. The library-section identity invariant
+            (v0.15) requires a positive
+            {' '}<code>section_key</code> on every per-server row.
+          </li>
+          <li>
+            <strong>Run-timings schema changes</strong>: bump the
+            {' '}<code>schema_version</code> stored in the
+            {' '}<code>schema_meta</code> table and add the
+            {' '}<code>ALTER TABLE</code> in the init path. This file
+            is regenerable; if migration is too gnarly, dropping and
+            recreating is acceptable (the worst case is losing 200
+            past runs of ETA training data).
+          </li>
+          <li>
+            <strong>JSON config changes</strong>: add a default to
+            the load path so older config files still parse. The
+            settings + servers + schedules loaders all tolerate
+            missing keys.
+          </li>
+        </ul>
+      </div>
+    </>
+  );
+}
+
+
+// ── Dev Notes > Live Sync ───────────────────────────────────────────────────
+//
+// Roadmap notes for the not-yet-shipped continuous source-to-destination
+// sync. This page is forward-looking: it describes what would be needed
+// to add, what's already in place that helps, and the open design
+// questions. Nothing here is shipped; treat the design as a strawman
+// to be torn down in a real planning round before any code lands.
+
+function DevNotesLiveSyncSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>What &ldquo;Live Sync&rdquo; means here</h2>
+        <p>
+          Today every cross-server move is an <em>explicit job</em>:
+          the operator submits Snapshot, Restore, Direct Transfer, or
+          schedules one to fire on a cron. There is no path that
+          notices &ldquo;the user scrobbled an episode on Server A&rdquo;
+          and propagates that to Server B without an operator-issued
+          job.
+        </p>
+        <p>
+          <strong>Live Sync</strong>, as proposed, would be a
+          long-running background service that watches one or more
+          source servers for changes, diffs against the last known
+          state, and applies the diff to one or more destinations
+          continuously. Think of it as the Direct Transfer engine
+          run on a tight loop, but smart enough to do almost nothing
+          when nothing has changed.
+        </p>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+          Nothing on this page is shipped. This section is a starting
+          point for the design conversation, not a substitute for it.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>What we already have that helps</h2>
+        <p>
+          A surprising amount of the work is already done. The pieces
+          a Live Sync would compose:
+        </p>
+        <ul>
+          <li>
+            <strong>The adapter ABC</strong>
+            (<code>services/adapters/__init__.py</code>) gives a
+            uniform read surface across Plex, Jellyfin, and Emby. A
+            poller can ask any backend &ldquo;what has changed since
+            timestamp X?&rdquo; through the same API.
+          </li>
+          <li>
+            <strong>media.db with upstream-keyed items</strong> means
+            cross-server matching is a hash lookup. A change observed
+            on Server A resolves to a destination
+            {' '}<code>backend_item_id</code> on Server B by going
+            through the upstream GUID, not by name fuzzy-match.
+          </li>
+          <li>
+            <strong>Direct Transfer&apos;s additive merge rules</strong>
+            already handle the &ldquo;don&apos;t overwrite, don&apos;t
+            reduce, only ever increase view counts&rdquo; constraint
+            that Live Sync needs by default. The engine&apos;s
+            existing Merge mode is the right write-path primitive.
+          </li>
+          <li>
+            <strong>Fan-out</strong>
+            ({' '}<code>server/fan_out.py</code>) already drives one
+            source against many destinations in parallel. A Live Sync
+            could be modelled as &ldquo;a long-lived fan-out job that
+            never finishes&rdquo;.
+          </li>
+          <li>
+            <strong>Run telemetry + ETA training</strong> means each
+            tick of the sync loop generates the same observability
+            data as a regular run. Operators see the same dashboard
+            surfaces; the learner gets more samples.
+          </li>
+          <li>
+            <strong>ContextVar-backed per-run state</strong>
+            ({' '}<code>services/state.py</code>) is the threading
+            primitive that lets two destinations run in parallel
+            without leaking state into each other. The same model
+            extends to N concurrent sync loops.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel">
+        <h2>What is missing</h2>
+        <ol>
+          <li>
+            <strong>A change-detection surface on the source.</strong>
+            Plex has WebSocket eventing (<code>/:/eventsource</code>)
+            and the <code>/status/sessions</code> endpoint for live
+            playback; Jellyfin and Emby have similar but
+            backend-specific channels. The adapter ABC has no
+            {' '}<code>subscribe_to_changes</code> method today.
+            Adding one is the single biggest piece of new work; it
+            requires per-backend implementations and a fallback path
+            for backends that don&apos;t support push (poll every N
+            seconds against a <code>changed_since</code> query).
+          </li>
+          <li>
+            <strong>A long-running daemon-mode loop</strong>. Today
+            {' '}<code>server/jobs.py</code> assumes jobs are finite:
+            they start, finish, and emit a final state. Live Sync is
+            an infinite job that emits intermediate run-history rows
+            but never terminates. The dashboard&apos;s job state
+            machine needs a new state (something like
+            {' '}<code>RUNNING_LIVE</code>) and the cancel path needs
+            to mean &ldquo;stop the loop&rdquo; rather than &ldquo;abort
+            mid-item&rdquo;.
+          </li>
+          <li>
+            <strong>A diff persistence layer</strong>. The poller
+            needs to remember &ldquo;the last view count I saw for
+            (item, user) on Server A&rdquo; so it can produce a delta
+            rather than re-applying the full state on every tick.
+            {' '}<code>media.db</code> already carries the
+            authoritative cross-server view; one new
+            {' '}<code>sync_cursor</code> column or a sibling table
+            of high-water marks would close the gap. SQL only -
+            another JSON file here would be a step backward.
+          </li>
+          <li>
+            <strong>Backpressure + rate limiting</strong>. A Plex
+            server can be made very unhappy by 1000 scrobbles in 1
+            second. The existing
+            {' '}<code>scrobble_workers_default_cap</code> tunable +
+            the retry budgets in
+            {' '}<code>services/tunables.py</code> are the right
+            knobs; Live Sync needs to honor them through the same
+            adapter rate-limit primitives the regular engines use.
+          </li>
+          <li>
+            <strong>Conflict policy</strong>. If two destinations are
+            in sync AND the operator edits a rating directly on one,
+            does the sync push the edit to the other or treat the
+            edit as a divergence to preserve? Today Merge mode says
+            &ldquo;never overwrite&rdquo;; under Live Sync that means
+            the manual edit wins forever. That may or may not be the
+            right default; it&apos;s a real product decision.
+          </li>
+          <li>
+            <strong>UI surface</strong>. A new tab (Servers &gt; Live
+            Sync?) with a per-source-server panel: enabled, poll
+            cadence, destinations, last-tick result, next-tick ETA,
+            running counters, a Pause button. Closely related to the
+            Schedules panel but driven by &ldquo;long-running
+            process&rdquo; semantics rather than &ldquo;cron-fires-job&rdquo;.
+          </li>
+        </ol>
+      </div>
+
+      <div className="panel">
+        <h2>A proposed shipping order</h2>
+        <p>
+          Splitting into independently shippable increments so each
+          step de-risks the next. None of this is a commitment; it&apos;s
+          a strawman for the planning round.
+        </p>
+        <ol>
+          <li>
+            <strong>Step 1 - poll-mode prototype, Plex source only.</strong>
+            Extend the adapter ABC with a
+            {' '}<code>changes_since(cursor)</code> method, implement
+            it for the Plex adapter using
+            {' '}<code>/status/sessions</code> + the existing watch
+            history endpoint with a <code>since=</code> filter, and
+            wire a 60-second-cadence loop in a new
+            {' '}<code>server/live_sync.py</code>. Output goes through
+            the existing Direct Transfer engine in Merge mode. No UI;
+            launch from a CLI flag. Goal: prove the end-to-end loop
+            on a single source-destination pair.
+          </li>
+          <li>
+            <strong>Step 2 - cursor persistence + restart safety.</strong>
+            Add the <code>sync_cursor</code> column to
+            {' '}<code>media.db</code> (per source server). On boot,
+            resume from the last persisted cursor; never replay the
+            same window twice. A crash mid-tick must not double-apply.
+          </li>
+          <li>
+            <strong>Step 3 - push-mode on Plex.</strong> Replace
+            polling with Plex&apos;s WebSocket eventing. Polling stays
+            as the fallback for offline / unreachable sources.
+          </li>
+          <li>
+            <strong>Step 4 - daemonised job lifecycle.</strong> A new
+            {' '}<code>RUNNING_LIVE</code> state in
+            {' '}<code>server/jobs.py</code>, intermediate
+            {' '}<code>run_history</code> rows per tick, a UI panel
+            with start / pause / stop controls. ETA training picks up
+            the new label automatically; no learner change needed.
+          </li>
+          <li>
+            <strong>Step 5 - Jellyfin + Emby source coverage.</strong>
+            Per-adapter <code>changes_since</code> implementations.
+            The engine&apos;s code path is already backend-agnostic by
+            this point, so the work is contained inside the adapter
+            modules.
+          </li>
+          <li>
+            <strong>Step 6 - conflict-policy tunable + UI surface.</strong>
+            Operator-facing knob for divergent-destination behaviour.
+            Default to today&apos;s Merge semantics (manual edit
+            wins); opt-in for &ldquo;source is authoritative&rdquo;
+            on a per-Live-Sync basis.
+          </li>
+        </ol>
+        <p style={{ fontSize: 12, color: 'var(--text-dim)' }}>
+          Steps 1-3 are the engineering proof; steps 4-6 are the
+          productisation. The split lets us validate the read-side
+          (change detection) and the cursor model before paying the
+          UI / lifecycle cost.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>Open questions before any code</h2>
+        <ul>
+          <li>
+            <strong>One-way or two-way?</strong> Almost certainly
+            one-way (source -&gt; destinations) for the first cut.
+            Two-way introduces the conflict policy work as a hard
+            prerequisite. Worth confirming.
+          </li>
+          <li>
+            <strong>Does &ldquo;live&rdquo; cover playlists +
+            collections, or only watch history + ratings?</strong>
+            The latter is much cheaper (smaller diffs, simpler
+            cursor model). Playlists+collections often warrant manual
+            review before propagation.
+          </li>
+          <li>
+            <strong>What happens when the destination is offline?</strong>
+            Queue the diff and apply on reconnect, or drop and let the
+            next tick re-derive? Storage cost vs. correctness window.
+          </li>
+          <li>
+            <strong>How does Live Sync interact with a Replace-mode
+            Restore?</strong> If a Restore is mid-flight on a
+            destination, should the sync loop pause for that
+            destination? Yes, probably; needs a lock + a UI surface
+            so the operator sees why a sync is paused.
+          </li>
+          <li>
+            <strong>Is the loop one-per-source or one-per-(source,
+            destination)?</strong> The fan-out model already does
+            many destinations per source in one job; preserving that
+            shape keeps the existing dashboard surfaces useful.
+          </li>
+        </ul>
+      </div>
+    </>
+  );
+}
+
+
+// ── Users & Roles ───────────────────────────────────────────────────────────
+//
+// What every operator-facing role can and cannot do, where to find
+// settings that look hidden, and three behaviours that surprise new
+// users. The source of truth for the role list lives in
+// server/auth_router.py (ROLE_PERMISSIONS, _ROLE_RANK) and
+// frontend/src/contexts/AuthContext.tsx mirrors it for UI gating.
+// Keep this page in sync if either side changes.
+
+type UsersAndRolesSubTab = 'overview' | 'finding_settings' | 'behaviors' | 'mechanisms';
+
+function UsersAndRolesPage() {
+  const [sub, setSub] = useState<UsersAndRolesSubTab>('overview');
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Users and Roles</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12 }}>
+          The app has six account roles. This page covers what each one
+          can do, where to find role-gated settings that look hidden,
+          three behaviours new users hit first, and how the supporting
+          mechanisms (View Mode, sudo-style elevation, per-user grants)
+          fit together.
+        </span>
+        <nav className="tabs sub-tabs" style={{ marginTop: 12 }}>
+          <button
+            className={sub === 'overview' ? 'active' : ''}
+            onClick={() => setSub('overview')}
+          >
+            Overview
+          </button>
+          <button
+            className={sub === 'finding_settings' ? 'active' : ''}
+            onClick={() => setSub('finding_settings')}
+          >
+            Finding Settings
+          </button>
+          <button
+            className={sub === 'behaviors' ? 'active' : ''}
+            onClick={() => setSub('behaviors')}
+          >
+            Behaviours
+          </button>
+          <button
+            className={sub === 'mechanisms' ? 'active' : ''}
+            onClick={() => setSub('mechanisms')}
+          >
+            View Mode &amp; Elevation
+          </button>
+        </nav>
+      </div>
+
+      {sub === 'overview' && <UsersOverviewSection />}
+      {sub === 'finding_settings' && <UsersFindingSettingsSection />}
+      {sub === 'behaviors' && <UsersBehavioursSection />}
+      {sub === 'mechanisms' && <UsersMechanismsSection />}
+    </>
+  );
+}
+
+
+// ── Users & Roles > Overview ────────────────────────────────────────────────
+
+function UsersOverviewSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>The six roles</h2>
+        <p>
+          Five of these roles can sign in. The sixth (Database Admin) is
+          a non-login credential that gates destructive User Management
+          writes; you never log in as it.
+        </p>
+        <table className="table" style={{ marginTop: 8 }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left' }}>Role</th>
+              <th style={{ textAlign: 'left' }}>What you can do</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Viewer</strong></td>
+              <td>See the dashboard and the list of registered servers. Nothing else.</td>
+            </tr>
+            <tr>
+              <td><strong>Operator</strong></td>
+              <td>Everything Viewer can do, plus start jobs, see schedules, browse logs and snapshots.</td>
+            </tr>
+            <tr>
+              <td><strong>Manager</strong></td>
+              <td>Everything Operator can do, plus stop jobs and edit schedules.</td>
+            </tr>
+            <tr>
+              <td><strong>Admin</strong></td>
+              <td>
+                Everything Manager can do, plus edit settings, register and remove servers,
+                manage other user accounts (except the Root account), and reach the
+                Database Admin Account page. Cannot edit System Tunables or Access Control.
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Root Admin</strong></td>
+              <td>
+                Full control. Owns System Tunables, Access Control, and root promotions.
+                The only role that can grant or revoke another root.
+              </td>
+            </tr>
+            <tr>
+              <td><strong>Database Admin</strong></td>
+              <td>
+                A non-login credential row. You never sign in as Database Admin.
+                The credential is used as a second password to confirm destructive
+                User Management writes (deleting Plex users, wiping per-user data).
+                Created and updated by an Admin or Root Admin under
+                Account &rsaquo; Account Management &rsaquo; Database Admin Account.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel">
+        <h2>How accounts are created</h2>
+        <p>
+          On a fresh install, the first-boot wizard creates two accounts
+          at once: a day-to-day <strong>Admin</strong> account and a
+          separate <strong>Root Admin</strong> account. After setup, you
+          are signed in as the Admin account. The Root Admin password is
+          held back for the few actions that need it (described in
+          Behaviours and View Mode &amp; Elevation).
+        </p>
+        <p>
+          If you completed setup before this requirement landed, an
+          &ldquo;Upgrade Split&rdquo; prompt will appear on your next
+          sign-in and walk you through creating the missing Root
+          account.
+        </p>
+        <p>
+          Once setup is complete, the Root Admin can create additional
+          accounts at any role from Account &rsaquo; Account Management
+          &rsaquo; User Accounts. The Root role can only be granted via
+          the dedicated &ldquo;Grant root&rdquo; action on a user row
+          (not by editing the role dropdown), and granting it requires a
+          fresh password re-confirmation.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>The Database Admin Account</h2>
+        <p>
+          If you find yourself asked for a &ldquo;Database Admin&rdquo;
+          password during a destructive User Management write, that is
+          the credential under Account &rsaquo; Account Management
+          &rsaquo; Database Admin Account, not your usual login
+          password. It exists because destructive user writes (deleting
+          a Plex managed user, wiping per-user metadata) are easy to
+          fire by accident; gating them on a credential you do not type
+          all day avoids that mistake. An Admin or Root Admin sets and
+          updates this credential at any time.
+        </p>
+      </div>
+    </>
+  );
+}
+
+
+// ── Users & Roles > Finding Settings ────────────────────────────────────────
+
+function UsersFindingSettingsSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Where to find settings that look hidden</h2>
+        <p>
+          Most settings live exactly where you would expect, but a
+          handful are intentionally tucked behind a role. If a feature
+          mentioned in help text is not on your screen, the most likely
+          reason is that your role is below the threshold for that
+          surface. Sign in as an Admin or Root Admin to see the rest.
+        </p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left' }}>You are looking for</th>
+              <th style={{ textAlign: 'left' }}>Where it lives</th>
+              <th style={{ textAlign: 'left' }}>Who can see it</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Add or remove a Plex / Jellyfin / Emby server</td>
+              <td>Servers &rsaquo; Overview</td>
+              <td>Admin, Root Admin</td>
+            </tr>
+            <tr>
+              <td>Run defaults (workers, output directory, log directory)</td>
+              <td>Servers &rsaquo; Run Defaults</td>
+              <td>Admin, Root Admin</td>
+            </tr>
+            <tr>
+              <td>System Tunables (HTTP timeouts, JWT lifetime, SQLite busy timeout)</td>
+              <td>Settings &rsaquo; System Tunables</td>
+              <td><strong>Root Admin only</strong></td>
+            </tr>
+            <tr>
+              <td>
+                Database viewer (browse the schema + data of every SQLite
+                database the app creates: auth, media, snapshots, run timings,
+                playlist cache, per-capture snapshot files)
+              </td>
+              <td>Settings &rsaquo; Databases</td>
+              <td><strong>Root Admin only</strong></td>
+            </tr>
+            <tr>
+              <td>Database Admin Account credential</td>
+              <td>Account &rsaquo; Account Management &rsaquo; Database Admin Account</td>
+              <td>Admin, Root Admin</td>
+            </tr>
+            <tr>
+              <td>Per-user permission grants and revokes</td>
+              <td>Account &rsaquo; Account Management &rsaquo; Access Control</td>
+              <td><strong>Root Admin only</strong></td>
+            </tr>
+            <tr>
+              <td>Create or delete a user account</td>
+              <td>Account &rsaquo; Account Management &rsaquo; User Accounts</td>
+              <td>Admin (cannot touch Root), Root Admin</td>
+            </tr>
+            <tr>
+              <td>Promote a user to Root Admin</td>
+              <td>Account &rsaquo; Account Management &rsaquo; User Accounts (Grant root button)</td>
+              <td>Root Admin (with elevation)</td>
+            </tr>
+            <tr>
+              <td>Stop a running job</td>
+              <td>Dashboard &rsaquo; Stop button</td>
+              <td>Manager and up</td>
+            </tr>
+            <tr>
+              <td>Schedule editing</td>
+              <td>Run Job &rsaquo; Schedules</td>
+              <td>Manager and up</td>
+            </tr>
+            <tr>
+              <td>Application logs (boot, errors, audit)</td>
+              <td>Settings &rsaquo; Logs</td>
+              <td>Operator and up</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div className="panel">
+        <h2>Where the Developer tab comes from</h2>
+        <p>
+          If you see a <strong>Developer</strong> tab in the top bar,
+          the backend container is running with{' '}
+          <code>PLEXMIGRATE_DEBUG_MODE=1</code>. Production deployments
+          leave the variable unset and the tab does not render. None of
+          its panels are gated by role; the env var is the only gate.
+        </p>
+      </div>
+    </>
+  );
+}
+
+
+// ── Users & Roles > Behaviours ──────────────────────────────────────────────
+
+function UsersBehavioursSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Three behaviours new users hit first</h2>
+        <ol>
+          <li style={{ marginBottom: 10 }}>
+            <strong>
+              You need to re-enter your password to do certain things,
+              even though you are already signed in.
+            </strong>
+            <br />
+            This is intentional. Creating a user, deleting a user,
+            changing a user&apos;s role, granting Root, editing
+            per-user permissions, and a handful of other root-level
+            writes require a fresh password re-confirmation. The
+            re-auth modal opens automatically when you click the
+            button; the elevation lasts 10 minutes by default so
+            repeated edits in the same sitting only prompt once.
+          </li>
+          <li style={{ marginBottom: 10 }}>
+            <strong>
+              Root Admin can preview the UI as any lower role.
+            </strong>
+            <br />
+            Click &ldquo;Switch View Mode&rdquo; in the topbar and pick
+            a role to drop to. The whole UI behaves as if you were
+            that role; the backend honours the drop, not just the
+            visuals. Use this to verify what an Operator or Viewer
+            actually sees without making a test account. Closing the
+            drop requires your password (so a tab left open cannot be
+            silently raised by a hostile page).
+          </li>
+          <li>
+            <strong>
+              Closing the browser tab does not sign you out.
+            </strong>
+            <br />
+            A long-lived refresh cookie (7 days by default, HttpOnly
+            and scoped to <code>/api/auth</code>) is what brings the
+            session back when you reopen the tab. To actually end the
+            session, click <strong>Sign Out</strong> in the topbar.
+            A password change also revokes every existing refresh
+            cookie for your account, so any device that was still
+            signed in has to log in again.
+          </li>
+        </ol>
+      </div>
+
+      <div className="panel">
+        <h2>Session shape, at a glance</h2>
+        <p>
+          What survives what. The access token lives in browser memory
+          only (never localStorage or sessionStorage); the refresh
+          cookie is HttpOnly and the browser cannot read it.
+        </p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left' }}>Event</th>
+              <th style={{ textAlign: 'left' }}>Access token</th>
+              <th style={{ textAlign: 'left' }}>Refresh cookie</th>
+              <th style={{ textAlign: 'left' }}>View Mode</th>
+              <th style={{ textAlign: 'left' }}>Elevation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Page reload</td>
+              <td>Re-minted via silent refresh</td>
+              <td>Survives</td>
+              <td>Survives</td>
+              <td>Survives</td>
+            </tr>
+            <tr>
+              <td>Close tab</td>
+              <td>Discarded</td>
+              <td>Survives</td>
+              <td>Survives</td>
+              <td>Survives</td>
+            </tr>
+            <tr>
+              <td>Sign Out</td>
+              <td>Discarded</td>
+              <td>Revoked + cleared</td>
+              <td>Cleared</td>
+              <td>Cleared</td>
+            </tr>
+            <tr>
+              <td>Password change (self)</td>
+              <td>Survives until 30-min expiry</td>
+              <td>All revoked</td>
+              <td>Cleared</td>
+              <td>Cleared</td>
+            </tr>
+            <tr>
+              <td>Container restart</td>
+              <td>Discarded</td>
+              <td>Survives in cookie + DB row</td>
+              <td><strong>Cleared</strong></td>
+              <td><strong>Cleared</strong></td>
+            </tr>
+            <tr>
+              <td>Idle 7 days</td>
+              <td>Auto-refresh fails, sign out</td>
+              <td>Expires</td>
+              <td>Cleared on next sign-in</td>
+              <td>Cleared on next sign-in</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+
+// ── Users & Roles > View Mode & Elevation ───────────────────────────────────
+
+function UsersMechanismsSection() {
+  return (
+    <>
+      <div className="panel">
+        <h2 style={{ marginTop: 0 }}>Sudo-style elevation</h2>
+        <p>
+          Some Root Admin actions need a fresh proof of password even
+          when you are already signed in as Root. Calling those
+          endpoints without elevation returns a 403, the UI opens an
+          inline re-auth modal, you type your password, and the
+          original request retries silently. Elevation lasts 10 minutes
+          by default (configurable in Settings &rsaquo; System Tunables
+          via <code>elevation_ttl_seconds</code>, floor 60s, ceiling
+          3600s).
+        </p>
+        <p>Actions that require elevation (all Root Admin-only):</p>
+        <ul>
+          <li>Create, update, delete a user account</li>
+          <li>Reset another user&apos;s password</li>
+          <li>Grant or revoke Root on another user</li>
+          <li>Edit per-user permission grants and revokes</li>
+          <li>Rotate a managed-user Plex token</li>
+          <li>Apply a PIN migration</li>
+        </ul>
+        <p>
+          Drop elevation immediately with the &ldquo;Clear
+          elevation&rdquo; button (equivalent to <code>sudo -k</code>)
+          or by signing out.
+        </p>
+      </div>
+
+      <div className="panel">
+        <h2>View Mode: previewing the UI as a lower role</h2>
+        <p>
+          Any role above Viewer can temporarily preview the UI as a
+          lower role. The drop is <strong>server-enforced</strong>:
+          every API call honours the dropped role, not just the
+          visuals. The trigger is the <strong>Switch View Mode</strong>
+          button in the topbar.
+        </p>
+        <table className="table">
+          <thead>
+            <tr>
+              <th style={{ textAlign: 'left' }}>Your real role</th>
+              <th style={{ textAlign: 'left' }}>Can drop to</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Viewer</td><td>(nothing; you already are the lowest)</td></tr>
+            <tr><td>Operator</td><td>Viewer</td></tr>
+            <tr><td>Manager</td><td>Operator, Viewer</td></tr>
+            <tr><td>Admin</td><td>Manager, Operator, Viewer</td></tr>
+            <tr><td>Root Admin</td><td>Manager, Operator, Viewer</td></tr>
+          </tbody>
+        </table>
+        <ul style={{ marginTop: 10 }}>
+          <li>Dropping is free.</li>
+          <li>Raising back to your real role requires your password.</li>
+          <li>The drop survives page reloads (it is keyed on the refresh-token id).</li>
+          <li>It clears on Sign Out, password change, user delete, or container restart.</li>
+        </ul>
+      </div>
+
+      <div className="panel">
+        <h2>Per-user permission overrides (Access Control)</h2>
+        <p>
+          Roles set the baseline. The Root Admin can layer two extra
+          lists on top of any non-Root user&apos;s baseline:
+        </p>
+        <ul>
+          <li>
+            <strong>Extra permissions</strong> add capabilities on top
+            of the role&apos;s baseline. Example: grant System
+            Tunables editing to one trusted Admin without promoting
+            them to Root.
+          </li>
+          <li>
+            <strong>Revoked permissions</strong> subtract capabilities
+            from the role&apos;s baseline. Example: revoke &ldquo;Stop
+            jobs&rdquo; from a single Manager who needs everything
+            else but should not stop in-flight work.
+          </li>
+        </ul>
+        <p>
+          Resolution rule: effective set = role baseline + extras
+          - revokes. Safety nets:
+        </p>
+        <ul>
+          <li>
+            A Root Admin row is immune to revokes; the resolver always
+            returns the full set so an accidental edit cannot lock the
+            only Root out.
+          </li>
+          <li>Unknown permission strings are silently ignored.</li>
+          <li>Editing any of this requires a fresh elevation (see above).</li>
+          <li>Database Admin rows have no per-user permissions.</li>
+        </ul>
+        <p>
+          Surface in the UI: Account &rsaquo; Account Management
+          &rsaquo; Access Control (Root Admin only).
         </p>
       </div>
     </>

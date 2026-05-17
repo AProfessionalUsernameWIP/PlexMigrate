@@ -11,7 +11,7 @@ import sys
 import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from plexapi.server import PlexServer
@@ -43,7 +43,7 @@ def _make_retry_adapter(pool_maxsize: Optional[int] = None) -> HTTPAdapter:
     unchanged.
 
     Tunables: ``total`` and ``backoff_factor`` come from
-    ``services.tunables`` so an operator can bump retry tolerance for
+    ``services.tunables`` so an end user can bump retry tolerance for
     flakier upstream Plex servers without a code change. ``pool_maxsize``
     falls back to the tunable when the caller doesn't override it.
 
@@ -296,7 +296,13 @@ def read_token_from_prefs(prefs_path: Path) -> Optional[str]:
         return None
 
 
-def connect_to_server(url: str, token: str, logger: logging.Logger) -> Optional[PlexServer]:
+def connect_to_server(
+    url: str,
+    token: str,
+    logger: logging.Logger,
+    *,
+    raise_on_failure: bool = False,
+) -> Optional[PlexServer]:
     """
     Connects to a Plex Media Server and returns the connection object.
 
@@ -308,9 +314,19 @@ def connect_to_server(url: str, token: str, logger: logging.Logger) -> Optional[
         url (str): Full server URL including protocol and port.
         token (str): Plex authentication token.
         logger (Logger): Shared logger for recording the outcome.
+        raise_on_failure (bool): When True, re-raise the underlying
+            exception instead of returning None on connect failure.
+            End user-facing probe / test paths set this so the actual
+            reason (TLS error, 401, plexapi-specific exception, etc.)
+            reaches the UI rather than being collapsed into a generic
+            "Plex unreachable" message. Engine paths leave the default
+            False so a transient connect failure surfaces as a
+            graceful None for the caller's own retry / fallback logic.
 
     Returns:
-        PlexServer if connection succeeds, or None if it fails.
+        PlexServer if connection succeeds. None if it fails AND
+        ``raise_on_failure`` is False. Raises the underlying exception
+        when ``raise_on_failure`` is True.
     """
     try:
         server = PlexServer(url, token, timeout=120)
@@ -336,7 +352,16 @@ def connect_to_server(url: str, token: str, logger: logging.Logger) -> Optional[
         return server
 
     except Exception as e:
-        logger.error(f"Failed to connect to Plex server at {url}: {e}")
+        # logger.exception (not .error) so the FULL traceback lands
+        # in the backend log. The exception class name plus the
+        # plexapi-specific message is what an end user needs to
+        # distinguish "token rejected" from "TLS handshake failed"
+        # from "URL malformed" - useless if the stack frames are
+        # stripped. The single error line stays as the leading
+        # message so existing log greppers still match.
+        logger.exception(f"Failed to connect to Plex server at {url}: {e}")
+        if raise_on_failure:
+            raise
         return None
 
 
@@ -410,7 +435,7 @@ def _lookup_stored_pin(username: str, machine_identifier: str) -> Optional[str]:
     back to its no-PIN path rather than crashing the per-user loop.
 
     PR-13 audit follow-up: every PIN read is recorded in
-    ``db_access.log`` so the operator can confirm the stored-PIN
+    ``db_access.log`` so the end user can confirm the stored-PIN
     path is actually firing for a given user.
     """
     if not username or not machine_identifier:
@@ -446,6 +471,59 @@ def _lookup_stored_pin(username: str, machine_identifier: str) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def _share_state_for_server(machine_identifier: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Return ``{username: {"active_share": bool, "is_pin_protected": bool,
+    "has_token": bool, "has_pin": bool, "refreshed_at": float|None}}``
+    for every cached managed-user row on the server identified by
+    ``machine_identifier``. Empty dict on any error.
+
+    The engine consults this map before fanning out per-user
+    authentication so we can:
+
+      * Skip rows the end user has effectively un-shared on Plex.tv
+        (``active_share=False``) with a single explanatory log line
+        instead of N noisy "could not authenticate" warnings.
+      * Emit a targeted "PIN-protected, save PIN under User Management"
+        log when a direct token fetch fails on a row Plex.tv flagged
+        as ``protected=1``.
+
+    Best-effort: a registry / DB hiccup returns an empty dict, which
+    makes the gate a no-op and preserves prior behaviour (every
+    ``account.users()`` row goes through the auth fan-out).
+    """
+    if not machine_identifier:
+        return {}
+    try:
+        from server import server_registry, media_db
+    except Exception:
+        return {}
+    try:
+        server_id = ""
+        for row in server_registry.list_servers(include_tokens=False):
+            if (row.get("machine_identifier") or "") == machine_identifier:
+                server_id = row["id"]
+                break
+        if not server_id:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in media_db.list_managed_users(server_id, include_hidden=True):
+            uname = row.get("username") or ""
+            if not uname:
+                continue
+            out[uname] = {
+                "active_share": bool(row.get("active_share", True)),
+                "is_pin_protected": bool(row.get("is_pin_protected", False)),
+                "has_token": bool(row.get("has_token")),
+                "has_pin": bool(row.get("has_pin")),
+                "refreshed_at": row.get("shared_state_refreshed_at"),
+                "kind": row.get("kind") or "managed",
+            }
+        return out
+    except Exception:
+        return {}
 
 
 def _tombstoned_usernames_for_server(machine_identifier: str) -> set:
@@ -505,6 +583,8 @@ def get_home_users(
     server: PlexServer,
     base_url: str,
     logger: logging.Logger,
+    *,
+    user_filter: Optional[Iterable[str]] = None,
 ) -> List[Tuple[str, str, PlexServer]]:
     """
     Returns a list of (username, token, server) for each Plex Home managed user.
@@ -518,6 +598,15 @@ def get_home_users(
         server (PlexServer): Admin server connection (must be linked to Plex.tv).
         base_url (str): Plex server base URL, e.g. "http://localhost:32400".
         logger (Logger): Shared logger.
+        user_filter (Iterable[str], optional): 2026-05-17 (operator
+            request): when provided, pre-filter the home-user list to
+            ONLY usernames present in the iterable BEFORE authenticating.
+            Saves a 5-30s burst per excluded user (each gets its own
+            ``user.get_token()`` round-trip with potential PIN auth).
+            Owner-only / single-user runs that used to wait for every
+            home user to auth now skip every user that wasn't picked.
+            ``None`` (default) preserves the legacy "auth everyone" path.
+            Case-insensitive match against ``user.username``.
 
     Returns:
         List of (username, user_token, user_server) tuples - one per managed user.
@@ -533,12 +622,48 @@ def get_home_users(
             logger.info("No Plex Home managed users found on this account.")
             return result
 
+        # 2026-05-17 (operator request): pre-auth user_filter. The
+        # snapshotter / restorer / direct-transfer callers select a
+        # subset of users on the UI side; this is the first chance to
+        # narrow the auth burst to JUST those usernames. Each excluded
+        # user saves a slow ``user.get_token()`` round-trip (+ optional
+        # PIN-auth retries). Case-insensitive username match.
+        if user_filter is not None:
+            wanted = {str(s).strip().lower() for s in user_filter if str(s).strip()}
+            if wanted:
+                users_before = len(users)
+                users = [
+                    u for u in users
+                    if (getattr(u, "title", "") or "").strip().lower() in wanted
+                ]
+                skipped = users_before - len(users)
+                if skipped:
+                    logger.info(
+                        "user_filter applied: authenticating %d of %d "
+                        "home user(s) (skipped %d not in selection: %s)",
+                        len(users), users_before, skipped,
+                        ", ".join(sorted(wanted)),
+                    )
+            else:
+                # Empty / whitespace-only filter — explicit "no managed
+                # users" signal. Skip the entire auth path.
+                logger.info(
+                    "user_filter is an empty set; skipping all home-user auth.",
+                )
+                return result
+
+        if not users:
+            logger.info(
+                "No managed users remain after user_filter; skipping auth burst.",
+            )
+            return result
+
         # PR-13 follow-up - apply tombstone filters BEFORE we
         # authenticate any user. Pre-fix, the engine connected to
-        # every managed user including ones the operator had hidden
+        # every managed user including ones the end user had hidden
         # via the User Management panel; the resulting per-user
         # payload then carried owner-attributed data (fix #4) or
-        # data the operator had explicitly asked us not to capture.
+        # data the end user had explicitly asked us not to capture.
         #
         # Two scopes filter here:
         #   * Global tombstones (``global_tombstones`` table) -
@@ -568,6 +693,88 @@ def get_home_users(
             )
             return result
 
+        # ── Share-state gate (2026-05-15; cross-server-leak fix 2026-05-17) ─
+        # ``account.users()`` returns every friend / managed user the
+        # admin has *ever* shared with - GLOBALLY across every server
+        # the owner has linked, including users who have NO share on
+        # the server we're currently snapshotting. The local
+        # ``managed_users`` cache (populated by
+        # ``sync_managed_users_from_live`` on every server-connect probe)
+        # is the authoritative per-server roster: every row in it
+        # represents a user with access to THIS server, and every user
+        # with access to this server IS in the cache after a successful
+        # sync.
+        #
+        # 2026-05-17 cross-server-leak fix: when the cache is populated
+        # for this server (non-empty), a user NOT in the cache is a
+        # user from another server, NOT a "new user the sync hasn't
+        # picked up yet". Drop them silently from the auth fan-out so
+        # the engine doesn't waste 30s per server-not-mine user trying
+        # tokens that 401 + emit the misleading "save the user's PIN
+        # under User Management" message (the user has no row to save
+        # a PIN on; they don't exist on this server).
+        #
+        # Pre-fix the "info is None -> assume active" branch was
+        # KEEPING those cross-server users, then trying to auth them
+        # with the admin token (which is scoped to this server), then
+        # emitting N warnings of the form:
+        #   "Home user 'Adam abu-issa' could not authenticate ... save
+        #    the user's Plex Home PIN under User Management"
+        # despite Adam having no row in this server's managed_users
+        # table at all. The cache stays empty only on the absolute
+        # first connect to this server (before the share-state sync
+        # has ever run); in that one case we fall through to the
+        # legacy "keep everything" semantics so we don't silently
+        # hide users on a brand-new install.
+        share_state = _share_state_for_server(
+            getattr(server, "machineIdentifier", "") or "",
+        )
+        if share_state:
+            stale = []           # cached but no active share (sync says off)
+            cross_server = []    # not in this server's cache at all
+            kept = []
+            for u in users:
+                uname = (getattr(u, "title", "") or "")
+                info = share_state.get(uname)
+                if info is None:
+                    # User isn't in this server's managed_users cache
+                    # despite the cache having rows -> they don't have
+                    # a share here. Drop silently.
+                    cross_server.append(uname)
+                    continue
+                if info.get("active_share", True):
+                    kept.append(u)
+                else:
+                    stale.append(uname)
+            if cross_server:
+                logger.info(
+                    "Share-state filter: skipped %d Plex Home user(s) "
+                    "with no share on this server (they appear on the "
+                    "owner's Plex.tv roster but have no access here). "
+                    "Skipped: %s. This is normal when the owner runs "
+                    "multiple Plex servers - account.users() returns "
+                    "the global Home roster, not the per-server share "
+                    "list.",
+                    len(cross_server),
+                    ", ".join(sorted(cross_server)),
+                )
+            if stale:
+                logger.info(
+                    "Share-state filter: skipped %d managed user(s) with "
+                    "no active share on this server (Plex.tv reports the "
+                    "share has been removed). Skipped: %s. Use "
+                    "Servers -> Users -> Refresh shared state to update "
+                    "the cache.",
+                    len(stale), ", ".join(sorted(stale)),
+                )
+            users = kept
+
+        if not users:
+            logger.info(
+                "No managed users with an active share on this server."
+            )
+            return result
+
         # Surface the slow per-user auth burst on the dashboard's
         # activity feed - without this the user sees nothing for the
         # 5-30 s it can take to walk every home user, especially when
@@ -593,12 +800,12 @@ def get_home_users(
         #
         # PR-13 fix #4 reverts to the pre-PR-2 behaviour (drop the
         # user if we can't authenticate them) BUT first tries to use
-        # the operator-supplied PIN from ``managed_users.plex_home_pin_enc``
+        # the end user-supplied PIN from ``managed_users.plex_home_pin_enc``
         # (PR-10 storage). If a PIN is stored, we sign in as the home
         # user via the account-level switch and obtain a real per-user
         # token. If no PIN is stored OR sign-in still fails, the user
         # is dropped from the roster with a warning - the pre-flight
-        # check (PR-12) surfaces this to the operator before the job
+        # check (PR-12) surfaces this to the end user before the job
         # commits so they can save the PIN under User Management.
         def _try_account_switch(user):
             """Use signInHomeUser when a PIN is stored. Returns a
@@ -667,7 +874,7 @@ def get_home_users(
                         logger.info(f"Connected as home user (stored PIN): {title}")
                         # Audit trail: explicit record that the stored
                         # PIN was successfully used to authenticate.
-                        # Lets the operator confirm the PIN-fetch path
+                        # Lets the end user confirm the PIN-fetch path
                         # is firing without grepping the run log.
                         try:
                             from services import db_access_log
@@ -685,19 +892,42 @@ def get_home_users(
                     # the admin server. Falling back would silently
                     # attribute the owner's watch / rating / playlist
                     # data to this user's row, corrupting per-user
-                    # state in every downstream snapshot. The operator
+                    # state in every downstream snapshot. The end user
                     # can save the user's PIN under Servers -> User
                     # Management and re-run; PR-12's pre-flight panel
                     # will surface PIN-protected users that lack stored
                     # PINs before the job commits.
-                    logger.warning(
-                        "Home user %r could not authenticate (%s) - "
-                        "user is being DROPPED from this run to avoid "
-                        "the owner-watch-bleed bug from PR-2. Save the "
-                        "user's Plex Home PIN under Servers -> User "
-                        "Management to capture their data on the next run.",
-                        u.title, e,
-                    )
+                    info = share_state.get(getattr(u, "title", "") or "", {})
+                    if info.get("is_pin_protected") and not info.get("has_pin"):
+                        # Targeted message: Plex.tv confirms this user
+                        # has a PIN set, but we don't have it stored.
+                        logger.warning(
+                            "Home user %r is PIN-protected on Plex.tv but "
+                            "no PIN is stored locally; dropping from this "
+                            "run. Save the PIN under Servers -> User "
+                            "Management to capture their data next run.",
+                            u.title,
+                        )
+                    elif info.get("is_pin_protected"):
+                        # PIN stored but switch still failed - likely a
+                        # stale / wrong PIN. Tell the end user exactly
+                        # what to check.
+                        logger.warning(
+                            "Home user %r is PIN-protected and a stored "
+                            "PIN was tried but Plex rejected it (%s); "
+                            "dropping from this run. Update the stored "
+                            "PIN under Servers -> User Management.",
+                            u.title, e,
+                        )
+                    else:
+                        logger.warning(
+                            "Home user %r could not authenticate (%s) - "
+                            "user is being DROPPED from this run to avoid "
+                            "the owner-watch-bleed bug from PR-2. Save the "
+                            "user's Plex Home PIN under Servers -> User "
+                            "Management to capture their data on the next run.",
+                            u.title, e,
+                        )
 
         if state.get_dashboard():
             state.get_dashboard().push_activity(

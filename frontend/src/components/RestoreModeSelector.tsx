@@ -18,7 +18,7 @@ export type RestoreMode = 'merge' | 'replace';
 // v0.13.x: sub-strategy under Merge for the watch-count math.
 //   higher = destination ends at max(stored, current). Idempotent;
 //            the legacy default.
-//   sum    = destination ends at current + stored. Operator opt-in;
+//   sum    = destination ends at current + stored. End user opt-in;
 //            NOT idempotent across re-runs.
 // Only consulted when mode === 'merge'; in 'replace' mode Plex's
 // view counts are overwritten unconditionally.

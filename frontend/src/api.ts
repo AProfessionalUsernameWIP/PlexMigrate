@@ -51,7 +51,7 @@ export interface DashboardState {
   // ``user_display_names`` before rendering.
   current_user?: string | null;
   // v0.9.6 Feature 3: source server's display-name map, copied at
-  // run start. Keys: raw Plex identifier. Values: operator-chosen
+  // run start. Keys: raw Plex identifier. Values: end user-chosen
   // display name. Empty / missing = render raw identifiers as-is.
   user_display_names?: Record<string, string>;
   // v0.9.6 Feature 2: HTTP telemetry - status code histogram and
@@ -81,11 +81,30 @@ export interface DashboardState {
     collections?: ContainerResult[];
   };
   // Timing engine (discover-don't-predict). ``rolling_etr_seconds`` is
-  // the single headline ETR, projected from a rolling window of real
+  // the live in-flight ETR, projected from a rolling window of real
   // throughput samples. ``null`` means the tracker doesn't have enough
-  // samples yet; the dashboard renders that as "Calculating...". There
-  // is no pre-run estimate.
+  // samples yet.
   rolling_etr_seconds?: number | null;
+  // Gap-B of the post-cutover review: the new ETA training engine's
+  // pre-run prediction, computed at run start and decayed by elapsed
+  // wall-clock. Used as the dashboard's "Estimated remaining" value
+  // when ``rolling_etr_seconds`` is null (the live tracker is still
+  // warming up). ``null`` when the engine has no history for this
+  // job shape AND fell through to its tier-5 default + zero samples.
+  predicted_etr_seconds?: number | null;
+  // Which source the dashboard should label the rendered value with.
+  // "live" = rolling_etr_seconds; "predicted" = predicted_etr_seconds;
+  // null = no estimate yet (renders as "Calculating...").
+  etr_source?: 'live' | 'predicted' | null;
+  // Bugfix 2026-05-16: backend-computed gate for the "Almost done"
+  // copy. True when the run is in the post-engine finalize phase OR
+  // when cumulative library completion is past the end user-tunable
+  // eta_almost_done_progress_threshold (Danger tab). The frontend
+  // refuses to render "Almost done" unless this is true, even when
+  // the numeric ETR drops below 5 seconds; otherwise a too-small
+  // cold-start prediction could falsely claim a 6-minute run was
+  // about to finish.
+  is_finishing?: boolean;
   // Per-batch independent ETRs. Each key is a batch label ("watch",
   // "rating", "playlist", "collection") and each value carries the
   // batch's current progress + smoothed ETR. ``total`` grows as the
@@ -109,7 +128,7 @@ export interface DashboardState {
 // ``skipped_items`` carries the per-member miss list (capped at 25 -
 // the backend leaves the full set in the run log). ``smart=true``
 // flags a smart playlist that was skipped entirely; ``reason`` is
-// the operator-facing one-liner when restored < total or the whole
+// the end user-facing one-liner when restored < total or the whole
 // container was skipped.
 export interface ContainerResult {
   name: string;
@@ -163,16 +182,18 @@ export interface ActivityEntry {
   // PR-2 / Phase C - empty string = unscoped (always shown). A
   // non-empty value tags this entry to a specific server; the WS
   // payload filters these out for non-participants during an active
-  // job so the operator only sees the source / destination(s)
+  // job so the end user only sees the source / destination(s)
   // they're actually running against.
   server_name?: string;
 }
 
 export interface JobPayload {
   job_id: string;
-  // v0.9.0 added 'direct' alongside the original two modes. The
-  // server-side JobRecord uses the same literal strings.
-  mode: 'snapshot' | 'restore' | 'direct';
+  // v0.9.0 added 'direct' alongside the original two modes. 2026-05-17
+  // added 'playlist_copy' for the Playlist Mgmt Deploy refactor (each
+  // Deploy becomes a JobRecord on the same queue). The server-side
+  // JobRecord uses the same literal strings.
+  mode: 'snapshot' | 'restore' | 'direct' | 'playlist_copy';
   // 'stopping' (v0.9.3) is the intermediate state between user click
   // and engine return - see server/jobs.py :: STATE_STOPPING.
   // 'completed_with_errors' (v0.13.x) is the partial-success outcome:
@@ -245,7 +266,7 @@ export interface ServerNetworkState {
   last_ping_at: number;
   last_seen_at: number;
   // Status code histograms. ``window`` is the trailing-60s view;
-  // ``cumulative`` runs from process start so the operator can spot
+  // ``cumulative`` runs from process start so the end user can spot
   // a server that's been chronically returning 429s.
   window_status_counts: Record<string, number>;
   cumulative_status_counts: Record<string, number>;
@@ -283,6 +304,105 @@ export interface DashboardFrame {
   // v0.12.0: per-server HTTP telemetry, always present.
   servers_network: ServerNetworkState[];
 }
+
+// Plan[ETA-TRAINING] PR-D. The job-form preview ships a body in this
+// shape; the response carries a whole-job rollup plus a per-library
+// breakdown so the UI can show which library dominates the runtime.
+// Plan[RUN-JOB-UI] follow-up: cross-server identity-map row shape.
+// Mirrors the columns on media.db's user_identity_map table; used by
+// the standalone mapping panel + the engine's future cross-server
+// user-filter resolver.
+export interface UserIdentityMap {
+  id: number;
+  // v12 canonical pair (app_user_uuid). Each end may resolve to a
+  // (server_id, user_handle) tuple via the backend's row lookup,
+  // surfaced in the legacy *_id / *_handle fields below for
+  // compatibility with existing UI surfaces. Either side can be
+  // null when the UUID no longer resolves to a live row (server
+  // removed, user deleted) - the panel can render an "unresolved"
+  // badge in that case.
+  user_a_uuid: string;
+  user_b_uuid: string;
+  server_a_id: string | null;
+  user_a_handle: string | null;
+  server_b_id: string | null;
+  user_b_handle: string | null;
+  source: 'manual' | 'auto_copy';
+  created_at: number;
+}
+
+
+export interface EtaPredictRequestLibrary {
+  name: string;
+  library_type: string;
+  items_count: number | null;
+}
+export interface EtaPredictRequest {
+  mode: 'snapshot' | 'restore' | 'direct';
+  source_server_id: string;
+  libraries: EtaPredictRequestLibrary[];
+  metrics_enabled: Record<string, boolean>;
+  user_count: number;
+  workers: number;
+  bulk_strategy: 'smart' | 'force_bulk' | 'force_server_side';
+}
+export interface EtaPredictionLibraryRow {
+  name: string;
+  library_type: string;
+  items_count: number | null;
+  point: number;
+  low: number;
+  high: number;
+  std: number;
+  samples: number;
+  tier: number;
+  // Latency-offset multiplier applied to the regression prediction.
+  // 1.0 = no offset (feature disabled, ping data unavailable, or no
+  // drift from training-time ping). Above 1.0 = worse current ping;
+  // below 1.0 = better. Bounded by the inflation cap + deflation floor.
+  latency_multiplier?: number;
+  display: string;
+}
+export interface EtaPrediction {
+  mode: string;
+  point: number;
+  low: number;
+  high: number;
+  std: number;
+  samples: number;
+  tier: number;
+  confidence_z: number;
+  latency_multiplier?: number;
+  display: string;
+  per_library: EtaPredictionLibraryRow[];
+}
+
+
+export interface EtaTrainingBucket {
+  label: string;
+  library_type: string;
+  bulk_strategy: string;
+  samples: number;
+  tier_one_ready: boolean;
+  anchor_ready: boolean;
+  ping_ema_ms: number | null;
+  last_observed_at: number;
+  predicted_at_xbar_seconds: number;
+}
+export interface EtaTrainingServerStatus {
+  server_id: string;
+  buckets: EtaTrainingBucket[];
+  summary: {
+    total_buckets: number;
+    tier_one_count: number;
+    anchor_count: number;
+    min_samples_for_tier_one: number;
+  };
+}
+export interface EtaTrainingStatus {
+  by_server: EtaTrainingServerStatus[];
+}
+
 
 export interface SettingsView {
   plex_url: string;
@@ -329,6 +449,20 @@ export interface SettingsView {
   // ETR colour multiplier for the dashboard stall thresholds (Phase 4).
   // Clamped to [0.5, 2.0] at the read boundary. Default 1.0.
   etr_color_multiplier?: number;
+  // Item 1: sudo-style elevation cache TTL in seconds. Floored 60,
+  // ceiled 3600 by the backend. Default 600 (10 minutes).
+  elevation_ttl_seconds?: number;
+  // Item 1: which onboarding model has run. 1 = legacy single-account,
+  // 2 = v2 two-step setup or upgrade-split completed.
+  auth_setup_version?: number;
+  // Item 5: global tooltip toggle. When false the InfoTip component
+  // renders no popover affordance; the full body lives in the Help
+  // tab only. Default true; root_admin to write.
+  tooltips_enabled?: boolean;
+  // Item 2 follow-up: opt-in token rotation on Refresh.
+  auto_rotate_tokens_on_refresh?: boolean;
+  // Item 3 follow-up: opt-in username-string fallback for PIN migration.
+  pin_migration_allow_username_fallback?: boolean;
   // Direct-transfer resolver-tier policy. Tiers 0/1 (DB + API GUID
   // matching) are always active and never appear here. Tier 2 is
   // the filepath-suffix fallback (default ON). Tier 3 is fuzzy
@@ -341,7 +475,7 @@ export interface SettingsView {
   // media.db retention + cascade-delete policy. The two prune_*_days
   // fields are placeholders for a future background sweep; the
   // cascade flags drive what happens to per-server rows in media.db
-  // when the operator removes a server from the registry.
+  // when the end user removes a server from the registry.
   media_db_retention?: {
     cascade_delete_on_server_remove?: boolean;
     prevent_cascade_delete?: boolean;
@@ -365,12 +499,12 @@ export interface SettingsView {
     auto_capture_before_replace?: boolean;
     // v0.13.x: Merge sub-strategy for watch-count math. "higher"
     // (default) = destination ends at max(stored, current); "sum" =
-    // current + stored. Operator opt-in. Ignored when mode=='replace'.
+    // current + stored. End user opt-in. Ignored when mode=='replace'.
     merge_watch_strategy?: 'higher' | 'sum';
   };
   // v0.13.x: library-level concurrency cap for file-mediated restore.
   // Replaces the legacy hardcoded ``min(3, libraries)``. Default 3
-  // preserves today's behavior; operators that see Plex 429s during
+  // preserves today's behavior; end users that see Plex 429s during
   // multi-library restores lower this (1 = serial). Direct transfer
   // is still serial in this release - this knob does not apply there.
   restore_library_workers?: number;
@@ -456,7 +590,36 @@ export interface ServerView {
   id: string;
   name: string;
   url: string;
+  // Backend kind: "plex" today, "emby" / "jellyfin" reserved for future
+  // adapters. The Snapshots panel uses (name, url, service) as the
+  // composite identity key so two registry rows describing the same
+  // server (same backend reachable at the same URL) merge into one
+  // tab, while same-URL-different-backend (a Plex and an Emby both on
+  // the same host) remain separate.
+  service?: string;
+  // PR-Backends backend discriminator. Mirror of the persisted
+  // ``service_type`` column. Drives:
+  //  - which authentication label the new-server form shows
+  //    ("Plex Token" vs "API Key" vs ...)
+  //  - which adapter the engine uses (Plex via plexapi, Jellyfin / Emby
+  //    via the HTTP adapter)
+  //  - which icon / badge the Servers panel renders alongside the row
+  // Rows that pre-date the picker default to 'plex'.
+  service_type?: 'plex' | 'jellyfin' | 'emby';
   has_token: boolean;
+  // Pending-token state (2026-05-15). When the end user's typed
+  // token failed at Add-server time and we used a borrowed token
+  // instead, the typed one is stashed under ``pending_token`` (the
+  // ciphertext never leaves the backend). The frontend gets only
+  // ``has_pending_token`` plus the timestamps so it can render a
+  // chip on the Servers row + a Retry button. The retry endpoint
+  // ``POST /api/servers/{id}/retry-pending-token`` probes the
+  // stashed token; on success it replaces the active token and
+  // clears every pending_* field.
+  has_pending_token?: boolean;
+  pending_token_first_seen_at?: number;
+  pending_token_last_probed_at?: number;
+  pending_token_source?: string;
   last_status: 'ok' | 'unreachable' | 'auth_error' | 'unknown';
   last_status_detail: string;
   last_checked_at: number;
@@ -465,7 +628,7 @@ export interface ServerView {
   // Latency of the last lightweight ping in milliseconds. ``null``
   // if no ping has ever been recorded for this server.
   last_response_ms: number | null;
-  // v0.9.6 Feature 3: operator-chosen friendly names for users on
+  // v0.9.6 Feature 3: end user-chosen friendly names for users on
   // this server. Keys: raw Plex identifier (owner email or managed
   // username). Empty / missing = no custom names assigned. The
   // Servers tab uses this to populate the inline owner-display-name
@@ -488,11 +651,49 @@ export interface ServerView {
   // Timing-spec inputs. Server-wide counts the ETR estimator needs.
   // ``null`` (or missing) means we never captured them; the next
   // Refresh / Test populates them. The frontend renders unknown
-  // counts as `?` rather than `0` so the operator can tell stale
+  // counts as `?` rather than `0` so the end user can tell stale
   // metadata from genuine empties.
   playlist_count?: number | null;
   collection_count?: number | null;
   counts_refreshed_at?: number | null;
+  // Item 2 (admin-management plan): present only on responses from
+  // POST /api/servers/{id}/test (the Refresh button). Reports what
+  // the additive token-capture sweep did. Absent on other endpoints
+  // that return ServerView.
+  token_capture?: TokenCaptureSummary;
+}
+
+export interface TokenCaptureSummary {
+  captured: number;
+  skipped_existing: number;
+  throttled: boolean;
+  errors: string[];
+}
+
+// Item 3: one row in the cross-server PIN migration suggestion list.
+export interface PinMigrationSuggestion {
+  target_username: string;
+  source_server_id: string;
+  source_server_name: string;
+  source_username: string;
+  match_kind: 'machine_id' | 'username';
+}
+
+// Auto-fallback offer (2026-05-15): when the end user's typed token
+// returns 401 but one of their existing registered servers' tokens
+// connects against the same URL, the backend includes this in the
+// probe response. Frontend renders a "Try fallback token" button on
+// the auth_error banner; clicking it sets use_fallback_from_server_id
+// on the create payload so the borrowed working token becomes the
+// active token and the typed one is stashed as a pending retry.
+export interface ProbeFallbackOffer {
+  borrowed_from_server_id: string;
+  borrowed_from_server_name: string;
+  friendly_name: string;
+  machine_identifier: string;
+  owner_name: string;
+  libraries: LibraryDescriptor[];
+  response_ms: number | null;
 }
 
 // v0.10.0: result of probing a URL+token without registering it.
@@ -502,7 +703,12 @@ export interface ServerView {
 // shares this server's machine_identifier (null when no collision).
 export interface ProbeUnsavedResult {
   ok: boolean;
-  status: 'ok' | 'unreachable' | 'auth_error' | 'unknown';
+  // ``auth_error`` covers 401 (token rejected) and 403 (token's
+  // account has no permission); the panel renders a token-finder
+  // help link distinctly from generic unreachable. ``ssl_error`` and
+  // ``timeout`` are split out so the end user sees the right action
+  // (trust the cert / switch protocol vs check the server health).
+  status: 'ok' | 'unreachable' | 'auth_error' | 'ssl_error' | 'timeout' | 'unknown';
   detail: string;
   friendly_name: string;
   machine_identifier: string;
@@ -512,16 +718,22 @@ export interface ProbeUnsavedResult {
   name_mismatch: boolean;
   duplicate_of: string | null;
   // Timing-spec counts surfaced from the unsaved probe so the
-  // operator can see "this would register a server with 3955 movies,
+  // end user can see "this would register a server with 3955 movies,
   // 12483 episodes, etc." before clicking Save.
   playlist_count?: number | null;
   collection_count?: number | null;
   counts_refreshed_at?: number | null;
+  // Auto-fallback. Only present when status==='auth_error' AND one
+  // of the end user's existing registered tokens connected against
+  // the same URL. ``null`` / undefined means no fallback is on
+  // offer (no other registered servers, or none of their tokens
+  // worked).
+  fallback?: ProbeFallbackOffer | null;
 }
 
 // v0.9.6 Feature 3: one row in the per-server Users panel.
 // ``raw_name`` is the canonical identifier (email for owner, username
-// for managed). ``display_name`` is the operator's chosen friendly
+// for managed). ``display_name`` is the end user's chosen friendly
 // name from the server's ``user_display_names`` map, or empty if none.
 export interface ServerUser {
   kind: 'owner' | 'managed';
@@ -550,6 +762,21 @@ export interface ServerIn {
   name: string;
   url: string;
   token?: string;
+  // PR-Backends backend discriminator. Omitted on legacy callers ->
+  // backend defaults to 'plex'. The new-server form sets this
+  // explicitly based on the radio picker so the registry knows which
+  // adapter to wrap the connection with.
+  service_type?: 'plex' | 'jellyfin' | 'emby';
+  // Auto-fallback save (2026-05-15). When set, the backend registers
+  // the new server using the BORROWED token from this existing
+  // server's stored credential, and stashes the end user's typed
+  // token (in ``token`` above) as a retry-able pending_token.
+  // Set by the Add Server form after the end user clicks
+  // "Try fallback token" on the auth_error banner.
+  // Only valid for Plex backends; the backend rejects this combined
+  // with service_type other than 'plex' because Jellyfin / Emby
+  // tokens are server-local and not shareable across servers.
+  use_fallback_from_server_id?: string;
 }
 
 // v0.9.5: returned by ``DELETE /api/servers/{id}`` after a cascading
@@ -585,6 +812,11 @@ export interface Schedule {
   id?: string;
   name: string;
   source_server_name?: string;
+  // 2026-05-16 (developer Emby fix): id-keyed source / destinations.
+  // Backend (ScheduleIn) prefers ID; the editor sets both fields so
+  // the routing chooses ID. Names stay for back-compat.
+  source_server_id?: string | null;
+  dest_server_ids?: string[] | null;
   libraries: string[];
   output_dir?: string | null;
   frequency: 'hourly' | 'daily' | 'weekly';
@@ -618,6 +850,70 @@ export interface Schedule {
   // email + managed usernames). null / undefined = capture every user
   // the source server reports.
   user_filter?: string[] | null;
+  // Task 2 (admin-management plan follow-up, 2026-05-15): schedule
+  // mode + restore/direct fields. Pre-Task-2 schedules read as
+  // mode='snapshot' (backend default).
+  mode?: 'snapshot' | 'restore' | 'direct';
+  dest_server_names?: string[] | null;
+  input_files?: string[] | null;
+  restore_mode?: 'merge' | 'replace' | null;
+  auto_capture_before_replace?: boolean | null;
+  confirm_replace?: boolean;
+  merge_watch_strategy?: 'higher' | 'sum' | null;
+  // Required true to save a schedule with merge_watch_strategy='sum'.
+  // End user confirmation that each fire ADDS stored counts on top
+  // of the destination's current counts (compounds across fires).
+  confirm_additive_merge?: boolean;
+  remap_old?: string | null;
+  remap_new?: string | null;
+  // Per-schedule strict-match override (restore + direct modes).
+  // None / undefined = inherit Run Defaults at fire time.
+  strict_match?: boolean | null;
+  // Phase C (admin-management follow-up, 2026-05-15): per-library
+  // metric filter. Authoritative when set; the engine consults this
+  // per library. Forward-typed via the shared LibraryMetricsMap.
+  // ``null`` (or undefined) on legacy schedule rows; the backend
+  // ScheduleIn validator expands global include_* flags into this
+  // map at save time so post-save schedules always have a populated
+  // map matching their library list.
+  library_metrics?: Record<string, { watch_history: boolean; ratings: boolean; playlists: boolean; collections: boolean }> | null;
+  // 2026-05-16 alignment additions (Plan[SCHEDULES-ALIGNMENT]):
+  // bring the schedule row up to Run Job parity so the editor can
+  // mirror the Run Job form 1:1.
+  include_managed_users?: boolean;
+  rate_mode?: 'default' | 'tunable' | 'numeric_only' | null;
+  rate_threshold?: number | null;
+  user_create_specs?: Array<{
+    source_user_handle: string;
+    target_username: string;
+    temp_password: string;
+    target_user_policy?: Record<string, unknown> | null;
+  }> | null;
+  // PIN-preflight acknowledgement persisted at save time. Cleared
+  // automatically by the editor when source_server_name changes.
+  pin_preflight_ack?: boolean;
+  // Per-Run Settings parity: overwrite_playlists is a no-op flag
+  // in the engine today but Run Job exposes it, so Schedules adopt
+  // it for the PerRunSettingsPanel prop surface to match.
+  overwrite_playlists?: boolean | null;
+  // Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-run overrides for
+  // the mixed-media playlist strategy. All optional; null/undefined
+  // inherits the corresponding global tunable from
+  // Tunables ▸ Playlist ▸ Mixed-media. Same field set lives on
+  // SnapshotJobIn / RestoreJobIn / DirectTransferIn server-side, so
+  // the editor wires identically across modes.
+  mixed_media_behavior?: 'skip' | 'dominant' | 'split' | null;
+  mixed_media_dominance_threshold?: number | null;
+  mixed_media_video_routing?: 'library_agnostic' | 'library_dominant' | null;
+  mixed_media_logging?: 'full' | 'decisions_only' | 'off' | null;
+  mixed_media_collision_handling?: 'duplicate' | 'suffix' | 'skip' | null;
+  // Phase C: per-destination cross-platform preflight resolutions
+  // persisted on the schedule row. Key is destination_server_id.
+  // Read by the scheduler at fire time + by the resolution editor
+  // UI for re-editing. Backend computes resolutions_status from
+  // this against the destination's current user roster.
+  cross_platform_resolutions?: Record<string, unknown> | null;
+  resolutions_status?: 'ok' | 'auto_fallback' | 'needs_review';
 }
 
 export interface LogRun {
@@ -626,6 +922,14 @@ export interface LogRun {
   size: number;
   passed: boolean | null;
   file_count: number;
+  // Per-server identity surfaced by the backend (Servers > Logs).
+  // Backend extracts ``server_slug`` from the run-dir name and
+  // reverse-maps to a registered server via safe_server_name. Either
+  // is null when the run-dir doesn't conform to the expected format
+  // or the server has since been removed from the registry.
+  server_slug?: string | null;
+  server_id?: string | null;
+  server_name?: string | null;
 }
 
 export interface LogFile {
@@ -655,6 +959,105 @@ export interface DbStats {
   last_updated_at: Record<string, number | null>;
   size_bytes: number;
   path: string;
+}
+
+// Feature 3 phase 3.3 / 3.4: developer-tool unit test runner.
+//
+// ``DevTestRunSummary`` is the shape POST /api/dev/run-tests returns
+// and GET /api/dev/test-runs returns one of per run in its ``runs``
+// array. Mirrors server.dev_test_harness.RunResult.to_summary_dict.
+// The frontend's Developer tab renders this both for the most-recent
+// run (POST response) and for the history list (GET response).
+export interface DevTestFailedTest {
+  nodeid: string;
+  duration_seconds: number;
+  error_excerpt: string;
+}
+
+export interface DevTestXfailTest {
+  nodeid: string;
+  reason: string;
+}
+
+export interface DevTestRunSummary {
+  run_id: string;
+  mode: 'synthetic' | 'structural' | 'live' | string;
+  started_at: number;
+  ended_at: number;
+  duration_seconds: number;
+  test_target: string;
+  filter: string | null;
+  exit_code: number;
+  operator: string | null;
+  totals: {
+    collected: number;
+    passed_normal: number;
+    passed_xfail: number;
+    failed: number;
+    errors: number;
+    skipped: number;
+    unexpected_pass: number;
+  };
+  failed_tests: DevTestFailedTest[];
+  xfail_tests: DevTestXfailTest[];
+  raises_tests: string[];
+  log_path: string;
+  _summary_filename?: string;
+}
+
+// Feature 1 phase 1.5: runtime breakdown panel.
+//
+// ``RuntimeRunSummary`` is one row in the Recent Runs list returned
+// by GET /api/run-timings/runs. ``RuntimeEntry`` is one row in the
+// per-run drilldown returned by GET /api/run-timings/runs/<id>. The
+// shapes mirror server.run_timings_db's read helpers; see that
+// module for the schema details.
+export interface RuntimeRunSummary {
+  run_id: string;
+  started_at: number;
+  ended_at: number;
+  duration_seconds: number;
+  entry_count: number;
+  total_items_processed: number;
+}
+
+export interface RuntimeEntry {
+  id: number;
+  run_id: string;
+  scope: 'run' | 'library' | 'user' | 'batch' | 'operation' | string;
+  label: string;
+  server_id: string | null;
+  library: string | null;
+  user_handle: string | null;
+  started_at: number;
+  ended_at: number;
+  duration_seconds: number;
+  items_processed: number | null;
+  etr_at_start: number | null;
+  recorded_at: number;
+  extra: Record<string, unknown>;
+}
+
+// Phase 4 of the dashboard / log reorg: per-RUN row in the
+// run_history sibling table. One row per completed job; drives
+// Servers > Recent Runtimes. has_settings_log / has_restoration_log
+// gate the deep-link buttons in the row's "Logs" cell.
+export interface RecentRunRow {
+  run_id: string;
+  started_at: number;
+  finished_at: number;
+  job_type: string;
+  server_id: string | null;
+  server_name: string | null;
+  libraries: string[];
+  users_affected: number;
+  users_affected_list: string[];
+  state: string;
+  duration_ms: number;
+  run_log_dir: string | null;
+  has_settings_log: boolean;
+  has_restoration_log: boolean;
+  error_summary: string | null;
 }
 
 export interface ServerTime {
@@ -702,13 +1105,19 @@ export interface Snapshot {
   file_path: string;
   captured_at: number;            // unix seconds
   libraries: string[];
+  // Phase E (2026-05-16): ``user_count`` is the full roster captured
+  // (owner + every managed user the engine attempted), and
+  // ``user_count_with_data`` is the subset that contributed rows to
+  // at least one metric table. The Exports panel renders
+  // "N of M users" when the two differ.
   user_count: number | null;
+  user_count_with_data: number | null;
   row_counts: Record<string, number>;
   file_size: number | null;
   prebuilt_json_path: string | null;
   // True when the .db at file_path is on disk. False rows are
   // rendered with a "File missing" badge + disabled Download +
-  // a Remove-entry button so the operator can clean dead rows.
+  // a Remove-entry button so the end user can clean dead rows.
   available: boolean;
   // True when a .plexexport.json sidecar has already been rendered
   // for this snapshot (either via the prebuild-on-capture toggle or
@@ -719,7 +1128,7 @@ export interface Snapshot {
   has_cached_sidecar: boolean;
   // Size of the cached .plexexport.json sidecar on disk, in bytes.
   // Null when no cache exists yet; the UI labels the column
-  // accordingly so the operator can compare .db vs JSON size at
+  // accordingly so the end user can compare .db vs JSON size at
   // a glance once both are present.
   sidecar_size: number | null;
   // Which data types the originating run actually gathered. Subset
@@ -731,7 +1140,26 @@ export interface Snapshot {
   // what THIS run touched. Null on rows captured before the column
   // landed; the frontend falls back to row_counts heuristics then.
   captured_types: string[] | null;
+  // Phase D (admin-management follow-up, 2026-05-15): a short
+  // human-readable one-line summary stamped at capture time. Lists
+  // the server, user count, library set, and metric set. Null on
+  // pre-Phase-D rows (the Exports panel renders an em-dash placeholder
+  // for null).
+  description: string | null;
 }
+
+// Phase C (admin-management follow-up, 2026-05-15): per-library metric
+// filter. Keys are library names; values describe which metric tables
+// to capture for THAT library. The legacy global include_* flags are
+// expanded into this shape at request-parse time so the engine only
+// ever consults the map.
+export interface LibraryMetricsRow {
+  watch_history: boolean;
+  ratings: boolean;
+  playlists: boolean;
+  collections: boolean;
+}
+export type LibraryMetricsMap = Record<string, LibraryMetricsRow>;
 
 // ── Auth (v0.11.0) ───────────────────────────────────────────────────────────
 //
@@ -756,6 +1184,28 @@ let _accessToken: string | null = null;
 // surfaces (which is anywhere, because every panel may call the API).
 let _onUnauthorized: (() => void) | null = null;
 
+// Phase 6 of the dashboard / log reorg: callback fired when an API
+// call returns 403 with the elevation-required detail. App.tsx
+// registers a handler that opens the ElevateModal, prompts for the
+// password, calls /api/auth/elevate, and resolves the promise true on
+// success / false on cancel. The http<T> helper waits on that promise
+// and transparently retries the original request when it resolves
+// true. This pattern lets any caller benefit from the auto-retry
+// without changing its signature.
+//
+// The detail string the backend returns is the marker; matching it
+// exactly keeps unrelated 403s (genuine permission failures) flowing
+// through the normal error path instead of triggering the modal.
+let _onElevationRequired:
+  | (() => Promise<boolean>)
+  | null = null;
+
+/**
+ * Substring the backend's elevation gate puts in its 403 detail.
+ * Kept as a const so tests and the modal share the canonical token.
+ */
+export const ELEVATION_REQUIRED_DETAIL_MARKER = 'recent password re-confirmation';
+
 // ── Token persistence - LoginBugFix1 (no persistence) ───────────────
 //
 // The token lives ONLY in this module's in-memory closure for the
@@ -764,7 +1214,7 @@ let _onUnauthorized: (() => void) | null = null;
 // the frontend.
 //
 // Reasoning (see LoginBugFix1.md): the prior "session" / "persistent"
-// modes let the operator's browser sync (Chrome sync, etc.) replicate
+// modes let the end user's browser sync (Chrome sync, etc.) replicate
 // the token across devices, which broke the basic safety property
 // that "opening the app on a new device requires logging in." A
 // page reload is also a fresh JS context - it correctly triggers
@@ -821,6 +1271,20 @@ export function onUnauthorized(handler: () => void): void {
   _onUnauthorized = handler;
 }
 
+/**
+ * Phase 6 - register the elevation handler. App.tsx supplies a
+ * function that opens the ElevateModal and resolves the returned
+ * promise true after a successful POST /api/auth/elevate, or false
+ * when the user cancels. Subsequent 403s carrying the elevation
+ * marker call this handler and retry the original request on
+ * resolved-true.
+ */
+export function onElevationRequired(
+  handler: (() => Promise<boolean>) | null,
+): void {
+  _onElevationRequired = handler;
+}
+
 // ── Auth types (PR-A2 / PR-A3) ──────────────────────────────────────────────
 
 /**
@@ -847,6 +1311,12 @@ export type Permission =
 export interface AuthStatus {
   auth_enabled: boolean;
   setup_needed: boolean;
+  // Item 1 (admin-management plan): which onboarding model has run.
+  // 1 = legacy single-account install (pre-Item-1). 2 = v2 two-step
+  // setup OR an upgrade-split completed. When setup_needed=false and
+  // setup_version=1, the frontend forces the upgrade-split modal on
+  // first login after upgrade.
+  setup_version?: number;
 }
 
 export interface AuthUser {
@@ -903,7 +1373,7 @@ export interface UserPermissionsResponse {
   root_admin_immune_to_revokes?: boolean;
 }
 
-// PR-10 - per-server managed users (Plex / Emby / Jellyfin operators
+// PR-10 - per-server managed users (Plex / Emby / Jellyfin end users
 // known to a registered server). Distinct from ``ManagedUser`` above,
 // which is the app-login user table. The API never returns plaintext
 // credentials; ``has_token`` / ``has_pin`` / ``has_password`` flags
@@ -938,11 +1408,142 @@ export interface ServerManagedUser {
   hidden_scope: ManagedUserHiddenScope;
   created_at: number;
   updated_at: number;
+  // 2026-05-15 share-state cross-reference. ``active_share`` is true
+  // when Plex.tv's /api/servers/{mid}/shared_servers confirms the user
+  // currently has an active share on this server; false when they did
+  // before but no longer. ``is_pin_protected`` reflects Plex.tv's
+  // /api/home/users ``protected`` flag. ``shared_state_refreshed_at``
+  // is the unix timestamp of the last successful refresh (null when
+  // the row hasn't been refreshed since the migration). UI consumers
+  // grey out stale rows in User Management, hide them in the picker,
+  // and surface a PIN badge when ``is_pin_protected`` is true.
+  active_share: boolean;
+  is_pin_protected: boolean;
+  shared_state_refreshed_at: number | null;
+  // 2026-05-15 follow-up #3 (migration v10). Canonical per-user
+  // identifier - the Plex.tv numeric userID for Plex servers, the
+  // equivalent backend-native id for Jellyfin / Emby once those
+  // adapters land. Null on rows that pre-date v10 or that haven't
+  // yet been resolved by the share-state refresh (which backfills
+  // on first successful alias match). The matcher uses this as the
+  // primary key for active_share decisions, making the gate immune
+  // to display-name drift, Unicode quirks, and duplicate names.
+  backend_user_id: string | null;
+  // USER-MGMT-IDENTITY-AUDIT (migration v12). App-generated stable
+  // user identifier in canonical form
+  // ``<Service>-<HostNameSlug>-<server_uid>-<userkey>``. Used as
+  // the cross-server validation handle in user_identity_map and
+  // surfaced on the User Management detail view's identity-links
+  // panel. Null on rows the boot-time backfill has not yet
+  // processed - new rows added through the standard upsert path
+  // always carry one.
+  app_user_uuid: string | null;
 }
 
 export interface GlobalTombstone {
   username: string;
   tombstoned_at: number;
+}
+
+
+// ── Databases viewer (Plan[DATABASES-VIEWER]-2026-05-16) ─────────────────
+// Mirrors server/db_browser.py's response shapes.
+
+export type DatabaseCardinality = 'single' | 'many';
+export type DatabaseSensitivity = 'high' | 'medium' | 'low';
+
+export interface DatabaseTypeSummary {
+  key: string;
+  display_name: string;
+  description: string;
+  cardinality: DatabaseCardinality;
+  sensitivity: DatabaseSensitivity;
+}
+
+export interface DatabaseInstance {
+  instance_id: string;
+  label: string;
+  file_path: string;
+  size_bytes: number;
+  exists?: boolean;
+  // snapshot_file-only fields (populated when the parent type is 'snapshot_file')
+  server_id?: string | null;
+  server_name?: string | null;
+  service_type?: string | null;
+  snapshot_name?: string | null;
+  captured_at?: number | null;
+}
+
+export interface DatabaseInstanceMetadata {
+  db_type: string;
+  instance_id: string;
+  file_path: string;
+  size_bytes: number;
+  modified_at: number;
+  schema_version: number | null;
+  wal_present: boolean;
+}
+
+export interface DatabaseColumn {
+  name: string;
+  type: string;
+  notnull: boolean;
+  default: string | null;
+  is_primary_key: boolean;
+}
+
+export interface DatabaseIndex {
+  name: string;
+  unique: boolean;
+  columns: string[];
+}
+
+export interface DatabaseTable {
+  name: string;
+  row_count: number;
+  columns: DatabaseColumn[];
+  indexes: DatabaseIndex[];
+  ddl: string;
+}
+
+export interface DatabaseInstanceSchema {
+  db_type: string;
+  instance_id: string;
+  tables: DatabaseTable[];
+}
+
+// Cell shape: the server pre-formats every value with security-aware
+// substitutions. ``display`` is always present (the human-readable
+// string). Optional fields:
+//
+//   * ``raw``           - the underlying value when safe to surface
+//                         (e.g. full text behind a truncation, raw
+//                         epoch behind an ISO timestamp display).
+//   * ``raw_present``   - true when the underlying value is held
+//                         back for security (encrypted columns,
+//                         bcrypt hashes, redacted refresh tokens).
+//                         The UI can offer no expand affordance for
+//                         these; they are deliberately one-way.
+//   * ``truncated``     - true for long TEXT clipped to the first
+//                         200 chars; the UI offers an "expand"
+//                         affordance to reveal ``raw``.
+export interface DatabaseCell {
+  display: string | number | boolean | null;
+  raw?: string | number | boolean | null;
+  raw_present?: boolean;
+  truncated?: boolean;
+}
+
+export interface DatabaseTableRowsPage {
+  db_type: string;
+  instance_id: string;
+  table: string;
+  columns: string[];
+  rows: DatabaseCell[][];
+  total_rows: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 
@@ -1027,13 +1628,33 @@ async function http<T>(path: string, init?: RequestInit, _isRetry = false): Prom
     // read". Read raw text once, then try to parse as JSON to extract
     // ``detail``; either way the original text is available for the
     // error message.
-    let detail = '';
+    // ``detail`` is whatever FastAPI puts in the ``detail`` slot of
+    // the JSON body. Some routes return a plain string, some return
+    // a structured ``{code, message}`` object (developer's playlist-mgmt
+    // routes do this for SMART_PLAYLIST_NOT_PORTABLE, PLAYLIST_NOT_FOUND,
+    // DEST_USER_TOKEN_MISSING, etc.). We keep the raw value here so the
+    // downstream Error message can format both shapes correctly. Without
+    // this, structured detail ended up as ``[object Object]`` in the
+    // thrown message because string-template coerces an object via
+    // ``Object.prototype.toString``.
+    let detail: string | Record<string, unknown> = '';
     try {
       const raw = await res.text();
       if (raw) {
         try {
           const body = JSON.parse(raw);
-          detail = (body && typeof body === 'object' && body.detail) || raw;
+          if (body && typeof body === 'object' && 'detail' in body) {
+            const inner = (body as { detail: unknown }).detail;
+            if (typeof inner === 'string') {
+              detail = inner;
+            } else if (inner && typeof inner === 'object') {
+              detail = inner as Record<string, unknown>;
+            } else {
+              detail = raw;
+            }
+          } else {
+            detail = raw;
+          }
         } catch {
           detail = raw;
         }
@@ -1043,10 +1664,392 @@ async function http<T>(path: string, init?: RequestInit, _isRetry = false): Prom
       // the status code + statusText below still tell the user
       // something useful.
     }
-    throw new Error(`${res.status} ${res.statusText}${detail ? `: ${detail}` : ''}`);
+    // Phase 6: 403s carrying the elevation-required marker are
+    // intercepted here. The handler opens the modal, captures the
+    // password, calls /api/auth/elevate, and resolves true on
+    // success. We then retry the original request once. A user
+    // cancel (resolved false) falls through to the normal throw so
+    // the caller sees a clean 403.
+    //
+    // The retry is gated on _isRetry so a misbehaving elevate flow
+    // (where the second call still returns 403) cannot infinite-loop.
+    // _isRetry is also already used by the 401-then-refresh path.
+    if (
+      res.status === 403
+      && !_isRetry
+      && _onElevationRequired
+      && typeof detail === 'string'
+      && detail.includes(ELEVATION_REQUIRED_DETAIL_MARKER)
+    ) {
+      try {
+        const ok = await _onElevationRequired();
+        if (ok) {
+          return http<T>(path, init, true);
+        }
+      } catch {
+        // Handler threw - fall through to the normal error throw
+        // below so the caller sees the original 403 and the modal
+        // closes via its own cancel path.
+      }
+    }
+    // Format the message. Structured ``{code, message}`` detail (returned
+    // by several /api/playlist-mgmt routes) is rendered as ``CODE: message``
+    // so the end user-actionable string is readable in toasts and result
+    // panels. When the detail carries both fields we additionally throw
+    // a ``PlaylistMgmtStructuredError`` so callers can ``instanceof``-
+    // dispatch on the code (e.g. handle DEST_USER_NOT_FOUND or
+    // DEST_USER_TOKEN_MISSING specifically). Plain-text details fall
+    // through to a regular ``Error`` so existing callers keep working.
+    let detailText = '';
+    let structuredCode: string | null = null;
+    let structuredMessage: string | null = null;
+    if (typeof detail === 'string') {
+      detailText = detail;
+    } else if (detail && typeof detail === 'object') {
+      const code = typeof (detail as { code?: unknown }).code === 'string'
+        ? (detail as { code: string }).code
+        : null;
+      const message = typeof (detail as { message?: unknown }).message === 'string'
+        ? (detail as { message: string }).message
+        : null;
+      structuredCode = code;
+      structuredMessage = message;
+      if (code && message) detailText = `${code}: ${message}`;
+      else if (message) detailText = message;
+      else if (code) detailText = code;
+      else {
+        try { detailText = JSON.stringify(detail); }
+        catch { detailText = '(unserializable detail)'; }
+      }
+    }
+    if (structuredCode && structuredMessage) {
+      throw new PlaylistMgmtStructuredError(
+        res.status, structuredCode, structuredMessage,
+      );
+    }
+    throw new Error(`${res.status} ${res.statusText}${detailText ? `: ${detailText}` : ''}`);
   }
   if (res.status === 204) return undefined as unknown as T;
   return (await res.json()) as T;
+}
+
+// ── Cross-platform preflight types (Phase C, 2026-05-16) ────────────────────
+//
+// Mirror of the Pydantic models in server/models.py:2260-2432
+// (CrossPlatformPreflightReport + dependents). developer ships and
+// owns the backend shapes; this block stays in sync.
+//
+// Contract sources:
+//   * Plan[UI-FOR-PREFLIGHT]-2026-05-16.md (data shape spec)
+//   * developer ACK on 2026-05-16 (PreflightResponse wrapper +
+//     InlineCreateUserResponse refinements)
+
+export type CppProposedResolution =
+  | 'identity_map'
+  | 'direct_match'
+  | 'single_admin_fallback'
+  | 'role_flip_ack'
+  | 'tombstone_blocked'
+  | 'zero_row_skip'
+  | 'no_match'
+  | 'multi_admin_collapse';
+
+export type CppOverallVerdict = 'ok' | 'ack_required' | 'blocked';
+export type CppSourceRole = 'owner' | 'admin' | 'managed';
+export type CppDestRole = 'owner' | 'admin' | 'managed';
+export type CppResolutionAction = 'map' | 'create' | 'drop' | 'accept_proposed';
+export type CppResolutionsStatus = 'ok' | 'auto_fallback' | 'needs_review';
+
+export interface CppUserRowCounts {
+  watch_history: number;
+  ratings: number;
+  playlists: number;
+  collections: number;
+}
+
+export interface CppDestUserOption {
+  backend_user_id: string;
+  username: string;
+  role: CppDestRole;
+  is_tombstoned: boolean;
+}
+
+export interface CppUserResolution {
+  source_username: string;
+  source_role: CppSourceRole;
+  source_row_counts: CppUserRowCounts;
+  proposed_resolution: CppProposedResolution;
+  proposed_dest_user_id: string | null;
+  proposed_dest_username: string | null;
+  proposed_dest_role: CppDestRole | null;
+  needs_ack: boolean;
+  blocks_submit: boolean;
+  warnings: string[];
+  available_dest_users: CppDestUserOption[];
+}
+
+export interface CppLibraryTypeNote {
+  source_library: string;
+  source_type: string;
+  dest_type_used: string;
+  message: string;
+}
+
+export interface CppTombstoneNote {
+  dest_username: string;
+  reason: string;
+}
+
+export interface CppZeroRowSkip {
+  source_username: string;
+  empty_signals: string[];
+  filter_flags_in_effect: string[];
+  message: string;
+}
+
+export interface CrossPlatformPreflightReport {
+  source_kind: string;
+  dest_kind: string;
+  source_server_id: string;
+  dest_server_id: string;
+  is_cross_platform: boolean;
+  source_admin_count: number;
+  dest_admin_count: number;
+  resolutions: CppUserResolution[];
+  smart_playlists_skipped: number;
+  smart_playlist_names: string[];
+  library_type_notes: CppLibraryTypeNote[];
+  tombstoned_users_excluded: CppTombstoneNote[];
+  zero_row_skipped: CppZeroRowSkip[];
+  overall_verdict: CppOverallVerdict;
+  blocking_reasons: string[];
+}
+
+// Uniform wrapper used by both preflight endpoints. Single-destination
+// jobs return one entry in ``reports``; fan-out / schedule responses
+// return N entries keyed by destination_server_id. ``aggregate_verdict``
+// is the worst-of across reports - the Submit gate reads this one
+// boolean.
+export interface PreflightResponse {
+  reports: Record<string, CrossPlatformPreflightReport>;
+  aggregate_verdict: CppOverallVerdict;
+}
+
+export interface CppUserResolutionDecision {
+  source_username: string;
+  action: CppResolutionAction;
+  // Populated when action='map'
+  dest_user_id?: string;
+  final_role?: 'admin' | 'managed';
+  // Populated when action='create'
+  create_username?: string;
+  create_role?: 'admin' | 'managed';
+  create_password?: string;
+  admin_acknowledgement?: boolean;
+}
+
+export interface CrossPlatformPreflightAck {
+  source_server_id: string;
+  dest_server_id: string;
+  resolutions: CppUserResolutionDecision[];
+  apply_col_scope_prefix: boolean;
+  persist_as_identity_map: boolean;
+}
+
+export interface InlineCreateUserBody {
+  destination_server_id: string;
+  username: string;
+  role: 'admin' | 'managed';
+  initial_password?: string;
+  acknowledgement: boolean;
+}
+
+export interface InlineCreateUserResponse {
+  user: CppDestUserOption;
+  was_newly_created: boolean;
+}
+
+// PATCH /api/schedules/{id}/resolutions body shape.
+export interface ScheduleResolutionsPatch {
+  resolutions: Record<string, CrossPlatformPreflightAck>;
+}
+
+// ── Playlist Management types (Plan[PLAYLIST-MANAGEMENT] section 5) ─────────
+//
+// Scaffolded against the documented shapes per developer's
+// coordination note (2026-05-16). developer's Pydantic models commit
+// with the Playlist Mgmt foundation next session; when they land
+// these types should match 1:1 with no structural drift.
+
+export interface PlaylistSpec {
+  playlist_id: string;
+  name: string;
+  item_count: number;
+  is_smart: boolean;
+}
+
+export interface PlaylistItem {
+  title: string;
+  guids: string[];
+  type: string; // 'movie' | 'episode' | 'audio' | ...
+  duration_ms: number | null;
+}
+
+export interface PlaylistDetail {
+  playlist_id: string;
+  name: string;
+  is_smart: boolean;
+  items: PlaylistItem[];
+  fetched_at: number; // epoch seconds
+  from_cache: boolean;
+}
+
+export interface PlaylistCopyIn {
+  source_server_id: string; // prefixed UID
+  source_user_id: string;
+  source_playlist_id: string;
+  dest_server_id: string;
+  dest_user_id: string;
+  dest_playlist_name?: string;
+}
+
+export interface PlaylistCopyResult {
+  success: boolean;
+  new_playlist_id: string | null;
+  items_written: number;
+  items_skipped_no_match: number;
+  items_failed: number;
+  errors: string[];
+  elapsed_seconds: number;
+  // 2026-05-17 (same-user-skip): true when copy_playlist short-
+  // circuited because source + dest resolved to the same logical
+  // user. The "Written / Skipped / Failed" counter row is hidden
+  // when true; ActiveDeploysPanel surfaces ``skip_reason`` instead.
+  skipped?: boolean;
+  skip_reason?: string | null;
+}
+
+export interface PlaylistCacheStatus {
+  server_id: string;
+  user_id: string;
+  last_refreshed_at: number; // epoch seconds
+  playlists_count: number;
+  age_seconds: number;
+  is_stale: boolean; // age > snapshot_threshold
+}
+
+// Returned by POST /api/playlist-mgmt/cache/refresh (per-user) and
+// /api/playlist-mgmt/cache/refresh-server (per-server bulk). Bulk
+// results surface `user_id = null` on the aggregate row.
+// Reconciled against developer's Pydantic PlaylistCacheRefreshResult
+// at server/models.py:2802 (2026-05-16).
+export interface PlaylistCacheRefreshResult {
+  server_id: string;
+  user_id: string | null;
+  refreshed_at: number;
+  playlists_count: number;
+  items_count: number;
+  duration_ms: number;
+  error: string | null;
+}
+
+// ── Playlist Mgmt endpoint response envelopes (developer shipped 2026-05-16) ──
+//
+// developer's shipped endpoints wrap the actual payloads in small
+// envelopes carrying query parameters back to the caller. The
+// frontend unwraps them at the API method boundary.
+
+// User shape returned by /api/playlist-mgmt/users — uniform across
+// all 3 backends. Different from the legacy `ServerUser` shape
+// (which keys by plex_id / raw_name / kind).
+export interface PlaylistMgmtUser {
+  backend_user_id: string;
+  username: string;
+  role: 'owner' | 'admin' | 'managed';
+  // 2026-05-16 (developer): true when service_type=plex AND a
+  // managed_users row exists for (server_id, username) AND its
+  // auth_token_enc is non-null. Always false on Jellyfin/Emby; the
+  // per-user-token affordance only matters for Plex Home routes.
+  has_token: boolean;
+  // 2026-05-16 (developer schema-v12 follow-up): canonical app-generated
+  // identifier from media_db.managed_users. Guaranteed unique per
+  // (server, user) when present. May be null for live-only users that
+  // haven't been written to managed_users yet; UI keying logic falls
+  // back to backend_user_id / username in that case.
+  app_user_uuid: string | null;
+}
+
+export interface PlaylistMgmtUsersResponse {
+  server_id: string;
+  service_type: 'plex' | 'jellyfin' | 'emby' | string;
+  users: PlaylistMgmtUser[];
+}
+
+// 2026-05-17 (end user request): job-tracked deploy. Each playlist
+// copy submitted via /api/playlist-mgmt/copy-job becomes a JobRecord
+// in the existing queue; this is the end user-facing serialization
+// returned by /api/playlist-mgmt/copy-jobs.
+export interface PlaylistCopyJob {
+  job_id: string;
+  // Matches JobRecord.state — typically 'queued' | 'running' |
+  // 'completed' | 'completed_with_errors' | 'failed' | 'cancelled'.
+  state: string;
+  queued_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  // Non-null when the worker stamped an error on rec.error. Distinct
+  // from the per-item misses inside result.errors — this is a
+  // single-line summary surfaced when the job state is 'failed' or
+  // 'completed_with_errors'.
+  error: string | null;
+  // The PlaylistCopyResult shape from copy_playlist. Null while the
+  // job is queued; populated as soon as the worker stamps a summary.
+  result: PlaylistCopyResult | null;
+  // The original PlaylistCopyIn submission, surfaced so the Clone
+  // Deploy button can re-submit without local memory.
+  params: {
+    source_server_id?: string;
+    source_user_id?: string;
+    source_playlist_id?: string;
+    dest_server_id?: string;
+    dest_user_id?: string;
+    dest_playlist_name?: string | null;
+  };
+}
+
+// Structured-error shape returned by /api/playlist-mgmt/copy on 4xx/5xx.
+// Codes developer documents: SMART_PLAYLIST_NOT_PORTABLE (422),
+// DEST_USER_TOKEN_MISSING (412), SOURCE_UNREACHABLE /
+// DEST_UNREACHABLE (502), PLAYLIST_NOT_FOUND / DEST_USER_NOT_FOUND
+// (404), DEST_WRITE_FAILED (502).
+export class PlaylistMgmtStructuredError extends Error {
+  status: number;
+  code: string;
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.name = 'PlaylistMgmtStructuredError';
+  }
+}
+
+export interface PlaylistMgmtPlaylistsResponse {
+  server_id: string;
+  user_id: string;
+  from_cache: boolean;
+  fetched_at: number;
+  playlists: PlaylistSpec[];
+}
+
+export interface PlaylistMgmtCacheStatusResponse {
+  server_id: string;
+  rows: PlaylistCacheStatus[];
+}
+
+export interface PlaylistMgmtBulkRefreshResponse {
+  server_id: string;
+  // Per-user rows followed by an aggregate row (`user_id = null`).
+  results: PlaylistCacheRefreshResult[];
 }
 
 // ── Endpoint wrappers ────────────────────────────────────────────────────────
@@ -1064,6 +2067,115 @@ export const api = {
         ...(displayName ? { display_name: displayName } : {}),
       }),
     }),
+
+  // Item 1: atomic two-step first-boot setup. Creates an admin account
+  // AND a separate root_admin account in a single request; signs the
+  // end user in as the admin. The frontend collects both credentials
+  // in its wizard and submits them together so a half-complete setup
+  // cannot leave the install with only one account.
+  authSetupV2: (input: {
+    admin_username: string;
+    admin_password: string;
+    admin_display_name?: string;
+    root_username: string;
+    root_password: string;
+    root_display_name?: string;
+  }) =>
+    http<AuthSession>('/api/auth/setup-v2', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  // Item 1: forced legacy-install split. Caller is the legacy
+  // root_admin; this creates a new dedicated root_admin and demotes
+  // the caller to admin. Caller must re-prove their password.
+  authUpgradeSplit: (input: {
+    caller_password: string;
+    root_username: string;
+    root_password: string;
+    root_display_name?: string;
+  }) =>
+    http<{ caller_demoted_to: string; new_root_username: string }>(
+      '/api/auth/upgrade-split',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+
+  // Item 1: sudo-style elevation. Caller proves their own password and
+  // the backend stamps an elevation flag on the JWT's session for the
+  // configured TTL (default 10 min). Elevated sessions can hit
+  // require_elevation-gated endpoints (root_admin destructive writes).
+  authElevate: (password: string) =>
+    http<{ elevated_until: number }>('/api/auth/elevate', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    }),
+
+  authElevationStatus: () =>
+    http<{ elevated: boolean; elevated_until: number | null; ttl_seconds: number }>(
+      '/api/auth/elevation/status',
+    ),
+
+  authElevationClear: () =>
+    http<{ ok: boolean }>('/api/auth/elevation/clear', { method: 'POST' }),
+
+  authGrantRoot: (username: string) =>
+    http<{ username: string; role: string; noop: boolean }>(
+      `/api/auth/users/${encodeURIComponent(username)}/grant-root`,
+      { method: 'POST' },
+    ),
+
+  authRevokeRoot: (username: string, newRole: string = 'admin') =>
+    http<{ username: string; role: string }>(
+      `/api/auth/users/${encodeURIComponent(username)}/revoke-root`,
+      { method: 'POST', body: JSON.stringify({ new_role: newRole }) },
+    ),
+
+  // Item 3: cross-server PIN migration suggestions + apply.
+  pinMigrationSuggestions: (serverId: string) =>
+    http<{ suggestions: PinMigrationSuggestion[] }>(
+      `/api/servers/${encodeURIComponent(serverId)}/pin-migration-suggestions`,
+    ),
+  pinMigrationApply: (
+    serverId: string,
+    suggestions: PinMigrationSuggestion[],
+  ) =>
+    http<{ applied: string[]; skipped: string[]; errors: string[] }>(
+      `/api/servers/${encodeURIComponent(serverId)}/pin-migration/apply`,
+      { method: 'POST', body: JSON.stringify({ suggestions }) },
+    ),
+
+  // Item 5: per-user manual token rotation. Bypasses the throttle
+  // and the additive-only contract for one user. Requires sudo-style
+  // elevation on the backend.
+  rotateManagedUserToken: (serverId: string, username: string) =>
+    http<{ captured: number; skipped_existing: number; throttled: boolean; errors: string[] }>(
+      `/api/servers/${encodeURIComponent(serverId)}/managed-users/${encodeURIComponent(username)}/rotate-token`,
+      { method: 'POST' },
+    ),
+
+  // 2026-05-16 (developer): persist a Plex Home user's X-Plex-Token so
+  // the Playlist Management `per_user_token` auth mode can create
+  // playlists under that user instead of the destination admin.
+  // Body re-authenticates db_admin per call (same gate as the broader
+  // managed-users PATCH). When clear_auth_token=true, auth_token is
+  // ignored and the row's token is wiped. Plex-only endpoint; non-Plex
+  // destinations 400 out.
+  setPlexHomeToken: (
+    serverId: string,
+    username: string,
+    body: {
+      db_admin_username: string;
+      db_admin_password: string;
+      auth_token: string | null;
+      clear_auth_token: boolean;
+      display_name?: string | null;
+    },
+  ) =>
+    http<ServerManagedUser>(
+      `/api/managed-users/${encodeURIComponent(serverId)}/${encodeURIComponent(username)}/plex-home-token`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+
   authLogin: (username: string, password: string) =>
     http<AuthSession>('/api/auth/login', {
       method: 'POST',
@@ -1189,7 +2301,7 @@ export const api = {
     ),
 
   // PR-9.1 - Database Admin Account (role='db_admin'). A SEPARATE row
-  // from the application-login admin so the operator can authorise
+  // from the application-login admin so the end user can authorise
   // destructive User Management writes (PR-10) with a credential they
   // don't use for everyday login. Always reachable regardless of
   // ``PLEXMIGRATE_AUTH_ENABLED``. Each mutating call carries the
@@ -1218,7 +2330,7 @@ export const api = {
 
   // PR-9.1 - Application-login admin (role='admin') management. The
   // existing first-boot ``/api/auth/setup`` flow is still the only
-  // path that CREATES this row; these endpoints let the operator
+  // path that CREATES this row; these endpoints let the end user
   // surface and UPDATE it from Settings → Accounts.
   getLoginAccountStatus: () =>
     http<{ has_admin: boolean; username: string | null }>('/api/auth/login-account/status'),
@@ -1271,8 +2383,16 @@ export const api = {
   // "Test Connection" button in the add-server form so testing
   // doesn't side-effect the registry. Also flags name mismatch and
   // duplicate-machine-identifier collisions so the UI can warn before
-  // the operator clicks Save.
-  testUnsavedServer: (body: { name: string; url: string; token: string }) =>
+  // the end user clicks Save.
+  testUnsavedServer: (body: {
+    name: string;
+    url: string;
+    token: string;
+    // PR-Backends: when omitted, the backend defaults to 'plex'.
+    // The Add Server form sets this explicitly based on the radio
+    // picker so the probe goes through the right adapter.
+    service_type?: 'plex' | 'jellyfin' | 'emby';
+  }) =>
     http<ProbeUnsavedResult>('/api/servers/test-unsaved', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -1283,6 +2403,21 @@ export const api = {
   // "Refresh" button.
   refreshServer: (id: string) =>
     http<ServerView>(`/api/servers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  // Retry the pending token stashed at Add-time (the end user's
+  // original token that failed with 401 but was kept aside for later
+  // retry once Plex.tv finished propagating the new server's
+  // authorization). On success, the backend swaps the pending into
+  // the active slot and clears every pending_* field. The response
+  // carries the outcome so the panel can refresh in place.
+  retryPendingToken: (id: string) =>
+    http<{
+      ok: boolean;
+      swapped: boolean;
+      status: string;
+      detail: string;
+    }>(`/api/servers/${encodeURIComponent(id)}/retry-pending-token`, {
+      method: 'POST',
+    }),
   pingServer: (id: string) =>
     http<PingResult>(`/api/servers/${encodeURIComponent(id)}/ping`, { method: 'POST' }),
   listServerLibraries: (id: string) =>
@@ -1335,12 +2470,222 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(params),
     }),
+
+  // Plan[ETA-TRAINING] PR-D: adaptive ETA prediction. The job-form
+  // preview hits this on every change (debounced) so the end user
+  // sees a learned "~12m (typically 8-15m)" estimate before submit.
+  predictEta: (body: EtaPredictRequest) =>
+    http<EtaPrediction>('/api/eta/predict', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  // Snapshot of the trainer's bucket store. Run Job form's 'Training
+  // progress' disclosure consumes this so the end user can confirm
+  // each bucket is accumulating samples after every job.
+  etaTrainingStatus: (server_id?: string) => {
+    const qs = server_id ? `?server_id=${encodeURIComponent(server_id)}` : '';
+    return http<EtaTrainingStatus>(`/api/eta/training-status${qs}`);
+  },
+
+  // Settings Run History database export / import. Per-table JSON
+  // dumps for backup + interop; replace-only import behind typed
+  // REPLACE confirmation. Per-server pivot for inspecting one
+  // server's identity-related rows in isolation.
+  listDatabaseTables: () =>
+    http<{ tables: Array<{
+      table_id: string;
+      db_file: string;
+      table_name: string;
+      row_count: number | null;
+      available: boolean;
+      per_server: boolean;
+    }> }>('/api/database/tables'),
+
+  exportDatabaseTable: (table_id: string) =>
+    http<Record<string, unknown>>(
+      `/api/database/export/${encodeURIComponent(table_id)}`,
+    ),
+
+  exportDatabaseArchive: () =>
+    http<Record<string, unknown>>('/api/database/export-all'),
+
+  importDatabaseTable: (table_id: string, payload: Record<string, unknown>) =>
+    http<{ table_id: string; deleted: number; inserted: number }>(
+      `/api/database/import/${encodeURIComponent(table_id)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ confirm: 'REPLACE', payload }),
+      },
+    ),
+
+  importDatabaseArchive: (payload: Record<string, unknown>) =>
+    http<{
+      per_table: Record<string, { deleted?: number; inserted?: number; error?: string }>;
+      total_deleted: number;
+      total_inserted: number;
+      errors: string[];
+    }>('/api/database/import-archive', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: 'REPLACE', payload }),
+    }),
+
+  listDatabasePerServer: (server_id: string) =>
+    http<{ server_id: string; tables: Array<{
+      table_id: string;
+      db_file: string;
+      table_name: string;
+      row_count: number;
+    }> }>(`/api/database/per-server/${encodeURIComponent(server_id)}`),
+
+  exportDatabasePerServer: (server_id: string) =>
+    http<Record<string, unknown>>(
+      `/api/database/export-per-server/${encodeURIComponent(server_id)}`,
+    ),
+
+  // Settings Run History "Repair legacy training data" button. Backfills
+  // missing server_id on run_timings entries by joining run_history.
+  // End user follows this with backfillEtaWeights(true) to rebuild
+  // the bucket store from the now-complete history.
+  etaRepairServerIds: () =>
+    http<{ updated: number; still_orphan: number }>('/api/eta/repair-server-ids', {
+      method: 'POST',
+    }),
+
+  // Settings ETA Training "Flush all training data" button. Admin-
+  // only; behind a typed FLUSH confirmation.
+  etaFlushAll: (include_run_timings: boolean) =>
+    http<{
+      in_memory_buckets_cleared: number;
+      eta_buckets_rows_deleted: number;
+      run_timings_rows_deleted: number;
+    }>('/api/eta/flush', {
+      method: 'POST',
+      body: JSON.stringify({ include_run_timings, confirm: 'FLUSH' }),
+    }),
+
+  // Plan[ETA-TRAINING] D-RESET: end user's "I just upgraded this
+  // server's storage; the learned timings are wrong" escape hatch.
+  // Behind a typed RESET confirmation in the server panel.
+  resetEtaWeights: (server_id: string) =>
+    http<{ server_id: string; removed: number }>('/api/eta/reset', {
+      method: 'POST',
+      body: JSON.stringify({ server_id, confirm: 'RESET' }),
+    }),
+
+  // Gap-A of the post-cutover review: warm-start the ETA engine
+  // from the historical run_timings table. Admin-only; safe to
+  // re-run (additive unless reset_first is true).
+  backfillEtaWeights: (reset_first: boolean = false) =>
+    http<{ entries_read: number; buckets_touched: number }>(
+      '/api/eta/backfill',
+      { method: 'POST', body: JSON.stringify({ reset_first }) },
+    ),
+
+  // Plan[RUN-JOB-UI] follow-up: ad-hoc single-user copy +
+  // cross-server identity mapping.
+  copyUserToDestination: (body: {
+    source_server_id: string;
+    target_server_id: string;
+    source_user_handle: string;
+    target_username: string;
+    temp_password: string;
+    target_user_policy?: Record<string, unknown> | null;
+  }) =>
+    http<{
+      backend_user_id: string;
+      target_username: string;
+      source_user_handle: string;
+    }>('/api/users/copy_to_destination', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  addUserIdentityMap: (body: {
+    server_a_id: string;
+    user_a_handle: string;
+    server_b_id: string;
+    user_b_handle: string;
+    source?: 'manual' | 'auto_copy';
+  }) =>
+    http<{ id: number | null; duplicate: boolean }>(
+      '/api/users/identity_map',
+      { method: 'POST', body: JSON.stringify({ source: 'manual', ...body }) },
+    ),
+
+  listUserIdentityMaps: () =>
+    http<{ maps: UserIdentityMap[] }>('/api/users/identity_map'),
+
+  deleteUserIdentityMap: (map_id: number) =>
+    http<{ removed: boolean; id: number }>(
+      `/api/users/identity_map/${map_id}`,
+      { method: 'DELETE' },
+    ),
+
+  // USER-MGMT-IDENTITY-AUDIT follow-on: end user-triggered rerun of
+  // the backend_user_id auto-link helper. The helper also fires
+  // automatically after every managed-users sync; this button is
+  // for end users who just added a manual mapping or registered a
+  // new server and want immediate cross-server detection without
+  // waiting for the next sync.
+  rerunAutoLinkIdentityMap: () =>
+    http<{ pairs_written: number; pairs_skipped_duplicate: number; groups_seen: number }>(
+      '/api/users/identity_map/rerun-auto-link',
+      { method: 'POST' },
+    ),
+
+  // ── Databases viewer (Plan[DATABASES-VIEWER]-2026-05-16) ──────────
+  //
+  // Root-admin only at the route layer. The frontend mirrors the
+  // server's read-only contract: no edit endpoints exist and none
+  // are exposed here. Cell values are pre-formatted server-side so
+  // the UI just renders ``display``.
+
+  dbBrowserListDatabases: () =>
+    http<{ databases: DatabaseTypeSummary[] }>('/api/db-browser/databases'),
+
+  dbBrowserListInstances: (db_type: string) =>
+    http<{ instances: DatabaseInstance[] }>(
+      `/api/db-browser/${encodeURIComponent(db_type)}/instances`,
+    ),
+
+  dbBrowserMetadata: (db_type: string, instance_id: string) =>
+    http<DatabaseInstanceMetadata>(
+      `/api/db-browser/${encodeURIComponent(db_type)}/${encodeURIComponent(instance_id)}/metadata`,
+    ),
+
+  dbBrowserSchema: (db_type: string, instance_id: string) =>
+    http<DatabaseInstanceSchema>(
+      `/api/db-browser/${encodeURIComponent(db_type)}/${encodeURIComponent(instance_id)}/schema`,
+    ),
+
+  dbBrowserRows: (
+    db_type: string,
+    instance_id: string,
+    table: string,
+    opts: {
+      limit?: number;
+      offset?: number;
+      filter_column?: string;
+      filter_value?: string;
+    } = {},
+  ) => {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts.offset !== undefined) params.set('offset', String(opts.offset));
+    if (opts.filter_column) params.set('filter_column', opts.filter_column);
+    if (opts.filter_value !== undefined) params.set('filter_value', opts.filter_value);
+    const qs = params.toString();
+    return http<DatabaseTableRowsPage>(
+      `/api/db-browser/${encodeURIComponent(db_type)}/${encodeURIComponent(instance_id)}/tables/${encodeURIComponent(table)}/rows${qs ? `?${qs}` : ''}`,
+    );
+  },
   // PR-12 preflight. Returns the at-risk managed-user list (empty
   // when the modal should be skipped: restore mode, or every user is
   // already credentialed). The frontend renders the warning modal
   // when ``checked && at_risk_users.length > 0`` and stamps
   // ``pin_preflight_acknowledged: true`` on the next submit when the
-  // operator clicks Continue anyway.
+  // end user clicks Continue anyway.
   preflightPinCheck: (params: {
     mode: 'snapshot' | 'restore' | 'direct';
     source_server_name?: string | null;
@@ -1362,6 +2707,32 @@ export const api = {
       { method: 'POST' },
     ),
 
+  // ── Cross-platform preflight (developer backend, Phase C) ─────────────
+  // Body shape matches /api/job submit for jobs preflight, and the
+  // schedule create/edit body for schedule preflight. Backend
+  // computes a CrossPlatformPreflightReport per destination and
+  // wraps them in PreflightResponse with an aggregate verdict.
+  jobsCrossPlatformPreflight: (params: Record<string, unknown>) =>
+    http<PreflightResponse>('/api/jobs/cross-platform-preflight', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }),
+  schedulesCrossPlatformPreflight: (params: Record<string, unknown>) =>
+    http<PreflightResponse>('/api/schedules/cross-platform-preflight', {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }),
+  jobsInlineCreateUser: (body: InlineCreateUserBody) =>
+    http<InlineCreateUserResponse>('/api/jobs/inline-create-user', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  schedulesUpdateResolutions: (id: string, body: ScheduleResolutionsPatch) =>
+    http<Schedule>(`/api/schedules/${encodeURIComponent(id)}/resolutions`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
   // Schedules
   listSchedules: () => http<Schedule[]>('/api/schedules'),
   createSchedule: (s: Schedule) =>
@@ -1376,6 +2747,51 @@ export const api = {
 
   // Logs
   listLogRuns: () => http<LogRun[]>('/api/logs'),
+
+  // Application-level logs (Settings > Application Logs). Admin-gated.
+  //
+  // Categories: 'db-access' (db_access.log) is the only category
+  // with a real backing log file today; 'auth', 'network', 'debug'
+  // are scaffolded placeholders.
+  //
+  // ``tailBytes`` defaults to 0, which the backend resolves to the
+  // end user-tuned log_read_max_bytes (default 16 MB). Pass an
+  // explicit non-zero value to read less. ``since`` selects polling
+  // mode (since=0 returns the tail; since=<offset> returns bytes
+  // from offset to current end). ``backup`` switches the read
+  // target from the active file to a specific rotated backup
+  // (e.g. "db_access.log.1"); when set, the endpoint ignores
+  // ``since`` and always returns the tail of that backup.
+  //
+  // Response distinguishes two truncation cases:
+  //
+  //   * head_omitted: initial-tail of a file larger than the read
+  //     cap. Older bytes are still in the same file.
+  //   * rotated_during_poll: the polling cursor landed past the
+  //     file's current end. Logrotate fired; older bytes are now
+  //     in the .1 (or higher) backup, listed in ``backups``.
+  readAppLog: (
+    category: string,
+    tailBytes = 0,
+    since = 0,
+    backup = '',
+  ) =>
+    http<{
+      category: string;
+      path: string;
+      size_bytes: number;
+      next_offset: number;
+      head_omitted: boolean;
+      rotated_during_poll: boolean;
+      content: string;
+      backups: Array<{ filename: string; size_bytes: number }>;
+      note: string;
+    }>(
+      `/api/logs/app/${encodeURIComponent(category)}`
+        + `?tail_bytes=${encodeURIComponent(tailBytes)}`
+        + `&since=${encodeURIComponent(since)}`
+        + (backup ? `&backup=${encodeURIComponent(backup)}` : ''),
+    ),
   listLogFiles: (run: string) => http<LogFile[]>(`/api/logs/${encodeURIComponent(run)}`),
   readLogFile: (run: string, name: string, since: number = 0) =>
     http<LogFileContent>(
@@ -1406,16 +2822,143 @@ export const api = {
   // minute fields with the zone they're interpreted in.
   getServerTime: () => http<ServerTime>('/api/server-time'),
 
+  // ── Playlist Management endpoints (developer shipped 2026-05-16) ──
+  // All endpoints accept query params for server_id + user_id +
+  // (optional) force_refresh; responses are wrapped in small
+  // envelopes that re-surface the query parameters. The methods
+  // below unwrap to the inner payload where the end user-visible
+  // data lives.
+  playlistMgmtListUsers: (serverId: string, forceRefresh = false) =>
+    http<PlaylistMgmtUsersResponse>(
+      `/api/playlist-mgmt/users?server_id=${encodeURIComponent(serverId)}${forceRefresh ? '&force_refresh=true' : ''}`,
+    ),
+  playlistMgmtListPlaylists: (serverId: string, userId: string, forceRefresh = false) =>
+    http<PlaylistMgmtPlaylistsResponse>(
+      `/api/playlist-mgmt/playlists?server_id=${encodeURIComponent(serverId)}&user_id=${encodeURIComponent(userId)}${forceRefresh ? '&force_refresh=true' : ''}`,
+    ),
+  playlistMgmtGetDetail: (serverId: string, userId: string, playlistId: string, forceRefresh = false) =>
+    http<PlaylistDetail>(
+      `/api/playlist-mgmt/playlist-detail?server_id=${encodeURIComponent(serverId)}&user_id=${encodeURIComponent(userId)}&playlist_id=${encodeURIComponent(playlistId)}${forceRefresh ? '&force_refresh=true' : ''}`,
+    ),
+  // Synchronous copy path. Kept for scripted callers / back-compat.
+  // The UI now uses the async copy-job pair below so deploys persist
+  // beyond page reload and stack on the active-deploys panel.
+  playlistMgmtCopy: (body: PlaylistCopyIn) =>
+    http<PlaylistCopyResult>('/api/playlist-mgmt/copy', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  // 2026-05-17 (end user request): async path. Submits the playlist
+  // copy as a job in the existing queue and returns the job_id
+  // immediately. The active-deploys panel then polls
+  // /api/playlist-mgmt/copy-jobs for state + result.
+  submitPlaylistCopyJob: (body: PlaylistCopyIn) =>
+    http<{ job_id: string; state: string }>(
+      '/api/playlist-mgmt/copy-job',
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  listPlaylistCopyJobs: () =>
+    http<{ jobs: PlaylistCopyJob[] }>(
+      '/api/playlist-mgmt/copy-jobs',
+    ),
+  playlistMgmtRefreshCache: (serverId: string, userId: string) =>
+    http<PlaylistCacheRefreshResult>('/api/playlist-mgmt/cache/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ server_id: serverId, user_id: userId }),
+    }),
+  // Per-server bulk refresh (locked answer #4). Body uses
+  // `user_id: null` to signal bulk. Response is a list of per-user
+  // PlaylistCacheRefreshResult rows + a final aggregate row with
+  // `user_id = null`.
+  playlistMgmtRefreshServer: (serverId: string, source: string = 'api') =>
+    http<PlaylistMgmtBulkRefreshResponse>(
+      `/api/playlist-mgmt/cache/refresh-server?source=${encodeURIComponent(source)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ server_id: serverId, user_id: null }),
+      },
+    ),
+  playlistMgmtCacheStatus: (serverId: string) =>
+    http<PlaylistMgmtCacheStatusResponse>(
+      `/api/playlist-mgmt/cache/status?server_id=${encodeURIComponent(serverId)}`,
+    ),
+
   // Engine + wire-protocol version, surfaced for the Help panel's
   // Troubleshooting page so bug reports auto-stamp the right build.
   getHealth: () =>
-    http<{ ok: boolean; api_version: string; app_version: string }>('/api/health'),
+    http<{
+      ok: boolean;
+      api_version: string;
+      app_version: string;
+      debug_mode?: boolean;
+    }>('/api/health'),
 
 
   // v0.12.0: media-state database health. Returns schema version,
   // per-table row counts, on-disk size, last-updated timestamps.
   // Used by diagnostic tools and the upcoming Database tab.
   getDbStats: () => http<DbStats>('/api/db/stats'),
+
+  // Feature 1 phase 1.5: runtime breakdown.
+  // ``limit`` is clamped server-side to [1, 200]; the panel default
+  // (25) matches the backend's default so a missing query string
+  // returns the same shape either way.
+  listRuntimeRuns: (limit = 25) =>
+    http<{ runs: RuntimeRunSummary[] }>(
+      `/api/run-timings/runs?limit=${encodeURIComponent(limit)}`,
+    ),
+
+  // Drill into one run. Returns ``{run_id, entries: []}`` for an
+  // unknown run_id (404 would force two empty-state branches in the
+  // panel for no actual gain).
+  getRuntimeRunDetail: (runId: string) =>
+    http<{ run_id: string; entries: RuntimeEntry[] }>(
+      `/api/run-timings/runs/${encodeURIComponent(runId)}`,
+    ),
+
+  // Phase 4 of the dashboard / log reorg: list per-run history rows.
+  // Backend clamps the limit to [1, 500]; default 200 matches the
+  // server-side default. Optional filters narrow to one server or
+  // one library.
+  listRecentRunHistory: (opts: {
+    limit?: number;
+    serverId?: string;
+    library?: string;
+  } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts.serverId) params.set('server_id', opts.serverId);
+    if (opts.library) params.set('library', opts.library);
+    const q = params.toString();
+    return http<{ runs: RecentRunRow[] }>(
+      `/api/runs/recent${q ? `?${q}` : ''}`,
+    );
+  },
+
+  // Drill into one run history row by id. 404 when absent.
+  getRecentRunDetail: (runId: string) =>
+    http<RecentRunRow>(`/api/runs/recent/${encodeURIComponent(runId)}`),
+
+  // Feature 3: developer tool unit test runner. Both endpoints
+  // return 403 when PLEXMIGRATE_DEBUG_MODE is unset on the backend.
+  // The Developer tab gates its render on the debug_mode field of
+  // /api/health; these calls only fire from inside the tab so a 403
+  // here indicates a server-side env-var change between page load
+  // and submit.
+  runDevTests: (body: {
+    mode: 'synthetic' | 'structural' | 'live';
+    pytest_filter?: string | null;
+    confirm_live?: boolean;
+  }) =>
+    http<DevTestRunSummary>('/api/dev/run-tests', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  listDevTestRuns: (limit = 25) =>
+    http<{ runs: DevTestRunSummary[] }>(
+      `/api/dev/test-runs?limit=${encodeURIComponent(limit)}`,
+    ),
 
   // Rule 2: library walk + prune missing items.
   getLibraryWalkStatus: (serverId: string) =>
@@ -1496,6 +3039,17 @@ export const api = {
       { method: 'DELETE', body: JSON.stringify(body) },
     ),
 
+  // Reassign orphan snapshot rows into a target server. Admin-gated;
+  // non-destructive (rewrites server_id only, never deletes files).
+  // The Exports panel already merges orphan rows at display time, so
+  // end users rarely need this; it exists for end users who want the
+  // underlying registry to be clean rather than display-side-clean.
+  mergeOrphanSnapshots: (serverId: string) =>
+    http<{ checked: number; reassigned: number; no_op: number }>(
+      `/api/snapshots/server/${encodeURIComponent(serverId)}/merge-orphans`,
+      { method: 'POST', body: JSON.stringify({}) },
+    ),
+
   // Legacy on-disk ``.plexexport.json`` files relocated to
   // ``snapshots/legacy/`` by the PR-13 migration. Read-only browse
   // + download, db_admin-gated delete.
@@ -1523,7 +3077,7 @@ export const api = {
     ),
 
   // PR-10 - per-server managed users (the User Management sub-tab
-  // under Servers). Reads are JWT-only (operator+); writes carry
+  // under Servers). Reads are JWT-only (end user+); writes carry
   // db_admin credentials in the body and the backend re-validates
   // them on every call.
   // PR-11.1 - the list endpoint accepts ``include_hidden`` so the
@@ -1706,7 +3260,7 @@ export class DashboardWsClient {
       // rejected). With Fix 1's 30-minute access token TTL this is
       // the expected path when an idle session crosses the expiry
       // line - we attempt a silent refresh and reconnect at once,
-      // bypassing the normal linear backoff so the operator sees
+      // bypassing the normal linear backoff so the end user sees
       // at most a 1-2 second blip instead of waiting for the next
       // poll cycle to invalidate-and-refresh the token.
       if (ev.code === 4001) {

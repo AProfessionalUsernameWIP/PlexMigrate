@@ -258,7 +258,7 @@ def _compute_merge_views_to_add(
         equals or exceeds stored). Computed as ``max(0, stored - current)``.
       * ``"sum"`` - add stored on top of current; destination ends at
         ``current + stored``. NOT idempotent: re-running the same
-        snapshot doubles the destination count. Operator opt-in for
+        snapshot doubles the destination count. End user opt-in for
         cases where the snapshot represents real plays on a different
         server that should contribute alongside, not replace.
 
@@ -376,7 +376,7 @@ def restore_watch_history(
     #   "sum" - final destination view count is current + stored.
     #       Every captured play is treated as a real event that adds
     #       to the destination's count. NOT idempotent: re-running the
-    #       same job will double-count. Operator opt-in.
+    #       same job will double-count. End user opt-in.
     # Ignored when mode == "replace" (Replace overwrites unconditionally,
     # so there is no notion of combining counts).
     merge_watch_strategy: str = "higher",
@@ -391,7 +391,7 @@ def restore_watch_history(
             * ``higher`` (default) - increase by max(0, stored - current),
               so destination ends at max(stored, current). Idempotent.
             * ``sum`` - increase by exactly ``stored``, so destination
-              ends at current + stored. Operator opt-in; NOT idempotent.
+              ends at current + stored. End user opt-in; NOT idempotent.
         - Resume position: only set if the target item has NO saved progress.
 
     Replace (opt-in, destructive):
@@ -400,7 +400,7 @@ def restore_watch_history(
           first, then we scrobble up to the stored count (capped by
           VIEWCOUNT_INCREMENT_CAP).
         - Resume position: set to the stored value unconditionally.
-        - Used for true point-in-time recovery. Operator-gated by the
+        - Used for true point-in-time recovery. End user-gated by the
           UI's typed-REPLACE confirmation; the safety belt auto-captures
           a pre-replace snapshot of the destination before the engine
           fires.
@@ -500,6 +500,15 @@ def restore_watch_history(
                         "IMPORT", lib_name, stored.get("type", "?"), stored["title"],
                         user=user, tier=tier, result="UNRESOLVED", reason=reason,
                     ))
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.failed(
+                        library=lib_name,
+                        item_title=stored.get("title", "?"),
+                        user=user,
+                        metric="view_count",
+                        reason=f"resolver_no_match: {reason}" if reason else "resolver_no_match",
+                    )
                 return
         finally:
             # Only clear on the unresolved-return path; the resolved
@@ -524,7 +533,7 @@ def restore_watch_history(
 
             # v0.13.x Replace mode: set viewCount to exactly the stored
             # value. If the destination is currently HIGHER than the
-            # snapshot (the operator watched something after the
+            # snapshot (the end user watched something after the
             # snapshot was taken), reset to 0 first via markUnplayed so
             # the scrobble loop below can bring it back up to the stored
             # value. The resume position is always overwritten.
@@ -543,7 +552,7 @@ def restore_watch_history(
                         # Best-effort: continue with the scrobble path
                         # anyway. The end state will be at least
                         # stored + (original current - stored) - not
-                        # perfect, but the operator was warned.
+                        # perfect, but the end user was warned.
                 views_to_add = max(0, stored_view_count - current_view_count)
                 set_offset_unconditionally = True
             else:
@@ -563,6 +572,8 @@ def restore_watch_history(
                 # even when view counts already match. Merge mode keeps
                 # the legacy skip-with-no-work behaviour.
                 if mode == "replace" and stored_view_offset != current_view_offset:
+                    _rlog = getattr(state, "_restoration_log", None)
+                    _t0 = time.monotonic()
                     try:
                         with scrobble_sem:
                             _set_resume_position(
@@ -575,11 +586,29 @@ def restore_watch_history(
                             "type": stored.get("type", "?"),
                             "action": f"[REPLACED] view_offset = {stored_view_offset}",
                         })
+                        if _rlog is not None:
+                            _rlog.restored(
+                                library=lib_name,
+                                item_title=stored.get("title", "?"),
+                                user=user,
+                                metric="view_offset",
+                                before=current_view_offset,
+                                after=stored_view_offset,
+                                duration_ms=int((time.monotonic() - _t0) * 1000),
+                            )
                     except Exception as exc:
                         logger.warning(
                             "[%s] Replace: failed to set view_offset on %r: %s",
                             lib_name, stored.get("title", "?"), exc,
                         )
+                        if _rlog is not None:
+                            _rlog.failed(
+                                library=lib_name,
+                                item_title=stored.get("title", "?"),
+                                user=user,
+                                metric="view_offset",
+                                reason=f"set_resume_position: {exc}",
+                            )
                     return
                 _record_success(lib_name, {
                     "ts": ts, "tier": tier,
@@ -595,6 +624,17 @@ def restore_watch_history(
                         plays=f"stored={stored_view_count} target={current_view_count}",
                         result="skipped",
                     ))
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.noop(
+                        library=lib_name,
+                        item_title=stored.get("title", "?"),
+                        user=user,
+                        metric="view_count",
+                        before=current_view_count,
+                        after=current_view_count,
+                        reason="already_matched",
+                    )
                 return
 
             # Bound the per-item scrobble burst to VIEWCOUNT_INCREMENT_CAP so
@@ -605,12 +645,13 @@ def restore_watch_history(
             actual_views = min(views_to_add, state.VIEWCOUNT_INCREMENT_CAP)
             capped = actual_views < views_to_add
 
+            _scrobble_t0 = time.monotonic()
             with scrobble_sem:
                 for _ in range(actual_views):
                     _scrobble(base_url, live_item.ratingKey, token)
 
                 # Merge: only set offset when target has no progress.
-                # Replace: always overwrite (operator wants point-in-time).
+                # Replace: always overwrite (end user wants point-in-time).
                 if set_offset_unconditionally:
                     if stored_view_offset != current_view_offset:
                         _set_resume_position(base_url, live_item.ratingKey, stored_view_offset, token)
@@ -642,6 +683,17 @@ def restore_watch_history(
                     plays=plays_str,
                     result="OK",
                 ))
+            _rlog = getattr(state, "_restoration_log", None)
+            if _rlog is not None:
+                _rlog.restored(
+                    library=lib_name,
+                    item_title=stored.get("title", "?"),
+                    user=user,
+                    metric="view_count",
+                    before=current_view_count,
+                    after=current_view_count + actual_views,
+                    duration_ms=int((time.monotonic() - _scrobble_t0) * 1000),
+                )
 
         except Exception as e:
             _record_failure(lib_name, {
@@ -656,6 +708,15 @@ def restore_watch_history(
             logger.warning(
                 f"[{lib_name}] API error restoring watch for '{stored['title']}': {e}"
             )
+            _rlog = getattr(state, "_restoration_log", None)
+            if _rlog is not None:
+                _rlog.failed(
+                    library=lib_name,
+                    item_title=stored.get("title", "?"),
+                    user=user,
+                    metric="view_count",
+                    reason=f"api_error: {e}",
+                )
         finally:
             if state.get_dashboard():
                 state.get_dashboard().clear_current_item()
@@ -690,6 +751,7 @@ def restore_playlists(
     existing_playlists: Optional[Dict[str, Any]] = None,
     stop_event: Optional[threading.Event] = None,
     mode: str = "merge",
+    user: str = "Plex Owner",
 ) -> None:
     """
     Imports playlists. Two modes:
@@ -733,6 +795,33 @@ def restore_playlists(
     # library that had no playlists to import.
     if not playlists and existing_playlists is None:
         return
+
+    # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: pre-restore transform.
+    # Reads the run-level mixed-media config from state (set by
+    # jobs.py before invoking the engine); applies the end user's
+    # skip/dominant/split strategy on rows whose source items span
+    # multiple Plex playlist-type families. Non-mixed rows pass
+    # through unchanged. Legacy snapshots whose items lack a `type`
+    # field classify as non-mixed and bypass the transform.
+    try:
+        from services import mixed_media as _mm
+        _mm_cfg = state.get_mixed_media_config()
+        if _mm_cfg is not None:
+            playlists = _mm.transform_playlists_for_restore(
+                playlists,
+                config=_mm_cfg,
+                per_user_configs=state.get_mixed_media_per_user_configs(),
+                logger=logger,
+            )
+            if not playlists:
+                # Everything got filtered out; nothing left to restore.
+                return
+    except Exception:
+        logger.exception(
+            "[%s] mixed-media pre-restore transform failed; falling back "
+            "to raw payload (existing playlist write semantics).",
+            lib_name,
+        )
 
     if state.get_dashboard():
         _non_smart_pl = sum(1 for pl_data in playlists if not pl_data.get("smart", False))
@@ -835,7 +924,7 @@ def restore_playlists(
         try:
             if pl_data.get("smart", False):
                 smart_content = pl_data.get("smart_content", "")
-                # Rule 5: surface the operator-facing reason at INFO so
+                # Rule 5: surface the end user-facing reason at INFO so
                 # the run log line is unambiguous and survives without
                 # log-level filtering.
                 logger.info(
@@ -858,6 +947,15 @@ def restore_playlists(
                         restored=0,
                         smart=True,
                         reason="Smart playlist - requires manual recreation on destination",
+                    )
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.skipped(
+                        library=lib_name,
+                        item_title=pl_name,
+                        user=user,
+                        metric="playlist_member",
+                        reason="smart_playlist",
                     )
                 continue
 
@@ -921,9 +1019,19 @@ def restore_playlists(
                         skipped_items=unresolved_members,
                         reason="No members resolved on destination",
                     )
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.failed(
+                        library=lib_name,
+                        item_title=pl_name,
+                        user=user,
+                        metric="playlist_member",
+                        reason=f"no_members_resolved (0/{total_members})",
+                    )
                 continue
 
             if pl_name not in existing_playlists:
+                _pl_t0 = time.monotonic()
                 try:
                     _create_playlist_chunked(server, pl_name, resolved_items)
                     _record_success(lib_name, {
@@ -932,6 +1040,17 @@ def restore_playlists(
                         "action": f"[CREATED] with {len(resolved_items)} items",
                     })
                     logger.info(f"Created playlist '{pl_name}' with {len(resolved_items)} items")
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        _rlog.restored(
+                            library=lib_name,
+                            item_title=pl_name,
+                            user=user,
+                            metric="playlist_member",
+                            before=0,
+                            after=len(resolved_items),
+                            duration_ms=int((time.monotonic() - _pl_t0) * 1000),
+                        )
                 except Exception as e:
                     _record_failure(lib_name, {
                         "ts": ts, "tier": "none", "title": pl_name,
@@ -939,13 +1058,22 @@ def restore_playlists(
                         "guid": "", "filepath": "",
                     }, "api_error")
                     logger.error(f"Failed to create playlist '{pl_name}': {e}")
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        _rlog.failed(
+                            library=lib_name,
+                            item_title=pl_name,
+                            user=user,
+                            metric="playlist_member",
+                            reason=f"create_failed: {e}",
+                        )
 
             else:
                 existing_pl = existing_playlists[pl_name]
                 # Plex enforces a single media type per playlist
                 # ("audio" / "video" / "photo"). Trying to addItems
                 # across that boundary fails with a generic API error.
-                # Catch it up front so the operator sees a clear
+                # Catch it up front so the end user sees a clear
                 # "destination playlist X is the wrong type" message
                 # instead of "can not mix media types when building".
                 # The polluted destination state usually traces to a
@@ -979,7 +1107,7 @@ def restore_playlists(
                         pl_name, existing_pl_type, expected_pl_type,
                     )
                     # Surface in the per-container summary so the
-                    # Dashboard's restore table shows the operator
+                    # Dashboard's restore table shows the end user
                     # the exact playlist that needs cleanup.
                     if state.get_dashboard():
                         state.get_dashboard().record_container_result(
@@ -990,7 +1118,20 @@ def restore_playlists(
                             restored=0,
                             reason=reason,
                         )
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        _rlog.skipped(
+                            library=lib_name,
+                            item_title=pl_name,
+                            user=user,
+                            metric="playlist_member",
+                            reason=(
+                                f"type_conflict (destination={existing_pl_type!r}, "
+                                f"snapshot={expected_pl_type!r})"
+                            ),
+                        )
                     continue
+                _pl_t0 = time.monotonic()
                 try:
                     existing_items = list(existing_pl.items())
                     existing_keys: Set[int] = {
@@ -1046,6 +1187,28 @@ def restore_playlists(
                             f"Replaced playlist '{pl_name}': "
                             f"+{len(items_to_add)} added, -{len(items_to_remove)} removed"
                         )
+                        _rlog = getattr(state, "_restoration_log", None)
+                        if _rlog is not None:
+                            if items_to_add or items_to_remove:
+                                _rlog.restored(
+                                    library=lib_name,
+                                    item_title=pl_name,
+                                    user=user,
+                                    metric="playlist_member",
+                                    before=len(existing_items),
+                                    after=len(existing_items) + len(items_to_add) - len(items_to_remove),
+                                    duration_ms=int((time.monotonic() - _pl_t0) * 1000),
+                                )
+                            else:
+                                _rlog.noop(
+                                    library=lib_name,
+                                    item_title=pl_name,
+                                    user=user,
+                                    metric="playlist_member",
+                                    before=len(existing_items),
+                                    after=len(existing_items),
+                                    reason="replace_target_already_matched",
+                                )
                     else:
                         # Merge (default): additive union only.
                         if items_to_add:
@@ -1071,6 +1234,29 @@ def restore_playlists(
                                 f"Playlist '{pl_name}': all {len(items_present)} item(s) already present"
                             )
 
+                        _rlog = getattr(state, "_restoration_log", None)
+                        if _rlog is not None:
+                            if items_to_add:
+                                _rlog.restored(
+                                    library=lib_name,
+                                    item_title=pl_name,
+                                    user=user,
+                                    metric="playlist_member",
+                                    before=len(existing_items),
+                                    after=len(existing_items) + len(items_to_add),
+                                    duration_ms=int((time.monotonic() - _pl_t0) * 1000),
+                                )
+                            else:
+                                _rlog.noop(
+                                    library=lib_name,
+                                    item_title=pl_name,
+                                    user=user,
+                                    metric="playlist_member",
+                                    before=len(existing_items),
+                                    after=len(existing_items),
+                                    reason="already_present",
+                                )
+
                 except Exception as e:
                     _record_failure(lib_name, {
                         "ts": ts, "tier": "none", "title": pl_name,
@@ -1078,6 +1264,15 @@ def restore_playlists(
                         "guid": "", "filepath": "",
                     }, "api_error")
                     logger.error(f"Failed to update playlist '{pl_name}': {e}")
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        _rlog.failed(
+                            library=lib_name,
+                            item_title=pl_name,
+                            user=user,
+                            metric="playlist_member",
+                            reason=f"update_failed: {e}",
+                        )
 
             # Rule 4: emit the per-container result for the Dashboard
             # summary + JobRecord.summary. Reached on the create-or-
@@ -1118,6 +1313,7 @@ def restore_collections(
     scan_lock: Optional[threading.Lock] = None,
     stop_event: Optional[threading.Event] = None,
     mode: str = "merge",
+    user: str = "Plex Owner",
 ) -> None:
     """
     Imports collections. Two modes:
@@ -1230,9 +1426,19 @@ def restore_collections(
                     reason="No members resolved on destination",
                 )
                 state.get_dashboard().clear_current_item()
+            _rlog = getattr(state, "_restoration_log", None)
+            if _rlog is not None:
+                _rlog.failed(
+                    library=lib_name,
+                    item_title=coll_name,
+                    user=user,
+                    metric="collection_member",
+                    reason=f"no_members_resolved (0/{total_members})",
+                )
             continue
 
         if coll_name not in existing_collections:
+            _coll_t0 = time.monotonic()
             try:
                 _create_collection_chunked(server, coll_name, section, resolved_items)
                 _record_success(lib_name, {
@@ -1241,6 +1447,17 @@ def restore_collections(
                     "action": f"[CREATED] with {len(resolved_items)} member(s)",
                 })
                 logger.info(f"Created collection '{coll_name}' with {len(resolved_items)} items")
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.restored(
+                        library=lib_name,
+                        item_title=coll_name,
+                        user=user,
+                        metric="collection_member",
+                        before=0,
+                        after=len(resolved_items),
+                        duration_ms=int((time.monotonic() - _coll_t0) * 1000),
+                    )
             except Exception as e:
                 _record_failure(lib_name, {
                     "ts": ts, "tier": "none", "title": coll_name,
@@ -1248,9 +1465,19 @@ def restore_collections(
                     "guid": "", "filepath": "",
                 }, "api_error")
                 logger.error(f"Failed to create collection '{coll_name}': {e}")
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.failed(
+                        library=lib_name,
+                        item_title=coll_name,
+                        user=user,
+                        metric="collection_member",
+                        reason=f"create_failed: {e}",
+                    )
 
         else:
             existing_coll = existing_collections[coll_name]
+            _coll_t0 = time.monotonic()
             try:
                 existing_items = list(existing_coll.items())
                 existing_keys: Set[int] = {
@@ -1299,6 +1526,28 @@ def restore_collections(
                         f"Replaced collection '{coll_name}': "
                         f"+{len(items_to_add)} added, -{len(items_to_remove)} removed"
                     )
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        if items_to_add or items_to_remove:
+                            _rlog.restored(
+                                library=lib_name,
+                                item_title=coll_name,
+                                user=user,
+                                metric="collection_member",
+                                before=len(existing_items),
+                                after=len(existing_items) + len(items_to_add) - len(items_to_remove),
+                                duration_ms=int((time.monotonic() - _coll_t0) * 1000),
+                            )
+                        else:
+                            _rlog.noop(
+                                library=lib_name,
+                                item_title=coll_name,
+                                user=user,
+                                metric="collection_member",
+                                before=len(existing_items),
+                                after=len(existing_items),
+                                reason="replace_target_already_matched",
+                            )
                 else:
                     # Merge (default): additive union only.
                     if items_to_add:
@@ -1324,6 +1573,29 @@ def restore_collections(
                             f"Collection '{coll_name}': all {len(items_present)} member(s) already present"
                         )
 
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        if items_to_add:
+                            _rlog.restored(
+                                library=lib_name,
+                                item_title=coll_name,
+                                user=user,
+                                metric="collection_member",
+                                before=len(existing_items),
+                                after=len(existing_items) + len(items_to_add),
+                                duration_ms=int((time.monotonic() - _coll_t0) * 1000),
+                            )
+                        else:
+                            _rlog.noop(
+                                library=lib_name,
+                                item_title=coll_name,
+                                user=user,
+                                metric="collection_member",
+                                before=len(existing_items),
+                                after=len(existing_items),
+                                reason="already_present",
+                            )
+
             except Exception as e:
                 _record_failure(lib_name, {
                     "ts": ts, "tier": "none", "title": coll_name,
@@ -1331,6 +1603,15 @@ def restore_collections(
                     "guid": "", "filepath": "",
                 }, "api_error")
                 logger.error(f"Failed to update collection '{coll_name}': {e}")
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.failed(
+                        library=lib_name,
+                        item_title=coll_name,
+                        user=user,
+                        metric="collection_member",
+                        reason=f"update_failed: {e}",
+                    )
 
         # Rule 4: per-container result for the Dashboard summary +
         # JobRecord.summary.
@@ -1440,6 +1721,15 @@ def restore_ratings(
                         "IMPORT", lib_name, stored.get("type", "?"), stored["title"],
                         user=user, tier=tier, result="UNRESOLVED", reason=reason,
                     ))
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.failed(
+                        library=lib_name,
+                        item_title=stored.get("title", "?"),
+                        user=user,
+                        metric="rating",
+                        reason=f"resolver_no_match: {reason}" if reason else "resolver_no_match",
+                    )
                 return
 
             # Advance phase: resolve done, now we'll either skip
@@ -1483,12 +1773,32 @@ def restore_ratings(
                         rating=f"target={current_rating} export={export_rating}",
                         result="skipped",
                     ))
+                _rlog = getattr(state, "_restoration_log", None)
+                if _rlog is not None:
+                    _rlog.noop(
+                        library=lib_name,
+                        item_title=stored.get("title", "?"),
+                        user=user,
+                        metric="rating",
+                        before=current_rating,
+                        after=current_rating,
+                        reason="merge_target_already_rated",
+                    )
             else:
                 if export_rating is None:
                     logger.warning(
                         f"[{lib_name}] Rating record for '{stored.get('title','?')}' "
                         "carries no value (neither 'rating' nor 'user_rating'); skipped."
                     )
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        _rlog.skipped(
+                            library=lib_name,
+                            item_title=stored.get("title", "?"),
+                            user=user,
+                            metric="rating",
+                            reason="export_record_missing_value",
+                        )
                     return
                 # In Replace mode, a same-value rating is a no-op API
                 # call but still worth logging as REPLACED so the audit
@@ -1498,6 +1808,7 @@ def restore_ratings(
                     and current_rating is not None
                     and float(current_rating) == float(export_rating)
                 )
+                _rate_t0 = time.monotonic()
                 try:
                     if not already_matches:
                         _rate_item(base_url, live_item.ratingKey, export_rating, token)
@@ -1519,6 +1830,33 @@ def restore_ratings(
                             rating=export_rating,
                             result="SET",
                         ))
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        if already_matches:
+                            # Replace mode: the destination already had
+                            # the exact stored value, so no API call
+                            # fired. From the end user's perspective
+                            # nothing changed - that's a NOOP, not a
+                            # RESTORED, regardless of action_tag.
+                            _rlog.noop(
+                                library=lib_name,
+                                item_title=stored.get("title", "?"),
+                                user=user,
+                                metric="rating",
+                                before=current_rating,
+                                after=current_rating,
+                                reason="replace_target_already_matched",
+                            )
+                        else:
+                            _rlog.restored(
+                                library=lib_name,
+                                item_title=stored.get("title", "?"),
+                                user=user,
+                                metric="rating",
+                                before=current_rating,
+                                after=export_rating,
+                                duration_ms=int((time.monotonic() - _rate_t0) * 1000),
+                            )
                 except Exception as e:
                     _record_failure(lib_name, {
                         "ts": ts, "tier": tier,
@@ -1530,6 +1868,15 @@ def restore_ratings(
                         "type": stored.get("type", "?"),
                     }, "api_error")
                     logger.warning(f"[{lib_name}] Failed to set rating for '{stored['title']}': {e}")
+                    _rlog = getattr(state, "_restoration_log", None)
+                    if _rlog is not None:
+                        _rlog.failed(
+                            library=lib_name,
+                            item_title=stored.get("title", "?"),
+                            user=user,
+                            metric="rating",
+                            reason=f"api_error: {e}",
+                        )
         finally:
             if state.get_dashboard():
                 state.get_dashboard().clear_current_item()
@@ -1566,6 +1913,12 @@ def restore_export_file(
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric map. When provided AND this library has an entry, the
+    # entry's flags override the include_* booleans for this
+    # library only. Keys are library names. Same pattern as
+    # ``services.snapshotter.snapshot_library``.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
     # v0.15: per-library section selector for reconstructed payloads.
     # A reconstructed payload (from ``snapshot_serializer.build_payload_from_db``)
     # carries a top-level ``libraries`` array - one entry per library
@@ -1582,7 +1935,7 @@ def restore_export_file(
     library_section_id: Optional[int] = None,
     # Optional target-name override. When supplied, takes precedence
     # over the picked entry's ``library`` field for destination
-    # routing - the operator may have renamed the library on the
+    # routing - the end user may have renamed the library on the
     # destination. ``run_restore`` resolves this against the live
     # destination section list before submitting the task.
     target_section_name_override: Optional[str] = None,
@@ -1602,6 +1955,17 @@ def restore_export_file(
     # + managed usernames), the importer drops payload users whose
     # handle isn't in the set BEFORE running their per-user restore.
     user_filter: Optional[List[str]] = None,
+    # USER-MGMT-IDENTITY-AUDIT R-1: server identity for the
+    # cross-server user resolution chain. When BOTH are provided, the
+    # per-user fan-out below routes each source user via
+    # ``services.user_resolution.resolve_destination_user`` (the
+    # 5-step chain: per-job override -> identity_map -> backend_user_id
+    # direct -> case-insensitive name -> single-admin owner). When
+    # either is None or empty, the per-user fan-out preserves the
+    # legacy direct-name-match behaviour. Defaults preserve every
+    # existing caller.
+    source_server_id: Optional[str] = None,
+    dest_server_id: Optional[str] = None,
 ) -> None:
     """
     Imports a single .plexexport.json file into the target server.
@@ -1631,6 +1995,20 @@ def restore_export_file(
     else:
         with open(export_path, encoding="utf-8") as f:
             data = json.load(f)
+
+    # USER-MGMT-IDENTITY-AUDIT R-1: when the caller didn't supply
+    # source_server_id explicitly (the common case for snapshot-file
+    # restores; jobs.py usually only knows the destination), peek at
+    # the payload's snapshot_meta to recover the source. Best-effort:
+    # legacy payloads without snapshot_meta leave source_server_id at
+    # None and the resolver chain falls through to backend_user_id /
+    # username matching (legacy behaviour).
+    if not source_server_id:
+        meta = data.get("snapshot_meta") or data.get("meta") or {}
+        if isinstance(meta, dict):
+            inferred = (meta.get("server_id") or meta.get("source_server_id") or "").strip()
+            if inferred:
+                source_server_id = inferred
 
     # v0.15: if the payload is a reconstructed multi-library wrapper
     # (``libraries`` array at the top level), select the entry matching
@@ -1668,6 +2046,24 @@ def restore_export_file(
     else:
         lib_name = data.get("library", "Unknown")
         logger.info(f"Importing from {export_path} → library: {lib_name}")
+
+    # Phase C (admin-management follow-up, 2026-05-15): if a per-library
+    # metric map was passed in AND this library has an entry, override
+    # the include_* booleans for this library only. Every downstream
+    # restore_* call inside this function reads from the local
+    # include_* names; only this rebind point changes.
+    if library_metrics and lib_name in library_metrics:
+        _lm_row = library_metrics[lib_name]
+        if isinstance(_lm_row, dict):
+            include_watch_history = bool(_lm_row.get("watch_history", include_watch_history))
+            include_ratings = bool(_lm_row.get("ratings", include_ratings))
+            include_playlists = bool(_lm_row.get("playlists", include_playlists))
+            include_collections = bool(_lm_row.get("collections", include_collections))
+            logger.info(
+                "Per-library metric override (restore) for %r: "
+                "watch_history=%s ratings=%s playlists=%s collections=%s",
+                lib_name, include_watch_history, include_ratings, include_playlists, include_collections,
+            )
 
     # v0.9.6 Feature 2: tag every Plex API call this library makes with
     # the library name so the Network panel can attribute traffic
@@ -1804,7 +2200,7 @@ def restore_export_file(
         )
     else:
         # PR-6: per-library skip notices are INFO. They're expected
-        # normal-operations output that confirms the operator's
+        # normal-operations output that confirms the end user's
         # filter choice on a per-library basis - not noise. The
         # redundant top-level summary was removed in PR-6 instead.
         logger.info(
@@ -1871,7 +2267,7 @@ def restore_export_file(
         and isinstance(ub, dict)
         and ub.get("role") != "owner"
     }
-    # v0.14 - per-job user filter. When the operator picked a subset
+    # v0.14 - per-job user filter. When the end user picked a subset
     # of users on the Restore form, drop everyone else here BEFORE the
     # per-user fan-out. The owner row was already handled by the role
     # lookup above; the matching filter for owner is the email
@@ -1897,17 +2293,79 @@ def restore_export_file(
     user_lookup: Dict[str, Tuple[str, PlexServer]] = {
         uname: (utok, usrv) for uname, utok, usrv in (home_users or [])
     }
+    # USER-MGMT-IDENTITY-AUDIT R-1: build a UserSpec-like view of the
+    # destination's available home users so resolve_destination_user
+    # can apply the 5-step priority chain (per-job override ->
+    # identity_map -> backend_user_id direct -> case-insensitive name
+    # -> single-admin owner). When source_server_id + dest_server_id
+    # are BOTH provided, the resolver runs; otherwise this stays in
+    # legacy direct-name-match mode.
+    class _UserView:
+        """Adapter shim: resolve_destination_user reads ``.username``,
+        ``.role``, ``.backend_user_id``, and ``.service_type``. The
+        Plex home_users list only carries usernames, so the latter
+        three default to safe values that let steps 0/1/4 work while
+        step 2 (backend_user_id direct match) naturally short-circuits
+        because Plex home users don't expose backend_user_id here."""
+        __slots__ = ("username", "role", "backend_user_id", "service_type")
+        def __init__(self, username: str):
+            self.username = username
+            self.role = "managed"
+            self.backend_user_id = ""
+            self.service_type = "plex"
+    _resolver_enabled = bool(source_server_id and dest_server_id)
+    _dest_by_username_lc: Dict[str, _UserView] = (
+        {n.lower(): _UserView(n) for n in user_lookup}
+        if _resolver_enabled else {}
+    )
 
     def _restore_user(username: str, user_data: dict) -> str:
         """Import one home user's watch history, playlists, and ratings."""
-        if username not in user_lookup:
+        # Identity resolution: when the 5-step resolver is enabled,
+        # route the source username through it and use the matched
+        # destination handle to look up the (token, server) tuple.
+        # Legacy mode (resolver disabled) is identical to the prior
+        # ``if username not in user_lookup`` skip.
+        resolved_dest = username
+        if _resolver_enabled:
+            try:
+                from services.user_resolution import resolve_destination_user
+                match = resolve_destination_user(
+                    source_username=username,
+                    source_role="managed",
+                    dest_by_username=_dest_by_username_lc,
+                    dest_admins=[],
+                    source_server_id=source_server_id or "",
+                    dest_server_id=dest_server_id or "",
+                    logger=logger,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "user_resolution call failed for %r; falling back to "
+                    "direct-name match. cause: %s", username, exc,
+                )
+                match = _dest_by_username_lc.get(username.lower())
+            if match is None:
+                from services.user_display import display_for_logging
+                logger.info(
+                    f"Home user "
+                    f"'{display_for_logging(source_server_id, username)}' "
+                    f"did not resolve to any user on the destination "
+                    f"(no identity_map row, no name match) - skipped."
+                )
+                return "skipped"
+            resolved_dest = match.username
+        if resolved_dest not in user_lookup:
+            from services.user_display import display_for_logging
             logger.info(
-                f"Home user '{username}' is in the export but not on this server - "
-                f"skipped. Add them to Plex Home and re-run to import their data."
+                f"Home user "
+                f"'{display_for_logging(source_server_id, username)}' is in "
+                f"the export but not on this server - skipped. Add them to "
+                f"Plex Home and re-run to import their data."
             )
             return "skipped"
 
-        user_token, user_server = user_lookup[username]
+        user_token, user_server = user_lookup[resolved_dest]
 
         user_section = next(
             (s for s in user_server.library.sections() if s.title == lib_name),
@@ -1962,6 +2420,7 @@ def restore_export_file(
                     existing_playlists=None,
                     stop_event=stop_event,
                     mode=mode,
+                    user=username,
                 )
             # v0.9.7 Item 9: restore this user's personal collections
             # (Plex Pass feature - collections that live in their
@@ -1975,6 +2434,7 @@ def restore_export_file(
                     scan_cache, scan_lock,
                     stop_event=stop_event,
                     mode=mode,
+                    user=username,
                 )
             if include_ratings:
                 restore_ratings(
@@ -2061,11 +2521,26 @@ def run_restore(
     # silently with an info log.
     user_filter: Optional[List[str]] = None,
     # v0.13.x: library-level concurrency cap. Was a hardcoded
-    # ``min(3, len)``; now operator-tunable via settings. The final
+    # ``min(3, len)``; now end user-tunable via settings. The final
     # pool size is ``min(library_workers, len(libraries))`` so the
     # tunable is a ceiling, never a floor. Lower when Plex rate-limits
     # multi-library bursts during a restore.
     library_workers: int = 3,
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric map. Forwarded to each ``restore_export_file`` call so
+    # the restore engine applies the end user's per-library choice.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
+    # USER-MGMT-IDENTITY-AUDIT R-1 production wire-up. Optional
+    # source / destination server ids forwarded down to
+    # restore_export_file so the per-user fan-out's identity_map
+    # resolver actually fires in production. Defaults to None preserve
+    # backward compat: when both are None the resolver short-circuits
+    # to the legacy case-insensitive username match (identical to
+    # pre-R-1 behaviour). ``source_server_id`` defaults to the value
+    # encoded in the snapshot's snapshot_meta when not supplied at
+    # this layer (restore_export_file picks it up automatically).
+    source_server_id: Optional[str] = None,
+    dest_server_id: Optional[str] = None,
 ) -> None:
     """
     Runs the full import pipeline for all selected export files.
@@ -2093,9 +2568,23 @@ def run_restore(
     # and troubleshoot.log don't inherit data from a prior job.
     state.reset_run_state()
 
+    # Phase 2: per-run restoration log. Open before any metric handler
+    # runs so emissions go to a single file across all libraries. The
+    # null-writer shim covers the "run logging disabled" path so the
+    # rest of the engine can call writer.restored() etc. unconditionally.
+    # The finally-block at the bottom closes it with a summary.
+    from services.restoration_log import open_restoration_log
+    # Forward dest_server_id so the writer can apply the
+    # log_use_display_name substitution (USER-MGMT-IDENTITY-AUDIT
+    # cosmetic toggle, off by default). Legacy callers that didn't
+    # plumb the kwarg through still see raw usernames in logs.
+    state._restoration_log = open_restoration_log(
+        log_dir, logger=logger, dest_server_id=dest_server_id or None,
+    )
+
     # One-line summary of which data types this run will import. The
     # per-library skip notices are DEBUG; this is the only INFO line
-    # confirming the operator's filter choices for the import side.
+    # confirming the end user's filter choices for the import side.
     _included = [
         n for n, v in (
             ("watch_history", include_watch_history),
@@ -2121,7 +2610,16 @@ def run_restore(
                 "Restore mode: merge (additive, watch counts keep HIGHER of stored/current)."
             )
 
-    home_users = get_home_users(server, base_url, logger)
+    # 2026-05-17 (operator request): pre-filter the home-user auth
+    # burst so we only authenticate users that the operator actually
+    # selected for this restore. Pre-fix every Plex Home user got an
+    # auth round-trip on every restore — wasteful + confusing in the
+    # activity feed when only one user is being restored. The
+    # downstream per-user gate still runs as a belt-and-braces check.
+    home_users = get_home_users(
+        server, base_url, logger,
+        user_filter=user_filter,
+    )
     home_user_names: Set[str] = {n for n, _, _ in home_users}
     if home_user_names:
         logger.info(
@@ -2133,7 +2631,7 @@ def run_restore(
 
     # PR-1 / Phase B (skip-playlists end-to-end): defer the destination
     # playlists prefetch until we know any payload actually carries
-    # playlists AND the operator hasn't disabled the playlist phase.
+    # playlists AND the end user hasn't disabled the playlist phase.
     # Skipping unnecessarily was previously responsible for a wasted
     # ``server.playlists()`` round-trip on every import - visible in
     # the Network panel even when ``skip_playlists=True`` was set at
@@ -2252,7 +2750,7 @@ def run_restore(
             # v0.15 reconstructed payload. Emit one task per entry,
             # each with its real per-library total. The destination
             # must have a section with the same title; case-sensitive
-            # (renaming on either side is the operator's contract).
+            # (renaming on either side is the end user's contract).
             dest_titles = _dest_section_titles()
             if not dest_titles:
                 logger.error(
@@ -2352,7 +2850,7 @@ def run_restore(
                 f"{missing}"
             )
 
-    # v0.13.x: library-level concurrency is operator-tunable via the
+    # v0.13.x: library-level concurrency is end user-tunable via the
     # ``restore_library_workers`` setting. Clamped at 1 (a 0/negative
     # value would silently disable the pool) and capped at the actual
     # library count so a high setting doesn't spawn idle workers.
@@ -2393,11 +2891,17 @@ def run_restore(
                 include_watch_history,
                 include_ratings,
                 include_collections,
+                # Phase C: per-library metric map. restore_export_file
+                # overrides the include_* booleans for any library
+                # listed in this map.
+                library_metrics,
                 section_id,        # library_section_id
                 override_name,     # target_section_name_override
                 mode,
                 merge_watch_strategy,
                 user_filter,
+                source_server_id,  # USER-MGMT-IDENTITY-AUDIT R-1 (None-safe)
+                dest_server_id,    # USER-MGMT-IDENTITY-AUDIT R-1 (None-safe)
             )
             fmap[fut] = lib_names[task]
         return fmap
@@ -2508,6 +3012,24 @@ def run_restore(
 
     write_troubleshoot_log(log_dir)
     write_unresolved_log(log_dir)
+
+    # Phase 2: close the per-run restoration log with its summary
+    # block. Guarded because the engine has many early-return paths
+    # above; we want the summary written regardless. Phase 4: stash
+    # the affected-user list on state before close so the jobs.py
+    # finalisation can populate run_history.users_affected_list.
+    try:
+        rlog = getattr(state, "_restoration_log", None)
+        if rlog is not None:
+            try:
+                state._restoration_log_affected_users = list(
+                    rlog.affected_user_list() or []
+                )
+            except Exception:
+                state._restoration_log_affected_users = []
+            rlog.close_with_summary()
+    finally:
+        state._restoration_log = None
 
     successes = state._lib_successes or {}
     failures = state._lib_failures or {}

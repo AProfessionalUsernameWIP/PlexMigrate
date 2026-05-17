@@ -43,7 +43,7 @@ export function DashboardPanel({
     return () => window.clearInterval(t);
   }, []);
 
-  // Phase 4: pull the operator-set ETR colour multiplier from settings
+  // Phase 4: pull the end user-set ETR colour multiplier from settings
   // on mount and stash it in the module-level value the per-phase
   // stall thresholds read. A change via Settings ▸ General takes
   // effect on the next DashboardPanel mount.
@@ -52,6 +52,14 @@ export function DashboardPanel({
       .then((s) => {
         const m = (s as { etr_color_multiplier?: number }).etr_color_multiplier;
         if (typeof m === 'number' && Number.isFinite(m)) setEtrColorMultiplier(m);
+        // 2026-05-17 (end user request): restore summary row cap.
+        // Tunable lives in settings.tunables.restoration_summary_panel_max_items.
+        const raw = (s as unknown as Record<string, unknown>).tunables;
+        const tn = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+        const cap = tn['restoration_summary_panel_max_items'];
+        if (typeof cap === 'number' && Number.isFinite(cap)) {
+          setRestorationSummaryMaxItems(cap);
+        }
       })
       .catch(() => { /* non-fatal - keep the default 1.0 */ });
   }, []);
@@ -63,9 +71,9 @@ export function DashboardPanel({
 
   // PR-8 - multi-job selection. When two or more jobs are active /
   // queued the parent (App.tsx) renders a sub-tab strip and threads
-  // the selected job id down via ``selectedJobId``. If the operator
+  // the selected job id down via ``selectedJobId``. If the end user
   // hasn't picked one yet (or the prior pick has fallen off the list)
-  // we default to the running job. If the operator selected a queued
+  // we default to the running job. If the end user selected a queued
   // job we render the lightweight QueuedJobPanel - there's no
   // dashboard to render until the worker picks it up.
   if (jobs.length > 1) {
@@ -112,9 +120,9 @@ export function DashboardPanel({
   );
 }
 
-// PR-8 - placeholder rendered when the operator clicks a queued
+// PR-8 - placeholder rendered when the end user clicks a queued
 // job's sub-tab. We don't have a DashboardState for a job that
-// hasn't started yet, so show the operator the queue position and
+// hasn't started yet, so show the end user the queue position and
 // the job's submitted scope so they can still inspect it without
 // having to wait for the worker to pick it up.
 function QueuedJobPanel({ job, queuePosition }: { job: JobPayload; queuePosition: number }) {
@@ -293,7 +301,7 @@ function DashboardBody({
 
 // Step 6: yellow review banner. Only fires during direct-transfer runs
 // where Tier 3 (fuzzy title matching) actually produced a match - the
-// gate ships OFF by default, so a non-zero count means the operator
+// gate ships OFF by default, so a non-zero count means the end user
 // explicitly opted in via Settings → Transfer Resolution and we want
 // to flag the result for spot-check.
 function FuzzyTierWarning({
@@ -371,26 +379,50 @@ function ContainerSummaryTable({
   rows: ContainerResult[];
 }) {
   const memberWord = kind === 'Playlists' ? 'items' : 'members';
+  // 2026-05-17 (end user request): cap on-screen rows + scroll the rest
+  // so the Restoration Summary panel doesn't unbounded-grow on libraries
+  // with hundreds of playlists. Cap source is the
+  // ``restoration_summary_panel_max_items`` tunable (default 10).
+  // Approx row height is ~32px; we set maxHeight at cap × row + header
+  // padding so the cap value × row height bounds the visible window.
+  const cap = getRestorationSummaryMaxItems();
+  const scrollable = rows.length > cap;
+  const APPROX_ROW_HEIGHT = 32;
+  const maxHeightPx = scrollable ? cap * APPROX_ROW_HEIGHT + 4 : undefined;
   return (
     <div style={{ marginBottom: 12 }}>
       <h3 style={{ fontSize: 13, margin: '6px 0', color: 'var(--text-dim)' }}>
         {kind} ({rows.length})
+        {scrollable && (
+          <span style={{ fontWeight: 400, marginLeft: 8, fontSize: 11 }}>
+            — showing {cap} of {rows.length}, scroll for more
+          </span>
+        )}
       </h3>
-      <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
-        <thead>
-          <tr style={{ textAlign: 'left', color: 'var(--text-dim)' }}>
-            <th style={{ padding: '4px 6px' }}>Name</th>
-            <th style={{ padding: '4px 6px' }}>Library</th>
-            <th style={{ padding: '4px 6px', textAlign: 'right' }}>Restored</th>
-            <th style={{ padding: '4px 6px' }}>Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((r, i) => (
-            <ContainerSummaryRow key={`${r.library}/${r.name}/${i}`} row={r} memberWord={memberWord} />
-          ))}
-        </tbody>
-      </table>
+      <div
+        style={{
+          maxHeight: maxHeightPx,
+          overflowY: scrollable ? 'auto' : undefined,
+          border: scrollable ? '1px solid var(--border, #2a3146)' : undefined,
+          borderRadius: scrollable ? 4 : undefined,
+        }}
+      >
+        <table style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+          <thead style={{ position: scrollable ? 'sticky' : undefined, top: 0, background: 'var(--bg-panel, #131722)' }}>
+            <tr style={{ textAlign: 'left', color: 'var(--text-dim)' }}>
+              <th style={{ padding: '4px 6px' }}>Name</th>
+              <th style={{ padding: '4px 6px' }}>Library</th>
+              <th style={{ padding: '4px 6px', textAlign: 'right' }}>Restored</th>
+              <th style={{ padding: '4px 6px' }}>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <ContainerSummaryRow key={`${r.library}/${r.name}/${i}`} row={r} memberWord={memberWord} />
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -665,7 +697,7 @@ function FanOutBody({
   // Track selection by tab key. Default to the first destination.
   const [active, setActive] = useState<FanOutTabKey>(fanOut[0]?.dest_name ?? '__overview__');
 
-  // If the active destination disappeared (rare - operator-side state
+  // If the active destination disappeared (rare - end user-side state
   // change between renders), fall back to overview rather than blank.
   useEffect(() => {
     if (active === '__overview__' || active === '__logs__') return;
@@ -1349,34 +1381,34 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
   const totalCount = dash ? dash.libraries.reduce((acc, l) => acc + l.total, 0) : 0;
   const completedCount = dash ? dash.libraries.reduce((acc, l) => acc + l.completed, 0) : 0;
   const pct = totalCount > 0 ? completedCount / totalCount : 0;
-  // ── Top-level ETA (discover-don't-predict) ──────────────────────
+  // ── Top-level ETA: engine-anchored progress (chosen 2026-05-16) ──
   //
-  // The single headline ETR comes straight from the backend's
-  // rolling throughput tracker (``dash.rolling_etr_seconds``). There
-  // is no pre-run estimate and no client-side heuristic: the value
-  // is ``null`` until the tracker has enough real samples to
-  // project. While the run is in flight but no rate samples have
-  // landed yet, we render "Calculating..." rather than a misleading
-  // "-" so the operator knows the estimate is pending, not absent.
-  const eta = (() => {
-    if (runIsOver) return '-';
-    if (!dash) return '-';
-    // Part B: once the engine returns, the job runner enters a
-    // post-engine close-out window (close logs / run-dir finalize /
-    // snapshot-DB capture). Every library row reads "Done" by then,
-    // so without this the header looks frozen at 100%. While
-    // ``finalizing`` is set we show the finalize sub-step instead of
-    // an ETR - the work isn't estimable and the point is just to
-    // tell the operator it's still going.
-    if (dash.finalizing) return `Finalizing - ${dash.finalizing}…`;
-    const rolling = dash.rolling_etr_seconds;
-    if (rolling !== null && rolling !== undefined && isFinite(rolling) && rolling >= 0) {
-      if (rolling < 5) return 'Almost done';
-      return secondsToHMS(rolling);
-    }
-    return 'Calculating...';
-  })();
-  const isFinalizing = !!dash?.finalizing && !runIsOver;
+  // The headline ETR is the engine-anchored progress estimate from
+  // ``dash.predicted_etr_seconds``. The math is:
+  //
+  //   etr = predicted_total * remaining_frac * calibration
+  //
+  // where ``predicted_total`` comes from cross-run learned timings,
+  // ``remaining_frac`` is (total - completed) / total, and
+  // ``calibration`` self-corrects mid-run by comparing observed
+  // elapsed vs expected elapsed. This replaces the previous per-tick
+  // rate-based projection that drifted between high and low as the
+  // engine moved through phases of heterogeneous throughput.
+  //
+  // ``dash.rolling_etr_seconds`` (the legacy live tracker) is kept
+  // for the per-batch Process List rows where its per-phase view is
+  // useful; it's no longer the headline number.
+  //
+  // The dashboard's "Estimated remaining" row used to surface the
+  // backend's predicted_etr_seconds / rolling_etr_seconds anchored
+  // estimate. Removed by end user request: the Run Job form's
+  // pre-submit prediction is the only ETA shown to the end user now.
+  // Maintaining a live-updating remaining-time number during the run
+  // was too noisy to be useful - completion fraction is item-weighted,
+  // not work-time-weighted, so a quick early phase cratered the
+  // displayed value. The backend still computes predicted_etr_seconds
+  // and surfaces it on the wire for any consumer that wants it (logs,
+  // future telemetry, etc.); the dashboard just stops displaying it.
 
   // Source / destination endpoints come from the job params dict.
   // ``deriveEndpoints`` is the single source of truth, shared with
@@ -1438,7 +1470,7 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
   // snapshot_watch_history's stop_event checkpoint.
   //
   // PR-A4 - Stop / Hard Stop are gated on ``jobs.stop``. Viewer and
-  // operator have no Stop permission; their buttons render disabled
+  // end user have no Stop permission; their buttons render disabled
   // so the layout stays consistent across roles. The backend
   // (``require_role('manager')`` on /api/job/stop) is the
   // authoritative gate - this is UX-only.
@@ -1472,7 +1504,7 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
                 moment the engine actually begins; ``finished_at`` is
                 stamped on terminal states (completed / failed /
                 cancelled). Both are unix seconds on the wire and
-                rendered in the operator's local timezone here. */}
+                rendered in the end user's local timezone here. */}
             <div className="k">Start time</div>
             <div className="v">{formatAbsoluteTimestamp(job?.started_at ?? null)}</div>
             <div className="k">End time</div>
@@ -1482,29 +1514,6 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
                 : <span style={{ color: 'var(--text-dim)' }}>--:--:--</span>}
             </div>
             <div className="k">Elapsed</div><div className="v">{elapsed}</div>
-            <div className="k">Estimated remaining</div>
-            {/* v0.12.1  soft qualifier so the operator reads this as
-                a scaling estimate rather than a hard countdown. The
-                value only adjusts at library boundaries and is
-                monotonically decreasing within a library. */}
-            <div className="v">
-              {isFinalizing ? (
-                // Part B: post-engine close-out. Show the finalize
-                // sub-step plainly (no "~", no "adjusts" qualifier) so
-                // the operator reads it as "still working", not a hung
-                // 100%.
-                <span style={{ color: 'var(--accent, #4a7afc)' }}>{eta}</span>
-              ) : eta === '-' || eta === 'Calculating...' ? (
-                <span>{eta}</span>
-              ) : (
-                <>
-                  <span>~ {eta}</span>
-                  <span style={{ marginLeft: 8, opacity: 0.6, fontSize: 11, fontFamily: 'inherit' }}>
-                    adjusts as run progresses
-                  </span>
-                </>
-              )}
-            </div>
             {/* "steps", not "items": totalCount/completedCount sum each
                 library's gather-phase count (4 owner data-type gathers +
                 one per home user), advanced at phase boundaries by
@@ -1725,6 +1734,27 @@ export function setEtrColorMultiplier(value: number): void {
   if (value < 0.5) _etrColorMultiplier = 0.5;
   else if (value > 2.0) _etrColorMultiplier = 2.0;
   else _etrColorMultiplier = value;
+}
+
+// 2026-05-17 (end user request): cap how many rows the Restoration
+// Summary panel renders before scrolling kicks in. Mirrors the activity
+// feed's "show N, scroll the rest" pattern so a restore against a
+// library with hundreds of playlists / collections doesn't blow up the
+// dashboard's vertical real estate. Reads
+// ``settings.tunables.restoration_summary_panel_max_items`` (end user-
+// tunable). Clamped to [1, 200] to defend against typo'd values.
+let _restorationSummaryMaxItems = 10;
+
+export function setRestorationSummaryMaxItems(value: number): void {
+  if (!Number.isFinite(value)) return;
+  const v = Math.trunc(value);
+  if (v < 1) _restorationSummaryMaxItems = 1;
+  else if (v > 200) _restorationSummaryMaxItems = 200;
+  else _restorationSummaryMaxItems = v;
+}
+
+export function getRestorationSummaryMaxItems(): number {
+  return _restorationSummaryMaxItems;
 }
 
 function getPhaseHealth(phase: string, ageSeconds: number): 'normal' | 'amber' | 'red' {
@@ -1994,7 +2024,7 @@ function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number;
                   so "8/16" on a snapshot run means "8 of (4 owner
                   phases + 12 user gathers) done." On restore /
                   direct-transfer-import, steps are items being
-                  processed - operator-visible breakdown adapts per
+                  processed - end user-visible breakdown adapts per
                   mode via the cell content below. */}
               <th style={{ width: '16%', textAlign: 'right' }}>
                 Steps
@@ -2193,7 +2223,7 @@ function secondsToHMS(s: number): string {
 }
 function pad2(n: number): string { return n < 10 ? `0${n}` : `${n}`; }
 
-// Render an absolute unix-second timestamp in the operator's local
+// Render an absolute unix-second timestamp in the end user's local
 // timezone. Returns '-' for null / undefined / non-finite inputs so
 // the dashboard reads consistently when a job has been queued but
 // not yet started, or when ``finished_at`` is still empty.

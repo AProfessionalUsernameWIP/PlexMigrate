@@ -361,8 +361,10 @@ def _run_cli_direct(args: argparse.Namespace, logger: logging.Logger, run_log_di
     from server.direct_transfer import run_direct_transfer
 
     try:
-        src_server, src_row = server_registry.connect_registered_server(args.source_server, logger)
-        dst_server, dst_row = server_registry.connect_registered_server(args.dest_server, logger)
+        src_conn = server_registry.connect_registered_server(args.source_server, logger)
+        dst_conn = server_registry.connect_registered_server(args.dest_server, logger)
+        src_server, src_row = src_conn.server, src_conn.row
+        dst_server, dst_row = dst_conn.server, dst_conn.row
     except (ValueError, ConnectionError) as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
@@ -373,8 +375,8 @@ def _run_cli_direct(args: argparse.Namespace, logger: logging.Logger, run_log_di
 
     # Prefix the run log dir with both server slugs so the artefact
     # name on disk records the direction of the transfer.
-    src_slug = server_registry.safe_server_name(src_row["name"])
-    dst_slug = server_registry.safe_server_name(dst_row["name"])
+    src_slug = server_registry.backend_aware_slug(src_row["name"], src_conn.service_type)
+    dst_slug = server_registry.backend_aware_slug(dst_row["name"], dst_conn.service_type)
     combined = f"{src_slug}-to-{dst_slug}"
     state._run_timestamp = f"{combined}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -564,12 +566,13 @@ def main() -> None:
     if args.source_server:
         from server import server_registry
         try:
-            srv_obj, srv_row = server_registry.connect_registered_server(args.source_server, logger)
+            _conn = server_registry.connect_registered_server(args.source_server, logger)
         except (ValueError, ConnectionError) as e:
             console.print(f"[red]{e}[/red]")
             sys.exit(1)
-        token = srv_row["token"]
-        base_url = srv_row["url"]
+        srv_obj, srv_row = _conn.server, _conn.row
+        token = _conn.token
+        base_url = _conn.url
         server = srv_obj
         state._plex_base_url = base_url
         state._plex_token = token
@@ -583,7 +586,7 @@ def main() -> None:
         # Prefix log dir + snapshot filenames with server slug for parity
         # with how the FastAPI job runner names artefacts.
         from datetime import datetime as _dt
-        slug = server_registry.safe_server_name(srv_row["name"])
+        slug = server_registry.backend_aware_slug(srv_row["name"], _conn.service_type)
         state._run_timestamp = f"{slug}_{_dt.now().strftime('%Y%m%d_%H%M%S')}"
         logger.info(f"Using registered server {srv_row['name']!r} ({base_url})")
         libs = discover_libraries(server, logger)

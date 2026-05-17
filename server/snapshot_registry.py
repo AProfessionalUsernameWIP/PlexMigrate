@@ -16,7 +16,7 @@ Lifecycle
   sidecar. Best-effort on the file deletes; the row deletion is
   authoritative.
 * :func:`enforce_retention` is called after every register and from
-  the Settings UI when the operator edits retention values.
+  the Settings UI when the end user edits retention values.
 
 Storage
 -------
@@ -65,7 +65,7 @@ log = logging.getLogger("plexmigrate.server.snapshot_registry")
 # the registry). The two need slightly different shapes:
 #
 #   * Display    - "{server} / {libs} / {YYYY-MM-DD HH:MM}". Slashes
-#                  and colons are operator-friendly separators.
+#                  and colons are end user-friendly separators.
 #   * Filename   - "{server} - {libs} - {YYYY-MM-DD HH-MM}". Slashes
 #                  and colons are filesystem-unsafe (Windows in
 #                  particular reserves both); replaced with " - " and
@@ -164,7 +164,16 @@ CREATE TABLE IF NOT EXISTS snapshots (
     file_path            TEXT NOT NULL,
     captured_at          REAL NOT NULL,
     libraries_json       TEXT,
+    -- Phase E (2026-05-16): ``user_count`` is now the full roster
+    -- captured (owner + every managed user the engine attempted to
+    -- gather, regardless of whether they had data). The companion
+    -- ``user_count_with_data`` column counts the subset that
+    -- actually contributed at least one row to any metric table.
+    -- Older snapshots have user_count populated under the legacy
+    -- "with-data only, excluding owner" semantics; the listing UI
+    -- treats user_count_with_data=NULL as "fall back to user_count".
     user_count           INTEGER,
+    user_count_with_data INTEGER,
     row_counts_json      TEXT,
     file_size            INTEGER,
     prebuilt_json_path   TEXT,
@@ -177,7 +186,13 @@ CREATE TABLE IF NOT EXISTS snapshots (
     -- whereas captured_types reflects what THIS run touched. NULL
     -- for rows captured before this column existed - the import UI
     -- falls back to row_counts in that case.
-    captured_types_json  TEXT
+    captured_types_json  TEXT,
+    -- Phase D (admin-management follow-up, 2026-05-15): a one-line
+    -- human-readable summary stamped at capture time. Lists the
+    -- server, library set, metric set, and user count. NULL for
+    -- rows captured before this column existed - the listing UI
+    -- renders an em-dash in that case.
+    description          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_server_id
     ON snapshots(server_id);
@@ -211,8 +226,24 @@ def init_registry() -> None:
                 conn.execute("ALTER TABLE snapshots ADD COLUMN captured_types_json TEXT")
                 log.info("snapshots.db: added captured_types_json column")
             except sqlite3.OperationalError:
+                pass
+            # Phase D migration: same pattern for the description column.
+            try:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN description TEXT")
+                log.info("snapshots.db: added description column")
+            except sqlite3.OperationalError:
                 # Column already exists. Expected on every boot after
                 # the first; not an error.
+                pass
+            # Phase E migration: user_count_with_data column. The
+            # legacy user_count column was populated under
+            # "with-data only, excluding owner" semantics; the new
+            # column carries the with-data subset while user_count
+            # now means the full roster.
+            try:
+                conn.execute("ALTER TABLE snapshots ADD COLUMN user_count_with_data INTEGER")
+                log.info("snapshots.db: added user_count_with_data column")
+            except sqlite3.OperationalError:
                 pass
         finally:
             conn.close()
@@ -269,6 +300,7 @@ def register(
     captured_at: Optional[float] = None,
     libraries: Optional[List[str]] = None,
     user_count: Optional[int] = None,
+    user_count_with_data: Optional[int] = None,
     row_counts: Optional[Dict[str, int]] = None,
     file_size: Optional[int] = None,
     prebuilt_json_path: Optional[str] = None,
@@ -287,6 +319,13 @@ def register(
     # ``snapshot_capture.create_snapshot_db`` and to here. Falls back
     # to a fresh uuid when None - legacy callers and orphan recovery.
     snapshot_id: Optional[str] = None,
+    # Phase D (admin-management follow-up, 2026-05-15): a short
+    # human-readable summary of the snapshot's contents (server,
+    # users, libraries, metrics). Persisted on the registry row so
+    # the Exports listing can render it without reaching into each
+    # .db. None on legacy registrations - the listing UI renders
+    # an em-dash placeholder.
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Insert a registry row for one newly-captured snapshot. Runs
@@ -305,20 +344,44 @@ def register(
     types_json = json.dumps(list(captured_types)) if captured_types is not None else None
     conn = _connect()
     try:
-        conn.execute(
-            """
-            INSERT INTO snapshots (
-                id, server_id, server_name, snapshot_name, file_path,
-                captured_at, libraries_json, user_count, row_counts_json,
-                file_size, prebuilt_json_path, captured_types_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                snapshot_id, server_id, server_name, snapshot_name,
-                file_path, ts, libs_json, user_count, rows_json,
-                file_size, prebuilt_json_path, types_json,
-            ),
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    id, server_id, server_name, snapshot_name, file_path,
+                    captured_at, libraries_json, user_count,
+                    user_count_with_data, row_counts_json,
+                    file_size, prebuilt_json_path, captured_types_json,
+                    description
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id, server_id, server_name, snapshot_name,
+                    file_path, ts, libs_json, user_count,
+                    user_count_with_data, rows_json,
+                    file_size, prebuilt_json_path, types_json,
+                    description,
+                ),
+            )
+        except sqlite3.OperationalError:
+            # Pre-migration registry: description / user_count_with_data
+            # column might not exist yet (init_registry runs the ALTER
+            # but a race against another process could in theory beat it).
+            # Retry with the pre-Phase-E shape.
+            conn.execute(
+                """
+                INSERT INTO snapshots (
+                    id, server_id, server_name, snapshot_name, file_path,
+                    captured_at, libraries_json, user_count, row_counts_json,
+                    file_size, prebuilt_json_path, captured_types_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id, server_id, server_name, snapshot_name,
+                    file_path, ts, libs_json, user_count, rows_json,
+                    file_size, prebuilt_json_path, types_json,
+                ),
+            )
     finally:
         conn.close()
     # Audit trail: registry insert is the third half of the snapshot
@@ -361,6 +424,13 @@ def list_snapshots(
     parameter binding because SQLite doesn't allow placeholders in
     ORDER BY clauses. We accept only a small whitelist so the
     caller can't inject SQL.
+
+    Each row's ``service_type`` is joined from the server registry
+    at call time (TODO-AGENT-2-4 from Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md);
+    snapshot rows themselves don't carry the backend type so the
+    frontend's backend-tier filter would otherwise need a per-row
+    registry join. We build the map once per call to keep it O(N+M)
+    instead of O(N*M).
     """
     init_registry()
     if order not in ("captured_at DESC", "captured_at ASC"):
@@ -378,7 +448,26 @@ def list_snapshots(
             ).fetchall()
     finally:
         conn.close()
-    return [_row_to_dict(r) for r in rows]
+    service_map = _build_service_type_map()
+    return [_row_to_dict(r, service_map=service_map) for r in rows]
+
+
+def _build_service_type_map() -> Dict[str, str]:
+    """Build ``{server_id: service_type}`` for every registered server.
+
+    Used by :func:`list_snapshots` to attach ``service_type`` to each
+    snapshot row without a per-row registry lookup. Empty dict on
+    registry failure - rows fall back to ``service_type=None`` which
+    the frontend treats as the legacy Plex bucket."""
+    try:
+        from server.server_registry import list_servers
+        return {
+            (sv.get("id") or ""): (sv.get("service_type") or "plex").lower()
+            for sv in list_servers(include_tokens=False) or []
+            if sv.get("id")
+        }
+    except Exception:
+        return {}
 
 
 def get(snapshot_id: str) -> Optional[Dict[str, Any]]:
@@ -393,7 +482,11 @@ def get(snapshot_id: str) -> Optional[Dict[str, Any]]:
         ).fetchone()
     finally:
         conn.close()
-    return _row_to_dict(row) if row is not None else None
+    if row is None:
+        return None
+    # Single-row path also gets service_type via the same registry
+    # join (TODO-AGENT-2-4); the map is cheap to build for one row.
+    return _row_to_dict(row, service_map=_build_service_type_map())
 
 
 def reconcile_orphaned_snapshots(output_dir: str) -> Dict[str, int]:
@@ -409,7 +502,7 @@ def reconcile_orphaned_snapshots(output_dir: str) -> Dict[str, int]:
 
     Returns ``{"recovered": N, "skipped": M, "errors": K}``. Best-
     effort: corrupt or unreadable ``.db`` files are logged at ERROR
-    and skipped - never auto-deleted. The operator decides what to
+    and skipped - never auto-deleted. The end user decides what to
     keep.
 
     Naming conventions accepted:
@@ -421,7 +514,7 @@ def reconcile_orphaned_snapshots(output_dir: str) -> Dict[str, int]:
 
     Either pattern is recovered; anything else (``media.db``,
     ``auth.db``, ``snapshots.db``, ``.db-wal`` / ``.db-shm`` sidecars,
-    operator-dropped files) is left alone.
+    end user-dropped files) is left alone.
 
     When the orphan file carries a ``snapshot_meta`` table (every
     snapshot built by the post-Rule-1 pipeline does), the recovered
@@ -435,7 +528,7 @@ def reconcile_orphaned_snapshots(output_dir: str) -> Dict[str, int]:
     out = {"recovered": 0, "skipped": 0, "errors": 0}
     base = Path(output_dir).resolve()
     if not base.is_dir():
-        # Nothing to scan. Fresh install, missing dir, or operator
+        # Nothing to scan. Fresh install, missing dir, or end user
         # pointed output_dir somewhere unexpected. Either way, no
         # orphans here.
         return out
@@ -572,6 +665,7 @@ def _ingest_orphan(
     meta_captured_at: Optional[float] = None
     meta_libraries: Optional[List[str]] = None
     meta_metrics: Optional[List[str]] = None
+    meta_description: Optional[str] = None
     user_count: Optional[int] = None
 
     try:
@@ -589,10 +683,21 @@ def _ingest_orphan(
         # an older .db without it falls through to filename-derived
         # values below.
         try:
-            meta_row = conn.execute(
-                "SELECT snapshot_id, server_name, captured_at, "
-                "libraries_json, metrics_json FROM snapshot_meta LIMIT 1"
-            ).fetchone()
+            # Phase D: also pull ``description`` when the column exists.
+            # Older snapshot files predating Phase D don't have the
+            # column; the LEFT JOIN to PRAGMA isn't worth the
+            # complexity, so we just try the wider SELECT and fall
+            # back to the narrower one if it errors.
+            try:
+                meta_row = conn.execute(
+                    "SELECT snapshot_id, server_name, captured_at, "
+                    "libraries_json, metrics_json, description FROM snapshot_meta LIMIT 1"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                meta_row = conn.execute(
+                    "SELECT snapshot_id, server_name, captured_at, "
+                    "libraries_json, metrics_json FROM snapshot_meta LIMIT 1"
+                ).fetchone()
             if meta_row is not None:
                 meta_snapshot_id = (meta_row["snapshot_id"] or None)
                 meta_server_name = (meta_row["server_name"] or None)
@@ -610,17 +715,45 @@ def _ingest_orphan(
                     meta_metrics = [str(x) for x in metrics_raw] if isinstance(metrics_raw, list) else None
                 except Exception:
                     meta_metrics = None
+                # Phase D: description column only present on snapshots
+                # captured by post-Phase-D engine builds. sqlite3.Row
+                # raises IndexError on missing keys, so the wrapping
+                # try shields legacy rows.
+                try:
+                    meta_description = meta_row["description"] or None
+                except Exception:
+                    meta_description = None
         except sqlite3.OperationalError:
             # Older schema without snapshot_meta - fall through.
             pass
 
+        # Phase E: read both the roster total and the with-data subset.
+        # Older snapshots without the had_data column fall back to
+        # roster-total only (with_data == total under pre-Phase-E
+        # semantics where only-with-data rows were ever written).
+        user_count: Optional[int] = None
+        user_count_with_data: Optional[int] = None
         try:
             row = conn.execute(
-                "SELECT COUNT(*) AS n FROM snapshot_users"
+                "SELECT "
+                "  COUNT(*) AS n_total, "
+                "  SUM(CASE WHEN had_data = 1 THEN 1 ELSE 0 END) AS n_with_data "
+                "FROM snapshot_users"
             ).fetchone()
-            user_count = int(row["n"]) if row else None
+            if row is not None:
+                user_count = int(row["n_total"] or 0) or None
+                ucwd = row["n_with_data"]
+                user_count_with_data = int(ucwd) if ucwd is not None else None
         except sqlite3.OperationalError:
-            user_count = None
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM snapshot_users"
+                ).fetchone()
+                if row is not None:
+                    user_count = int(row["n"]) if row else None
+                    user_count_with_data = user_count
+            except sqlite3.OperationalError:
+                pass
 
         # Per-table row counts so the registry row mirrors the shape
         # of a fresh capture's ``row_counts_json``.
@@ -694,14 +827,16 @@ def _ingest_orphan(
                 """
                 INSERT INTO snapshots (
                     id, server_id, server_name, snapshot_name, file_path,
-                    captured_at, libraries_json, user_count, row_counts_json,
+                    captured_at, libraries_json, user_count,
+                    user_count_with_data, row_counts_json,
                     file_size, prebuilt_json_path, captured_types_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot_id, server_id, server_name, snapshot_name,
                     str(path.resolve()), captured_at,
                     json.dumps(libraries_for_row), user_count,
+                    user_count_with_data,
                     json.dumps(counters), file_size, None,
                     json.dumps(meta_metrics) if meta_metrics is not None else None,
                 ),
@@ -774,7 +909,7 @@ def materialise_sidecar(snapshot_id: str) -> Optional[str]:
     unchanged.
 
     Used by:
-      * ``_capture_snapshot_after_run`` when the operator opted in to
+      * ``_capture_snapshot_after_run`` when the end user opted in to
         ``prebuild_json_sidecar`` on the snapshot job / schedule.
       * The ``GET /api/snapshots/{id}/download`` endpoint on its first
         cache miss, so the second download is instant.
@@ -860,7 +995,7 @@ def reap_stale_sidecars(*, ttl_seconds: Optional[int] = None, now: Optional[floa
 
     Generated sidecars are re-materialisable from the snapshot ``.db``
     at any time (the download endpoint regenerates on first miss),
-    so reaping a stale one is non-destructive - the operator's next
+    so reaping a stale one is non-destructive - the end user's next
     Download click rebuilds it. The point of the TTL is to avoid
     holding the rendered JSON on disk indefinitely; pre-built or
     just-downloaded sidecars are intentionally short-lived caches.
@@ -894,7 +1029,7 @@ def reap_stale_sidecars(*, ttl_seconds: Optional[int] = None, now: Optional[floa
             # rather than disabling the sweep silently.
             ttl_seconds = 300
     if ttl_seconds <= 0:
-        # Operator-disabled. Caller may still want a structured
+        # End user-disabled. Caller may still want a structured
         # response so the loop can log "sweep disabled" once.
         return counters
 
@@ -1006,7 +1141,7 @@ def delete(snapshot_id: str, *, keep_json: bool = False) -> Dict[str, Any]:
     Keep-JSON flow:
       1. If no cached sidecar exists yet, materialise one from the
          ``.db`` (so deletion never silently drops capturable data
-         the operator wanted to preserve).
+         the end user wanted to preserve).
       2. Move the sidecar into ``<output_dir>/legacy/`` - the same
          directory that backs the JSON-archive listing endpoint
          (``GET /api/snapshots/legacy``) and the JobForm's "From
@@ -1027,9 +1162,9 @@ def delete(snapshot_id: str, *, keep_json: bool = False) -> Dict[str, Any]:
     json_archived = False
     archived_path: Optional[str] = None
 
-    # Step 1: materialise the sidecar if the operator wants to keep
+    # Step 1: materialise the sidecar if the end user wants to keep
     # JSON but no cache exists yet. Best-effort - if render fails we
-    # still proceed with .db deletion; the operator loses the JSON
+    # still proceed with .db deletion; the end user loses the JSON
     # but the explicit failure surfaces in ``errors``.
     if keep_json:
         try:
@@ -1109,7 +1244,7 @@ def delete(snapshot_id: str, *, keep_json: bool = False) -> Dict[str, Any]:
     finally:
         conn.close()
     # Audit trail: the row drop and any side-effects (.db unlink, JSON
-    # archive move, sidecar delete) are operator-visible state changes
+    # archive move, sidecar delete) are end user-visible state changes
     # that belong in db_access.log.
     try:
         from services import db_access_log
@@ -1164,9 +1299,69 @@ def enforce_retention(server_id: str) -> Dict[str, int]:
     return {"deleted": deleted, "errors": errors}
 
 
+def reassign_orphan_snapshots(
+    *,
+    target_server_id: str,
+    target_server_name: str,
+) -> Dict[str, int]:
+    """
+    Find every snapshot whose stored ``server_name`` matches
+    ``target_server_name`` but whose ``server_id`` no longer points at
+    any registered server, and rewrite their ``server_id`` to
+    ``target_server_id``.
+
+    Used by the "Merge orphan snapshots" admin action surfaced under
+    Tunables. The Exports panel already merges orphans into one tab
+    at display time, so the end user-facing UX is the same either
+    way; this helper exists to MIGRATE the underlying rows when an
+    end user wants to clean up the registry once and for all.
+
+    Returns counters: ``{checked, reassigned, no_op}``. ``no_op`` is
+    the count of rows whose server_id was already correct (defensive
+    in case the helper is called twice in a row).
+    """
+    from server import server_registry as _registry
+    # Build the live id set so we know which snapshots are orphaned.
+    live_ids = {s["id"] for s in _registry.list_servers()}
+
+    counters = {"checked": 0, "reassigned": 0, "no_op": 0}
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, server_id FROM snapshots WHERE server_name = ?",
+            (target_server_name,),
+        ).fetchall()
+        for r in rows:
+            counters["checked"] += 1
+            current_id = r["server_id"]
+            if current_id == target_server_id:
+                counters["no_op"] += 1
+                continue
+            if current_id in live_ids:
+                # The current id is a DIFFERENT live server; do NOT
+                # rewrite. The end user would be quietly merging
+                # snapshots from a genuinely-separate registered
+                # server. Counts under no_op because the row is
+                # already correctly attached to a live server.
+                counters["no_op"] += 1
+                continue
+            conn.execute(
+                "UPDATE snapshots SET server_id = ? WHERE id = ?",
+                (target_server_id, r["id"]),
+            )
+            counters["reassigned"] += 1
+    finally:
+        conn.close()
+    log.info(
+        "reassign_orphan_snapshots target=%r (id=%r): %s",
+        target_server_name, target_server_id, counters,
+    )
+    return counters
+
+
 def delete_all_for_server(server_id: str) -> Dict[str, int]:
     """
-    Operator-driven 'clear all snapshots for this server' path from
+    End user-driven 'clear all snapshots for this server' path from
     the Backups panel. Removes every snapshot row + file for the
     given server. db_admin gating happens in the route layer.
     """
@@ -1186,7 +1381,11 @@ def delete_all_for_server(server_id: str) -> Dict[str, int]:
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+def _row_to_dict(
+    row: sqlite3.Row,
+    *,
+    service_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     import json
     file_path = row["file_path"] or ""
     prebuilt = row["prebuilt_json_path"] or ""
@@ -1225,15 +1424,44 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     except (IndexError, KeyError):
         types_raw = None
     captured_types = _safe_json_list(types_raw) if types_raw else None
+    # Phase D: description is None on pre-migration rows. The
+    # frontend renders an em-dash placeholder when None.
+    description: Optional[str] = None
+    try:
+        description = row["description"] or None
+    except (IndexError, KeyError):
+        description = None
+    server_id = row["server_id"]
+    # TODO-AGENT-2-4: service_type joined from the server registry.
+    # ``None`` when the server is no longer registered (orphan
+    # snapshot from a since-deleted server); the frontend treats
+    # null as the legacy Plex bucket. ``service_map`` is the
+    # pre-built lookup from :func:`_build_service_type_map`; absent
+    # for legacy callers that haven't migrated yet.
+    service_type: Optional[str] = None
+    if service_map is not None and server_id:
+        service_type = service_map.get(server_id)
+    # Phase E: user_count is the roster total; user_count_with_data
+    # is the subset with at least one row of metric data. Legacy
+    # rows have NULL user_count_with_data; the frontend treats NULL
+    # as "fall back to user_count for both numbers".
+    user_count_with_data: Optional[int] = None
+    try:
+        ucwd = row["user_count_with_data"]
+        if ucwd is not None:
+            user_count_with_data = int(ucwd)
+    except (IndexError, KeyError):
+        pass
     return {
         "id": row["id"],
-        "server_id": row["server_id"],
+        "server_id": server_id,
         "server_name": row["server_name"],
         "snapshot_name": row["snapshot_name"],
         "file_path": file_path,
         "captured_at": row["captured_at"],
         "libraries": _safe_json_list(row["libraries_json"]),
         "user_count": row["user_count"],
+        "user_count_with_data": user_count_with_data,
         "row_counts": _safe_json_dict(row["row_counts_json"]),
         "file_size": row["file_size"],
         "prebuilt_json_path": prebuilt,
@@ -1241,6 +1469,8 @@ def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "has_cached_sidecar": has_sidecar,
         "sidecar_size": sidecar_size,
         "captured_types": captured_types,
+        "description": description,
+        "service_type": service_type,
     }
 
 
@@ -1264,3 +1494,81 @@ def _safe_json_dict(raw: Optional[str]) -> Dict[str, int]:
         return {str(k): int(val) for k, val in v.items()} if isinstance(v, dict) else {}
     except Exception:
         return {}
+
+
+# ── Server-UID boot migration helper (Plan[SERVER-UID-IDENTITY]) ─────────────
+#
+# Companion to ``server/server_registry.migrate_server_ids_add_backend_prefix``.
+# When the boot upgrade rewrites bare-UUID server rows to the prefixed
+# form, snapshots.db's ``snapshots.server_id`` column (and the
+# ``snapshot_retention_per_server`` settings map) also needs the
+# rewrite so registered snapshots keep resolving to the right
+# server. Best-effort: failures are caught + logged + non-fatal.
+
+def rewrite_server_ids_in_snapshots(
+    old_to_new: Dict[str, str],
+) -> int:
+    """Bulk-update ``snapshots.server_id`` rows whose value appears
+    in ``old_to_new``. Also rewrites the
+    ``snapshot_retention_per_server`` settings map (JSON-encoded
+    dict keyed by server_id) so per-server retention overrides
+    survive the upgrade.
+
+    Returns the total number of rows touched (snapshot rows updated
+    plus 1 if the retention settings map was rewritten)."""
+    if not old_to_new:
+        return 0
+    n = 0
+    init_registry()
+    conn = _connect()
+    try:
+        # Snapshot rows.
+        for old_id, new_id in old_to_new.items():
+            try:
+                cur = conn.execute(
+                    "UPDATE snapshots SET server_id = ? "
+                    "WHERE server_id = ?", (new_id, old_id),
+                )
+                n += cur.rowcount or 0
+            except Exception:
+                log.exception(
+                    "rewrite_server_ids_in_snapshots: pair "
+                    "(%r -> %r) update failed; continuing.",
+                    old_id, new_id,
+                )
+        # Per-server retention settings map (stored as JSON in the
+        # snapshot_settings k/v table). Rewrite keys in-place.
+        try:
+            row = conn.execute(
+                "SELECT value FROM snapshot_settings "
+                "WHERE key = 'snapshot_retention_per_server'",
+            ).fetchone()
+            if row is not None and row[0]:
+                import json as _json
+                try:
+                    current = _json.loads(row[0])
+                except Exception:
+                    current = None
+                if isinstance(current, dict):
+                    rewritten = {
+                        old_to_new.get(k, k): v
+                        for k, v in current.items()
+                    }
+                    if rewritten != current:
+                        conn.execute(
+                            "UPDATE snapshot_settings SET value = ? "
+                            "WHERE key = 'snapshot_retention_per_server'",
+                            (_json.dumps(rewritten),),
+                        )
+                        n += 1
+        except Exception:
+            log.exception(
+                "rewrite_server_ids_in_snapshots: per-server retention "
+                "rewrite failed; continuing.",
+            )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return n

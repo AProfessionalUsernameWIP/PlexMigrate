@@ -21,18 +21,32 @@
 // and the UI renders "(stored - re-enter to replace)" hints next to
 // inputs that already have a value on the server side.
 
-import { useEffect, useState } from 'react';
-import { api, GlobalTombstone, ServerManagedUser, ServerView } from '../api';
+import { useEffect, useMemo, useState } from 'react';
+import { api, GlobalTombstone, ServerManagedUser, ServerView, UserIdentityMap } from '../api';
 import { InfoTip } from './InfoTip';
+import { useElevation } from '../contexts/ElevationContext';
+import { UserCopyPanel } from './UserCopyPanel';
+import { UserMappingPanel } from './UserMappingPanel';
+import {
+  BackendTabStrip,
+  BackendType,
+  backendCounts,
+  serversForBackend,
+} from './BackendTabStrip';
 
 
 export function UserManagementPanel() {
   const [servers, setServers] = useState<ServerView[] | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
+  // Phase B of the backend-filter UI restructure (see
+  // Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). Backend tier above
+  // the existing per-server ServerSelector so the end user can
+  // narrow to Plex / Jellyfin / Emby users separately.
+  const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
   const [detailUsername, setDetailUsername] = useState<string | null>(null);
   // ``refreshKey`` is bumped after a global sync so the currently-
-  // visible UserListView re-fetches without the operator having to
+  // visible UserListView re-fetches without the end user having to
   // switch servers manually.
   const [refreshKey, setRefreshKey] = useState(0);
   // PR-11.1 follow-up - global "Sync all servers" state.
@@ -59,6 +73,44 @@ export function UserManagementPanel() {
       .catch((e) => setServerError(String(e)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Derived: registered-server list filtered to the active backend.
+  // Passed into ServerSelector so its per-server strip only shows
+  // backends the end user chose. Memoised so the dependency-tracked
+  // effect below doesn't fire on every render.
+  const backendServers = useMemo(
+    () => serversForBackend(servers || [], activeBackend),
+    [servers, activeBackend],
+  );
+
+  // Auto-correct activeBackend when its bucket is empty and another
+  // backend has servers. Mirrors the same pattern in ServersPanel
+  // so an end user who deletes the last server of the active backend
+  // doesn't stare at an empty pane.
+  useEffect(() => {
+    if (!servers || servers.length === 0) return;
+    const counts = backendCounts(servers);
+    if (counts[activeBackend] === 0) {
+      const fallback = (['plex', 'jellyfin', 'emby'] as BackendType[])
+        .find((b) => counts[b] > 0);
+      if (fallback) setActiveBackend(fallback);
+    }
+  }, [servers, activeBackend]);
+
+  // When the active backend changes (or its server list refreshes),
+  // ensure the per-server selection still points at a row of the
+  // active backend. Otherwise switching to Jellyfin while a Plex
+  // serverId was selected would leave the panel showing stale
+  // (cross-backend) detail.
+  useEffect(() => {
+    if (selectedServerId === null) return;
+    const stillValid = backendServers.some((s) => s.id === selectedServerId);
+    if (!stillValid) {
+      setSelectedServerId(backendServers[0]?.id || null);
+      setDetailUsername(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [backendServers]);
 
   const syncAllServers = async () => {
     if (servers === null || servers.length === 0) return;
@@ -89,7 +141,7 @@ export function UserManagementPanel() {
       });
       const synced_total = per_server.reduce((acc, p) => acc + p.synced, 0);
       setGlobalSyncResult({ synced_total, per_server });
-      // Force the visible UserListView to refetch so the operator
+      // Force the visible UserListView to refetch so the end user
       // sees fresh data immediately.
       setRefreshKey((k) => k + 1);
     } finally {
@@ -151,8 +203,14 @@ export function UserManagementPanel() {
         )}
       </div>
 
+      <BackendTabStrip
+        servers={servers || []}
+        activeBackend={activeBackend}
+        onChange={setActiveBackend}
+      />
+
       <ServerSelector
-        servers={servers}
+        servers={backendServers}
         selectedId={selectedServerId}
         onSelect={(id) => {
           setSelectedServerId(id);
@@ -166,6 +224,7 @@ export function UserManagementPanel() {
         <UserDetailView
           serverId={selectedServerId}
           username={detailUsername}
+          allServers={servers}
           onBack={() => setDetailUsername(null)}
         />
       ) : (
@@ -176,6 +235,14 @@ export function UserManagementPanel() {
           refreshKey={refreshKey}
         />
       )}
+
+      {/* Plan[RUN-JOB-UI] follow-up: the unscoped (global) identity-
+          mapping panel that used to live here has been dropped. The
+          per-user detail view now hosts a scoped UserMappingPanel
+          that filters to the viewed user; the end user manages
+          mappings from inside each user's detail page rather than
+          from a single global list at the bottom of the User
+          Management tab. */}
     </>
   );
 }
@@ -254,7 +321,7 @@ function UserListView({
   const [syncing, setSyncing] = useState(false);
   // PR-11.1 - 'Show hidden' toggle. Includes both per-server and
   // globally tombstoned rows. Default off so the picker contract
-  // (visible users only) and the everyday operator view match.
+  // (visible users only) and the everyday end user view match.
   const [showHidden, setShowHidden] = useState(false);
 
   const refresh = async () => {
@@ -300,7 +367,11 @@ function UserListView({
               Read from the local database. The list does not hit Plex
               on every visit; click <em>Sync users from server</em> to
               refresh against the live API. Sync is metadata-only and
-              never touches stored credentials.
+              never touches stored credentials. The same sync also
+              refreshes share state: which users currently have an
+              active share on this server (per
+              <code>shared_servers</code>) and which Plex Home users
+              are PIN-protected.
             </InfoTip>
           </h2>
           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 12 }}>
@@ -338,6 +409,7 @@ function UserListView({
                 <th>Service</th>
                 <th>Token</th>
                 <th>PIN / password</th>
+                <th>Share</th>
                 <th>Last seen</th>
                 <th>State</th>
               </tr>
@@ -345,13 +417,22 @@ function UserListView({
             <tbody>
               {users.map((u) => {
                 const isHidden = u.hidden_scope !== 'none';
+                // 2026-05-15: grey out rows where Plex.tv reports no
+                // active share on this server. The picker also filters
+                // them; surfacing them here (rather than hiding) lets
+                // the end user confirm the cache reflects the change
+                // they made on Plex.tv.
+                const inactiveShare = u.kind !== 'owner' && u.active_share === false;
+                const sharedAtLabel = u.shared_state_refreshed_at
+                  ? `Share state refreshed ${new Date(u.shared_state_refreshed_at * 1000).toLocaleString()}`
+                  : 'Share state has not been refreshed yet. Click Sync users from server.';
                 return (
                   <tr
                     key={u.username}
                     onClick={() => onSelect(u.username)}
                     style={{
                       cursor: 'pointer',
-                      opacity: isHidden ? 0.55 : 1,
+                      opacity: isHidden || inactiveShare ? 0.55 : 1,
                     }}
                   >
                     <td className="mono">{u.username}</td>
@@ -372,6 +453,23 @@ function UserListView({
                           'Not stored'
                         }
                       />
+                    </td>
+                    <td title={sharedAtLabel}>
+                      {u.kind === 'owner' ? (
+                        <StatusPill stored={true} label="Owner" />
+                      ) : inactiveShare ? (
+                        <StatusPill stored={false} label="No active share" />
+                      ) : (
+                        <StatusPill stored={true} label="Active" />
+                      )}
+                      {u.is_pin_protected && (
+                        <span style={{ marginLeft: 6 }}>
+                          <StatusPill
+                            stored={u.has_pin}
+                            label={u.has_pin ? 'PIN-protected (stored)' : 'PIN-protected (no PIN stored)'}
+                          />
+                        </span>
+                      )}
                     </td>
                     <td>
                       {u.last_seen
@@ -396,7 +494,7 @@ function UserListView({
       </div>
 
       {/* PR-11.1 - global tombstones panel. Lists usernames hidden
-          across every server; lets the operator unhide directly from
+          across every server; lets the end user unhide directly from
           here (useful when the username has no row on the current
           server because the sync has been skipping it). */}
       <GlobalTombstonesPanel onChange={refresh} />
@@ -531,12 +629,18 @@ type WritePayload =
 function UserDetailView({
   serverId,
   username,
+  allServers,
   onBack,
 }: {
   serverId: string;
   username: string;
+  allServers: ServerView[];
   onBack: () => void;
 }) {
+  // Plan[RUN-JOB-UI] follow-up: copy-user-to-destination panel.
+  // Visibility toggle gates the panel so the detail view does not
+  // grow vertically by default.
+  const [copyPanelOpen, setCopyPanelOpen] = useState(false);
   const [user, setUser] = useState<ServerManagedUser | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
@@ -545,6 +649,32 @@ function UserDetailView({
   const [pinDraft, setPinDraft] = useState('');
   const [passwordDraft, setPasswordDraft] = useState('');
   const [pendingWrite, setPendingWrite] = useState<WritePayload | null>(null);
+  // Item 5: per-user token rotation. The button calls
+  // requireElevation() (opens the ElevationModal if the operator
+  // isn't currently elevated), then POSTs to the dedicated
+  // rotate-token endpoint. Refresh + toast on success.
+  const elevation = useElevation();
+  const [rotating, setRotating] = useState(false);
+  const rotateToken = async () => {
+    const elev = await elevation.requireElevation(`rotate token for ${username}`);
+    if (!elev) return;
+    setError(null); setOk(null); setRotating(true);
+    try {
+      const res = await api.rotateManagedUserToken(serverId, username);
+      if (res.captured > 0) {
+        setOk(`Token rotated for ${username}.`);
+      } else if (res.errors && res.errors.length > 0) {
+        setError(`Rotation failed: ${res.errors[0]}`);
+      } else {
+        setError('Rotation produced no new token (user may be PIN-protected with no stored PIN).');
+      }
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRotating(false);
+    }
+  };
 
   const refresh = async () => {
     setError(null);
@@ -681,7 +811,7 @@ function UserDetailView({
       await refresh();
     } catch (e) {
       setError(String(e));
-      // Keep the modal open on failure so the operator can retype.
+      // Keep the modal open on failure so the end user can retype.
       // Re-throw so the modal knows the submit failed and stays open.
       throw e;
     }
@@ -786,6 +916,29 @@ function UserDetailView({
         inputType="password"
       />
 
+      {/* Item 5: per-user manual token rotation. Bypasses the
+          additive-only contract on the Refresh sweep so the end user
+          can re-capture a stale token without overwriting other
+          users' stored tokens. Requires sudo-style elevation. */}
+      <div className="panel" style={{ paddingTop: 8, paddingBottom: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+          <span className="help" style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+            Re-capture this user's Plex auth token from the live API. Use after
+            the user has signed out and back in on Plex's side (which rotates
+            their token). Bypasses the per-server throttle. Requires re-confirming
+            your password.
+          </span>
+          <button
+            onClick={rotateToken}
+            disabled={rotating}
+            className="primary"
+            title="Force a fresh token capture for this one user."
+          >
+            {rotating ? 'Rotating…' : 'Rotate token'}
+          </button>
+        </div>
+      </div>
+
       {user.service_type === 'plex' && (
         <CredentialSection
           title="Plex Home PIN"
@@ -884,6 +1037,88 @@ function UserDetailView({
           onCancel={() => setPendingWrite(null)}
           onSubmit={submitWrite}
         />
+      )}
+
+      {/* USER-MGMT-IDENTITY-AUDIT: identity links. The user's own
+          app_user_uuid is the validation handle every cross-server
+          resolution keys off; every linked row (manual mapping OR
+          backend_user_id auto-link) appears here so the end user
+          can see who this user is mapped to across servers. */}
+      {user && (
+        <IdentityLinksPanel
+          serverId={serverId}
+          serverName={
+            allServers.find((s) => s.id === serverId)?.name || serverId
+          }
+          username={username}
+          user={user}
+          allServers={allServers}
+        />
+      )}
+
+      {/* Plan[RUN-JOB-UI] follow-up: per-user copy-to-destination
+          panel. Toggled by the button below; opens inline so the
+          end user does not lose the detail-view context. The panel
+          drives /api/users/copy_to_destination and, when "Run
+          automatic transfer" is checked, also submits a follow-up
+          /api/job/direct constrained to this single user. */}
+      {user && (
+        <div className="panel" style={{ marginTop: 12 }}>
+          {!copyPanelOpen ? (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontSize: 13 }}>
+                <strong>Copy this user to another server</strong>
+                <span style={{ color: 'var(--text-dim)', marginLeft: 8, fontSize: 12 }}>
+                  Creates a matching account on a Jellyfin or Emby
+                  destination and (optionally) transfers their data.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setCopyPanelOpen(true)}
+                style={{ fontSize: 12, padding: '5px 12px' }}
+              >
+                Open copy panel
+              </button>
+            </div>
+          ) : (
+            <UserCopyPanel
+              sourceServer={
+                allServers.find((s) => s.id === serverId) || {
+                  id: serverId, name: serverId, service_type: 'plex',
+                } as ServerView
+              }
+              sourceUser={user}
+              allServers={allServers}
+              onClose={() => setCopyPanelOpen(false)}
+              onCopySucceeded={() => { void refresh(); }}
+            />
+          )}
+        </div>
+      )}
+
+      {/* Plan[RUN-JOB-UI] follow-up: scoped identity-map panel.
+          When inside a user detail view, the mapping list is
+          filtered to rows involving this user; the add-form's
+          server A + user A are locked to the viewed user. End user
+          only picks server B and (optionally) edits user B if the
+          target uses a different name. The global mapping panel
+          at the bottom of the User Management page stays unscoped
+          for cases where the end user wants the full list. */}
+      {user && (
+        <div style={{ marginTop: 12 }}>
+          <UserMappingPanel
+            allServers={allServers}
+            scopedTo={{
+              server:
+                allServers.find((s) => s.id === serverId) || {
+                  id: serverId, name: serverId, service_type: 'plex',
+                } as ServerView,
+              userHandle: username,
+              userDisplayName: user.display_name || undefined,
+            }}
+          />
+        </div>
       )}
     </>
   );
@@ -1073,6 +1308,158 @@ function DbAdminAuthModal({
           </button>
           <button onClick={onCancel} disabled={submitting}>Cancel</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ── USER-MGMT-IDENTITY-AUDIT: identity links panel ─────────────────────────
+//
+// Renders the user's own app_user_uuid (the canonical cross-server
+// validation handle) plus every link to another (server, user) pair
+// authored manually OR derived automatically by the
+// auto_link_identity_map_by_backend_user_id helper. Lives above the
+// Copy-to-Account panel in the per-user detail view.
+
+function IdentityLinksPanel({
+  serverId,
+  serverName,
+  username,
+  user,
+  allServers,
+}: {
+  serverId: string;
+  serverName: string;
+  username: string;
+  user: ServerManagedUser;
+  allServers: ServerView[];
+}) {
+  const [links, setLinks] = useState<UserIdentityMap[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setError(null);
+    setLinks(null);
+    api.listUserIdentityMaps()
+      .then((r) => {
+        if (cancelled) return;
+        // Filter to rows that name this (server, user) on either side.
+        const matches = (r.maps || []).filter(
+          (m) =>
+            (m.server_a_id === serverId && (m.user_a_handle || '').toLowerCase() === username.toLowerCase())
+            || (m.server_b_id === serverId && (m.user_b_handle || '').toLowerCase() === username.toLowerCase())
+        );
+        setLinks(matches);
+      })
+      .catch((e) => { if (!cancelled) setError(String(e)); });
+    return () => { cancelled = true; };
+  }, [serverId, username]);
+
+  const ownUuid = user.app_user_uuid;
+  const serverNameById = (sid: string | null | undefined): string => {
+    if (!sid) return '(unresolved)';
+    const s = allServers.find((x) => x.id === sid);
+    return s ? s.name : sid;
+  };
+
+  return (
+    <div className="panel" style={{ marginTop: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
+        <strong style={{ fontSize: 13 }}>Identity links</strong>
+        <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
+          Cross-server identity handle + every linked account.
+        </span>
+      </div>
+
+      {ownUuid ? (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+            This user&apos;s app identifier
+          </div>
+          <code style={{
+            display: 'inline-block', fontSize: 11, padding: '2px 6px',
+            background: 'var(--code-bg, rgba(127,127,127,0.12))',
+            borderRadius: 3, marginTop: 2, wordBreak: 'break-all',
+          }}>
+            {ownUuid}
+          </code>
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
+            On <strong>{serverName}</strong> as <strong>{username}</strong>
+            {user.kind === 'owner' ? ' (server owner)' : ''}
+          </div>
+        </div>
+      ) : (
+        <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 8 }}>
+          No app identifier yet for this user; will be assigned on the
+          next sync.
+        </div>
+      )}
+
+      <div style={{ borderTop: '1px solid var(--border, rgba(127,127,127,0.2))', paddingTop: 8 }}>
+        <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 4 }}>
+          Linked to {links?.length ?? 0} other account{links?.length === 1 ? '' : 's'}
+        </div>
+        {error && (
+          <div className="banner error" style={{ fontSize: 12, marginTop: 4 }}>
+            Could not load links: {error}
+          </div>
+        )}
+        {links !== null && links.length === 0 && !error && (
+          <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+            None yet. Links are created manually via the Mapping panel
+            below, or automatically by the backend when two servers
+            report the same Plex.tv / Jellyfin / Emby user ID.
+          </div>
+        )}
+        {links !== null && links.length > 0 && (
+          <table className="table" style={{ marginTop: 4, fontSize: 12 }}>
+            <thead>
+              <tr>
+                <th style={{ textAlign: 'left' }}>Other server</th>
+                <th style={{ textAlign: 'left' }}>Other user</th>
+                <th style={{ textAlign: 'left' }}>Source</th>
+                <th style={{ textAlign: 'left' }}>App identifier</th>
+              </tr>
+            </thead>
+            <tbody>
+              {links.map((m) => {
+                const isThisOnA = m.server_a_id === serverId
+                  && (m.user_a_handle || '').toLowerCase() === username.toLowerCase();
+                const otherServerId = isThisOnA ? m.server_b_id : m.server_a_id;
+                const otherHandle = isThisOnA ? m.user_b_handle : m.user_a_handle;
+                const otherUuid = isThisOnA ? m.user_b_uuid : m.user_a_uuid;
+                return (
+                  <tr key={m.id}>
+                    <td>{serverNameById(otherServerId)}</td>
+                    <td>{otherHandle || <em style={{ color: 'var(--text-dim)' }}>(unresolved)</em>}</td>
+                    <td>
+                      <span style={{
+                        fontSize: 10, padding: '1px 5px',
+                        borderRadius: 2,
+                        background: m.source === 'auto_copy'
+                          ? 'rgba(80,150,200,0.18)'
+                          : 'rgba(150,150,150,0.18)',
+                      }}>
+                        {m.source === 'auto_copy' ? 'auto' : 'manual'}
+                      </span>
+                    </td>
+                    <td>
+                      <code style={{
+                        fontSize: 10, padding: '1px 4px',
+                        background: 'var(--code-bg, rgba(127,127,127,0.12))',
+                        borderRadius: 2, wordBreak: 'break-all',
+                      }}>
+                        {otherUuid}
+                      </code>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );

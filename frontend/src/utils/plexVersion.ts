@@ -51,12 +51,12 @@ export function compareVersions(a: PlexVersionTuple, b: PlexVersionTuple): numbe
  * ``librarySectionUserID`` attribute on collection objects landed.
  * Older servers don't expose it and the engine would auto-fall-back
  * to the slower rating-key dedup; we explicitly gate the toggle off
- * in the UI for clarity rather than letting the operator enable a
+ * in the UI for clarity rather than letting the end user enable a
  * feature that silently degrades.
  *
  * **Unknown version is treated as unsupported.** A row added before
  * the plex_version field landed (or one that hasn't been refreshed
- * since this code shipped) returns false here. Operators get a
+ * since this code shipped) returns false here. End users get a
  * "refresh this server to enable" hint in the toggle's tooltip.
  */
 export function serverSupportsFastCollections(version: string | null | undefined): boolean {

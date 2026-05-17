@@ -30,7 +30,7 @@ If you came here from a pointer in the README, the section you want is probably 
 
 **Advanced setup and operations (referenced from the README)**
 
-* [Security architecture](#security-architecture) - at-rest encryption, JWT auth, log scrubber, file permissions
+* [Security architecture](#security-architecture) - root account model, sudo-style elevation, at-rest encryption, JWT auth, log scrubber, file permissions
 * [Exposing PlexBackUp to other devices on your network](#exposing-plexbackup-to-other-devices-on-your-network) - the optional LAN-exposure walkthrough
 * [Migration from v0.8.0](#migration-from-v080) - what happens to your old settings and schedules on upgrade
 
@@ -281,9 +281,20 @@ The web UI's basics (always-on login, encrypted tokens at rest) are described in
 ### Auth layer (always on)
 
 * The backend has **always-on multi-user authentication as of PR-A2**. Previously it was opt-in via `PLEXMIGRATE_AUTH_ENABLED=true`; that env var has been removed. There is no fallback flag to disable auth.
-* On first boot the web UI walks you through creating a root admin account; every subsequent boot goes to the login screen.
+* On first boot the web UI walks you through a two-step wizard that creates a day-to-day **admin** account AND a separate dedicated **root_admin** account (see "Root account model" below).
 * Every API call and the WebSocket require a JWT issued by `/api/auth/login`.
-* **Upgrade note:** on first boot after upgrading to PR-A2, you'll be prompted to log in with your existing admin credentials.
+* **Upgrade note from a single-account install:** on first authenticated load the UI presents a non-dismissable "split your account" modal that creates a separate root_admin and demotes the existing single account to admin. The split is one-time and required; there is no skip option.
+
+### Root account model and sudo-style elevation
+
+Modeled on a Linux-style separation of `user` and `root`:
+
+* **Two-account onboarding.** Fresh installs create both accounts atomically (`POST /api/auth/setup-v2`). Legacy single-admin installs go through the forced upgrade-split (`POST /api/auth/upgrade-split`) on first post-upgrade login.
+* **One root account per person.** Granting another operator root permission is done by promoting their existing admin row to `root_admin` via `POST /api/auth/users/{u}/grant-root` (which itself requires sudo-style elevation). There is no shared root password.
+* **Sudo-style elevation.** Privileged actions (creating or modifying other user accounts, granting/revoking root, applying a cross-server PIN migration) require the caller to re-enter their own password via `POST /api/auth/elevate`. The elevation is cached on the JWT's session id for a configurable TTL (default 600 seconds, clamped 60-3600 by the helper). During that window further privileged calls in the same session don't re-prompt.
+* **Drop on demand.** `POST /api/auth/elevation/clear` (sudo -k equivalent) drops the elevation immediately. The topbar exposes a one-click chip when elevation is live.
+* **Endpoint gates.** Five user-touching endpoints (`POST /users`, `PATCH /users/{u}`, `POST /users/{u}/reset-password`, `DELETE /users/{u}`, `PATCH /users/{u}/permissions`) require elevation. Two self-service endpoints (`POST /users/me/display-name`, `POST /users/me/password`) do not - the operator policy explicitly carved out "any user can change their own password". The full audit matrix lives in [CODEREVIEW[ADMINAUDIT]-2026-05-15.md](CODEREVIEW[ADMINAUDIT]-2026-05-15.md).
+* **Recovery if all root passwords are lost.** Stop the container, delete `server_data/auth.db`, restart. The first-boot two-step wizard runs again and you create new admin + root accounts. **`media.db`, `snapshots.db`, `.keyfile`, and `servers.json` are preserved** so no Plex data, no captured snapshots, and no stored Plex tokens are lost - only the app-user identities are reset. The keyfile (still on disk) decrypts the existing servers.json tokens after the new accounts are created. There is no CLI escape hatch by design: adding one would create an extra attack surface for the same outcome that already exists implicitly via filesystem access.
 
 ### Tokens encrypted at rest (v0.9.5+)
 

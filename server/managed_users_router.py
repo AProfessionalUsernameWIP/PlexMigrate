@@ -4,7 +4,7 @@ PR-10 - Managed Users management API.
 Surfaces under ``/api/managed-users/{server_id}/...`` and powers the
 new User Management sub-tab. Reads expose metadata + boolean presence
 flags only (no plaintext credentials); writes require BOTH a valid
-JWT (operator+) AND a separate db_admin username/password pair in the
+JWT (end user+) AND a separate db_admin username/password pair in the
 request body. The db_admin gate is server-side: ``auth_db.verify_password``
 re-validates on every write so a stolen JWT alone cannot mutate stored
 credentials.
@@ -95,6 +95,33 @@ class GlobalTombstoneDeleteIn(_DbAdminGate):
     """
 
 
+class PlexHomeTokenIn(_DbAdminGate):
+    """Body for the Playlist Management convenience endpoint
+    ``POST /api/managed-users/{server_id}/{username}/plex-home-token``.
+
+    Lets the end user paste a Plex Home user's token (obtained from
+    plex.tv > Account > Authorized Devices > <device> > X-Plex-Token)
+    so the Playlist Management copy path can act AS that user when the
+    `playlist_mgmt_plex_home_auth_mode` tunable is set to
+    `per_user_token` (instead of the owner_token default).
+
+    Different from the existing PATCH endpoint: this one auto-upserts
+    the managed_users row when missing (saves the end user the
+    additional "run a sync first" step the PATCH requires). The token
+    field uses two semantics shared with the PATCH endpoint:
+      * Supplying a non-empty `auth_token` stores it.
+      * `clear_auth_token=true` wipes the stored token.
+    """
+    auth_token: Optional[str] = None
+    clear_auth_token: bool = False
+    # Plex Home users have rotating tokens. The end user may use this
+    # endpoint to refresh after a token rotates without re-typing
+    # every per-user-token; the optional friendly display_name lets
+    # them annotate the row on first write so the UI shows a clearer
+    # label than the raw username.
+    display_name: Optional[str] = None
+
+
 class GlobalCredentialIn(_DbAdminGate):
     """
     PR-13 fix #2 - apply one credential to every managed-user row
@@ -104,7 +131,7 @@ class GlobalCredentialIn(_DbAdminGate):
     (``auth_token`` / ``plex_home_pin`` / ``service_password``);
     ``plaintext`` is the value (empty string clears). One write per
     matching row; rows globally tombstoned are still updated so an
-    operator who un-tombstones later finds the credential intact.
+    end user who un-tombstones later finds the credential intact.
     """
     kind: str = Field(
         description="Credential to apply: 'auth_token', 'plex_home_pin', or 'service_password'."
@@ -206,7 +233,7 @@ def set_global_credential(
     service_password) to every ``managed_users`` row that shares this
     username across registered servers. Useful when one Plex Home
     user exists on multiple registered Plex servers with the same
-    PIN / password / token: the operator types the value once and
+    PIN / password / token: the end user types the value once and
     every server's row picks it up.
 
     db_admin gated. Plaintext is encrypted by
@@ -217,7 +244,7 @@ def set_global_credential(
     Returns ``{username, kind, applied: int, missing: int}``:
       * ``applied`` - rows whose credential was successfully written.
       * ``missing`` - servers where the username has no row yet
-        (silently skipped; operator can sync those servers first).
+        (silently skipped; end user can sync those servers first).
     """
     _verify_db_admin(body.db_admin_username, body.db_admin_password)
     if body.kind not in media_db.MANAGED_USER_CREDENTIAL_KINDS:
@@ -274,7 +301,7 @@ def list_users(
     """
     Return every managed-user row known for one server. Credentials
     are never inlined - only ``has_token`` / ``has_pin`` / ``has_password``
-    booleans tell the UI whether something is stored. Operators+ only;
+    booleans tell the UI whether something is stored. End users+ only;
     viewer doesn't see User Management at all.
 
     ``include_hidden=true`` (default false) also returns rows whose
@@ -318,7 +345,7 @@ def update_user(
     Update credentials and/or display name for one managed user.
 
     Requires:
-      * Operator+ JWT (frontend tab visibility gate).
+      * End user+ JWT (frontend tab visibility gate).
       * Valid db_admin username + password in the body. Re-verified
         on every call - there is no persistent db_admin session.
 
@@ -387,6 +414,84 @@ def update_user(
     return updated
 
 
+@router.post("/{server_id}/{username}/plex-home-token")
+def set_plex_home_token(
+    server_id: str,
+    username: str,
+    body: PlexHomeTokenIn,
+    user: Dict[str, Any] = Depends(require_role("operator")),
+) -> Dict[str, Any]:
+    """Save (or clear) a Plex Home user's X-Plex-Token so the
+    Playlist Management copy path can act AS that user when
+    ``playlist_mgmt_plex_home_auth_mode`` is ``per_user_token``.
+
+    Behaviour:
+      * Auto-upserts the managed_users row (kind='managed',
+        service_type='plex') when it doesn't yet exist. Saves the
+        end user the "run a sync first" step that the PATCH
+        endpoint enforces.
+      * Non-empty ``auth_token`` stores Fernet-encrypted via
+        :mod:`server.secrets`.
+      * ``clear_auth_token=true`` wipes the stored token.
+      * ``display_name`` (optional) updates the end user-visible
+        label on first write.
+
+    Plex-destination convenience only. The destination must be a
+    Plex server (other backends ignore the per-user-token mode
+    because admin-token-with-UserId writes work universally).
+    db_admin re-auth on every call, same as the broader PATCH.
+    """
+    _verify_db_admin(body.db_admin_username, body.db_admin_password)
+    server_row = _ensure_server_exists(server_id)
+    if (server_row.get("service_type") or "plex").lower() != "plex":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Per-user-token storage is Plex-only. Destination "
+                f"server {server_id!r} is "
+                f"{server_row.get('service_type') or 'plex'!r}; "
+                "Jellyfin / Emby admin tokens write per-user via "
+                "the UserId in the URL so this endpoint is not needed."
+            ),
+        )
+    # Auto-upsert. Metadata only; the credential set below is the
+    # actual write the end user cares about.
+    try:
+        media_db.upsert_managed_user(
+            server_id=server_id, username=username,
+            display_name=body.display_name,
+            service_type="plex", kind="managed",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Resolve the credential mutation.
+    try:
+        if body.clear_auth_token:
+            media_db.set_managed_user_credential(
+                server_id=server_id, username=username,
+                kind="auth_token", plaintext="",
+            )
+        elif body.auth_token is not None and body.auth_token != "":
+            media_db.set_managed_user_credential(
+                server_id=server_id, username=username,
+                kind="auth_token", plaintext=body.auth_token,
+            )
+        else:
+            # Neither set nor clear: nothing to do; surface the
+            # current row so the UI can re-render its "has_token"
+            # badge without a follow-up GET.
+            current = media_db.get_managed_user(server_id, username)
+            assert current is not None
+            return current
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    updated = media_db.get_managed_user(server_id, username)
+    assert updated is not None
+    return updated
+
+
 @router.delete("/{server_id}/{username}")
 def hide_user_on_server(
     server_id: str,
@@ -403,7 +508,7 @@ def hide_user_on_server(
     Restoring is either ``PATCH ... {tombstoned: false}`` from the
     detail view's Unhide button, or letting a future sync run with
     no per-server tombstone in place (a fresh sync from the same
-    server would re-upsert as ``tombstoned=0`` only if the operator
+    server would re-upsert as ``tombstoned=0`` only if the end user
     has explicitly toggled it; the sync helper itself doesn't reset
     the flag).
 
@@ -445,7 +550,7 @@ def sync_users(
     _ensure_server_exists(server_id)
     result = media_db.sync_managed_users_from_live(server_id, log)
     # 502 if the live API was unreachable (sync helper swallows the
-    # exception so the operator-facing message stays clean here).
+    # exception so the end user-facing message stays clean here).
     if result.get("error"):
         err_low = result["error"].lower()
         status = 404 if "no server" in err_low else 502

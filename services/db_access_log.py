@@ -4,14 +4,14 @@ PR-13 follow-up - database access audit log.
 A small helper that writes a dedicated ``db_access.log`` alongside
 the existing per-run log files. Captures every read / write the
 engine performs against the local databases (``media.db``,
-``auth.db``, ``snapshots.db``) plus the operator-driven credential
+``auth.db``, ``snapshots.db``) plus the end user-driven credential
 fetches inside :func:`services.auth.get_home_users`.
 
 Why a separate log?
 -------------------
 The run log is dominated by per-track / per-item engine activity.
 Credential reads and other database hits are sparse and operationally
-important - the operator needs to be able to answer "did we actually
+important - the end user needs to be able to answer "did we actually
 use the stored PIN for Crystal Jean?" without grepping through tens
 of thousands of track lines.
 
@@ -25,7 +25,7 @@ Destination
   directory (``<run_log_dir>/db_access.log``). This keeps the audit
   trail co-located with the run's other artefacts so the Logs panel
   surfaces it next to ``run_*.log``.
-* Otherwise (e.g. operator clicks Download in the Backups panel
+* Otherwise (e.g. end user clicks Download in the Backups panel
   outside of a run) it falls back to ``server_data/db_access.log``
   so the trail never goes silently nowhere.
 
@@ -40,8 +40,41 @@ log at the same time will serialise on the handler.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+# Default rotation limits applied when the end user hasn't configured
+# the tunables (or the settings.json read fails). Sized so a chatty
+# DB-access trail can still reach a useful history without ballooning
+# disk usage: 50 MB max per file, 5 archives kept (~250 MB ceiling).
+_DEFAULT_ROTATE_MAX_BYTES = 50 * 1024 * 1024
+_DEFAULT_ROTATE_BACKUP_COUNT = 5
+
+
+def _resolve_rotate_settings() -> tuple:
+    """
+    Read ``settings.log_rotate_max_size_mb`` (converted to bytes) and
+    ``settings.log_rotate_backup_count`` from the persisted settings,
+    falling back to the defaults above on any read failure. Tunables
+    are clamped at sane bounds (size >= 1 MB, count >= 0) so a typo
+    in settings.json can't disable rotation by writing 0 / negative.
+    """
+    max_bytes = _DEFAULT_ROTATE_MAX_BYTES
+    backup_count = _DEFAULT_ROTATE_BACKUP_COUNT
+    try:
+        from server.persistence import load_settings
+        settings = load_settings() or {}
+        raw_mb = settings.get("log_rotate_max_size_mb")
+        if isinstance(raw_mb, (int, float)) and raw_mb >= 1:
+            max_bytes = int(raw_mb * 1024 * 1024)
+        raw_count = settings.get("log_rotate_backup_count")
+        if isinstance(raw_count, int) and raw_count >= 0:
+            backup_count = raw_count
+    except Exception:
+        pass
+    return max_bytes, backup_count
 
 
 _LOGGER_NAME = "plexmigrate.db_access"
@@ -99,8 +132,22 @@ def _get_logger() -> logging.Logger:
     log.setLevel(logging.INFO)
     log.propagate = False  # don't double-print into the main run log
     file_path = target / _FILE_NAME
+    max_bytes, backup_count = _resolve_rotate_settings()
     try:
-        handler = logging.FileHandler(str(file_path), encoding="utf-8")
+        # RotatingFileHandler rolls the active file to
+        # ``db_access.log.1`` (then .2, .3 …) when it crosses
+        # ``maxBytes``. Older archives beyond ``backupCount`` are
+        # deleted by the handler. This bounds disk usage without
+        # the end user having to babysit the file. Tunables read at
+        # handler-attach time; a settings change requires a server
+        # restart or a new run (the per-run target re-attaches a
+        # fresh handler) to take effect.
+        handler: logging.Handler = logging.handlers.RotatingFileHandler(
+            str(file_path),
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
     except OSError as exc:
         # Defensive: failure to open the file shouldn't fail the
         # caller. The logger stays without a handler and effectively
@@ -140,7 +187,7 @@ def _fmt_where(where: Dict[str, Any]) -> str:
 
 
 # ── Enable/disable flag ──────────────────────────────────────────────────────
-# Operator can disable the audit trail via the db_admin-gated endpoint
+# End user can disable the audit trail via the db_admin-gated endpoint
 # /api/settings/audit-log-toggle. When disabled all log_* calls no-op.
 # The flag is cached at module level (no settings.json read per call);
 # the toggle endpoint refreshes the cache and lifespan startup
@@ -212,7 +259,7 @@ def log_read(
     intent: str = "",
 ) -> None:
     """
-    Record a database read. ``intent`` is a one-line operator-readable
+    Record a database read. ``intent`` is a one-line end user-readable
     reason (e.g. ``"per-user PIN lookup for snapshot impersonation"``).
     """
     if not _enabled:
@@ -253,7 +300,7 @@ def log_write(
 
 def log_event(message: str, *args: Any) -> None:
     """
-    Free-form audit line for operator-meaningful events that don't
+    Free-form audit line for end user-meaningful events that don't
     fit a strict read/write shape (e.g. "PIN successfully authorised
     home-user sign-in for Crystal Jean").
     """

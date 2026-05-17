@@ -1,7 +1,7 @@
 // Servers ▸ Advanced Settings sub-tab.
 //
 // Per-server overrides for snapshot-time defaults. The Run-Job form
-// seeds its toggles from the resolved value when the operator picks
+// seeds its toggles from the resolved value when the end user picks
 // a source server; scheduled jobs respect explicit per-schedule
 // values first, so the resolution chain ends up:
 //
@@ -11,7 +11,7 @@
 // Layout: one row per registered server, columns per setting. Each
 // cell is the override input plus a "use global" reset action. The
 // resolved global default is shown as a labeled badge at the top of
-// each column so the operator can see what's being inherited.
+// each column so the end user can see what's being inherited.
 
 import { useEffect, useState } from 'react';
 import { api, ServerView, SettingsView } from '../api';
@@ -53,7 +53,7 @@ interface ColumnDef {
   // the field has no global (Pydantic default is the only fallback).
   globalKey: keyof SettingsView | null;
   // The built-in default the engine applies when no override and no
-  // global is set. Shown in the column header so operators can see
+  // global is set. Shown in the column header so end users can see
   // exactly what kicks in for a server with no override.
   builtinDefault: boolean;
   helpText: string;
@@ -319,7 +319,7 @@ export function ServerAdvancedSettingsPanel() {
                       // enabling the override there silently
                       // degrades. Render the toggle as a locked
                       // "off - unsupported" pill with a tooltip
-                      // instead of letting the operator pick a
+                      // instead of letting the end user pick a
                       // value that does nothing.
                       const isFastCol = col.field === 'fast_collection_detection';
                       const ver = s.plex_version ?? '';
@@ -455,7 +455,7 @@ function TriStateToggle({
   onChange: (v: boolean | undefined) => void;
   // v0.14 - when true (e.g. version-gated features against an
   // unsupported PMS), the toggle renders as a single "off - <reason>"
-  // pill that the operator can't interact with. The value is
+  // pill that the end user can't interact with. The value is
   // assumed to be ``false`` by the caller in that state.
   disabled?: boolean;
   disabledReason?: string;
@@ -472,7 +472,7 @@ function TriStateToggle({
     );
   }
   // Three discrete buttons rather than a click-cycle - cycling makes
-  // the operator hunt for the right state on a wide table; explicit
+  // the end user hunt for the right state on a wide table; explicit
   // buttons are scannable and require one click to land anywhere.
   return (
     <div style={{ display: 'inline-flex', gap: 4, fontSize: 11 }}>

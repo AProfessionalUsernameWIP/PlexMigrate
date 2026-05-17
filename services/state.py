@@ -188,7 +188,7 @@ _destination_var: contextvars.ContextVar = contextvars.ContextVar(
 )
 # v0.9.7 Item 4: gate for the dashboard's ``current_user`` field.
 # True only during a direct-transfer run with a non-empty
-# ``user_filter`` (i.e. the operator explicitly narrowed the run to
+# ``user_filter`` (i.e. the end user explicitly narrowed the run to
 # specific users). In every other case - standard snapshot, standard
 # import, direct transfer with no filter - the four ``set_current_user``
 # call sites in importer/snapshotter become no-ops and the field stays
@@ -274,6 +274,20 @@ _snapshot_payloads: List[Dict[str, Any]] = []
 _console_handler: Optional[logging.Handler] = None
 _media_logger: Optional[logging.Logger] = None
 _live_instance: Optional[Any] = None      # active Live context; set in run_snapshot/run_restore
+# Per-run restoration log writer (services.restoration_log.RestorationLogWriter
+# or its null-writer shim). ``run_restore`` opens this at the top of every
+# import job and closes it in the finally-block; the per-metric helpers
+# emit RESTORED / NOOP / SKIPPED / FAILED entries through it. Treated as
+# best-effort: a missing attribute or a closed writer must never crash the
+# engine. Reads via ``getattr(state, "_restoration_log", None)`` are safe.
+_restoration_log: Optional[Any] = None
+# Phase 4 of the dashboard / log reorg: captured snapshot of the users
+# with at least one RESTORED entry from the last run's restoration
+# log. Populated by services.restorer when it closes the writer; read
+# by server.jobs at finalisation to populate run_history. Reset to []
+# when no restore has happened. Never carries sensitive data - just
+# usernames / Plex.tv emails.
+_restoration_log_affected_users: List[str] = []
 
 # Cross-thread mirror of the currently-active DashboardState.
 #
@@ -343,7 +357,7 @@ _run_schedule_name: str = ""
 # per-library payload can be ingested directly into
 # ``media.db`` via ``media_db.ingest_snapshot_payload(server_id, ...)``.
 # Empty string means "no registered server" - the engine refuses to
-# persist data when this is empty so the operator gets a hard error
+# persist data when this is empty so the end user gets a hard error
 # rather than a silent drop.
 _snapshot_server_id: str = ""
 
@@ -411,6 +425,49 @@ def get_dashboard() -> Optional[Any]:
         return ctx_val
     with _dashboard_global_lock:
         return _dashboard_global
+
+# ── Mixed-media playlist run config ──────────────────────────────────────────
+#
+# Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: jobs.py resolves the
+# end user's per-run + global mixed-media config once per restore
+# invocation and stashes the result here so the engine modules
+# (services/restorer.py + services/restorer_adapter.py) can read it
+# without threading another kwarg through every internal call. None
+# means "no config set; engine treats every row as pass-through"
+# (matches the legacy behaviour for callers that pre-date this
+# feature).
+
+_mixed_media_config: Optional[Any] = None
+_mixed_media_per_user_configs: Optional[Dict[str, Any]] = None
+_mixed_media_lock = threading.Lock()
+
+
+def set_mixed_media_config(
+    cfg: Optional[Any],
+    per_user: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Set the mixed-media config for the current restore run. Pass
+    ``None`` to clear. Idempotent."""
+    global _mixed_media_config, _mixed_media_per_user_configs
+    with _mixed_media_lock:
+        _mixed_media_config = cfg
+        _mixed_media_per_user_configs = per_user
+
+
+def get_mixed_media_config() -> Optional[Any]:
+    """Return the run-level mixed-media config or ``None`` when no
+    restore is in flight or when the end user didn't configure one."""
+    with _mixed_media_lock:
+        return _mixed_media_config
+
+
+def get_mixed_media_per_user_configs() -> Optional[Dict[str, Any]]:
+    """Return the per-user mixed-media config map or ``None``. Used
+    when the end user overrode the strategy per source user via the
+    cross_platform_resolutions payload."""
+    with _mixed_media_lock:
+        return _mixed_media_per_user_configs
+
 
 # ── Small-Terminal Fallback Progress State ────────────────────────────────────
 # Used when the terminal is < 80×22 (Rich Progress bars instead of dashboard).

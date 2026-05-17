@@ -35,7 +35,7 @@ Tables explicitly skipped
   another host would have unreadable cells; safer to keep credentials
   out of the snapshot entirely. PR-11's sync re-populates after a
   restore.
-* ``global_tombstones``  - operator-only UI state; not data.
+* ``global_tombstones``  - end user-only UI state; not data.
 * ``schema_version``     - copied implicitly via the schema DDL
   application above; needed so the snapshot file is openable by code
   that runs migrations.
@@ -70,7 +70,7 @@ _PER_SERVER_TABLES = (
     "collections",
 )
 
-# Mapping from the operator-facing metric label ("watch_history" etc.)
+# Mapping from the end user-facing metric label ("watch_history" etc.)
 # to the per-server SQL table the metric lives in. Used to gate the
 # per-table INSERT loop on the requested-metrics list. Tables NOT in
 # this map (``server_items``, ``items``, ``servers``) are always
@@ -121,7 +121,7 @@ def create_snapshot_db(
 
     Scoping
     -------
-    ``metrics`` is the operator-requested subset of
+    ``metrics`` is the end user-requested subset of
     ``{"watch_history", "ratings", "playlists", "collections"}``.
     When supplied, only the corresponding per-server tables receive
     rows; the rest are created with their full schema but left empty.
@@ -152,7 +152,7 @@ def create_snapshot_db(
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     if snapshot_path.exists():
         # Clean re-create: an existing file at this path means a
-        # previous capture failed mid-write or the operator picked
+        # previous capture failed mid-write or the end user picked
         # a colliding name. Either way, drop it.
         snapshot_path.unlink()
 
@@ -216,11 +216,20 @@ def create_snapshot_db(
             libraries=list(libraries or []),
             metrics=list(metrics) if metrics is not None else list(_METRIC_TO_TABLE.keys()),
             created_by=created_by,
+            # Phase D: surface a user-count summary in the snapshot
+            # description string. Legacy create_snapshot_db path
+            # doesn't have direct access to a managed-user roster, so
+            # we approximate via the user_display_names map size; if
+            # that's also unset, _synthesize_snapshot_description
+            # omits the count gracefully.
+            user_count=len(user_display_names or {}),
         )
         _write_snapshot_users(
             dst_conn,
             metrics=metrics,
             user_display_names=user_display_names or {},
+            server_id=server_id,
+            src_conn=src_conn,
         )
     finally:
         src_conn.close()
@@ -314,7 +323,7 @@ def _copy_rows(
 
     Metric gating
     -------------
-    ``metrics`` is the operator-requested subset of
+    ``metrics`` is the end user-requested subset of
     ``{"watch_history", "ratings", "playlists", "collections"}``.
 
     Per-table behaviour:
@@ -420,12 +429,36 @@ def _create_meta_tables(dst: sqlite3.Connection) -> None:
             libraries_json  TEXT NOT NULL,
             metrics_json    TEXT NOT NULL,
             created_by      TEXT,
-            schema_version  INTEGER NOT NULL DEFAULT 0
+            schema_version  INTEGER NOT NULL DEFAULT 0,
+            -- Phase D (admin-management follow-up, 2026-05-15):
+            -- short human-readable summary of what this snapshot
+            -- contains (users, libraries, metrics). Populated at
+            -- capture time; older snapshots without this column
+            -- fall through to filename-derived content on read.
+            description     TEXT
         );
         CREATE TABLE IF NOT EXISTS snapshot_users (
             user_handle     TEXT PRIMARY KEY,
             display_name    TEXT,
-            is_owner        INTEGER NOT NULL DEFAULT 0
+            is_owner        INTEGER NOT NULL DEFAULT 0,
+            -- Phase E (2026-05-16): distinguishes users captured WITH
+            -- data (had_data=1) from roster users captured with zero
+            -- activity (had_data=0). The Exports panel renders
+            -- "N captured / M roster" using these counts.
+            had_data        INTEGER NOT NULL DEFAULT 0,
+            -- v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-1): the
+            -- application-wide canonical user identifier from
+            -- media.db v12. Without this column the snapshot is
+            -- self-describing for everything EXCEPT the identity of
+            -- the users it captured, breaking cross-install identity
+            -- preservation. backend_user_id is the per-backend native
+            -- id (Plex.tv numeric userID; J/E GUID); kept alongside
+            -- so a snapshot loaded on a fresh install can ground its
+            -- users against either the end user's identity_map (by
+            -- app_user_uuid) OR the backend's auto-link path (by
+            -- (service_type, backend_user_id)).
+            app_user_uuid   TEXT,
+            backend_user_id TEXT
         );
         CREATE TABLE IF NOT EXISTS library_sections (
             server_id      TEXT NOT NULL,
@@ -445,11 +478,48 @@ def _create_meta_tables(dst: sqlite3.Connection) -> None:
 # Snapshot file schema version. Bumped whenever the on-disk shape
 # changes in a way that requires re-capture (not just additive). The
 # restore-side reader refuses files where snapshot_meta.schema_version
-# is less than this constant; the error message tells the operator
+# is less than this constant; the error message tells the end user
 # which version they have and which is required. v15 introduced the
 # library_sections anchor and made section_key required on every
 # per-server row.
-SNAPSHOT_SCHEMA_VERSION = 15
+# v16 adds app_user_uuid + backend_user_id columns to snapshot_users
+# and starts populating the existing app_user_uuid column on
+# server_users (DDL was already cloned from media.db v12; rows just
+# arrived NULL pre-v16). Existing v15 snapshots become unreadable on
+# upgrade per the existing refuse-at-load policy in
+# server/snapshot_serializer.py; end users re-capture per the
+# Legacy Support Policy (pre-release).
+SNAPSHOT_SCHEMA_VERSION = 16
+
+
+def _synthesize_snapshot_description(
+    *,
+    server_name: str,
+    libraries: List[str],
+    metrics: List[str],
+    user_count: Optional[int],
+) -> str:
+    """
+    Build a one-line summary of a snapshot's contents for the Exports
+    listing. Format:
+
+        "Plex1 · 3 user(s) · Movies, TV Shows, Music (3 libraries) · watch_history, ratings, playlists, collections"
+
+    Empty / unknown sections are dropped so a snapshot with no users
+    captured reads as "Plex1 · Movies, TV Shows · watch_history, ratings".
+    """
+    parts: List[str] = []
+    if server_name:
+        parts.append(server_name)
+    if user_count is not None and user_count > 0:
+        parts.append(f"{user_count} user(s)")
+    if libraries:
+        first = ", ".join(libraries[:4])
+        more = "" if len(libraries) <= 4 else f", +{len(libraries) - 4} more"
+        parts.append(f"{first}{more} ({len(libraries)} library/ies)")
+    if metrics:
+        parts.append(", ".join(metrics))
+    return " · ".join(parts)
 
 
 def _write_snapshot_meta(
@@ -462,24 +532,42 @@ def _write_snapshot_meta(
     libraries: List[str],
     metrics: List[str],
     created_by: Optional[str],
+    description: Optional[str] = None,
+    user_count: Optional[int] = None,
 ) -> None:
     """
     Insert the single ``snapshot_meta`` row. Re-runnable: if a row
     already exists (re-stamping a recovered orphan), the existing
     row is replaced with the freshly-supplied values.
+
+    Phase D (admin-management follow-up, 2026-05-15): ``description``
+    is an optional short human-readable summary stamped on the
+    snapshot at capture time. If the caller doesn't pre-compute one,
+    we synthesize a generic summary from the libraries + metrics +
+    user_count so every fresh snapshot has at least a populated
+    field (older snapshots get a NULL description and the reader
+    falls back to filename-derived content).
     """
+    if description is None:
+        description = _synthesize_snapshot_description(
+            server_name=server_name,
+            libraries=libraries,
+            metrics=metrics,
+            user_count=user_count,
+        )
     dst.execute("DELETE FROM snapshot_meta")
     dst.execute(
         """
         INSERT INTO snapshot_meta (
             snapshot_id, server_id, server_name, captured_at,
-            libraries_json, metrics_json, created_by, schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            libraries_json, metrics_json, created_by, schema_version,
+            description
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             snapshot_id, server_id, server_name, captured_at,
             json.dumps(libraries), json.dumps(metrics), created_by,
-            SNAPSHOT_SCHEMA_VERSION,
+            SNAPSHOT_SCHEMA_VERSION, description,
         ),
     )
     # No commit here: this function is called from two paths, and the
@@ -497,15 +585,24 @@ def _write_snapshot_users(
     *,
     metrics: Optional[List[str]],
     user_display_names: Dict[str, str],
+    server_id: str = "",
+    src_conn: Optional[sqlite3.Connection] = None,
 ) -> None:
     """
-    Populate ``snapshot_users`` from the DISTINCT ``user_handle``
-    values found in the per-server metric tables that were actually
-    populated by ``_copy_rows``. Zero-activity users (handles present
-    on the source server but absent from every populated table) are
-    never inserted here.
+    Populate ``snapshot_users`` with the full roster captured during
+    this snapshot run: the owner plus every managed user from
+    ``user_display_names``. Each row carries a ``had_data`` flag set
+    to 1 if the user appears in at least one populated metric table,
+    0 otherwise.
 
-    Display name is filled from the operator-supplied map when
+    Phase E (2026-05-16): previously, this function ONLY wrote users
+    with data; zero-activity managed users were silently dropped and
+    the registry's user_count under-counted by the roster minus
+    active-users delta. The end user's Exports panel now renders
+    "N captured / M roster" using both counts so a server with 8
+    managed users where 3 have actual data shows "3 of 9".
+
+    Display name is filled from the end user-supplied map when
     available; missing entries land as NULL. ``is_owner`` is true
     iff the handle is the empty string (``""``), which is the
     project convention for server-owner data across every metric
@@ -513,7 +610,7 @@ def _write_snapshot_users(
     """
     # Determine which tables we actually populated. ``metrics=None``
     # means "all of them" (legacy / recovery path); otherwise only
-    # the operator-requested subset.
+    # the end user-requested subset.
     if metrics is None:
         populated_tables = list(_METRIC_TABLES)
     else:
@@ -521,37 +618,89 @@ def _write_snapshot_users(
             _METRIC_TO_TABLE[m] for m in metrics if m in _METRIC_TO_TABLE
         ]
 
-    if not populated_tables:
-        # Nothing to derive from - leave snapshot_users empty.
-        # No explicit commit: same rationale as _write_snapshot_meta -
-        # the autocommit caller has nothing to flush, and the
-        # transaction caller would have its outer COMMIT broken by a
-        # mid-flight commit here.
-        return
+    # Build the set of handles that had data in this capture (union
+    # across populated metric tables). Empty handles (owner) are
+    # valid and preserved through the DISTINCT.
+    had_data_handles: set = set()
+    if populated_tables:
+        union_parts = [
+            f"SELECT user_handle FROM {t}"
+            for t in populated_tables
+        ]
+        union_sql = " UNION ".join(union_parts)
+        had_data_handles = {
+            (r[0] or "") for r in dst.execute(
+                f"SELECT DISTINCT user_handle FROM ({union_sql})"
+            ).fetchall()
+        }
 
-    # UNION across only the populated tables. Empty strings (owner)
-    # are valid handles and are preserved through the DISTINCT.
-    union_parts = [
-        f"SELECT user_handle FROM {t}"
-        for t in populated_tables
-    ]
-    union_sql = " UNION ".join(union_parts)
-    handles = {
-        (r[0] or "") for r in dst.execute(
-            f"SELECT DISTINCT user_handle FROM ({union_sql})"
-        ).fetchall()
-    }
+    # Compose the full roster: owner + every managed user from the
+    # end user-supplied display-name map + any handle that had data
+    # but wasn't in the supplied roster (safety net for engine paths
+    # that discover users dynamically).
+    roster: set = {""}  # owner is always present in a snapshot
+    roster.update(user_display_names.keys())
+    roster.update(had_data_handles)
 
-    for handle in handles:
+    # v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-1): build a
+    # {handle -> (app_user_uuid, backend_user_id)} lookup from the
+    # source media.db once so each per-handle write doesn't pay a
+    # roundtrip. Empty handle ("" = owner) keys both tables: prefer
+    # managed_users (the authoritative app_user_uuid origin), fall
+    # back to server_users. NULL on both sides is acceptable - rows
+    # land with NULL identity, callers downstream still get the
+    # display_name + had_data signal.
+    identity_lookup: Dict[str, Dict[str, Optional[str]]] = {}
+    if src_conn is not None and server_id:
+        try:
+            mu_rows = src_conn.execute(
+                "SELECT username, app_user_uuid, backend_user_id "
+                "FROM managed_users WHERE server_id = ?",
+                (server_id,),
+            ).fetchall()
+            for r in mu_rows:
+                identity_lookup[r["username"] or ""] = {
+                    "app_user_uuid":   r["app_user_uuid"],
+                    "backend_user_id": r["backend_user_id"],
+                }
+        except sqlite3.OperationalError:
+            pass
+        try:
+            su_rows = src_conn.execute(
+                "SELECT user_handle, app_user_uuid, backend_user_id "
+                "FROM server_users WHERE server_id = ?",
+                (server_id,),
+            ).fetchall()
+            for r in su_rows:
+                h = r["user_handle"] or ""
+                # Don't overwrite a managed_users entry; server_users
+                # is the fallback when managed_users had no row for
+                # this handle (pre-PR-10 rows, rare).
+                if h not in identity_lookup:
+                    identity_lookup[h] = {
+                        "app_user_uuid":   r["app_user_uuid"],
+                        "backend_user_id": r["backend_user_id"],
+                    }
+        except sqlite3.OperationalError:
+            pass
+
+    for handle in roster:
         display = user_display_names.get(handle) or None
         is_owner = 1 if handle == "" else 0
+        had_data = 1 if handle in had_data_handles else 0
+        identity = identity_lookup.get(handle, {})
         dst.execute(
             """
             INSERT OR REPLACE INTO snapshot_users
-                (user_handle, display_name, is_owner)
-            VALUES (?, ?, ?)
+                (user_handle, display_name, is_owner, had_data,
+                 app_user_uuid, backend_user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (handle, display, is_owner),
+            (
+                handle, display, is_owner, had_data,
+                identity.get("app_user_uuid"),
+                identity.get("backend_user_id"),
+            ),
         )
     # No commit here: see _write_snapshot_meta for the contract.
 
@@ -669,7 +818,7 @@ def build_snapshot_db_from_payloads(
     # own transaction with its own fsync. On a multi-library /
     # multi-user snapshot that meant tens-to-hundreds of thousands of
     # one-row commits and dominated the post-engine 6-8 minute hang
-    # the operator saw between "libraries 100%" and the job actually
+    # the end user saw between "libraries 100%" and the job actually
     # finishing. One BEGIN / COMMIT pair collapses the whole write
     # phase into a single fsync at the end.
     #
@@ -1109,19 +1258,52 @@ def build_snapshot_db_from_payloads(
     def _write_server_user_row(user_handle: str, role: str,
                                display_name: Optional[str],
                                backend: str = "plex",
-                               backend_user_id: Optional[str] = None) -> None:
+                               backend_user_id: Optional[str] = None,
+                               app_user_uuid: Optional[str] = None) -> None:
         """Insert a server_users identity row into the snapshot .db so
         the on-demand serializer can rebuild a payload with proper role
         + display_name fields. INSERT OR IGNORE is safe because the
-        UNIQUE(server_id, user_handle) constraint prevents dup rows."""
+        UNIQUE(server_id, user_handle) constraint prevents dup rows.
+
+        v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-1): the column has
+        existed on the cloned DDL since media.db v12 but the INSERT
+        was omitting it, leaving every snapshot row with
+        ``app_user_uuid=NULL``. Now populated from media.db at
+        capture time. When the caller doesn't supply
+        ``app_user_uuid``, the helper looks up the canonical value
+        from media.db's managed_users first, then server_users.
+        Best-effort: a NULL result lands as a NULL column and the
+        downstream resolver falls through to backend_user_id /
+        username matching."""
+        resolved_app_uuid = app_user_uuid
+        if resolved_app_uuid is None:
+            try:
+                row = src_conn.execute(
+                    "SELECT app_user_uuid FROM managed_users "
+                    "WHERE server_id = ? AND username = ?",
+                    (server_id, user_handle),
+                ).fetchone()
+                if row is not None and row["app_user_uuid"]:
+                    resolved_app_uuid = row["app_user_uuid"]
+                else:
+                    row = src_conn.execute(
+                        "SELECT app_user_uuid FROM server_users "
+                        "WHERE server_id = ? AND user_handle = ?",
+                        (server_id, user_handle),
+                    ).fetchone()
+                    if row is not None and row["app_user_uuid"]:
+                        resolved_app_uuid = row["app_user_uuid"]
+            except sqlite3.OperationalError:
+                pass
         try:
             dst_conn.execute(
                 "INSERT OR IGNORE INTO server_users "
                 "(server_id, user_handle, display_name, role, backend, "
-                " backend_user_id, created_at, last_seen_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                " backend_user_id, app_user_uuid, created_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (server_id, user_handle, display_name, role, backend,
-                 backend_user_id, captured_at_resolved, captured_at_resolved),
+                 backend_user_id, resolved_app_uuid,
+                 captured_at_resolved, captured_at_resolved),
             )
         except sqlite3.OperationalError:
             # Pre-v0.13.0 schema in the destination snapshot DB (shouldn't
@@ -1189,6 +1371,10 @@ def build_snapshot_db_from_payloads(
                 _write_collection_row(handle, col, sec_id_int)
 
     # 4. Meta tables (snapshot_meta + snapshot_users).
+    # Phase D: also pass the user_count for the description summary.
+    # We count the user_display_names dict entries (the union of
+    # owner + every managed user that produced data in this capture).
+    _phase_d_user_count = len(user_display_names or {})
     _write_snapshot_meta(
         dst_conn,
         snapshot_id=snapshot_id or "",
@@ -1198,11 +1384,14 @@ def build_snapshot_db_from_payloads(
         libraries=list(libraries or []),
         metrics=list(metrics) if metrics is not None else list(_METRIC_TO_TABLE.keys()),
         created_by=created_by,
+        user_count=_phase_d_user_count,
     )
     _write_snapshot_users(
         dst_conn,
         metrics=metrics,
         user_display_names=user_display_names or {},
+        server_id=server_id,
+        src_conn=src_conn,
     )
 
     # v0.13.x: matching COMMIT for the BEGIN above. dst_conn.commit() is
@@ -1215,7 +1404,7 @@ def build_snapshot_db_from_payloads(
     # the transaction may have closed early. Issuing COMMIT against an
     # autocommit connection raises ``OperationalError: cannot commit -
     # no transaction is active`` and the prior writes would be lost to
-    # the operator behind a confusing error. The right writers are
+    # the end user behind a confusing error. The right writers are
     # commit-free (see _write_snapshot_meta / _write_snapshot_users)
     # but this guard makes a future regression visible as a warning
     # instead of a hard fail.
@@ -1264,33 +1453,99 @@ def build_snapshot_db_from_payloads(
     except Exception:
         pass
 
+    # Feature 2: post-capture integrity validation. Gated by the
+    # ``validate_snapshot_after_capture`` setting (default ON per
+    # decision D4/D5). Runs the structural validator against a temp
+    # copy of the freshly-written .db. Errors abort the capture by
+    # raising RuntimeError; warnings are logged but do not abort.
+    try:
+        from services import snapshot_validator
+        if snapshot_validator.is_after_capture_enabled():
+            report = snapshot_validator.validate_snapshot(snapshot_path)
+            log.info(
+                "post-capture validation: %s",
+                report.format_summary_line(),
+            )
+            for issue in report.warnings:
+                log.warning(
+                    "snapshot validation warning [%s @ %s]: %s",
+                    issue.code, issue.where or "-", issue.message,
+                )
+            if not report.ok:
+                err_lines = [
+                    f"[{i.code} @ {i.where or '-'}] {i.message}"
+                    for i in report.errors
+                ]
+                raise RuntimeError(
+                    "Snapshot integrity check failed after capture. "
+                    "The .db was written but is structurally invalid; "
+                    "the job will be marked failed so a bad artefact "
+                    "is not stored. Errors:\n  - "
+                    + "\n  - ".join(err_lines)
+                )
+    except RuntimeError:
+        # Real validation failure; surface to the caller so the job
+        # record gets the error.
+        raise
+    except Exception:
+        # Validator itself crashed (e.g. snapshot_validator import
+        # broken). Log loudly but DO NOT block the capture: the
+        # snapshot file is still on disk and a future re-validation
+        # via the dev tool can catch any issue. The capture path
+        # shouldn't fail because of a telemetry / introspection bug.
+        log.exception(
+            "post-capture validator crashed unexpectedly; the snapshot "
+            "was still written and will be returned. Re-validate via "
+            "the Developer tool if you need a structural check."
+        )
+
     return counters
 
 
-def count_distinct_users(server_id: str) -> int:
+def count_snapshot_users(snapshot_db_path: Any) -> Dict[str, int]:
     """
-    Count distinct ``user_handle`` values across the per-server
-    tables for this server. The DB doesn't enumerate users directly;
-    this is an approximation good enough for the panel's "5 users"
-    metadata.
+    Read user counts from the freshly-written snapshot's
+    ``snapshot_users`` table. Returns
+    ``{"total": M, "with_data": N}`` where ``total`` is every row
+    (owner + every roster managed user) and ``with_data`` is the
+    subset with ``had_data=1`` (users who appear in at least one
+    populated metric table).
+
+    Replaces the legacy ``count_distinct_users`` which queried
+    ``media.db`` globally - that path was wrong for two reasons:
+    (1) it excluded the owner, and (2) ``media.db`` is the cumulative
+    cross-snapshot store rather than this snapshot's own contents,
+    so under the default ``cache_snapshot_payloads_to_media_db=False``
+    setting it could be empty or hold data from a different snapshot.
     """
-    from server import media_db
-    conn = sqlite3.connect(
-        f"file:{media_db._db_path()}?mode=ro", uri=True, timeout=10.0,
-    )
     try:
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT user_handle) AS n FROM ("
-            "  SELECT user_handle FROM watch_events WHERE server_id = ? AND user_handle != '' "
-            "  UNION "
-            "  SELECT user_handle FROM ratings WHERE server_id = ? AND user_handle != '' "
-            "  UNION "
-            "  SELECT user_handle FROM playlists WHERE server_id = ? AND user_handle != '' "
-            "  UNION "
-            "  SELECT user_handle FROM collections WHERE server_id = ? AND user_handle != '' "
-            ")",
-            (server_id, server_id, server_id, server_id),
-        ).fetchone()
-        return int(row[0] if row else 0)
+        conn = sqlite3.connect(
+            f"file:{snapshot_db_path}?mode=ro", uri=True, timeout=5.0,
+        )
+    except sqlite3.OperationalError:
+        return {"total": 0, "with_data": 0}
+    try:
+        try:
+            row = conn.execute(
+                "SELECT "
+                "  COUNT(*) AS total, "
+                "  SUM(CASE WHEN had_data = 1 THEN 1 ELSE 0 END) AS with_data "
+                "FROM snapshot_users"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Older snapshot without the had_data column - fall back
+            # to a simple row count and assume every row had data
+            # (consistent with the pre-Phase-E semantics).
+            row = conn.execute(
+                "SELECT COUNT(*) AS total, COUNT(*) AS with_data FROM snapshot_users"
+            ).fetchone()
+        if row is None:
+            return {"total": 0, "with_data": 0}
+        return {
+            "total": int(row[0] or 0),
+            "with_data": int(row[1] or 0),
+        }
+    except sqlite3.OperationalError:
+        return {"total": 0, "with_data": 0}
     finally:
         conn.close()

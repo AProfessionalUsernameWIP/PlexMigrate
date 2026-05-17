@@ -112,8 +112,29 @@ class ETRTracker:
         Unsmoothed projection. Returns ``None`` when the window has
         fewer than 3 samples - the caller treats that as "still
         measuring" and the UI shows "Calculating...".
+
+        Also returns ``None`` when ``self.total <= 0`` (the engine
+        has not yet enumerated any work to do) or when
+        ``self.completed > self.total`` (a momentary state when the
+        engine ticks faster than it grows the total). Both cases used
+        to return ``0`` here, which the smoother then published as
+        "Almost done" on the dashboard - a misleading signal that
+        produced a real end user-facing bug: a 6-minute run flashing
+        "Almost done" within seconds. The right answer when we have
+        insufficient evidence to project is "Calculating...", not
+        "you are about to finish."
         """
         if len(self.window) < 3:
+            return None
+        if self.total <= 0:
+            # Engine has not yet enumerated any work. Whatever the
+            # rate window is showing, we have no denominator to
+            # project from.
+            return None
+        if self.completed > self.total:
+            # Momentary state where the engine ticked faster than it
+            # grew the total. The reverse will fire in a tick or
+            # two; in the meantime do not claim "done."
             return None
         # Weighted average of (count / inter-sample-delta). Each
         # subsequent sample is weighted ``i + 1`` so the most recent
@@ -135,7 +156,8 @@ class ETRTracker:
         rate = weighted_rate / total_weight
         if rate <= 0:
             return None
-        remaining = max(self.total - self.completed, 0)
+        remaining = self.total - self.completed
+        # remaining is now guaranteed >= 0 by the guards above.
         return remaining / rate
 
     @property
@@ -177,7 +199,7 @@ class ETRTracker:
 
 def format_etr_for_display(seconds: Optional[float]) -> str:
     """
-    Turn an ETR value into the operator-facing string. ``None``
+    Turn an ETR value into the end user-facing string. ``None``
     becomes ``"Calculating..."`` (still measuring); below-floor values
     become ``"Almost done"``; everything else becomes ``"HH:MM:SS"``
     (or ``"MM:SS"`` when under an hour).

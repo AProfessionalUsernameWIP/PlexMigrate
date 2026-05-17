@@ -1,8 +1,8 @@
 // Pre-submit confirmation for Replace Restore.
 //
-// The Run Job and Schedules forms show this modal when the operator
+// The Run Job and Schedules forms show this modal when the end user
 // has picked Replace mode and hits the run / save button. The modal
-// lists the destructive consequences and requires the operator to
+// lists the destructive consequences and requires the end user to
 // type the literal word REPLACE before the confirm button activates.
 // Cancelling aborts the submit; confirming sets ``confirm_replace``
 // to true on the outgoing payload.
@@ -20,7 +20,7 @@ interface Props {
   // destination(s); for schedules it's "this scheduled job".
   targetLabel: string;
   // Whether the form has auto-capture enabled. Surfaced in the modal
-  // body so the operator sees what safety belt (if any) is in place.
+  // body so the end user sees what safety belt (if any) is in place.
   autoCaptureBeforeReplace: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -39,7 +39,7 @@ export function ReplaceConfirmModal({
 
   // Reset the typed field every time the modal opens. Without this, a
   // cancelled+reopened modal would still have "REPLACE" in the field
-  // and the button would be primed - the operator effectively skipped
+  // and the button would be primed - the end user effectively skipped
   // the typed-confirmation gate on the second pass.
   useEffect(() => {
     if (open) setTyped('');

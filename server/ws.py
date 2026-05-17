@@ -48,13 +48,13 @@ def _build_servers_network() -> List[Dict[str, Any]]:
     DashboardState - invisible when idle, gone in fan-out. This
     function reads from the process-lifetime collector keyed by
     URL host, then joins with the registry by host so each entry
-    carries the operator-friendly server name and the registry
+    carries the end user-friendly server name and the registry
     id needed for the "open server settings" affordance.
 
     Servers the collector hasn't seen any traffic for still appear
     with empty windows - the UI treats them as "no data yet."
     Telemetry buckets for hosts no longer in the registry (the
-    operator removed a row mid-run) are dropped from this payload;
+    end user removed a row mid-run) are dropped from this payload;
     the buckets themselves persist in the collector until process
     restart, which is intentional - they're harmless and let stale
     references resolve cleanly if the registry row comes back.
@@ -65,7 +65,7 @@ def _build_servers_network() -> List[Dict[str, Any]]:
         return []
 
     # Normalise registry hosts the same way the collector does so
-    # the join key matches even when an operator typed mixed case
+    # the join key matches even when an end user typed mixed case
     # or a trailing slash into the registry URL.
     by_host: Dict[str, Dict[str, Any]] = {}
     for row in servers:

@@ -17,10 +17,15 @@
 // All writes funnel through a shared DbAdminAuthModal that collects
 // the db_admin username + password and submits them with the
 // destructive request. Modal style matches the User Management
-// panel's modal so operators see a consistent destructive surface.
+// panel's modal so end users see a consistent destructive surface.
 
-import { useEffect, useRef, useState } from 'react';
-import { api, ExportArchive, getAccessToken, Snapshot } from '../api';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { api, ExportArchive, getAccessToken, ServerView, Snapshot } from '../api';
+import {
+  BackendTabStrip,
+  BackendType,
+  backendCounts,
+} from './BackendTabStrip';
 
 type PendingDestructive =
   | { kind: 'delete_snapshot'; id: string; name: string; canKeepJson: boolean }
@@ -53,6 +58,17 @@ export function ExportsPanel() {
   // every server's snapshots have been deleted). After refresh we
   // auto-select the first server with rows.
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
+  // Phase B of the backend-filter UI restructure (Finding[BACKEND-
+  // FILTER-AUDIT]-2026-05-16.md). Snapshots are grouped by composite
+  // server key below; this state filters the visible groups to a
+  // single backend before they reach the SnapshotServerSelector.
+  const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
+  // Live registered servers - needed for the composite-key grouping
+  // that merges snapshots from a removed+re-added server back under
+  // one tab. Stays null until the first /api/servers fetch lands;
+  // until then, grouping falls back to keying by server_id alone so
+  // the panel still renders something on a slow registry call.
+  const [registeredServers, setRegisteredServers] = useState<ServerView[] | null>(null);
   // Tick counter for the animated "Generating…" label. Increments
   // every GENERATING_FRAME_MS while ``downloading`` is non-null and
   // resets to 0 between clicks. Module-level frame index is
@@ -78,30 +94,33 @@ export function ExportsPanel() {
   const refresh = async () => {
     setError(null);
     try {
-      const [snapsResult, archiveResult] = await Promise.allSettled([
+      const [snapsResult, archiveResult, serversResult] = await Promise.allSettled([
         api.listSnapshots(),
         api.listLegacySnapshots(),
+        api.listServers(),
       ]);
       if (snapsResult.status === 'fulfilled') {
         const list = snapsResult.value.snapshots;
         setSnapshots(list);
-        // Auto-select first server with snapshots after a refresh,
-        // BUT only when the operator hasn't already picked one OR
-        // the currently-selected server no longer has snapshots
-        // (e.g. they just got cleared). Mirrors UserManagementPanel's
-        // pattern.
-        const firstServerId =
-          list.find((s) => s.server_id)?.server_id || null;
-        setSelectedServerId((prev) => {
-          if (!prev) return firstServerId;
-          const stillExists = list.some((s) => s.server_id === prev);
-          return stillExists ? prev : firstServerId;
-        });
+        // Auto-selection key is set against ``selectedServerId``
+        // which now holds a composite key (name|url|service) rather
+        // than the raw server_id. The composite is built below in
+        // the grouped map; here we just fall back to "first key
+        // from the first row" since the composite isn't yet
+        // computed at this point in the refresh path. The grouping
+        // memo below validates the selection and resets to a real
+        // key on next render.
+        setSelectedServerId((prev) => prev);
       } else {
         setError(String(snapsResult.reason));
       }
       // Archives missing is non-fatal - empty list is a valid state.
       setArchives(archiveResult.status === 'fulfilled' ? archiveResult.value : []);
+      // Servers list missing falls back to server_id grouping. Not a
+      // fatal error because the panel still renders something useful.
+      setRegisteredServers(
+        serversResult.status === 'fulfilled' ? serversResult.value : null,
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -113,7 +132,7 @@ export function ExportsPanel() {
   // and the auth middleware would 401). Receive as blob, save via
   // a synthetic <a> element.
   //
-  // Diagnostic console.log lines are intentional: when the operator
+  // Diagnostic console.log lines are intentional: when the end user
   // reports a download failure, the browser console gives us the
   // status / size / first-bytes signal the network tab also shows
   // but is easier to copy-paste back. Remove later if noise becomes
@@ -222,13 +241,79 @@ export function ExportsPanel() {
     }
   };
 
-  // Group snapshots by server for the per-server section + bulk button.
-  const grouped: Record<string, { server_name: string; rows: Snapshot[] }> = {};
+  // Group snapshots by composite (name + url + service) so a server
+  // that was removed and re-added under the same name + URL + backend
+  // collapses back into a single tab instead of splitting on its new
+  // server_id. Resolution order for each snapshot:
+  //
+  //   1. Look up its server_id in the live registry. If found, use
+  //      that server's composite key (name|url|service).
+  //   2. Otherwise (the registry row is gone), fall back to a name-
+  //      based match: if any live server has the same name AND the
+  //      snapshot row's reported server_name matches, use that
+  //      server's composite. This is the orphan-merge case.
+  //   3. Otherwise (server truly removed and not re-added under the
+  //      same name), fall back to a stable orphan key keyed off the
+  //      snapshot's server_name so orphan groups stay grouped among
+  //      themselves rather than each becoming its own tab.
+  //
+  // For each grouping decision we also record a representative
+  // server_id (the live one when available, the snapshot's row id
+  // otherwise) so the "Clear all snapshots for this server" bulk
+  // action still points at a real server_id the backend recognises.
+  const grouped: Record<
+    string,
+    { server_name: string; representative_server_id: string; rows: Snapshot[] }
+  > = {};
   if (snapshots) {
+    // Reverse map: server_id -> composite key. Also a name->composite
+    // map for the orphan-merge fallback. Only populated when the
+    // server list has loaded; before that we degrade to server_id
+    // grouping so the panel still renders.
+    const idToComposite: Record<string, { key: string; name: string; id: string }> = {};
+    const nameToComposite: Record<string, { key: string; name: string; id: string }> = {};
+    for (const sv of (registeredServers || [])) {
+      const composite = `${sv.name}|${sv.url}|${sv.service || 'plex'}`;
+      idToComposite[sv.id] = { key: composite, name: sv.name, id: sv.id };
+      // Last-write-wins on duplicate names; the duplicate-detection
+      // warning at server-add time should make duplicates rare, but
+      // if one slips through the user's latest registration is the
+      // one snapshots merge into.
+      nameToComposite[sv.name] = { key: composite, name: sv.name, id: sv.id };
+    }
+
     for (const s of snapshots) {
-      const key = s.server_id || '__unknown__';
+      let key: string;
+      let display_name: string;
+      let rep_id: string;
+      // Resolution 1: live registry hit by server_id.
+      const byId = idToComposite[s.server_id];
+      if (byId) {
+        key = byId.key;
+        display_name = byId.name;
+        rep_id = byId.id;
+      } else {
+        // Resolution 2: orphan merge by name.
+        const byName = nameToComposite[s.server_name];
+        if (byName) {
+          key = byName.key;
+          display_name = byName.name;
+          rep_id = byName.id;
+        } else {
+          // Resolution 3: stable orphan key (the registry row really
+          // is gone). Group by name only so two snapshots from the
+          // same removed server stay together.
+          key = `__orphan__|${s.server_name || '(unknown)'}`;
+          display_name = s.server_name || '(unknown server)';
+          rep_id = s.server_id || '';
+        }
+      }
       if (!grouped[key]) {
-        grouped[key] = { server_name: s.server_name || '(unknown server)', rows: [] };
+        grouped[key] = {
+          server_name: display_name,
+          representative_server_id: rep_id,
+          rows: [],
+        };
       }
       grouped[key].rows.push(s);
     }
@@ -236,6 +321,65 @@ export function ExportsPanel() {
   const groupKeys = Object.keys(grouped).sort((a, b) => {
     return grouped[a].server_name.localeCompare(grouped[b].server_name);
   });
+
+  // Phase B: derive the backend for each group so the filter strip
+  // can show only the active backend's groups. Each grouped entry
+  // carries representative_server_id; look up the registered server
+  // to get service_type. Orphans (no registry row) default to 'plex'
+  // because the historical install has been Plex-only.
+  const groupBackend: Record<string, BackendType> = {};
+  for (const key of groupKeys) {
+    const repId = grouped[key].representative_server_id;
+    const reg = (registeredServers || []).find((s) => s.id === repId);
+    const t = ((reg as unknown as { service_type?: string })?.service_type) || 'plex';
+    groupBackend[key] = (t === 'jellyfin' || t === 'emby') ? t : 'plex';
+  }
+  const visibleGroupKeys = groupKeys.filter((k) => groupBackend[k] === activeBackend);
+
+  // Synthesize a ServerView-shaped list for the BackendTabStrip's
+  // counts. One pseudo-row per snapshot group, carrying service_type
+  // so counts[plex/jellyfin/emby] reflect group counts (not raw
+  // server registry counts). This keeps the strip's "count in
+  // parens" semantics meaningful for the Exports view.
+  const stripServers = useMemo(() => {
+    return groupKeys.map((k) => ({
+      id: k,
+      name: grouped[k].server_name,
+      service_type: groupBackend[k],
+    })) as unknown as ServerView[];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupKeys.join('|'), Object.values(groupBackend).join('|')]);
+
+  // Auto-correct activeBackend when the active bucket has no groups
+  // but another backend does. Same pattern used elsewhere on the
+  // backend filter; keeps the end user from staring at an empty pane.
+  useEffect(() => {
+    if (groupKeys.length === 0) return;
+    const counts = backendCounts(stripServers);
+    if (counts[activeBackend] === 0) {
+      const fallback = (['plex', 'jellyfin', 'emby'] as BackendType[])
+        .find((b) => counts[b] > 0);
+      if (fallback) setActiveBackend(fallback);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stripServers, activeBackend]);
+
+  // Auto-select the first composite key whenever the current
+  // selection is missing from the live grouping OR is outside the
+  // currently-visible (backend-filtered) set. Runs in a side-effect
+  // after grouping + filtering are computed so the snapshot-refresh
+  // path doesn't have to know about composite keys or the backend
+  // filter.
+  useEffect(() => {
+    if (visibleGroupKeys.length === 0) {
+      if (selectedServerId !== null) setSelectedServerId(null);
+      return;
+    }
+    if (!selectedServerId || !visibleGroupKeys.includes(selectedServerId)) {
+      setSelectedServerId(visibleGroupKeys[0]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapshots, registeredServers, activeBackend]);
 
   return (
     <>
@@ -259,14 +403,23 @@ export function ExportsPanel() {
           </div>
         ) : (
           <>
+            {/* Phase B of the backend-filter UI restructure: backend
+                tier above the per-server tab strip. Auto-hidden when
+                only one backend has snapshots. Each backend's tab
+                renders its server-group count in parens. */}
+            <BackendTabStrip
+              servers={stripServers}
+              activeBackend={activeBackend}
+              onChange={setActiveBackend}
+            />
             {/* v0.14 - per-server sub-tab strip. One button per server
                 that has snapshots, with the count in parens for at-a-
                 glance distribution. Mirrors the strip used on Servers
-                ▸ User Management and Servers ▸ Overview so operators
+                ▸ User Management and Servers ▸ Overview so end users
                 see a consistent navigation pattern when they're
                 drilling into a single server. */}
             <SnapshotServerSelector
-              groupKeys={groupKeys}
+              groupKeys={visibleGroupKeys}
               grouped={grouped}
               selectedId={selectedServerId}
               onSelect={setSelectedServerId}
@@ -274,7 +427,7 @@ export function ExportsPanel() {
             {selectedServerId && grouped[selectedServerId] ? (
               <ServerGroup
                 key={selectedServerId}
-                serverId={selectedServerId}
+                serverId={grouped[selectedServerId].representative_server_id}
                 serverName={grouped[selectedServerId].server_name}
                 rows={grouped[selectedServerId].rows}
                 downloadingUrl={downloading}
@@ -306,7 +459,10 @@ export function ExportsPanel() {
                 onClearAll={() =>
                   setPending({
                     kind: 'clear_server',
-                    server_id: selectedServerId,
+                    // Bulk-clear API expects a real server_id; the
+                    // composite key in selectedServerId would not
+                    // resolve at the backend.
+                    server_id: grouped[selectedServerId].representative_server_id,
                     server_name: grouped[selectedServerId].server_name,
                     count: grouped[selectedServerId].rows.length,
                   })
@@ -362,7 +518,7 @@ export function ExportsPanel() {
 // One button per server that owns at least one snapshot. Labels carry
 // the snapshot count in parens for at-a-glance distribution
 // (``Plex1 (12)``). Mirrors the Servers ▸ User Management strip so
-// operators get a consistent "drill into one server" affordance.
+// end users get a consistent "drill into one server" affordance.
 
 function SnapshotServerSelector({
   groupKeys,
@@ -464,7 +620,7 @@ function ServerGroup({
             // Recovered rows are reconciled orphans - the file was on
             // disk but the registry row was missing (process crashed
             // between step 4 and step 5 of the snapshot pipeline). The
-            // chip flags them so the operator knows the metadata is
+            // chip flags them so the end user knows the metadata is
             // best-effort (no libraries list captured).
             const recovered = s.snapshot_name.endsWith(' (recovered)');
             // Dead rows have a registry entry but no .db on disk.
@@ -495,10 +651,49 @@ function ServerGroup({
                       file missing
                     </span>
                   )}
+                  {/* Phase D (admin-management follow-up, 2026-05-15):
+                      one-line summary of what the snapshot contains.
+                      Stamped at capture time. Older snapshots without
+                      a description (pre-Phase-D) render no second
+                      line - the existing display already shows the
+                      key facts. */}
+                  {s.description && (
+                    <div
+                      style={{
+                        marginTop: 2,
+                        fontSize: 11,
+                        color: 'var(--text-dim)',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        maxWidth: 520,
+                      }}
+                      title={s.description}
+                    >
+                      {s.description}
+                    </div>
+                  )}
                 </td>
                 <td>{new Date((s.captured_at || 0) * 1000).toLocaleString()}</td>
                 <td>{(s.libraries || []).length || <em>-</em>}</td>
-                <td>{s.user_count ?? <em>-</em>}</td>
+                <td title={
+                  s.user_count != null
+                    ? (s.user_count_with_data != null && s.user_count_with_data !== s.user_count
+                        ? `${s.user_count_with_data} captured with data / ${s.user_count} on roster (owner + managed users)`
+                        : `${s.user_count} user(s) captured`)
+                    : undefined
+                }>
+                  {s.user_count == null ? (
+                    <em>-</em>
+                  ) : s.user_count_with_data != null && s.user_count_with_data !== s.user_count ? (
+                    <span>
+                      {s.user_count_with_data}
+                      <span style={{ color: 'var(--text-dim)' }}> of {s.user_count}</span>
+                    </span>
+                  ) : (
+                    s.user_count
+                  )}
+                </td>
                 <td className="num">{dead ? <em style={{ color: 'var(--text-dim)' }}>-</em> : formatBytes(s.file_size || 0)}</td>
                 <td className="num">
                   {s.sidecar_size !== null
@@ -564,7 +759,7 @@ function ServerGroup({
 // ── JSON Archives section ────────────────────────────────────────────────────
 //
 // Renders standalone .plexexport.json archives - either kept from a
-// snapshot delete (operator checked "Keep JSON archive") or relocated
+// snapshot delete (end user checked "Keep JSON archive") or relocated
 // from a pre-PR-13 layout at startup. Hidden entirely when the archive
 // directory is empty, so a clean install doesn't show a no-op section.
 

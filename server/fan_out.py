@@ -70,7 +70,7 @@ class FanOutDestResult:
     # v0.13.x: when this destination's fan-out leg was a Replace and the
     # safety belt fired successfully, this carries the snapshot_id of
     # the pre-Replace rollback point. Surfaced into the parent JobRecord's
-    # summary["pre_replace_snapshots"] map so the operator can find every
+    # summary["pre_replace_snapshots"] map so the end user can find every
     # destination's recovery point on the Snapshots tab.
     pre_replace_snapshot_id: Optional[str] = None
 
@@ -293,8 +293,8 @@ def run_fan_out_direct(
     boot_logger = logging.getLogger("plexmigrate")
 
     # ── Connect once to the source ───────────────────────────────────
-    src_server, src_row = connect_registered_server(source_name, boot_logger)
-    src_token = decrypt_server_token(src_row)
+    src_conn = connect_registered_server(source_name, boot_logger)
+    src_server, src_row, src_token = src_conn.server, src_conn.row, src_conn.token
     try:
         src_home_users = get_home_users(src_server, src_row["url"], boot_logger)
     except Exception as e:
@@ -324,6 +324,7 @@ def run_fan_out_direct(
                 futs.append(pool.submit(
                     _run_one_direct_destination,
                     source_name=source_name,
+                    source_service_type=src_conn.service_type,
                     source_server=src_server,
                     source_url=src_row["url"],
                     source_token=src_token,
@@ -486,6 +487,7 @@ def run_fan_out_restore(
 def _run_one_direct_destination(
     *,
     source_name: str,
+    source_service_type: str,
     source_server: PlexServer,
     source_url: str,
     source_token: str,
@@ -564,8 +566,8 @@ def _run_one_direct_destination(
 
     try:
         # ── Connect to this destination ──────────────────────────────
-        dst_server, dst_row = connect_registered_server(dest_name, logger)
-        dst_token = decrypt_server_token(dst_row)
+        dst_conn = connect_registered_server(dest_name, logger)
+        dst_server, dst_row, dst_token = dst_conn.server, dst_conn.row, dst_conn.token
         try:
             dst_home_users = get_home_users(dst_server, dst_row["url"], logger)
         except Exception as e:
@@ -575,8 +577,48 @@ def _run_one_direct_destination(
         # ── Per-destination log directory ────────────────────────────
         run_log_dir = _build_per_dest_log_dir(
             log_dir_root, source_name, dest_name, verbose,
+            source_service_type=source_service_type,
+            dest_service_type=dst_conn.service_type,
         )
         dest_result.log_dir = run_log_dir
+
+        # Diagnostic: dump the params + tunables that drove this
+        # destination's run alongside its log dir. Best-effort, never
+        # raises - the runner does its own try/except inside.
+        try:
+            from services.run_settings_log import write_run_settings
+            write_run_settings(
+                run_log_dir=run_log_dir,
+                job_type="fan_out_direct",
+                job_params={
+                    "source_name": source_name,
+                    "dest_name": dest_name,
+                    "libraries": libraries,
+                    "user_filter": user_filter,
+                    "remap": list(remap) if remap else None,
+                    "strict_match": strict_match,
+                    "output_dir": output_dir,
+                    "workers": workers,
+                    "scrobble_workers": scrobble_workers,
+                    "verbose": verbose,
+                    "run_trigger": run_trigger,
+                    "schedule_name": schedule_name,
+                    "skip_collections": skip_collections,
+                    "fast_collection_detection": fast_collection_detection,
+                    "skip_playlists": skip_playlists,
+                    "include_watch_history": include_watch_history,
+                    "include_ratings": include_ratings,
+                    "include_playlists": include_playlists,
+                    "include_collections": include_collections,
+                    "mode": mode,
+                    "merge_watch_strategy": merge_watch_strategy,
+                    "library_workers": library_workers,
+                    "pre_replace_settings_present": bool(pre_replace_settings),
+                },
+                logger=logger,
+            )
+        except Exception:
+            pass
 
         # Install this destination's run-context on the calling thread.
         # Writes hit the thread's ContextVar so engine workers spawned
@@ -615,6 +657,7 @@ def _run_one_direct_destination(
                 dest_server_id=dst_id,
                 dest_server_name=str(dst_row.get("name") or dest_name),
                 dest_url=dst_row["url"],
+                dest_service_type=dst_conn.service_type,
             )
             dest_result.pre_replace_snapshot_id = pre_id
 
@@ -702,7 +745,7 @@ def _run_one_import_destination(
     # v0.13.x: see _run_one_direct_destination for the contract.
     pre_replace_settings: Optional[Dict[str, Any]] = None,
     # v0.14 - per-job user filter. Each destination applies the same
-    # operator-selected user list; the restore engine drops payload
+    # end user-selected user list; the restore engine drops payload
     # users not on this destination automatically (no user lookup),
     # so a destination missing a user just no-ops for that user.
     user_filter: Optional[List[str]] = None,
@@ -729,14 +772,45 @@ def _run_one_import_destination(
     state._destination = dest_name
 
     try:
-        dst_server, dst_row = connect_registered_server(dest_name, logger)
-        dst_token = decrypt_server_token(dst_row)
+        dst_conn = connect_registered_server(dest_name, logger)
+        dst_server, dst_row, dst_token = dst_conn.server, dst_conn.row, dst_conn.token
         owner_name = dst_row.get("owner_name") or "Plex Owner"
 
         run_log_dir = _build_per_dest_log_dir(
             log_dir_root, "restore", dest_name, verbose,
+            dest_service_type=dst_conn.service_type,
         )
         dest_result.log_dir = run_log_dir
+
+        # Diagnostic: dump the params + tunables that drove this
+        # destination's restore alongside its log dir.
+        try:
+            from services.run_settings_log import write_run_settings
+            write_run_settings(
+                run_log_dir=run_log_dir,
+                job_type="fan_out_restore",
+                job_params={
+                    "dest_name": dest_name,
+                    "input_files": list(input_files or []),
+                    "remap": list(remap) if remap else None,
+                    "strict_match": strict_match,
+                    "workers": workers,
+                    "scrobble_workers": scrobble_workers,
+                    "verbose": verbose,
+                    "output_dir": output_dir,
+                    "user_filter": user_filter,
+                    "include_watch_history": include_watch_history,
+                    "include_ratings": include_ratings,
+                    "include_playlists": include_playlists,
+                    "include_collections": include_collections,
+                    "mode": mode,
+                    "merge_watch_strategy": merge_watch_strategy,
+                    "pre_replace_settings_present": bool(pre_replace_settings),
+                },
+                logger=logger,
+            )
+        except Exception:
+            pass
 
         # Per-destination input-file resolution. Three attempts:
         # direct path, then ``<output_dir>/<file>`` (active snapshots),
@@ -791,6 +865,7 @@ def _run_one_import_destination(
                 dest_server_id=dst_id,
                 dest_server_name=str(dst_row.get("name") or dest_name),
                 dest_url=dst_row["url"],
+                dest_service_type=dst_conn.service_type,
             )
             dest_result.pre_replace_snapshot_id = pre_id
 
@@ -860,6 +935,9 @@ def _build_per_dest_log_dir(
     source_or_kind: str,
     dest_name: str,
     verbose: bool,
+    *,
+    source_service_type: str = "plex",
+    dest_service_type: str = "plex",
 ) -> str:
     """
     Build the per-destination log directory and configure the engine's
@@ -869,12 +947,18 @@ def _build_per_dest_log_dir(
     ``state._run_timestamp = …`` here is isolated from siblings -
     sibling destinations have their own ContextVar value for the same
     name.
+
+    PR-Backends: ``source_service_type`` / ``dest_service_type`` make
+    the run-directory slug backend-aware. Two same-named-different-
+    backend destinations (Emby Jade.TV + Plex Jade.TV in one fan-out)
+    write to distinct log directories rather than colliding.
     """
-    from server.server_registry import safe_server_name
+    from server.server_registry import backend_aware_slug
     from services.logging_ops import setup_logging
 
     slug = (
-        f"{safe_server_name(source_or_kind)}-to-{safe_server_name(dest_name)}-fanout"
+        f"{backend_aware_slug(source_or_kind, source_service_type)}"
+        f"-to-{backend_aware_slug(dest_name, dest_service_type)}-fanout"
     )
     ts = time.strftime("%Y%m%d_%H%M%S")
     state._run_timestamp = f"{slug}_{ts}"

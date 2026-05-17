@@ -4,7 +4,7 @@
 //
 //   * Snapshot mode               → one card for the source server only.
 //   * Direct transfer / fan-out   → tab toggle across source + every
-//                                   destination so the operator can
+//                                   destination so the end user can
 //                                   compare both sides while the
 //                                   transfer is in flight.
 //
@@ -63,7 +63,7 @@ const TILE_LIVE_WINDOW_SECONDS = 3;
 // Ping cadence for the in-panel poller. Matches the existing
 // ServersPanel / JobFormPanel pollers so the per-server collector's
 // last_ping_ms field stays warm regardless of which UI tab the
-// operator is sitting on. 30s is the same value those panels use.
+// end user is sitting on. 30s is the same value those panels use.
 const PING_INTERVAL_MS = 30_000;
 
 
@@ -188,7 +188,7 @@ export function NetworkPanel({ frame, scopedDest = null }: Props) {
   // the Dashboard had no ping cadence at all (only the Servers tab and
   // JobForm fired pings on a 30s interval); the "Last ping" tile read
   // ``-`` because the per-server collector had no fresh ping data
-  // while the operator was sitting on the Dashboard. The poll fires
+  // while the end user was sitting on the Dashboard. The poll fires
   // an immediate kick on mount so the first value lands within a tick
   // of the WS broadcast rather than after 30s.
   //

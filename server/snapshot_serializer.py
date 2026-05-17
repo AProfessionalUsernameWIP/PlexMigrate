@@ -6,7 +6,7 @@ Snapshot serializer (v0.15+). Reads a per-server snapshot ``.db`` file
 Two callers:
 
 * The download endpoint when ``prebuilt_json_path`` is NULL on the
-  registry row - i.e. the operator did not toggle ``prebuild_json``
+  registry row - i.e. the end user did not toggle ``prebuild_json``
   on the snapshot job. This module's :func:`build_payload_from_db`
   generates the JSON on demand and the endpoint streams it back.
 * The sidecar materializer in :mod:`server.snapshot_registry` which
@@ -24,7 +24,7 @@ to fan-out / divide-by-N approximations.
 
 The serializer refuses to read any snapshot file with
 ``snapshot_meta.schema_version < SNAPSHOT_SCHEMA_VERSION``. Older
-snapshots are not migrated in place; the operator must re-capture.
+snapshots are not migrated in place; the end user must re-capture.
 The boot-time auto-archive in :mod:`server.app` retires pre-v15
 ``media.db`` files so the next snapshot run produces a v15-compliant
 file.
@@ -86,9 +86,20 @@ log = logging.getLogger("plexmigrate.server.snapshot_serializer")
 
 class SnapshotSchemaMismatch(RuntimeError):
     """Raised when the snapshot .db's schema_version is lower than
-    what this serializer requires. Operator action: re-capture the
+    what this serializer requires. End user action: re-capture the
     snapshot with the current build, then retry the
     download / restore."""
+
+
+def _safe_col(row: sqlite3.Row, col: str) -> Any:
+    """sqlite3.Row raises IndexError for missing columns; return None
+    instead so the caller can treat absent columns as NULLs. Used for
+    additive columns the serializer wants to read even when reading
+    a snapshot from a build that pre-dated the column."""
+    try:
+        return row[col]
+    except (IndexError, KeyError):
+        return None
 
 
 def build_payload_from_db(
@@ -104,7 +115,7 @@ def build_payload_from_db(
     multi-library payload as a Python dict.
 
     Refuses snapshots written by older builds (schema_version < 15) by
-    raising :class:`SnapshotSchemaMismatch`. The operator must
+    raising :class:`SnapshotSchemaMismatch`. The end user must
     re-capture; there is no in-place migration of older .db files.
 
     ``libraries`` from the caller is treated as a hint for display
@@ -125,7 +136,7 @@ def build_payload_from_db(
         # ── Schema-version gate ────────────────────────────────────────
         # Refuse pre-v15 files. The ``schema_version`` column was added
         # to ``snapshot_meta`` in v15; if the column is missing we treat
-        # it as 0 and refuse. Operator-facing error includes both the
+        # it as 0 and refuse. End user-facing error includes both the
         # observed and required versions.
         try:
             meta_row = conn.execute(
@@ -208,6 +219,12 @@ def build_payload_from_db(
                     "display_name": r["display_name"],
                     "backend": r["backend"],
                     "backend_user_id": r["backend_user_id"],
+                    # v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-2):
+                    # surface the snapshot's canonical user identifier
+                    # in the .plexexport.json sidecar. Older snapshots
+                    # (v15 and earlier) carry NULL here; the JSON
+                    # emitter writes null, matching the legacy shape.
+                    "app_user_uuid": _safe_col(r, "app_user_uuid"),
                 }
                 if r["backend"]:
                     backend_in_db = r["backend"]
@@ -510,6 +527,7 @@ def _build_users_block(
             "display_name": None,
             "backend": backend_in_db,
             "backend_user_id": None,
+            "app_user_uuid": None,
         }
 
     def _json_key_for(handle: str, meta: Dict[str, Any]) -> str:
@@ -532,6 +550,14 @@ def _build_users_block(
             "role": meta["role"],
             "display_name": meta.get("display_name"),
             "backend_user_id": meta.get("backend_user_id"),
+            # v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-2): emit the
+            # canonical app-generated user identifier. Old snapshots
+            # (v15-) write null here; v16+ snapshots write the value
+            # populated by snapshot_capture._write_snapshot_users +
+            # _write_server_user_row. End users who share a .plexexport
+            # sidecar across installs surface the source install's
+            # canonical identity natively.
+            "app_user_uuid": meta.get("app_user_uuid"),
             **buckets[handle],
         }
 

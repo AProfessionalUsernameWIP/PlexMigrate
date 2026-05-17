@@ -3,7 +3,7 @@
 // Two render states inside one panel, no page routing, no browse
 // modals (destructive confirms only):
 //
-//   * List view  : table of every login user (viewer / operator /
+//   * List view  : table of every login user (viewer / end user /
 //                  manager / root_admin). Whole rows are clickable;
 //                  drilling into a user re-renders the panel into
 //                  the detail view.
@@ -19,6 +19,7 @@
 import { useEffect, useState } from 'react';
 import { api, ManagedUser, Role } from '../api';
 import { permissionSummaryForRole, ROLE_RANK, useAuthContext } from '../contexts/AuthContext';
+import { useElevation } from '../contexts/ElevationContext';
 
 
 export function UserAccountsExplorer() {
@@ -38,7 +39,7 @@ export function UserAccountsExplorer() {
   };
   useEffect(() => { refresh(); }, []);
 
-  // If the operator is deep in the detail view and that user
+  // If the end user is deep in the detail view and that user
   // disappears (deleted, renamed) on a refresh, return to the list.
   useEffect(() => {
     if (view.kind === 'detail' && users !== null && !users.some((u) => u.username === view.username)) {
@@ -158,7 +159,7 @@ function UserDetailView({
   const [displayDraft, setDisplayDraft] = useState(user.display_name ?? '');
   const [roleDraft, setRoleDraft] = useState<Role>(user.role);
   useEffect(() => {
-    // If the operator navigates between detail views without unmounting
+    // If the end user navigates between detail views without unmounting
     // (rare but possible) keep the drafts in sync with the underlying row.
     setDisplayDraft(user.display_name ?? '');
     setRoleDraft(user.role);
@@ -203,6 +204,44 @@ function UserDetailView({
   // Destructive actions: reset password + delete. Each uses a modal.
   const [resetModal, setResetModal] = useState(false);
   const [deleteModal, setDeleteModal] = useState(false);
+
+  // Item 1: grant / revoke root_admin. Both gated by sudo-style
+  // elevation - the ElevationContext opens its modal when the
+  // caller's session isn't currently elevated, and resolves once the
+  // end user has either confirmed or cancelled.
+  const elevation = useElevation();
+  const onGrantRoot = async (username: string) => {
+    const ok = await elevation.requireElevation(`grant root to ${username}`);
+    if (!ok) return;
+    setError(null); setOk(null); setSubmitting(true);
+    try {
+      await api.authGrantRoot(username);
+      setOk(`Granted root_admin to ${username}.`);
+      await onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  const onRevokeRoot = async (username: string) => {
+    if (!confirm(
+      `Revoke root_admin from ${username}? They will become an admin. ` +
+      `This is blocked if they are the last root.`
+    )) return;
+    const ok = await elevation.requireElevation(`revoke root from ${username}`);
+    if (!ok) return;
+    setError(null); setOk(null); setSubmitting(true);
+    try {
+      await api.authRevokeRoot(username, 'admin');
+      setOk(`Revoked root_admin from ${username}.`);
+      await onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   const perms = permissionSummaryForRole(user.role);
 
@@ -334,11 +373,39 @@ function UserDetailView({
             {!isRoot && (
               <button className="danger" onClick={() => setDeleteModal(true)}>Delete account…</button>
             )}
+            {/* Item 1: grant / revoke root admin. Visible only to
+                root_admin callers (real role, not effective). Each
+                triggers an elevation modal first (sudo-style password
+                re-confirm) before calling the backend. */}
+            {caller.realRole === 'root_admin' && !isRoot && (
+              <button
+                className="primary"
+                onClick={() => onGrantRoot(user.username)}
+                title="Promote this account to root_admin. Requires password re-confirm."
+              >
+                Grant root…
+              </button>
+            )}
+            {caller.realRole === 'root_admin' && isRoot && user.username !== caller.username && (
+              <button
+                className="danger"
+                onClick={() => onRevokeRoot(user.username)}
+                title="Demote this root account to admin. Requires password re-confirm. Blocked if this is the only root."
+              >
+                Revoke root…
+              </button>
+            )}
           </div>
-          {isRoot && (
+          {isRoot && user.username === caller.username && (
             <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
-              The root admin account cannot be deleted or demoted - those controls
-              are intentionally absent for this row to prevent accidental lock-out.
+              You are looking at your own root account row. Root cannot revoke
+              its own role - have another root_admin do it via the Revoke root
+              control on this same row.
+            </span>
+          )}
+          {isRoot && user.username !== caller.username && caller.realRole !== 'root_admin' && (
+            <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
+              The root admin account cannot be deleted or demoted from your role.
             </span>
           )}
         </div>

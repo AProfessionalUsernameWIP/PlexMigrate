@@ -6,13 +6,13 @@ Roadmap reference: Part 5 / Feature 2 of ``roadmapplan4.md``.
 This database is deliberately kept separate from the (future) ``media.db``
 that Feature 3 introduces. The two have entirely different lifecycles:
 
-* ``auth.db`` - operator login accounts for the web UI. Sensitive
+* ``auth.db`` - end user login accounts for the web UI. Sensitive
   (holds bcrypt hashes), tiny (a handful of rows), backed up
   conservatively.
 * ``media.db`` - the media-state cache that replaces the JSON files.
   Much larger, regenerable from a re-snapshot, low-sensitivity.
 
-Keeping them in separate files lets the operator back up the small
+Keeping them in separate files lets the end user back up the small
 auth file frequently and the large media file rarely; restoring one
 does not perturb the other.
 
@@ -91,9 +91,9 @@ def init_auth_db() -> None:
 
     * ``viewer``     - read-only role. Dashboard + Servers (RO) +
                        own Account Settings.
-    * ``operator``   - read + start jobs. Cannot stop jobs or edit
+    * ``end user``   - read + start jobs. Cannot stop jobs or edit
                        schedules. Can see Logs + Backups.
-    * ``manager``    - operator + stop jobs + edit schedules + view
+    * ``manager``    - end user + stop jobs + edit schedules + view
                        Sync (when Feature 5 ships).
     * ``root_admin`` - full access. Only role that can manage other
                        user accounts.
@@ -103,8 +103,8 @@ def init_auth_db() -> None:
                        → Accounts → Database Admin Account.
 
     Migration path for legacy installs:
-      * pre-PR-9   schema admitted ``admin`` + ``operator`` only.
-      * PR-9.1     widened to ``admin`` + ``db_admin`` + ``operator``.
+      * pre-PR-9   schema admitted ``admin`` + ``end user`` only.
+      * PR-9.1     widened to ``admin`` + ``db_admin`` + ``end user``.
       * PR-A1      widens further to include ``viewer`` + ``manager``
                    + ``root_admin``, ADDS ``display_name`` and
                    ``last_login`` columns, AND remaps every existing
@@ -127,9 +127,9 @@ def init_auth_db() -> None:
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     username            TEXT UNIQUE NOT NULL,
                     password_hash       TEXT NOT NULL,
-                    role                TEXT NOT NULL DEFAULT 'operator'
+                    role                TEXT NOT NULL DEFAULT 'end user'
                                         CHECK (role IN (
-                                            'viewer', 'operator', 'manager',
+                                            'viewer', 'end user', 'manager',
                                             'admin', 'root_admin', 'db_admin'
                                         )),
                     display_name        TEXT,
@@ -248,7 +248,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     #   * remaps the LEGACY ``admin`` (pre-PR-A1) → ``root_admin``,
     #     BUT only when the new ``admin`` role doesn't already exist
     #     in the schema (i.e. the legacy CHECK constraint had at most
-    #     ``admin`` / ``operator`` / ``db_admin``).
+    #     ``admin`` / ``end user`` / ``db_admin``).
     #   * leaves the new ``admin`` role alone on already-PR-A1
     #     installs being upgraded to add the sudo-root admin value.
     #
@@ -268,9 +268,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             username            TEXT UNIQUE NOT NULL,
             password_hash       TEXT NOT NULL,
-            role                TEXT NOT NULL DEFAULT 'operator'
+            role                TEXT NOT NULL DEFAULT 'end user'
                                 CHECK (role IN (
-                                    'viewer', 'operator', 'manager',
+                                    'viewer', 'end user', 'manager',
                                     'admin', 'root_admin', 'db_admin'
                                 )),
             display_name        TEXT,
@@ -367,7 +367,7 @@ def create_user(
       * ``password`` is shorter than 8 characters or longer than
         :data:`_MAX_PASSWORD_LEN` (bcrypt truncates at 72 bytes -
         rejecting up front prevents silent prefix collisions)
-      * ``role`` is not one of ``viewer | operator | manager |
+      * ``role`` is not one of ``viewer | end user | manager |
         root_admin | db_admin``
       * a user with that username already exists
 
@@ -650,6 +650,19 @@ def _count_role(conn: sqlite3.Connection, role: str) -> int:
         "SELECT COUNT(*) AS n FROM app_users WHERE role = ?", (role,)
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def count_role(role: str) -> int:
+    """Public wrapper around ``_count_role``. Opens its own connection
+    so callers don't need to plumb one through. Used by the Item 1
+    upgrade-split endpoint to detect "exactly one root_admin = legacy
+    install" before performing the split."""
+    init_auth_db()
+    conn = _connect()
+    try:
+        return _count_role(conn, role)
+    finally:
+        conn.close()
 
 
 def update_role(username: str, new_role: str) -> None:

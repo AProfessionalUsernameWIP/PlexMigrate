@@ -129,7 +129,7 @@ def signal_hard_stop() -> bool:
     futures and exits at the next library boundary, which can take
     seconds or minutes depending on what's in flight. A "hard" stop is
     for the case where that's too slow (long-running per-library
-    operations, a misbehaving destination server) and the operator just
+    operations, a misbehaving destination server) and the end user just
     wants the worker free *right now* even if some in-flight items end
     up in the failure log.
 

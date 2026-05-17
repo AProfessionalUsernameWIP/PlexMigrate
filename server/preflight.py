@@ -1,13 +1,13 @@
 """
 PR-12 preflight checks. Today the only check is the PIN preflight:
 for each managed user in scope on the relevant server(s), confirm
-that the operator has stored either an auth token or a Plex Home
+that the end user has stored either an auth token or a Plex Home
 PIN in :mod:`server.media_db`.
 
 A managed user with neither credential on file is at risk: the engine
 falls back to admin-token impersonation, which can return incomplete
 data for PIN-scoped content. The pre-flight check surfaces those
-users to the operator BEFORE the job commits so a PIN can be saved
+users to the end user BEFORE the job commits so a PIN can be saved
 under User Management and the job re-run cleanly.
 
 Mode awareness
@@ -35,6 +35,9 @@ def compute_pin_preflight(
     source_server_name: Optional[str],
     dest_server_names: Optional[List[str]],
     user_filter: Optional[List[str]],
+    *,
+    source_service_type: str = "plex",
+    dest_service_types: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Return ``{mode, checked, at_risk_users, servers_checked}``:
@@ -53,6 +56,12 @@ def compute_pin_preflight(
     ``user_filter`` narrows the scope to specific usernames when
     supplied (mirrors the per-user transfer scope used by
     :class:`DirectTransferIn`).
+
+    PR-Backends: ``source_service_type`` / ``dest_service_types``
+    disambiguate same-named-different-backend servers (TODO-AGENT-2-5
+    from Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). Pre-PR-Backends
+    callers omit them and we default to "plex" - matches the existing
+    behaviour for installs without duplicate names.
     """
     # Restore is the only mode that bypasses per-user auth (the file
     # is the source of truth; the admin token writes everyone's data
@@ -69,16 +78,28 @@ def compute_pin_preflight(
     # Build the list of servers the run will need per-user auth from.
     # Snapshot reads from one server (the source); direct also writes
     # to each destination, so destinations also need their own users
-    # authenticated.
-    server_names_to_check: List[str] = []
+    # authenticated. Each entry is a (name, service_type) tuple so
+    # we can disambiguate same-named servers across backends.
+    src_type = (source_service_type or "plex").lower()
+    servers_to_check: List[tuple] = []
+    seen: Set[tuple] = set()
     if source_server_name:
-        server_names_to_check.append(source_server_name)
+        key = (source_server_name, src_type)
+        servers_to_check.append(key)
+        seen.add(key)
     if mode == "direct" and dest_server_names:
-        for dn in dest_server_names:
-            if dn and dn not in server_names_to_check:
-                server_names_to_check.append(dn)
+        dst_types = dest_service_types or []
+        for i, dn in enumerate(dest_server_names):
+            if not dn:
+                continue
+            ds = (dst_types[i] if i < len(dst_types) else "plex") or "plex"
+            ds = ds.lower()
+            key = (dn, ds)
+            if key not in seen:
+                servers_to_check.append(key)
+                seen.add(key)
 
-    if not server_names_to_check:
+    if not servers_to_check:
         return {
             "mode": mode,
             "checked": False,
@@ -96,8 +117,10 @@ def compute_pin_preflight(
     at_risk: Set[str] = set()
     servers_checked: List[str] = []
 
-    for sname in server_names_to_check:
-        row = server_registry.get_server_by_name(sname, include_token=False)
+    for sname, sservice in servers_to_check:
+        row = server_registry.get_server_by_name(
+            sname, include_token=False, service_type=sservice,
+        )
         if row is None:
             # Unknown server name. Skip silently; the job submission
             # itself will reject the request with a clearer error.
@@ -126,6 +149,24 @@ def compute_pin_preflight(
             if user_filter_set is not None and uname not in user_filter_set:
                 continue
             if u.get("has_token") or u.get("has_pin"):
+                continue
+            # Share-state gate (2026-05-15). Pre-fix this branch flagged
+            # every credential-less row as "PIN-protected," which
+            # included stale users the end user had un-shared on
+            # Plex.tv. Two new flags from /api/servers/{mid}/shared_servers
+            # + /api/home/users now tell us which is which:
+            #   * active_share=False -> user is gone from this server.
+            #     The engine's share-state gate already drops them; no
+            #     point asking the end user to save a PIN for a row
+            #     they don't actually have access to.
+            #   * is_pin_protected=False -> user is shared but does not
+            #     have a PIN set on Plex.tv. They authenticate without
+            #     one; a missing stored PIN isn't a problem.
+            # Only flag the row when Plex.tv confirms an active share
+            # AND a PIN requirement AND we don't have one stored.
+            if not u.get("active_share", True):
+                continue
+            if not u.get("is_pin_protected", False):
                 continue
             at_risk.add(uname)
 

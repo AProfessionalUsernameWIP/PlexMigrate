@@ -11,15 +11,15 @@ Two layers of leniency cover the realistic failure modes:
 
 * Users that are PIN-protected with no stored PIN cannot have their
   tokens captured here. The companion PR-12 preflight check
-  (:mod:`server.preflight`) surfaces those users to the operator
-  before each job runs, so the operator can save the PIN under
+  (:mod:`server.preflight`) surfaces those users to the end user
+  before each job runs, so the end user can save the PIN under
   User Management and the *next* sync completes the capture.
 
 * The Plex.tv calls behind ``account.users()`` and
   ``user.get_token()`` are rate-limited per server (default 4
   attempts per hour). The throttle is the gate that protects against
-  a chatty operator clicking Test Connection repeatedly and hammering
-  Plex.tv. ``force=True`` bypasses it for an explicit operator action
+  a chatty end user clicking Test Connection repeatedly and hammering
+  Plex.tv. ``force=True`` bypasses it for an explicit end user action
   (a "Refresh users" click).
 
 Stored values are encrypted at rest by the existing Fernet machinery
@@ -50,9 +50,9 @@ def _throttle_min_interval_seconds() -> float:
     """
     Read the ``user_token_capture_throttle_per_hour`` setting and
     return the minimum interval between attempts in seconds, per
-    server. Floor of 1/hour so an operator can't disable the limiter
+    server. Floor of 1/hour so an end user can't disable the limiter
     by writing 0; ceiling is whatever Plex.tv will tolerate (we leave
-    that to operator judgement).
+    that to end user judgement).
     """
     try:
         from server.persistence import load_settings
@@ -74,7 +74,7 @@ def _throttle_allows(server_id: str, *, force: bool = False) -> bool:
     subsequent calls within the interval get rejected.
 
     ``force=True`` always allows AND stamps. Use it only from explicit
-    operator-triggered paths (e.g. a "Refresh users" button).
+    end user-triggered paths (e.g. a "Refresh users" button).
     """
     now = time.time()
     interval = _throttle_min_interval_seconds()
@@ -109,29 +109,48 @@ def capture_managed_user_tokens(
     server_id: str,
     *,
     force: bool = False,
+    only_if_missing: bool = True,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
     Best-effort: capture per-user auth tokens for every managed user
     on ``server_id`` and store them encrypted in media.db.
 
-    Returns ``{captured, throttled, errors}``:
+    Returns ``{captured, skipped_existing, throttled, errors}``:
 
-      * ``captured`` (int)    - tokens successfully stored.
-      * ``throttled`` (bool)  - True if the per-server rate limit
-                                blocked this attempt; nothing was tried.
-      * ``errors`` (list[str]) - human-readable per-user failure
-                                strings. PIN-protected users without a
-                                stored PIN do NOT count as errors here;
-                                they simply aren't returned by
-                                ``get_home_users`` and the preflight
-                                check surfaces them later.
+      * ``captured`` (int)         - tokens successfully stored.
+      * ``skipped_existing`` (int) - users that already had a stored
+                                     token and were skipped because
+                                     ``only_if_missing=True``.
+      * ``throttled`` (bool)       - True if the per-server rate limit
+                                     blocked this attempt; nothing
+                                     was tried.
+      * ``errors`` (list[str])     - human-readable per-user failure
+                                     strings. PIN-protected users
+                                     without a stored PIN do NOT count
+                                     as errors here; they simply aren't
+                                     returned by ``get_home_users`` and
+                                     the preflight check surfaces them
+                                     later.
 
-    Pass ``force=True`` to bypass the throttle (operator-triggered
-    refresh).
+    Parameters:
+
+      * ``force=True`` bypasses the per-server throttle. Use it only
+        from explicit end user-triggered paths (e.g. a Refresh-server
+        click).
+      * ``only_if_missing=True`` (default) skips users that already
+        have a stored auth_token in media.db. This is the additive-
+        only contract the Refresh-server flow requires: never
+        overwrite an existing token. Set to False on an explicit
+        per-user "Rotate token" action.
     """
     logger = logger or log
-    out: Dict[str, Any] = {"captured": 0, "throttled": False, "errors": []}
+    out: Dict[str, Any] = {
+        "captured": 0,
+        "skipped_existing": 0,
+        "throttled": False,
+        "errors": [],
+    }
 
     if not _throttle_allows(server_id, force=force):
         wait = max(0.0, _next_attempt_seconds(server_id))
@@ -186,7 +205,31 @@ def capture_managed_user_tokens(
         out["errors"].append(f"get_home_users failed: {exc}")
         return out
 
+    # Build the "already has a stored token" set when additive-only.
+    # We include hidden rows so a tombstoned user with a token doesn't
+    # get its token quietly overwritten by an additive sweep.
+    existing_token_users: set[str] = set()
+    if only_if_missing:
+        try:
+            for u in media_db.list_managed_users(server_id, include_hidden=True):
+                if u.get("has_token"):
+                    existing_token_users.add(u["username"])
+        except Exception as exc:
+            # If the existence check fails we cannot guarantee the
+            # additive contract, so fail closed: log and abort. Better
+            # to do nothing than to silently overwrite tokens.
+            logger.warning(
+                "user_capture: could not read existing tokens for server %r"
+                " (additive contract requires this); aborting sweep: %s",
+                server_id, exc,
+            )
+            out["errors"].append(f"existing-token check failed: {exc}")
+            return out
+
     for username, token, _user_server in home_users:
+        if only_if_missing and username in existing_token_users:
+            out["skipped_existing"] += 1
+            continue
         try:
             media_db.set_managed_user_credential(
                 server_id=server_id,
@@ -200,7 +243,13 @@ def capture_managed_user_tokens(
 
     if out["captured"]:
         logger.info(
-            "Captured per-user tokens for %d managed user(s) on server %r",
-            out["captured"], server_id,
+            "Captured per-user tokens for %d managed user(s) on server %r"
+            " (skipped %d already-stored)",
+            out["captured"], server_id, out["skipped_existing"],
+        )
+    elif out["skipped_existing"]:
+        logger.debug(
+            "User-token sweep for server %r: no new tokens (skipped %d already-stored)",
+            server_id, out["skipped_existing"],
         )
     return out

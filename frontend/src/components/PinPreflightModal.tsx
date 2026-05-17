@@ -1,6 +1,6 @@
 // PR-12 preflight modal.
 //
-// The Run Job form shows this modal between the operator's "Run"
+// The Run Job form shows this modal between the end user's "Run"
 // click and the actual job submission when the backend's preflight
 // check (``POST /api/job/preflight-pin-check``) returns a non-empty
 // list of at-risk managed users. At-risk = no stored auth token AND
@@ -14,7 +14,7 @@
 // params on the JobRecord. The engine writes a per-run warning line
 // to ``runtime.log`` when the flag is set.
 //
-// "Cancel" aborts the submit; the operator can fix things (save the
+// "Cancel" aborts the submit; the end user can fix things (save the
 // missing PINs under Servers - User Management) and try again.
 
 interface Props {

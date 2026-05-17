@@ -43,7 +43,7 @@ def _archive_dir() -> Path:
     """
     Resolve the JSON-archive directory: ``<output_dir>/legacy/``.
 
-    Standalone JSON archives (operator-kept after deleting a
+    Standalone JSON archives (end user-kept after deleting a
     snapshot, or pre-PR-13 archives relocated by
     ``relocate_legacy_exports``) live here. The directory is named
     ``legacy/`` for historical reasons; the UI labels it "JSON
@@ -137,7 +137,7 @@ def delete_all_archives() -> Dict[str, Any]:
     ``<output_dir>/legacy/``. Returns ``{deleted, errors}``.
 
     Non-archive files in the same directory are left alone so an
-    operator who has dropped something else in there doesn't lose it
+    end user who has dropped something else in there doesn't lose it
     to a blanket clear-all. The route-level db_admin gate keeps this
     behind explicit consent.
     """

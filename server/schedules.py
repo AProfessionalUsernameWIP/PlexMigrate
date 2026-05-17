@@ -231,51 +231,139 @@ class Scheduler:
                 mutated = True
                 continue
             if row["next_run_at"] <= now_ts:
-                # Build the snapshot params from the schedule. The job
-                # queue inherits any unset fields from saved settings
-                # automatically.
+                # Task 2 (admin-management plan follow-up, 2026-05-15):
+                # schedules can fire snapshot OR restore OR direct.
+                # Pre-Task-2 schedules have no ``mode`` field; treat
+                # them as snapshot so behaviour on upgrade is identical.
+                mode = str(row.get("mode") or "snapshot").strip()
+                if mode not in ("snapshot", "restore", "direct"):
+                    log.warning(
+                        "Schedule %r has unknown mode %r; rolling forward without firing.",
+                        row.get("name"), row.get("mode"),
+                    )
+                    row["next_run_at"] = _compute_next(row, now=now_ts)
+                    mutated = True
+                    continue
+
+                # Common params shared by every mode.
                 params: Dict[str, Any] = {
                     "libraries": list(row.get("libraries") or []),
                 }
                 if row.get("output_dir"):
                     params["output_dir"] = row["output_dir"]
-                # Tag the run so the resulting .plexexport.json carries
-                # "Scheduled: <schedule name>" in its metadata - the
-                # Snapshots tab uses this to badge each row by origin.
                 params["_trigger"] = "schedule"
                 params["_schedule_name"] = str(row.get("name") or "")
-                if row.get("source_server_name"):
-                    params["source_server_name"] = row["source_server_name"]
-                else:
+
+                # ── Mode-specific requirement checks. Same shape as
+                # the ScheduleIn validator but reading from the on-
+                # disk row to handle schedules that were saved by an
+                # older API version (defensive). ──
+                if mode in ("snapshot", "direct") and not row.get("source_server_name"):
                     log.warning(
-                        "Schedule %r has no source_server_name set; rolling forward without firing. "
-                        "Edit it under the Schedules tab and pick a registered server.",
-                        row.get("name"),
+                        "Schedule %r (mode=%s) has no source_server_name; rolling forward.",
+                        row.get("name"), mode,
                     )
                     row["next_run_at"] = _compute_next(row, now=now_ts)
                     mutated = True
                     continue
-                # P2-1: forward per-schedule strict_match override when set.
-                # None on the schedule row means "inherit settings.json".
-                if row.get("strict_match") is not None:
-                    params["strict_match"] = bool(row["strict_match"])
-                # PR-3 / Phase D - forward the four-flag data-type filter
-                # from the schedule row. Schedules saved before Phase D
-                # default to all-true at load time via the Pydantic
-                # model so unset fields preserve pre-Phase-D behaviour.
+                if mode in ("restore", "direct"):
+                    dests = row.get("dest_server_names") or []
+                    if not dests:
+                        log.warning(
+                            "Schedule %r (mode=%s) has no dest_server_names; rolling forward.",
+                            row.get("name"), mode,
+                        )
+                        row["next_run_at"] = _compute_next(row, now=now_ts)
+                        mutated = True
+                        continue
+                if mode == "restore":
+                    files = row.get("input_files") or []
+                    if not files:
+                        log.warning(
+                            "Schedule %r (mode='restore') has no input_files; rolling forward.",
+                            row.get("name"),
+                        )
+                        row["next_run_at"] = _compute_next(row, now=now_ts)
+                        mutated = True
+                        continue
+
+                # ── Forward source / destination(s). ──
+                if row.get("source_server_name"):
+                    params["source_server_name"] = row["source_server_name"]
+                if mode in ("restore", "direct"):
+                    params["dest_server_names"] = list(row.get("dest_server_names") or [])
+                if mode == "restore":
+                    params["input_files"] = list(row.get("input_files") or [])
+
+                # ── Per-mode-specific knobs. ──
+                if mode in ("restore", "direct"):
+                    if row.get("restore_mode") in ("merge", "replace"):
+                        params["mode"] = row["restore_mode"]
+                    if row.get("auto_capture_before_replace") is not None:
+                        params["auto_capture_before_replace"] = bool(row["auto_capture_before_replace"])
+                    if row.get("merge_watch_strategy") in ("higher", "sum"):
+                        # 'sum' is allowed on a schedule when the
+                        # end user set confirm_additive_merge=true at
+                        # save time. The ScheduleIn validator gates
+                        # this; the check below is belt-and-suspenders
+                        # against a hand-edited row that drops the
+                        # confirmation flag.
+                        if (
+                            row["merge_watch_strategy"] == "sum"
+                            and not row.get("confirm_additive_merge")
+                        ):
+                            log.warning(
+                                "Schedule %r has merge_watch_strategy='sum' but no "
+                                "confirm_additive_merge flag; coercing to 'higher' for this fire.",
+                                row.get("name"),
+                            )
+                            params["merge_watch_strategy"] = "higher"
+                        else:
+                            params["merge_watch_strategy"] = row["merge_watch_strategy"]
+                    if row.get("restore_mode") == "replace":
+                        # The validator gates this on confirm_replace at
+                        # save time; double-check at fire time so a
+                        # legacy row never silently fires Replace.
+                        if not row.get("confirm_replace"):
+                            log.warning(
+                                "Schedule %r requested restore_mode='replace' without confirm_replace; "
+                                "rolling forward without firing.",
+                                row.get("name"),
+                            )
+                            row["next_run_at"] = _compute_next(row, now=now_ts)
+                            mutated = True
+                            continue
+                        params["confirm_replace"] = True
+                    if row.get("remap_old"):
+                        params["remap_old"] = str(row["remap_old"])
+                    if row.get("remap_new"):
+                        params["remap_new"] = str(row["remap_new"])
+                    if row.get("strict_match") is not None:
+                        params["strict_match"] = bool(row["strict_match"])
+                else:  # snapshot
+                    if row.get("strict_match") is not None:
+                        params["strict_match"] = bool(row["strict_match"])
+
+                # ── Data-type filter (all four modes accept the same flags). ──
                 for _flag in (
                     "include_watch_history", "include_ratings",
                     "include_playlists", "include_collections",
-                    "prebuild_json_sidecar",
                 ):
                     if _flag in row:
                         params[_flag] = bool(row[_flag])
-                # v0.14 Per-Run Settings on schedules. Each non-None
-                # field overrides the global / per-server value the
-                # snapshot job would otherwise inherit at fire time.
-                # Empty / blank strings on watch_ratings_filter_strategy
-                # are skipped so the chain falls through to per-server
-                # or global default.
+                if mode == "snapshot" and "prebuild_json_sidecar" in row:
+                    params["prebuild_json_sidecar"] = bool(row["prebuild_json_sidecar"])
+
+                # ── Phase C (admin-management follow-up, 2026-05-15):
+                # per-library metric map. The schedule's ScheduleIn
+                # validator already expanded any global include_*
+                # flags into library_metrics at save time, so the row
+                # on disk should have a populated library_metrics
+                # entry. Pass it straight through to the fired job.
+                if row.get("library_metrics"):
+                    params["library_metrics"] = row["library_metrics"]
+
+                # ── Per-run settings (worker counts, verbose, log dir, etc.). ──
                 for _num_field in ("workers", "scrobble_workers"):
                     _v = row.get(_num_field)
                     if isinstance(_v, (int, float)) and _v >= 1:
@@ -291,23 +379,87 @@ class Scheduler:
                 _wr = row.get("watch_ratings_filter_strategy")
                 if isinstance(_wr, str) and _wr.strip() in ("smart", "force_bulk", "force_server_side"):
                     params["watch_ratings_filter_strategy"] = _wr.strip()
-                # v0.14 - forward the per-schedule user_filter. None /
-                # missing = capture every user the source server
-                # reports (historical default). The snapshot engine
-                # filters home_users + derives owner_included.
                 _uf = row.get("user_filter")
                 if isinstance(_uf, list):
                     params["user_filter"] = [str(s) for s in _uf if isinstance(s, str)]
-                rec = queue.submit_snapshot(params)
+
+                # ── Schedules-alignment additions (2026-05-16) ──────
+                # Forward the new per-job knobs that bring the schedule
+                # row to Run Job submit parity. Each field is only
+                # forwarded when present and meaningful on the disk row;
+                # pre-alignment schedules omit them and the engine falls
+                # back to the same defaults Run Job uses on a fresh form.
+                # D-OWNER (a): per-user fan-out toggle. Default True
+                # matches the adapter engines' include_managed_users
+                # kwarg. We forward unconditionally so a hand-edited row
+                # that flipped it to False is honored.
+                if "include_managed_users" in row:
+                    params["include_managed_users"] = bool(row["include_managed_users"])
+                # D-RATE: per-job rating-mapping policy. Cross-backend
+                # routes (source.service_type != dest.service_type)
+                # consult these; same-backend routes ignore them. The
+                # engine reads rate_threshold only when rate_mode ==
+                # 'tunable' (validator gates this combination too).
+                _rm = row.get("rate_mode")
+                if _rm in ("default", "tunable", "numeric_only"):
+                    params["rate_mode"] = _rm
+                _rt = row.get("rate_threshold")
+                if isinstance(_rt, (int, float)):
+                    params["rate_threshold"] = float(_rt)
+                # D-OWNER (b): pre-confirmed user-create specs. The
+                # adapter engine reads this list and idempotently
+                # creates missing destination users before the data
+                # write. List of dicts shaped like ProposedUser /
+                # UserCreateSpec.
+                _ucs = row.get("user_create_specs")
+                if isinstance(_ucs, list) and _ucs:
+                    params["user_create_specs"] = _ucs
+                # Per-Run Settings parity: overwrite_playlists. Run Job
+                # exposes this in Per-Run Settings > General; the engine
+                # treats it as a back-compat no-op today but Run Job
+                # forwards it on every submit so we mirror that on
+                # scheduled fires too.
+                if row.get("overwrite_playlists") is not None:
+                    params["overwrite_playlists"] = bool(row["overwrite_playlists"])
+                # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-run mixed-
+                # media playlist overrides. None on the row means
+                # "inherit global tunable", so we forward only when the
+                # end user set an explicit value. Same field set lives
+                # on SnapshotJobIn / RestoreJobIn / DirectTransferIn.
+                for _mm_field in (
+                    "mixed_media_behavior",
+                    "mixed_media_dominance_threshold",
+                    "mixed_media_video_routing",
+                    "mixed_media_logging",
+                    "mixed_media_collision_handling",
+                ):
+                    _mm_val = row.get(_mm_field)
+                    if _mm_val is not None:
+                        params[_mm_field] = _mm_val
+                # Note: pin_preflight_ack is a save-time UX gate ONLY.
+                # It is intentionally NOT forwarded to the engine; the
+                # field tracks end user acknowledgement of cross-server
+                # PIN risk in the editor and clears when the schedule's
+                # source server changes.
+
+                # ── Dispatch to the right submit_* call. ──
+                if mode == "snapshot":
+                    rec = queue.submit_snapshot(params)
+                elif mode == "restore":
+                    rec = queue.submit_restore(params)
+                else:  # direct
+                    rec = queue.submit_direct(params)
                 row["last_job_id"] = rec.job_id
                 row["last_fired_at"] = now_ts
                 # Roll forward to the next future occurrence.
                 row["next_run_at"] = _compute_next(row, now=now_ts)
                 mutated = True
                 log.info(
-                    "Scheduler fired schedule %r (server=%s, job_id=%s, next=%s)",
+                    "Scheduler fired schedule %r (mode=%s, server=%s, dests=%s, job_id=%s, next=%s)",
                     row.get("name"),
+                    mode,
                     row.get("source_server_name"),
+                    row.get("dest_server_names") or "-",
                     rec.job_id,
                     dt.datetime.fromtimestamp(row["next_run_at"]).isoformat(timespec="seconds"),
                 )
@@ -333,8 +485,86 @@ def list_schedules() -> List[Dict[str, Any]]:
 
     Used by ``GET /api/schedules`` so the frontend always sees an
     up-to-date "next run" column even right after a fire.
+
+    Also augments each row with ``resolutions_status`` per
+    Plan[CROSS-PLATFORM-PREFLIGHT] step 5: a status badge for the
+    schedule list UI based on whether the row's stored
+    cross_platform_resolutions still point at users that exist on
+    the current destination roster.
     """
     rows = persistence.load_schedules()
     for row in rows:
         ensure_next_run_at(row)
+        row["resolutions_status"] = _compute_resolutions_status(row)
     return rows
+
+
+def _compute_resolutions_status(schedule_row: Dict[str, Any]) -> str:
+    """Return 'ok' | 'auto_fallback' | 'needs_review' for one schedule.
+
+    Conservative classification:
+      * No stored resolutions OR no cross-platform involvement -> 'ok'.
+      * Any stored decision points at a destination that's no longer
+        registered, OR a 'map' decision targets a backend_user_id that
+        no longer exists on the destination roster -> 'needs_review'.
+      * Any decision is 'accept_proposed' -> 'auto_fallback' (the
+        schedule fires with the original implicit pick; consider
+        locking with an identity map).
+      * Otherwise -> 'ok'.
+
+    Read-only. Failures during the live roster check default the
+    affected destination to 'ok' so the schedules list always
+    renders; the engine still enforces correctness at fire time.
+    """
+    stored = schedule_row.get("cross_platform_resolutions") or {}
+    if not isinstance(stored, dict) or not stored:
+        return "ok"
+    worst = "ok"
+    rank = {"ok": 0, "auto_fallback": 1, "needs_review": 2}
+    for dest_server_id, ack in stored.items():
+        if not isinstance(ack, dict):
+            continue
+        # Destination still registered?
+        try:
+            from server import server_registry
+            row = server_registry.get_server_by_id(
+                dest_server_id, include_token=False,
+            )
+        except Exception:
+            row = None
+        if row is None:
+            worst = "needs_review"
+            continue
+        decisions = ack.get("resolutions") or []
+        if not isinstance(decisions, list):
+            continue
+        live_user_ids = _live_dest_user_ids(dest_server_id)
+        for dec in decisions:
+            if not isinstance(dec, dict):
+                continue
+            action = (dec.get("action") or "").strip().lower()
+            if action == "map":
+                target = (dec.get("dest_user_id") or "").strip()
+                if (target and live_user_ids is not None
+                        and target not in live_user_ids):
+                    if rank["needs_review"] > rank[worst]:
+                        worst = "needs_review"
+            elif action == "accept_proposed":
+                if rank["auto_fallback"] > rank[worst]:
+                    worst = "auto_fallback"
+    return worst
+
+
+def _live_dest_user_ids(dest_server_id: str):
+    """Return the current backend_user_id set for the destination,
+    or None on any lookup failure (caller treats None as
+    'can't verify; skip drift check' rather than 'every id is stale')."""
+    try:
+        from server import server_registry
+        connection = server_registry.connect_registered_server(
+            dest_server_id, log,
+        )
+        users = connection.adapter.list_users() or []
+        return {u.backend_user_id for u in users if u.backend_user_id}
+    except Exception:
+        return None

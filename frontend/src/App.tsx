@@ -14,7 +14,7 @@
 //
 // The access token lives in component state only - never in
 // localStorage, sessionStorage, or cookies. Closing the tab logs the
-// operator out. This is the deliberate trade-off documented in
+// end user out. This is the deliberate trade-off documented in
 // roadmapplan4.md: a locally-hosted tool exposed beyond localhost
 // should optimise for "no persisted creds in the browser" over
 // "stay-signed-in" UX.
@@ -26,6 +26,7 @@ import {
   Role,
   api,
   dashboardWsClient,
+  onElevationRequired,
   onUnauthorized,
   setAccessToken,
   ServerTime,
@@ -35,9 +36,15 @@ import { AuthProvider, ROLE_RANK, useAuthContext } from './contexts/AuthContext'
 import { ClockProvider, useClockDisplay } from './contexts/ClockContext';
 import { usePermission } from './hooks/usePermission';
 import { DashboardPanel } from './components/DashboardPanel';
+import { ElevateModal } from './components/ElevateModal';
+import { RuntimeBreakdownPanel } from './components/RuntimeBreakdownPanel';
+import { DeveloperPanel } from './components/DeveloperPanel';
+import { ServerLogsPanel } from './components/ServerLogsPanel';
 import { JobFormPanel } from './components/JobFormPanel';
 import { SchedulesPanel } from './components/SchedulesPanel';
+import { PlaylistManagementPanel } from './components/PlaylistManagementPanel';
 import { LogsPanel } from './components/LogsPanel';
+import { ApplicationLogsPanel } from './components/ApplicationLogsPanel';
 import { ExportsPanel } from './components/ExportsPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 import { AccountsPanel } from './components/AccountsPanel';
@@ -48,21 +55,27 @@ import { NetworkingPanel } from './components/NetworkingPanel';
 import { ServerAdvancedSettingsPanel } from './components/ServerAdvancedSettingsPanel';
 import { RunDefaultsPanel } from './components/RunDefaultsPanel';
 import { TunablesPanel } from './components/TunablesPanel';
+import { DatabasesPanel } from './components/DatabasesPanel';
 import { AccessControlPanel } from './components/AccessControlPanel';
 import { UserManagementPanel } from './components/UserManagementPanel';
 import { LoginPage } from './components/LoginPage';
 import { SetupPage } from './components/SetupPage';
+import { UpgradeSplitModal } from './components/UpgradeSplitModal';
 import { InfoTip } from './components/InfoTip';
 import { HelpPanel } from './components/HelpPanel';
+import { TooltipProvider } from './contexts/TooltipContext';
+import { ElevationProvider, useElevation } from './contexts/ElevationContext';
 
-type Tab = 'dashboard' | 'run' | 'servers' | 'account' | 'settings';
+// 'developer' is appended dynamically only when the backend reports
+// debug_mode=true on /api/health. Production builds never see it.
+type Tab = 'dashboard' | 'run' | 'servers' | 'account' | 'settings' | 'developer';
 // Sub-tabs nested under Run Job. Persists across navigation.
-type RunSubTab = 'run' | 'schedules';
+type RunSubTab = 'run' | 'schedules' | 'playlists';
 // Sub-tabs nested under Servers. PR-7 removed 'logs' and 'snapshots'
 // from here and moved them under Settings; PR-10 added 'users' for
-// the User Management panel (operator+ only).
-type ServersSubTab = 'servers' | 'networking' | 'users' | 'run_defaults' | 'advanced' | 'exports';
-// Sub-tabs nested under Account. ``account`` is every operator's own
+// the User Management panel (end user+ only).
+type ServersSubTab = 'servers' | 'networking' | 'users' | 'run_defaults' | 'advanced' | 'exports' | 'logs';
+// Sub-tabs nested under Account. ``account`` is every end user's own
 // self-service surface (display name, password, clock). ``account_management``
 // is admin/root_admin only and contains the Database Admin Account
 // page + the User Accounts explorer, switched between via the
@@ -71,9 +84,9 @@ type ServersSubTab = 'servers' | 'networking' | 'users' | 'run_defaults' | 'adva
 // ``users.manage``).
 type AccountSubTab = 'account' | 'account_management';
 // Sub-tabs nested under Settings. After the Account-promotion, the
-// Settings tab houses system-level operator views only: system
+// Settings tab houses system-level end user views only: system
 // preferences, logs, exports, plus a flat Help reference page.
-type SettingsSubTab = 'settings' | 'tunables' | 'logs' | 'help';
+type SettingsSubTab = 'settings' | 'tunables' | 'databases' | 'logs' | 'help';
 
 // Inner nav inside the Account Management sub-tab. Three pages:
 //   db_admin       - Database Admin Account credential (db_admin.access)
@@ -121,17 +134,49 @@ export function App() {
   const [me, setMe] = useState<MeResponse | null>(null);
   const [meError, setMeError] = useState<string | null>(null);
 
+  // Phase 6 of the dashboard / log reorg: inline re-auth modal state.
+  // Open when an API call returns 403 with the elevation marker;
+  // ``elevatePromiseRef`` carries the pending resolve callback so the
+  // http<T> helper can await the end user's confirm / cancel choice
+  // before deciding whether to retry the original request.
+  const [elevateOpen, setElevateOpen] = useState<boolean>(false);
+  const elevatePromiseRef = useRef<((ok: boolean) => void) | null>(null);
+
   // Register the 401 handler once. With refresh tokens in play, this
   // fires only AFTER api.ts's internal silent-refresh-and-retry has
   // already failed - i.e. the refresh cookie is gone or revoked. We
   // drop the in-memory state and the render gate below sends the
-  // operator to the login screen.
+  // end user to the login screen.
   useEffect(() => {
     onUnauthorized(() => {
       setAccessToken(null);
       setToken(null);
       setMe(null);
     });
+  }, []);
+
+  // Phase 6: register the elevation handler once. http<T> calls this
+  // on any 403 carrying the elevation marker; we stash the resolver
+  // on the ref so the modal's close handler can finish the promise.
+  // If the modal is already open when another elevation-required
+  // call lands, we resolve the previous promise false so the prior
+  // call surfaces a normal error rather than waiting forever - the
+  // end user can only consciously confirm one elevate at a time.
+  useEffect(() => {
+    onElevationRequired(() => {
+      return new Promise<boolean>((resolve) => {
+        // If a prior modal is still pending, dismiss its waiter
+        // with false. This is rare in practice (modal blocks
+        // further user actions) but defensive against parallel
+        // background fetches.
+        if (elevatePromiseRef.current) {
+          try { elevatePromiseRef.current(false); } catch { /* ignore */ }
+        }
+        elevatePromiseRef.current = resolve;
+        setElevateOpen(true);
+      });
+    });
+    return () => onElevationRequired(null);
   }, []);
 
   // First-mount: probe /api/auth/status (setup vs login) and attempt
@@ -271,11 +316,25 @@ export function App() {
     );
   }
 
+  // Item 1: forced upgrade-split for legacy installs. If the install
+  // was set up with the legacy single-account flow (setup_version=1
+  // or undefined) AND the end user is a root_admin (the only role
+  // such installs can produce), block the main UI until they create
+  // a separate root account. The modal is non-dismissable.
+  const needsUpgradeSplit =
+    (authStatus.setup_version ?? 1) < 2
+    && me.real_role === 'root_admin';
+
   // Authenticated and profile loaded - wrap Main in AuthProvider so
   // every gated component can read role + permissions via context.
+  // TooltipProvider lives outside the auth tree so even the
+  // upgrade-split modal could in principle consume it (no current
+  // call site, but the layering is consistent).
   return (
     <ClockProvider>
-      <AuthProvider
+     <TooltipProvider>
+      <ElevationProvider>
+       <AuthProvider
         username={me.username}
         displayName={me.display_name}
         realRole={me.real_role}
@@ -286,6 +345,22 @@ export function App() {
         createdAt={me.created_at}
         refreshMe={refreshMe}
       >
+        {needsUpgradeSplit && (
+          <UpgradeSplitModal
+            callerUsername={me.username}
+            onComplete={() => {
+              // Force a fresh login: the end user's role just changed
+              // from root_admin to admin in the DB, but their current
+              // JWT still claims root_admin. Sign out cleanly.
+              api.authLogout().catch(() => { /* no-op */ });
+              dashboardWsClient.close();
+              setAccessToken(null);
+              setToken(null);
+              setMe(null);
+              setAuthStatus({ ...authStatus, setup_version: 2 });
+            }}
+          />
+        )}
         <Main
           onLogout={() => {
             api.authLogout().catch(() => { /* no-op */ });
@@ -294,8 +369,37 @@ export function App() {
             setToken(null);
             setMe(null);
           }}
+          onSessionSwap={(newToken) => {
+            // Login-as-root landed a fresh AuthSession. Adopt the new
+            // token + clear ``me`` so the identity-fetch effect re-runs
+            // and the new role lands on screen. The dashboard WS is
+            // left alone: the new token is attached to subsequent
+            // frames automatically since the WS client reads the
+            // module-level access token slot.
+            setAccessToken(newToken);
+            setToken(newToken);
+            setMe(null);
+          }}
         />
-      </AuthProvider>
+        {/* Phase 6 of the dashboard / log reorg: inline re-auth modal.
+            Mounted as a sibling to Main so it overlays whichever tab
+            the end user was on when the elevation-required 403
+            landed. The api.ts http<T> helper awaits the end user's
+            confirm / cancel choice via the elevatePromiseRef-backed
+            resolver and either retries the original request silently
+            (on confirm) or throws the 403 to the caller (on cancel). */}
+        <ElevateModal
+          open={elevateOpen}
+          onClose={(ok) => {
+            setElevateOpen(false);
+            const resolve = elevatePromiseRef.current;
+            elevatePromiseRef.current = null;
+            if (resolve) resolve(ok);
+          }}
+        />
+       </AuthProvider>
+      </ElevationProvider>
+     </TooltipProvider>
     </ClockProvider>
   );
 }
@@ -305,8 +409,15 @@ export function App() {
 
 function Main({
   onLogout,
+  onSessionSwap,
 }: {
   onLogout: (() => void) | null;
+  // Re-auth callback: when "Login as root" lands a fresh AuthSession,
+  // App owns the token + me state and must adopt them. Main can't
+  // touch those slots directly, so it hands the new token up. The
+  // App callback below mirrors the onLogout cleanup but installs the
+  // new token instead of clearing.
+  onSessionSwap: ((newToken: string) => void) | null;
 }) {
   // PR-A3 - identity now reads from AuthContext. The previous
   // ``currentUser`` prop is gone; Main is always rendered inside an
@@ -317,20 +428,32 @@ function Main({
   const [snapshot, setSnapshot] = useState<DashboardFrame | null>(null);
   const [conn, setConn] = useState<ConnState>('connecting');
   const [tab, setTab] = useState<Tab>('dashboard');
+  // Feature 3: debug-mode probe. Polled once on mount. The Developer
+  // tab is only added to the nav when this is true. Production
+  // deployments leave PLEXMIGRATE_DEBUG_MODE unset and the tab never
+  // renders. False-positive risk: an end user who unsets the env var
+  // mid-session keeps the tab visible until they reload; the backend
+  // endpoint still 403s so no harm done.
+  const [debugMode, setDebugMode] = useState<boolean>(false);
+  useEffect(() => {
+    api.getHealth()
+      .then((h) => setDebugMode(Boolean(h.debug_mode)))
+      .catch(() => setDebugMode(false));
+  }, []);
   // Both sub-tab states persist independently - navigating away and back
   // always restores the last active sub-tab rather than resetting.
   const [runSubTab, setRunSubTab] = useState<RunSubTab>('run');
   const [serversSubTab, setServersSubTab] = useState<ServersSubTab>('servers');
-  // Account tab inner state. Defaults to the operator's own account
+  // Account tab inner state. Defaults to the end user's own account
   // surface; the Account Management sub-tab is only visible for roles
   // with ``users.manage`` (admin / root_admin).
   const [accountSubTab, setAccountSubTab] = useState<AccountSubTab>('account');
   // Settings tab inner state. Defaults to system settings; the snap-back
-  // effect below picks the first sub-tab the operator actually has
+  // effect below picks the first sub-tab the end user actually has
   // permission for when they land on the Settings tab.
   const [settingsSubTab, setSettingsSubTab] = useState<SettingsSubTab>('settings');
   // Inner page within the Account Management sub-tab. Persists
-  // separately so the operator's last-viewed inner page survives
+  // separately so the end user's last-viewed inner page survives
   // navigation around the rest of the app.
   const [accountMgmtPage, setAccountMgmtPage] = useState<AccountMgmtPage>('db_admin');
 
@@ -368,10 +491,16 @@ function Main({
   // PR-A5 - Switch View Mode modal visibility. Only root_admin ever
   // sees the trigger button (rendered conditionally below).
   const [showSwitchViewModal, setShowSwitchViewModal] = useState(false);
+  // Login-as-root re-auth modal visibility. Trigger lives next to
+  // Logout in the topbar. The flow runs a fresh /api/auth/login call
+  // against root_admin credentials and swaps the in-memory access
+  // token on success; the existing refresh-token cookie is replaced
+  // by the new login's cookie, so the prior session is overwritten.
+  const [showLoginAsRootModal, setShowLoginAsRootModal] = useState(false);
 
-  // The Settings tab carries operator surfaces plus the always-on
+  // The Settings tab carries end user surfaces plus the always-on
   // Help reference page; if the effective role has none of the
-  // operator surfaces we still keep the tab visible because Help is
+  // end user surfaces we still keep the tab visible because Help is
   // available to everyone, but that means the tab is effectively
   // unconditional. Kept as a constant for symmetry with the snap-back
   // and tab-strip logic below.
@@ -383,9 +512,10 @@ function Main({
   useEffect(() => {
     if (tab === 'run' && !canStartJobs) setTab('dashboard');
     if (tab === 'settings' && !canSeeSettingsTab) setTab('dashboard');
-  }, [tab, canStartJobs, canSeeSettingsTab]);
+    if (tab === 'developer' && !debugMode) setTab('dashboard');
+  }, [tab, canStartJobs, canSeeSettingsTab, debugMode]);
   // Servers sub-tab snap-back. ``users`` (User Management, PR-10) is
-  // operator+ only; ``exports`` is gated by canViewExports. If a
+  // end user+ only; ``exports`` is gated by canViewExports. If a
   // Switch View Mode drop strands the caller on either, bounce back
   // to the plain Servers list.
   useEffect(() => {
@@ -395,7 +525,10 @@ function Main({
     if (tab === 'servers' && serversSubTab === 'exports' && !canViewExports) {
       setServersSubTab('servers');
     }
-  }, [tab, serversSubTab, canStartJobs, canViewExports]);
+    if (tab === 'servers' && serversSubTab === 'logs' && !canViewLogs) {
+      setServersSubTab('servers');
+    }
+  }, [tab, serversSubTab, canStartJobs, canViewExports, canViewLogs]);
   // Account sub-tab snap-back. Only ``account_management`` can become
   // forbidden via a Switch View Mode drop - the personal ``account``
   // page is always available to every role.
@@ -407,7 +540,7 @@ function Main({
   // Settings sub-tab snap-back. Picks the first permitted face when the
   // current one is no longer visible (e.g. ``settings`` after a drop
   // out of canEditSettings). ``help`` is unconditional, so it's the
-  // ultimate fallback when no operator surface is available.
+  // ultimate fallback when no end user surface is available.
   // ``exports`` moved to the Servers tab in v0.13.0 and is no longer
   // a Settings sub-tab.
   useEffect(() => {
@@ -415,6 +548,7 @@ function Main({
     const valid =
       (settingsSubTab === 'settings' && canEditSettings) ||
       (settingsSubTab === 'tunables' && canManageTunables) ||
+      (settingsSubTab === 'databases' && canManageTunables) ||
       (settingsSubTab === 'logs' && canViewLogs) ||
       settingsSubTab === 'help';
     if (valid) return;
@@ -423,7 +557,7 @@ function Main({
     else if (canViewLogs) setSettingsSubTab('logs');
     else setSettingsSubTab('help');
   }, [tab, settingsSubTab, canEditSettings, canManageTunables, canViewLogs]);
-  // If the operator was viewing the Database Admin inner page and a
+  // If the end user was viewing the Database Admin inner page and a
   // Switch View Mode drop removes ``db_admin.access``, fall back to
   // the User Accounts inner page so the surrounding nav doesn't show
   // an active-but-hidden button with a blank pane below it.
@@ -437,7 +571,7 @@ function Main({
       setAccountMgmtPage('user_accounts');
     }
   }, [tab, accountSubTab, accountMgmtPage, canAccessDbAdmin]);
-  // Same snap-back for Access Control: if the operator was on this
+  // Same snap-back for Access Control: if the end user was on this
   // page and lost root_admin (e.g. View Mode drop), bounce them to
   // User Accounts so the page doesn't render under the wrong identity.
   useEffect(() => {
@@ -596,7 +730,7 @@ function Main({
     };
     // ``server`` mode keeps the server timezone. ``local`` mode and
     // ``custom`` mode render in the browser's local timezone - the
-    // operator chose to look away from the server clock, so the
+    // end user chose to look away from the server clock, so the
     // browser zone is the right context for those modes.
     if (clock.mode === 'server') {
       try {
@@ -654,7 +788,7 @@ function Main({
               function when auth is enabled AND a token is in state.
               ``currentUser`` is optional decoration; if the JWT
               payload didn't decode cleanly the button still appears
-              so the operator never gets locked into a half-state
+              so the end user never gets locked into a half-state
               with no way out. */}
           {onLogout && (
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
@@ -684,18 +818,23 @@ function Main({
                   )}
                 </span>
               )}
+              {/* Item 1: elevation chip. Only visible when the
+                  caller is currently elevated (sudo-style cache is
+                  live). Shows a countdown to expiry and lets the
+                  end user drop elevation manually. */}
+              {auth.realRole === 'root_admin' && <TopbarElevationChip />}
               {/* Switch View Mode button visibility is keyed off the
                   REAL role, not the effective one - the button must
-                  stay reachable while dropped so the operator can
+                  stay reachable while dropped so the end user can
                   always restore. Hidden only for viewer (no drop
                   targets exist for that role). */}
               {auth.realRole !== 'viewer' && (
                 <button
                   onClick={() => setShowSwitchViewModal(true)}
-                  title="View mode resets on page refresh."
+                  title="Change the active permission level for this session. Resets on page refresh."
                   style={{ fontSize: 12 }}
                 >
-                  Switch View Mode
+                  Switch permissions
                 </button>
               )}
               <button
@@ -705,6 +844,26 @@ function Main({
               >
                 Log out
               </button>
+              {/* Login-as-root shortcut. Visible only when the end user's
+                  REAL role is below root_admin and they are not already in
+                  a switched-down view (use Exit view mode from the
+                  permissions modal in that case). Single-click path to
+                  the same viewModeEnter('root_admin') flow surfaced
+                  via the renamed Switch permissions modal; saved as a
+                  dedicated button at the end user's request because
+                  many sessions need root for a single action and
+                  burying it in the modal is friction. */}
+              {auth.realRole !== 'root_admin'
+                && auth.realRole === auth.role
+                && auth.realRole !== 'viewer' && (
+                <button
+                  onClick={() => setShowLoginAsRootModal(true)}
+                  title="Elevate this session to root_admin permissions. Requires the root password."
+                  style={{ fontSize: 12 }}
+                >
+                  Login as root
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -714,28 +873,47 @@ function Main({
           for viewer (no ``jobs.start``); ``Account`` is visible to
           every role (everyone can manage their own profile);
           ``Settings`` is visible only when the role has at least one
-          operator surface (system settings, logs, or exports). */}
+          end user surface (system settings, logs, or exports). */}
       <nav className="tabs">
         <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
         {canStartJobs && (
-          <button className={tab === 'run' ? 'active' : ''} onClick={() => setTab('run')}>Run Job</button>
+          <button className={tab === 'run' ? 'active' : ''} onClick={() => setTab('run')}>Jobs</button>
         )}
         <button className={tab === 'servers' ? 'active' : ''} onClick={() => setTab('servers')}>Servers</button>
         <button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')}>Account</button>
         {canSeeSettingsTab && (
           <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button>
         )}
+        {debugMode && (
+          <button
+            className={tab === 'developer' ? 'active' : ''}
+            onClick={() => setTab('developer')}
+            title="Visible only when PLEXMIGRATE_DEBUG_MODE is enabled on the backend."
+          >
+            Developer
+          </button>
+        )}
       </nav>
 
       {tab === 'run' && canStartJobs && (
         <nav className="tabs sub-tabs">
           <button className={runSubTab === 'run' ? 'active' : ''} onClick={() => setRunSubTab('run')}>Run Job</button>
-          {/* Schedules sub-tab requires schedules.view (operator+) -
+          {/* Schedules sub-tab requires schedules.view (end user+) -
               viewer never reaches this whole branch anyway because
               Run Jobs is hidden for them. */}
           {canViewSchedules && (
             <button className={runSubTab === 'schedules' ? 'active' : ''} onClick={() => setRunSubTab('schedules')}>Schedules</button>
           )}
+          {/* Playlist Transfer — new sub-tab per Plan[PLAYLIST-MANAGEMENT].
+              Same permission gate as Run Job; viewers don't see this
+              branch. (Tab renamed from "Playlist Management" to
+              "Playlist Transfer" 2026-05-17 per end user request — the
+              feature is specifically about transferring a playlist
+              from one user to another, which the new name makes
+              explicit. Internal identifiers + API URLs keep the
+              -mgmt-prefixed names; only the operator-facing label
+              changed.) */}
+          <button className={runSubTab === 'playlists' ? 'active' : ''} onClick={() => setRunSubTab('playlists')}>Playlist Transfer</button>
         </nav>
       )}
 
@@ -743,7 +921,7 @@ function Main({
         <nav className="tabs sub-tabs">
           <button className={serversSubTab === 'servers' ? 'active' : ''} onClick={() => setServersSubTab('servers')}>Overview</button>
           <button className={serversSubTab === 'networking' ? 'active' : ''} onClick={() => setServersSubTab('networking')}>Networking</button>
-          {/* PR-10 - User Management. Operator+ only; hidden from
+          {/* PR-10 - User Management. End user+ only; hidden from
               viewer since they have no jobs to set up credentials for. */}
           {canStartJobs && (
             <button className={serversSubTab === 'users' ? 'active' : ''} onClick={() => setServersSubTab('users')}>User Management</button>
@@ -770,6 +948,14 @@ function Main({
           {canViewExports && (
             <button className={serversSubTab === 'exports' ? 'active' : ''} onClick={() => setServersSubTab('exports')}>Export</button>
           )}
+          {/* Logs sub-tab. Mirrors the per-server-grouped layout of
+              Exports so the end user can scope log browsing to one
+              server without leaving the Servers tab. The global view
+              of every run (including ones whose server has since been
+              removed) still lives under Settings > Logs. */}
+          {canViewLogs && (
+            <button className={serversSubTab === 'logs' ? 'active' : ''} onClick={() => setServersSubTab('logs')}>Logs</button>
+          )}
         </nav>
       )}
 
@@ -795,7 +981,7 @@ function Main({
       )}
 
       {/* Settings sub-tabs filtered by role: general settings (admin+),
-          logs (operator+). Help is always visible since it's a reference
+          logs (end user+). Help is always visible since it's a reference
           page with no destructive controls. v0.13.0 moved Exports to
           the Servers tab; the "Settings" sub-tab is now labeled
           "General Settings" to distinguish it from Servers > Advanced
@@ -810,6 +996,14 @@ function Main({
               that used to be hardcoded literals. */}
           {canManageTunables && (
             <button className={settingsSubTab === 'tunables' ? 'active' : ''} onClick={() => setSettingsSubTab('tunables')}>Tunables</button>
+          )}
+          {/* Databases viewer - root_admin only. Read-only schema +
+              row browser for every SQLite database the app creates.
+              Plan[DATABASES-VIEWER]-2026-05-16. Same gate as Tunables
+              + Access Control (most sensitive end user surface in
+              the app; auth.db is in here). */}
+          {canManageTunables && (
+            <button className={settingsSubTab === 'databases' ? 'active' : ''} onClick={() => setSettingsSubTab('databases')}>Databases</button>
           )}
           {canViewLogs && (
             <button className={settingsSubTab === 'logs' ? 'active' : ''} onClick={() => setSettingsSubTab('logs')}>Logs</button>
@@ -827,9 +1021,9 @@ function Main({
       {tab === 'dashboard' && (snapshot?.jobs?.length ?? 0) > 1 && (() => {
         const jobs = snapshot!.jobs!;
         // Resolve the effective selection so the active highlight is
-        // never blank: the operator's pick (when still in the list),
+        // never blank: the end user's pick (when still in the list),
         // else the running job, else the first job. ``dashJobId`` is
-        // not auto-cleared when stale - the operator keeps the
+        // not auto-cleared when stale - the end user keeps the
         // affordance to click back to their old pick if it reappears,
         // but the visual always points at a real entry.
         const effective =
@@ -864,20 +1058,37 @@ function Main({
 
       <main className="main">
         {tab === 'dashboard' && (
-          <DashboardPanel
-            snapshot={displaySnapshot}
-            connState={conn}
-            selectedJobId={dashJobId}
-          />
+          <>
+            <DashboardPanel
+              snapshot={displaySnapshot}
+              connState={conn}
+              selectedJobId={dashJobId}
+            />
+            {/* Feature 1 phase 1.5: per-operation runtime data lives in
+                its own panel below the live dashboard. The panel reads
+                from /api/run-timings/runs and is collapsible via the
+                Verbose toggle (default ON per D3). Keeping it as a
+                sibling of DashboardPanel rather than embedding inside
+                DashboardPanel avoids editing the 2200-line dashboard
+                component.
+                2026-05-17 bug fix: pass the current job so the panel
+                can auto-refresh on the running -> terminal transition
+                (pre-fix it only refreshed on mount + manual click, so
+                a just-completed restore wasn't visible until the
+                end user clicked Refresh). */}
+            <RuntimeBreakdownPanel job={displaySnapshot?.job ?? null} />
+          </>
         )}
         {tab === 'run' && runSubTab === 'run' && canStartJobs && <JobFormPanel snapshot={snapshot} />}
         {tab === 'run' && runSubTab === 'schedules' && canViewSchedules && <SchedulesPanel />}
+        {tab === 'run' && runSubTab === 'playlists' && canStartJobs && <PlaylistManagementPanel />}
         {tab === 'servers' && serversSubTab === 'servers' && <ServersPanel />}
         {tab === 'servers' && serversSubTab === 'networking' && <NetworkingPanel snapshot={snapshot} />}
         {tab === 'servers' && serversSubTab === 'users' && canStartJobs && <UserManagementPanel />}
         {tab === 'servers' && serversSubTab === 'run_defaults' && canEditSettings && <RunDefaultsPanel />}
         {tab === 'servers' && serversSubTab === 'advanced' && canEditSettings && <ServerAdvancedSettingsPanel />}
         {tab === 'servers' && serversSubTab === 'exports' && canViewExports && <ExportsPanel />}
+        {tab === 'servers' && serversSubTab === 'logs' && canViewLogs && <ServerLogsPanel />}
         {tab === 'account' && accountSubTab === 'account' && <AccountSettingsPanel />}
         {tab === 'account' && accountSubTab === 'account_management' && canManageUsers && (
           <>
@@ -919,10 +1130,27 @@ function Main({
         )}
         {tab === 'settings' && settingsSubTab === 'settings' && canEditSettings && <SettingsPanel />}
         {tab === 'settings' && settingsSubTab === 'tunables' && canManageTunables && <TunablesPanel />}
-        {tab === 'settings' && settingsSubTab === 'logs' && canViewLogs && <LogsPanel />}
+        {tab === 'settings' && settingsSubTab === 'databases' && canManageTunables && <DatabasesPanel />}
+        {/* Settings > Logs hosts APP-LEVEL logs only after the
+            ServersPanel > Logs sub-tab landed; per-run job logs now
+            live there grouped by server. ``LogsPanel`` still exists
+            in the codebase but is no longer mounted; deletion is a
+            follow-up cleanup if the end user confirms nothing else
+            references it. */}
+        {tab === 'settings' && settingsSubTab === 'logs' && canViewLogs && <ApplicationLogsPanel />}
         {tab === 'settings' && settingsSubTab === 'help' && <HelpPanel />}
+        {tab === 'developer' && debugMode && <DeveloperPanel />}
       </main>
 
+      {showLoginAsRootModal && (
+        <LoginAsRootModal
+          onClose={() => setShowLoginAsRootModal(false)}
+          onSuccess={(newToken) => {
+            if (onSessionSwap) onSessionSwap(newToken);
+            setShowLoginAsRootModal(false);
+          }}
+        />
+      )}
       {showSwitchViewModal && (
         <SwitchViewModeModal onClose={() => setShowSwitchViewModal(false)} />
       )}
@@ -938,7 +1166,7 @@ function Main({
 // transition (enter, switch between drops, exit).
 //
 // The dropdown shows the caller's drop targets only - all roles
-// strictly below their REAL role. The operator can switch between
+// strictly below their REAL role. The end user can switch between
 // any two of those targets without exiting first; the server
 // overwrites the existing entry.
 
@@ -974,7 +1202,7 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
   // Direction-aware password rule (matches backend enforcement):
   //   * Apply requires password only when raising the visible role
   //     (target rank > current effective rank). Dropping to a lower
-  //     target is free - the operator already has the higher privilege.
+  //     target is free - the end user already has the higher privilege.
   //   * Exit always raises the visible role (effective -> real), so
   //     it always requires a password.
   // The input field is rendered only when one of the visible actions
@@ -1076,7 +1304,7 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
         style={{ width: 480, maxWidth: '92vw' }}
       >
         <h2 style={{ marginTop: 0 }}>
-          Switch view mode
+          Switch permissions
           <InfoTip>
             Backend-enforced privilege drop. The server actually denies
             elevated calls while you're dropped, not just the UI. The
@@ -1154,5 +1382,159 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
 }
 
 
+// ── Login-as-Root modal ─────────────────────────────────────────────────────
+//
+// Re-auth flow. Triggered from the topbar button placed under Logout.
+// Calls /api/auth/login with the root account credentials, the
+// backend rotates the refresh-token cookie and returns a fresh
+// access token, and App.tsx's onSessionSwap callback adopts both.
+// The prior admin session is replaced; logging out from the new
+// root session does not bring the admin session back (intentional:
+// the end user chose to swap, not stack).
+//
+// The existing /api/auth/login endpoint already implements every
+// security control needed (rate limit, audit log, password hash
+// comparison) so no new backend code is required.
+
+function LoginAsRootModal({
+  onClose,
+  onSuccess,
+}: {
+  onClose: () => void;
+  onSuccess: (newToken: string) => void;
+}) {
+  const [username, setUsername] = useState('root');
+  const [password, setPassword] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const canSubmit = !submitting && username.length > 0 && password.length > 0;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const session = await api.authLogin(username, password);
+      // Confirm the resulting role is actually root_admin so the
+      // end user doesn't think they elevated when they actually just
+      // signed in as a non-root account. The backend already rejects
+      // bad credentials; this guard catches a "wrong username typed"
+      // case (root_admin role landed on the wrong user record).
+      if (session.user.role !== 'root_admin') {
+        setError(
+          `Sign-in succeeded but the resulting role is "${session.user.role}", `
+            + 'not root_admin. Use the actual root account name to elevate.',
+        );
+        // Discard the token rather than silently swap; the end user
+        // probably did not mean to drop to a non-root account.
+        return;
+      }
+      onSuccess(session.access_token);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0,
+        background: 'rgba(0,0,0,0.55)',
+        zIndex: 1000,
+        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+        paddingTop: '8vh',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="panel"
+        style={{ width: 380, maxWidth: '92vw' }}
+      >
+        <h2 style={{ marginTop: 0 }}>Login as root</h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
+          Sign in as the root account. This replaces your current
+          session entirely; logging out afterward does not return you
+          to the previous account.
+        </span>
+        <div className="field">
+          <span className="label">Username</span>
+          <input
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            disabled={submitting}
+            autoFocus
+          />
+        </div>
+        <div className="field" style={{ marginTop: 8 }}>
+          <span className="label">Password</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+            disabled={submitting}
+          />
+        </div>
+        {error && (
+          <div className="banner error" style={{ fontSize: 12, marginTop: 12 }}>
+            {error}
+          </div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+          <button onClick={onClose} disabled={submitting}>Cancel</button>
+          <button onClick={() => void submit()} disabled={!canSubmit}>
+            {submitting ? 'Signing in…' : 'Sign in'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 // String-literal alias used in one place only.
 type JobPayloadState = 'idle' | 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+
+// ── Item 1: topbar elevation chip ────────────────────────────────────────────
+//
+// Renders a small "Elevated · MM:SS" pill when the current session
+// has a live sudo-style elevation, with a click handler to drop it.
+// Visible only to root_admins; other roles can't elevate and would
+// never see a live expiry.
+
+function TopbarElevationChip() {
+  const { expiresAt, tick, dropElevation } = useElevation();
+  if (expiresAt === null) return null;
+  // Re-read time via the per-second tick so the countdown repaints
+  // without us depending on Date.now() inside React's render cycle.
+  void tick;
+  const secondsLeft = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+  const mm = Math.floor(secondsLeft / 60).toString().padStart(2, '0');
+  const ss = (secondsLeft % 60).toString().padStart(2, '0');
+  return (
+    <button
+      onClick={() => { void dropElevation(); }}
+      title="Click to drop elevation now (sudo -k equivalent)."
+      style={{
+        fontSize: 11,
+        fontWeight: 700,
+        letterSpacing: 0.3,
+        textTransform: 'uppercase',
+        padding: '2px 10px',
+        borderRadius: 999,
+        background: '#2e5a3f',
+        color: '#fff',
+        border: 'none',
+        cursor: 'pointer',
+      }}
+    >
+      Elevated · {mm}:{ss}
+    </button>
+  );
+}

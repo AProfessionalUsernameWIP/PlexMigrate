@@ -77,7 +77,7 @@ class TokenScrubFilter(logging.Filter):
     the same record see the already-redacted state - idempotent.
 
     Never raises: a filter that throws would silently drop the
-    record and the operator would lose the log entry entirely.
+    record and the end user would lose the log entry entirely.
     Errors here are swallowed with a best-effort fallback (return
     the record unmodified).
     """

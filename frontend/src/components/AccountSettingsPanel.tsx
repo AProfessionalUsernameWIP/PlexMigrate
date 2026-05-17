@@ -40,7 +40,7 @@ function AccountIdentitySection() {
   const auth = useAuthContext();
   // Live tick so "Session duration" updates without a snapshot refresh.
   // Re-render once per second. ~24 bytes of state per re-render; the
-  // operator usually leaves this panel after a few seconds.
+  // end user usually leaves this panel after a few seconds.
   const [, setTick] = useState(0);
   useEffect(() => {
     const id = window.setInterval(() => setTick((x) => x + 1), 1000);
@@ -166,7 +166,7 @@ function ClockDisplaySection() {
   // the topbar to read right now. We translate that into an offset
   // from the server's current time and stash it. Stored offset is
   // relative to server time; we don't track the typed HH:MM after
-  // submit because the operator's local moves on.
+  // submit because the end user's local moves on.
   const [customDraft, setCustomDraft] = useState(() =>
     formatHHMM(new Date(Date.now() + clock.customOffsetMs)),
   );
@@ -188,7 +188,7 @@ function ClockDisplaySection() {
     }
     // Compute the offset that maps server-now → typed HH:MM today.
     // We anchor the target to today's date in the browser's local
-    // timezone - that's what the operator's eyes are on.
+    // timezone - that's what the end user's eyes are on.
     const target = new Date();
     target.setHours(hh, mm, 0, 0);
     const offsetMs = target.getTime() - Date.now();

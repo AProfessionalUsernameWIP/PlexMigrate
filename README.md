@@ -321,6 +321,34 @@ If a managed user has a Plex Home PIN set and PlexBackUp doesn't have a captured
 
 The technical detail of how managed user auth actually works (parallel token-based auth with PIN fallback, background token capture, why we don't silently fall back to admin impersonation) lives in [OVERVIEW.md: Managed user authentication](OVERVIEW.md#managed-user-authentication).
 
+### How users are identified across servers (the app_user_uuid)
+
+PlexBackUp tracks three identifiers per user, each with a different lifetime and scope:
+
+| Identifier | What it is | Mutable? |
+|---|---|---|
+| `user_handle` | Backend username (Plex username, Jellyfin Name, Emby Name) | Yes — when the operator renames on the backend |
+| `backend_user_id` | Backend-assigned per-server stable id (Plex.tv numeric userID; Jellyfin / Emby GUID) | Usually stable; can rotate on some backends |
+| `app_user_uuid` | App-generated canonical anchor — the validation handle this app keys off | **No** — immutable for the lifetime of the row |
+
+**The invariant: every user added to this app gets an `app_user_uuid` generated at insert time.** That covers every path a user can enter the app — managed-user sync, snapshot capture, snapshot restore, the User Management endpoints, the Plex Home per-user-token save endpoint, inline cross-platform user creation. The two writer helpers (`upsert_managed_user` + `get_or_create_server_user`) generate via `generate_unique_app_user_uuid` and the column has a partial UNIQUE index so duplicates fail loudly rather than silently land. Legacy rows from before the v12 migration are filled on the next app boot via an idempotent backfill. There is no path that adds a user without a UUID.
+
+**Format:** `<Service>-<HostNameSlug>-<server_uid>-<userkey>` — for example `Plex-JadeTV-plex_a1b2c3d4e5f67890abcdef1234567890-a3f9c2d8`. The Service segment is "Plex" / "Jellyfin" / "Emby"; HostNameSlug is the cosmetic per-server label (auto-refreshed on server rename so the slug stays human-readable); `server_uid` is the prefixed server identifier (also immutable); and the 8-hex `userkey` is randomly generated per (server, user) pair. What stays the same across a server rename: everything except the HostNameSlug. What stays the same across the user's lifetime: everything — `userkey` is generated once and never changes.
+
+**Why an app-generated identifier rather than reusing the backend's own user id?** Each backend assigns its own user ids in its own ID space; the ids don't cross between backends and the app doesn't control them. `app_user_uuid` is the application's own anchor: format we choose, lifetime we control, present on every row regardless of backend, and useable as a primary key in cross-server identity links.
+
+**Cross-server identity:** the `user_identity_map` table keys off two `app_user_uuid` values rather than (server_id, user_handle) tuples. That means an operator-authored mapping like "the Plex 'Crystal Jean' on Server A is the same human as the Jellyfin 'crystal.jean' on Server B" survives renames on either side, `backend_user_id` rotation, and even one of the backends being re-registered. The auto-link helper additionally writes "auto_copy" rows for same-(service_type, backend_user_id) pairs so the operator doesn't have to manually map their own Plex.tv account across two of their own Plex servers.
+
+**Where the resolution happens:** snapshot restore, direct transfer, and playlist copy all walk the same 5-step chain when picking the destination user for each source user's payload:
+
+1. Per-job operator override (Map decision from the cross-platform preflight modal)
+2. `user_identity_map` lookup (authoritative)
+3. `backend_user_id` direct match within the same service_type
+4. Case-insensitive username match (the legacy fallback)
+5. Owner-role single-admin fallback (when the source user is the owner and the destination has exactly one admin)
+
+The `strict_identity_resolution` tunable cuts the chain short after step 2 so operators who want every routing to come from an explicit map (or operator-confirmed preflight resolution) can lock that in. The full primer also lives under **Help > Topics > Servers > How users are identified across servers** in the web UI.
+
 ---
 
 ## Terminal Mode (CLI)

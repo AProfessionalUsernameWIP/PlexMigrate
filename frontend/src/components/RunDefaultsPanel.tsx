@@ -13,6 +13,7 @@
 import { useEffect, useState } from 'react';
 import { api, SettingsView } from '../api';
 import { RestoreModeSelector, RestoreMode, MergeWatchStrategy } from './RestoreModeSelector';
+import { InfoTip } from './InfoTip';
 
 type WrStrategy = 'smart' | 'force_bulk' | 'force_server_side';
 
@@ -58,6 +59,12 @@ export function RunDefaultsPanel() {
   // value above (today's behavior, preserved on upgrade).
   const [snapshotLibraryWorkers, setSnapshotLibraryWorkers] = useState<number>(0);
 
+  // Feature 2: snapshot integrity validation toggles. Two flags so
+  // post-capture and pre-restore behave independently. Defaults per
+  // D4 / D5: after-capture ON, before-restore OFF.
+  const [validateAfterCapture, setValidateAfterCapture] = useState<boolean>(true);
+  const [validateBeforeRestore, setValidateBeforeRestore] = useState<boolean>(false);
+
   const load = async () => {
     try {
       const s = await api.getSettings();
@@ -98,6 +105,17 @@ export function RunDefaultsPanel() {
           ? s.snapshot_library_workers
           : 0,
       );
+      const sRec = s as unknown as Record<string, unknown>;
+      setValidateAfterCapture(
+        typeof sRec.validate_snapshot_after_capture === 'boolean'
+          ? sRec.validate_snapshot_after_capture as boolean
+          : true,
+      );
+      setValidateBeforeRestore(
+        typeof sRec.validate_snapshot_before_restore === 'boolean'
+          ? sRec.validate_snapshot_before_restore as boolean
+          : false,
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -129,6 +147,8 @@ export function RunDefaultsPanel() {
       restore_library_workers: Math.max(1, Math.min(16, Math.floor(Number(restoreLibraryWorkers) || 3))),
       fan_out_destination_workers: Math.max(0, Math.min(32, Math.floor(Number(fanOutDestinationWorkers) || 0))),
       snapshot_library_workers: Math.max(0, Math.min(16, Math.floor(Number(snapshotLibraryWorkers) || 0))),
+      validate_snapshot_after_capture: validateAfterCapture,
+      validate_snapshot_before_restore: validateBeforeRestore,
     };
     try {
       const updated = await api.saveSettings(patch);
@@ -159,13 +179,19 @@ export function RunDefaultsPanel() {
           drive letters. See the commented examples at the bottom of <code>docker-compose.yml</code>.
         </div>
         <label className="field">
-          <span className="label">Output directory</span>
-          <span className="help">Where snapshots land by default. Job forms can override per-run. Must be a container-visible path (e.g. <code>./snapshots</code> or <code>/app/nas_exports</code>).</span>
+          <span className="label">
+            Output directory
+            <InfoTip topicId="output-dir" />
+          </span>
+          <span className="help">Where snapshots land by default. Container-visible path.</span>
           <input type="text" value={outputDir} onChange={(e) => setOutputDir(e.target.value)} />
         </label>
         <label className="field">
-          <span className="label">Log directory</span>
-          <span className="help">Where per-run log subdirectories are created. Job forms can override per-run. Same container-path constraint as above.</span>
+          <span className="label">
+            Log directory
+            <InfoTip topicId="log-dir" />
+          </span>
+          <span className="help">Where per-run log subdirectories land. Same path constraint.</span>
           <input type="text" value={logDir} onChange={(e) => setLogDir(e.target.value)} />
         </label>
       </div>
@@ -174,7 +200,10 @@ export function RunDefaultsPanel() {
         <h2>Default Performance &amp; Behaviour</h2>
         <div className="grid-2">
           <label className="field">
-            <span className="label">Worker threads</span>
+            <span className="label">
+              Worker threads
+              <InfoTip topicId="worker-threads" />
+            </span>
             <span className="help">Default value for <code>--workers</code>.</span>
             <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(Number(e.target.value))} />
           </label>
@@ -186,13 +215,19 @@ export function RunDefaultsPanel() {
         </div>
         <label className="switch">
           <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.target.checked)} />
-          <span>Verbose logging by default</span>
-          <span className="help">DEBUG-level console and run log output. Equivalent to <code>--verbose</code>.</span>
+          <span>
+            Verbose logging by default
+            <InfoTip topicId="verbose-logging" />
+          </span>
+          <span className="help">DEBUG-level output. Equivalent to <code>--verbose</code>.</span>
         </label>
         <label className="switch">
           <input type="checkbox" checked={strictMatch} onChange={(e) => setStrictMatch(e.target.checked)} />
-          <span>Strict match by default</span>
-          <span className="help">When unchecked, behaves like <code>--no-strict-match</code> - uses the first fuzzy result on ambiguity.</span>
+          <span>
+            Strict match by default
+            <InfoTip topicId="strict-match" />
+          </span>
+          <span className="help">Unchecked = behaves like <code>--no-strict-match</code>.</span>
         </label>
       </div>
 
@@ -204,18 +239,21 @@ export function RunDefaultsPanel() {
             checked={prebuildJsonSidecarDefault}
             onChange={(e) => setPrebuildJsonSidecarDefault(e.target.checked)}
           />
-          <span>Pre-build JSON sidecar by default</span>
+          <span>
+            Pre-build JSON sidecar by default
+            <InfoTip topicId="json-sidecar" />
+          </span>
           <span className="help">
-            Renders a <code>.plexexport.json</code> next to the snapshot <code>.db</code> at the
-            end of every snapshot run. Per-job toggles in the Run Job form override this.
+            Renders a <code>.plexexport.json</code> sidecar at capture time. Per-job toggles override.
           </span>
         </label>
         <div className="field" style={{ marginTop: 16 }}>
-          <span className="label">Watch+Ratings capture strategy</span>
+          <span className="label">
+            Watch+Ratings capture strategy
+            <InfoTip topicId="watch-ratings-strategy" />
+          </span>
           <span className="help">
-            Controls how the owner phase fetches items when both watch-history and ratings
-            are wanted. Per-server overrides on the <strong>Advanced Settings</strong> tab
-            take precedence over this value.
+            How the owner phase fetches items. Per-server overrides take precedence.
           </span>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
             <label
@@ -268,14 +306,52 @@ export function RunDefaultsPanel() {
       </div>
 
       <div className="panel">
-        <h2>Restore Defaults</h2>
+        <h2>Snapshot Integrity Validation</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
-          Default restoration mode for restore + direct-transfer jobs. The per-job
-          form (Run Job, Schedules) and per-server overrides take precedence - this
-          is the bottom-of-chain fallback. <strong>Merge</strong> is additive and
-          safe to re-run; <strong>Replace</strong> overwrites the destination to
-          match the snapshot exactly and requires typed-REPLACE confirmation on
-          submit.
+          Structural validator runs against a temp copy of the snapshot
+          <code>.db</code>; the original file is never modified. Errors abort the
+          surrounding job; warnings log without aborting.
+        </span>
+        <label className="switch">
+          <input
+            type="checkbox"
+            checked={validateAfterCapture}
+            onChange={(e) => setValidateAfterCapture(e.target.checked)}
+          />
+          <span>
+            Validate after capture <em>(default on)</em>
+            <InfoTip topicId="validate-after-capture" />
+          </span>
+          <span className="help">
+            Cheap structural check at the end of capture. Catches malformed snapshots at source.
+          </span>
+        </label>
+        <label className="switch" style={{ marginTop: 8 }}>
+          <input
+            type="checkbox"
+            checked={validateBeforeRestore}
+            onChange={(e) => setValidateBeforeRestore(e.target.checked)}
+          />
+          <span>
+            Validate before restore
+            <InfoTip topicId="validate-before-restore" />
+          </span>
+          <span className="help">
+            Checks the snapshot <code>.db</code> when a restore-from-snapshot
+            request is submitted. Adds wall time to every restore; turn on for
+            belt-and-suspenders against a snapshot that was hand-edited or
+            corrupted in transit.
+          </span>
+        </label>
+      </div>
+
+      <div className="panel">
+        <h2>
+          Restore Defaults
+          <InfoTip topicId="restore-default-mode" />
+        </h2>
+        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+          Default mode for restore + direct-transfer jobs. Per-job and per-server overrides take precedence.
         </span>
         <RestoreModeSelector
           mode={restoreMode}
@@ -289,7 +365,7 @@ export function RunDefaultsPanel() {
       </div>
 
       {/* v0.13.x: Concurrency tunables. Two orthogonal axes that let
-          the operator pull back from default parallelism when Plex
+          the end user pull back from default parallelism when Plex
           rate-limits the multi-library / multi-destination API bursts.
           Both default to today's behavior so an unchanged install is a
           no-op. */}
@@ -319,13 +395,12 @@ export function RunDefaultsPanel() {
           />
         </label>
         <label className="field">
-          <span className="label">Restore: libraries in parallel</span>
+          <span className="label">
+            Restore: libraries in parallel
+            <InfoTip topicId="restore-library-workers" />
+          </span>
           <span className="help">
-            How many libraries the file-mediated restore processes at once.
-            Default <strong>3</strong> (the legacy hardcoded ceiling). Set to{' '}
-            <strong>1</strong> to serialise libraries one at a time - useful when
-            Plex returns 429s during multi-library restores. Capped at the actual
-            library count, so higher values have no effect beyond that.
+            Default <strong>3</strong>. Set to 1 to serialise (helps with 429s).
           </span>
           <input
             type="number"
@@ -336,14 +411,12 @@ export function RunDefaultsPanel() {
           />
         </label>
         <label className="field">
-          <span className="label">Fan-out: destinations in parallel</span>
+          <span className="label">
+            Fan-out: destinations in parallel
+            <InfoTip topicId="fanout-workers" />
+          </span>
           <span className="help">
-            How many fan-out destinations run at once. <strong>0</strong> (default) =
-            no cap - one worker per destination, current behavior. <strong>1</strong>{' '}
-            serialises destinations (use when all destinations share a network
-            bottleneck or the source Plex is the constraint). Independent of the
-            libraries-in-parallel value above - each destination uses its own
-            within-job library concurrency separately.
+            <strong>0</strong> (default) = no cap. <strong>1</strong> serialises destinations.
           </span>
           <input
             type="number"
@@ -367,10 +440,12 @@ export function RunDefaultsPanel() {
             checked={allowFilepathFallback}
             onChange={(e) => setAllowFilepathFallback(e.target.checked)}
           />
-          <span>Allow filepath suffix fallback (Tier 2)</span>
+          <span>
+            Allow filepath suffix fallback (Tier 2)
+            <InfoTip topicId="filepath-fallback" />
+          </span>
           <span className="help">
-            When Tiers 0/1 (DB cache + live GUID lookup) miss, fall back to matching by the last
-            N components of the file path. Default <strong>on</strong> - safe for most catalogues.
+            Fall back to trailing path components when GUID lookup misses. Default <strong>on</strong>.
           </span>
         </label>
         <label className="switch">
@@ -379,10 +454,12 @@ export function RunDefaultsPanel() {
             checked={allowFuzzyFallback}
             onChange={(e) => setAllowFuzzyFallback(e.target.checked)}
           />
-          <span>Allow fuzzy title fallback (Tier 3)</span>
+          <span>
+            Allow fuzzy title fallback (Tier 3)
+            <InfoTip topicId="fuzzy-fallback" />
+          </span>
           <span className="help">
-            Last-resort match by fuzzy title. Default <strong>off</strong> - can produce
-            incorrect matches; enable only when you've verified your catalogue tolerates it.
+            Last-resort fuzzy title match. Default <strong>off</strong>: can produce wrong matches.
           </span>
         </label>
       </div>

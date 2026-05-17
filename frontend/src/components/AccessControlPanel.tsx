@@ -63,7 +63,7 @@ export function AccessControlPanel() {
     api.listManagedUsers()
       .then((r) => {
         setUsers(r.users);
-        // Auto-select the first user so the operator lands somewhere
+        // Auto-select the first user so the end user lands somewhere
         // useful. Skip self to discourage editing own permissions
         // (the backend allows it but it's rarely what you want).
         if (r.users.length > 0) setSelectedUsername(r.users[0].username);
@@ -95,7 +95,7 @@ export function AccessControlPanel() {
   const allPermissions = data?.all_permissions ?? [];
   const isRootAdmin = data?.role === 'root_admin';
 
-  // Live recomputation of the effective set as the operator toggles
+  // Live recomputation of the effective set as the end user toggles
   // - no need to wait for save to see what it'll look like.
   const effectivePreview = useMemo(() => {
     if (!data) return new Set<Permission>();

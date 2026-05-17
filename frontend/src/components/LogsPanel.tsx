@@ -12,11 +12,16 @@
 // against shutil.rmtree on the backend; best-effort, with errors
 // surfaced in the response banner. A run currently being written to
 // by the engine may fail to delete on Windows (file locks); the
-// operator can retry once the job finishes.
+// end user can retry once the job finishes.
 
-import { useEffect, useState } from 'react';
-import { api, LogFile, LogRun, getAccessToken } from '../api';
+import { useEffect, useMemo, useState } from 'react';
+import { api, LogFile, LogRun, ServerView, getAccessToken } from '../api';
 import { LogTailer } from './LogTailer';
+import {
+  BackendTabStrip,
+  BackendType,
+  backendCounts,
+} from './BackendTabStrip';
 
 
 // Auth-aware blob download. The auth middleware rejects a plain
@@ -73,17 +78,36 @@ export function LogsPanel() {
     | null
   >(null);
 
+  // Phase C of the backend-filter UI restructure (Finding[BACKEND-
+  // FILTER-AUDIT]-2026-05-16.md). Logs are runs, not servers; the
+  // filter joins ``run.server_id`` to the registry's service_type
+  // client-side. Once developer ships service_type on the log-list
+  // response shape (TODO-AGENT-2-3 in the Finding), the join here
+  // can be retired in favour of a direct read.
+  const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
+  const [registeredServers, setRegisteredServers] = useState<ServerView[]>([]);
+
   // ── Run directory list ─────────────────────────────────────────────────
   const refreshRuns = async () => {
     try { setRuns(await api.listLogRuns()); }
     catch (e) { setError(String(e)); }
   };
+
+  // Fetch the registered server list once for the backend join. The
+  // Servers tab's poll keeps the registry warm; here we just need a
+  // snapshot for the service_type lookup. Failure is non-fatal: the
+  // join falls back to "everything is Plex" so runs still render.
+  useEffect(() => {
+    api.listServers()
+      .then(setRegisteredServers)
+      .catch(() => setRegisteredServers([]));
+  }, []);
   // Initial fetch + low-cadence auto-poll. 15s is short enough that a
-  // job kicked off elsewhere shows up on the operator's Logs tab
+  // job kicked off elsewhere shows up on the end user's Logs tab
   // within a quarter-minute without manual refreshes, but long enough
   // that a hundred Logs-tab visits per day are still negligible load
   // against ``listLogRuns`` (one ``Path.iterdir`` + sizes per call).
-  // The Refresh button stays for impatient operators.
+  // The Refresh button stays for impatient end users.
   useEffect(() => {
     refreshRuns();
     const id = window.setInterval(refreshRuns, 15_000);
@@ -106,6 +130,71 @@ export function LogsPanel() {
   const runIsFinished =
     !!selectedRun && (selectedRun.endsWith('_PASS') || selectedRun.endsWith('_FAIL'));
 
+  // Phase C: backend-of-each-run lookup + filtered visible list.
+  // Build a server_id -> backend map from the registry, default
+  // unknown ids to 'plex' so historical runs continue to render
+  // under the original backend label.
+  const idToBackend = useMemo(() => {
+    const out: Record<string, BackendType> = {};
+    for (const s of registeredServers) {
+      const t = ((s as unknown as { service_type?: string }).service_type) || 'plex';
+      out[s.id] = (t === 'jellyfin' || t === 'emby') ? t : 'plex';
+    }
+    return out;
+  }, [registeredServers]);
+
+  const runBackend = (r: LogRun): BackendType => {
+    const id = r.server_id;
+    if (id && idToBackend[id]) return idToBackend[id];
+    return 'plex';
+  };
+
+  const visibleRuns = useMemo(
+    () => runs.filter((r) => runBackend(r) === activeBackend),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [runs, idToBackend, activeBackend],
+  );
+
+  // BackendTabStrip's counts represent how many RUNS each backend
+  // has (not how many servers). Synthesize one pseudo ServerView per
+  // run so the strip's count-in-parens reads "Plex (47)" / "Jellyfin
+  // (3)" rather than the registry-derived totals.
+  const stripServers = useMemo(() => {
+    return runs.map((r) => ({
+      id: `run:${r.name}`,
+      name: r.name,
+      service_type: runBackend(r),
+    })) as unknown as ServerView[];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runs, idToBackend]);
+
+  // Auto-correct activeBackend when its bucket is empty and another
+  // backend has runs. Same pattern as the other panels.
+  useEffect(() => {
+    if (runs.length === 0) return;
+    const counts = backendCounts(stripServers);
+    if (counts[activeBackend] === 0) {
+      const fallback = (['plex', 'jellyfin', 'emby'] as BackendType[])
+        .find((b) => counts[b] > 0);
+      if (fallback) setActiveBackend(fallback);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stripServers, activeBackend]);
+
+  // If the currently-selected run is filtered out by the backend
+  // change, clear the selection so the file viewer doesn't show
+  // stale content.
+  useEffect(() => {
+    if (!selectedRun) return;
+    const stillVisible = visibleRuns.some((r) => r.name === selectedRun);
+    if (!stillVisible) {
+      setSelectedRun(null);
+      setSelectedFile(null);
+      setFiles([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleRuns]);
+
   const doDeleteOne = async (name: string) => {
     setError(null);
     setInfo(null);
@@ -115,7 +204,7 @@ export function LogsPanel() {
         `Deleted ${r.deleted} (${r.file_count} file${r.file_count === 1 ? '' : 's'})`
         + (r.errors.length ? ` with ${r.errors.length} error(s): ${r.errors.join(' · ')}` : '.'),
       );
-      // Clear the selection if the operator just deleted the active run.
+      // Clear the selection if the end user just deleted the active run.
       if (selectedRun === name) {
         setSelectedRun(null);
         setSelectedFile(null);
@@ -170,23 +259,37 @@ export function LogsPanel() {
                 </button>
               </div>
             </div>
+            {/* Phase C: backend filter strip above the run list.
+                Auto-hidden when only one backend has runs. The strip's
+                count reflects RUN count per backend (not server count)
+                so the end user sees the actual workload distribution
+                across backends. */}
+            <BackendTabStrip
+              servers={stripServers}
+              activeBackend={activeBackend}
+              onChange={setActiveBackend}
+              style={{ marginTop: 8 }}
+            />
             {runs.length === 0 ? (
               <div className="empty">No log directories yet. Run a job first.</div>
+            ) : visibleRuns.length === 0 ? (
+              <div className="empty">
+                No log directories for the selected backend. Switch backends
+                above or run a job against this backend to populate.
+              </div>
             ) : (
-              // Cap the list at ~10 visible rows. With a few hundred
-              // runs the page would otherwise scroll the entire app
-              // instead of the table - which moves the Refresh /
-              // Clear-all controls offscreen. Internal overflow-y
-              // keeps the panel a fixed height; the table header
-              // stays in view because it's part of the same scroll
-              // container the operator looks at.
-              <div style={{ maxHeight: 380, overflowY: 'auto', marginTop: 8 }}>
+              // Run directories list. Renders at its natural height; the
+              // surrounding panel uses normal page scroll. The earlier
+              // maxHeight + overflowY wrap was removed because nested
+              // scroll regions made the page UX feel cramped on hosts
+              // with many runs.
+              <div style={{ marginTop: 8 }}>
                 <table className="list">
                   <thead>
                     <tr><th>Name</th><th>When</th><th>Files</th><th>Result</th><th></th></tr>
                   </thead>
                   <tbody>
-                    {runs.map((r) => (
+                    {visibleRuns.map((r) => (
                       <tr key={r.name}
                           onClick={() => setSelectedRun(r.name)}
                           style={{ cursor: 'pointer', background: r.name === selectedRun ? 'var(--bg-panel)' : undefined }}>
@@ -341,7 +444,13 @@ export function LogsPanel() {
 
 // ── Confirm modal (shared by both delete paths) ────────────────────────────
 
-function ConfirmDeleteModal({
+// Exported so the Servers > Logs panel reuses the exact same
+// destructive-action modal. Keeping a single ConfirmDeleteModal
+// across log surfaces keeps the safety pattern uniform: same typed
+// confirm-word UX, same danger-button styling, same cancel
+// semantics. A future cleanup could lift it to its own module if a
+// third caller appears outside the logging area.
+export function ConfirmDeleteModal({
   title,
   body,
   confirmWord,
@@ -351,7 +460,7 @@ function ConfirmDeleteModal({
 }: {
   title: string;
   body: React.ReactNode;
-  // When set, the operator must type this exact string before the
+  // When set, the end user must type this exact string before the
   // danger button enables. Used for the clear-all path; single-run
   // delete uses ``null`` (one-click confirm).
   confirmWord: string | null;

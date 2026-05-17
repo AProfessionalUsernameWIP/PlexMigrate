@@ -15,7 +15,7 @@ Release-notes line (drop into the PR-A2 commit body):
     prompted to log in with your existing admin credentials."
 
 Role hierarchy (PR-A1):
-  viewer < operator < manager < root_admin  (+ db_admin non-login)
+  viewer < end user < manager < root_admin  (+ db_admin non-login)
 
 Role enforcement strategy (immediacy contract from §8.7 of
 multiuserauth.md): every protected endpoint re-reads the user's
@@ -61,7 +61,7 @@ log = logging.getLogger("plexmigrate.server.auth_router")
 # JWTs are signed with a 32-byte hex secret kept at
 # ``server_data/.auth_secret``. Same atomic-write pattern as
 # ``server/secrets.py``'s ``.keyfile`` so a first-boot race between
-# two workers produces exactly one secret. Operators who already
+# two workers produces exactly one secret. End users who already
 # manage their own secrets can override via ``PLEXMIGRATE_AUTH_SECRET``
 # (raw 64-char hex string) - that path skips the file entirely.
 
@@ -88,7 +88,7 @@ def _load_or_create_secret() -> str:
             return _cached_secret
         env = (os.environ.get("PLEXMIGRATE_AUTH_SECRET") or "").strip()
         if env:
-            # Sanity-check the operator-provided value: hex, even length.
+            # Sanity-check the end user-provided value: hex, even length.
             try:
                 bytes.fromhex(env)
             except ValueError as exc:
@@ -190,7 +190,7 @@ def issue_token(
     Returned dict matches the OAuth2 password-flow vocabulary the
     frontend expects.
 
-    ``display_name`` is included so the topbar can show the operator's
+    ``display_name`` is included so the topbar can show the end user's
     chosen display name without a separate ``/api/auth/me`` round-trip
     on first paint. The authoritative value still lives in the DB -
     every protected endpoint re-reads it via ``auth_db.get_user()`` so
@@ -201,7 +201,7 @@ def issue_token(
 
     ``sid`` is the *session identifier*: the same value across every
     access token minted from the same refresh-token cookie. The View
-    Mode session table keys off ``sid`` so an operator's view-mode
+    Mode session table keys off ``sid`` so an end user's view-mode
     override survives /refresh (new access JWT, same sid) and clears
     on logout (refresh token revoked, no future JWT carries that sid).
     Passing ``sid=None`` is supported for transitional /me / verify
@@ -400,7 +400,7 @@ def role_at_least(actual: str, minimum: str) -> bool:
 
 # ── View Mode (server-side privilege drop) ──────────────────────────────────
 #
-# Operators with at least one valid drop target (anyone except viewer)
+# End users with at least one valid drop target (anyone except viewer)
 # can preview the UI as a lesser role. The override is server-enforced:
 # require_role() below looks up the caller's session id (``sid`` claim,
 # = the refresh-token cookie value) in _VIEW_MODE_SESSIONS before
@@ -409,13 +409,13 @@ def role_at_least(actual: str, minimum: str) -> bool:
 #
 # Why key off ``sid`` and not ``jti``?
 #   * ``jti`` is unique per access token. Keying off it would erase
-#     the operator's override on every /refresh, which fires every
+#     the end user's override on every /refresh, which fires every
 #     ~30 minutes and on every page reload.
 #   * ``sid`` is the refresh-token id. It stays constant across every
 #     access JWT minted from the same refresh cookie, so the override
 #     survives /refresh and survives page reloads (which themselves
 #     drive a /refresh). The override clears when:
-#       (a) the operator hits /view-mode/exit explicitly, or
+#       (a) the end user hits /view-mode/exit explicitly, or
 #       (b) /logout revokes the refresh row, taking the sid with it,
 #       (c) a password change / user delete revokes the refresh row,
 #       (d) the container restarts (in-memory dict wiped).
@@ -438,6 +438,132 @@ _VIEW_MODE_DROP_TARGETS: Dict[str, tuple] = {
 # { sid: {"real_role": str, "view_role": str, "username": str} }
 _VIEW_MODE_SESSIONS: Dict[str, Dict[str, str]] = {}
 _VIEW_MODE_LOCK = threading.Lock()
+
+
+# ── Sudo-style elevation session table (Item 1 of admin plan) ───────────────
+#
+# Logging in as a root_admin is the everyday-work session. Performing a
+# root-level action (creating users, granting root, migrating PINs)
+# requires the caller to RE-AUTH with their own password. The
+# re-auth grants a time-limited elevation (default 10 minutes,
+# tunable). The elevation is keyed on the JWT's ``sid`` so it
+# survives /refresh but clears on /logout and on container restart.
+#
+# This is intentionally separate from View Mode (which DROPS privilege
+# for the end user to safely click through a lower-tier view) and from
+# the general role-rank gate (which the regular session JWT satisfies
+# for non-elevated paths). Together: role-rank says "you are allowed to
+# call this endpoint", elevation says "you have proven possession of
+# the password recently enough that we trust this destructive write".
+
+_ELEVATION_SESSIONS: Dict[str, float] = {}
+_ELEVATION_LOCK = threading.Lock()
+
+# Default cached-elevation TTL in seconds. Picked to match common
+# sudo defaults (10 minutes). The value can be overridden via the
+# ``elevation_ttl_seconds`` setting; floor 60 seconds, ceiling 3600.
+_DEFAULT_ELEVATION_TTL = 600
+
+
+def _elevation_ttl_seconds() -> int:
+    """
+    Read the elevation TTL from settings, clamped to a sane range.
+    Floor of 60 keeps elevation a real proof; ceiling of 3600 keeps
+    it from drifting into "the end user left their session open all
+    day" territory.
+    """
+    try:
+        from server.persistence import load_settings
+        v = (load_settings() or {}).get("elevation_ttl_seconds")
+        if v is None:
+            v = _DEFAULT_ELEVATION_TTL
+        return max(60, min(3600, int(v)))
+    except Exception:
+        return _DEFAULT_ELEVATION_TTL
+
+
+def _elevation_stamp(sid: str) -> float:
+    """Record (or refresh) an elevation for this session. Returns the
+    new expiry timestamp in unix seconds."""
+    expires_at = time.time() + _elevation_ttl_seconds()
+    with _ELEVATION_LOCK:
+        _ELEVATION_SESSIONS[sid] = expires_at
+    return expires_at
+
+
+def _elevation_valid(sid: Optional[str]) -> bool:
+    """Return True iff this session has an unexpired elevation entry.
+    Expired entries are purged on read so the table doesn't grow."""
+    if not sid:
+        return False
+    now = time.time()
+    with _ELEVATION_LOCK:
+        exp = _ELEVATION_SESSIONS.get(sid)
+        if exp is None:
+            return False
+        if exp < now:
+            _ELEVATION_SESSIONS.pop(sid, None)
+            return False
+        return True
+
+
+def _elevation_expires_at(sid: Optional[str]) -> Optional[float]:
+    """Return the unix timestamp this session's elevation expires at,
+    or None if no valid elevation exists."""
+    if not sid:
+        return None
+    now = time.time()
+    with _ELEVATION_LOCK:
+        exp = _ELEVATION_SESSIONS.get(sid)
+        if exp is None or exp < now:
+            if exp is not None:
+                _ELEVATION_SESSIONS.pop(sid, None)
+            return None
+        return exp
+
+
+def _elevation_clear(sid: str) -> None:
+    """Drop a session's elevation. Idempotent. Called on logout and
+    when the end user hits the 'drop elevation' button."""
+    with _ELEVATION_LOCK:
+        _ELEVATION_SESSIONS.pop(sid, None)
+
+
+def _elevation_reset_for_tests() -> None:
+    """Wipe the elevation table. Not called from production code."""
+    with _ELEVATION_LOCK:
+        _ELEVATION_SESSIONS.clear()
+
+
+def require_elevation():
+    """
+    FastAPI dependency factory: gate an endpoint on a valid elevation
+    for the caller's session id. The caller must ALSO be a root_admin
+    (real role, not view-mode role) - elevation without root_admin
+    role is meaningless and rejected so we fail loudly rather than
+    quietly succeed.
+
+    Returned dict matches require_role()'s shape so handlers reading
+    ``user['username']`` etc. don't need to special-case the elevated
+    path.
+    """
+    base = require_role("root_admin")
+
+    def _dep(request: Request) -> Dict[str, Any]:
+        user = base(request)
+        ctx = getattr(request.state, "auth", None) or {}
+        sid = ctx.get("sid") if isinstance(ctx, dict) else None
+        if not _elevation_valid(sid):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "This action requires a recent password re-confirmation. "
+                    "Re-authenticate via POST /api/auth/elevate."
+                ),
+            )
+        return user
+
+    return _dep
 
 
 def _view_mode_lookup(sid: Optional[str]) -> Optional[Dict[str, str]]:
@@ -470,7 +596,7 @@ def _effective_role_for(payload: Dict[str, Any], real_role: str) -> str:
     """
     Resolve the effective role for an authenticated request. If the
     JWT's sid is present in _VIEW_MODE_SESSIONS AND the recorded
-    real_role still matches the live DB role (the operator wasn't
+    real_role still matches the live DB role (the end user wasn't
     demoted out from under their override), the view_role is returned.
     Otherwise the real role is returned and any stale entry is purged.
     """
@@ -631,7 +757,7 @@ class VerifyPasswordIn(BaseModel):
     """
     PR-A2 - server-side verification for the Switch View Mode flow.
     Body carries only the password; the username is read from the
-    caller's JWT to prevent operators from verifying anyone else's
+    caller's JWT to prevent end users from verifying anyone else's
     credentials.
     """
     password: str
@@ -700,14 +826,27 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 def auth_status() -> Dict[str, Any]:
     """
     Public probe used by the frontend on first load. PR-A2 always
-    returns ``auth_enabled: true`` (auth is no longer optional). The
-    only meaningful field is ``setup_needed`` - True when no user
-    rows exist yet, in which case the frontend renders
-    ``<SetupPage />`` instead of ``<LoginPage />``.
+    returns ``auth_enabled: true`` (auth is no longer optional).
+
+    Fields:
+
+      * ``setup_needed`` - True when no user rows exist yet; the
+        frontend renders ``<SetupPage />`` (or the v2 two-step variant)
+        instead of ``<LoginPage />``.
+      * ``setup_version`` (Item 1) - records which onboarding ran.
+        Returned for every call so the frontend can detect a legacy
+        install (``setup_version=1``, ``setup_needed=False``) and
+        force the upgrade-split modal on the first authenticated load.
     """
+    try:
+        from server.persistence import load_settings
+        setup_version = int((load_settings() or {}).get("auth_setup_version", 1))
+    except Exception:
+        setup_version = 1
     return {
         "auth_enabled": True,
         "setup_needed": not auth_db.has_any_users(),
+        "setup_version": setup_version,
     }
 
 
@@ -719,7 +858,7 @@ def auth_setup(body: SetupIn, request: Request, response: Response) -> Dict[str,
     Self-locking: once any user exists in ``app_users`` this endpoint
     returns 403 on every subsequent call. The frontend's setup screen
     re-checks ``/auth/status`` after each attempt so a race between
-    two operators on first boot resolves cleanly - the loser sees a
+    two end users on first boot resolves cleanly - the loser sees a
     "Setup already completed" error and is redirected to the login
     screen.
 
@@ -743,7 +882,7 @@ def auth_setup(body: SetupIn, request: Request, response: Response) -> Dict[str,
     # Issue a token immediately so the frontend can hop straight into
     # the main UI without a second round-trip through the login form.
     # Create the refresh row first so we can stamp its id into the JWT
-    # as the session id - any view-mode override the operator sets in
+    # as the session id - any view-mode override the end user sets in
     # this session then survives /refresh.
     auth_db.update_last_login(user["username"])
     refresh_id = auth_db.create_refresh_token(user["username"])
@@ -760,6 +899,303 @@ def auth_setup(body: SetupIn, request: Request, response: Response) -> Dict[str,
         },
         **token,
     }
+
+
+# ── Item 1: two-step setup (admin + root) and the upgrade-split flow ────────
+
+class SetupV2In(BaseModel):
+    """
+    Two-step setup: the end user creates their day-to-day ``admin``
+    account AND a separate ``root_admin`` account in a single atomic
+    request. The frontend collects both credential pairs in its
+    wizard and submits them together so a half-complete setup can't
+    leave the install with only one account.
+    """
+    admin_username: str
+    admin_password: str
+    admin_display_name: Optional[str] = None
+    root_username: str
+    root_password: str
+    root_display_name: Optional[str] = None
+
+
+class UpgradeSplitIn(BaseModel):
+    """
+    Forced split for legacy single-account installs. The legacy
+    end user (currently a ``root_admin``) re-authenticates with their
+    own password, names a new root_admin account, and creates it.
+    The legacy account is demoted to ``admin``.
+    """
+    caller_password: str = Field(
+        description="The legacy root_admin's own current password.",
+    )
+    root_username: str = Field(
+        description="Username for the new dedicated root_admin account.",
+    )
+    root_password: str = Field(
+        description="Password for the new dedicated root_admin account (>= 8 chars).",
+    )
+    root_display_name: Optional[str] = None
+
+
+class GrantRevokeRootIn(BaseModel):
+    """Body for revoke-root: the role the demoted user should drop to.
+    grant-root takes no body (the username comes from the URL path)."""
+    new_role: str = Field(
+        default="admin",
+        description=(
+            "Role to demote the user to. One of: viewer, operator, "
+            "manager, admin. db_admin is rejected. The last-root-admin "
+            "floor in auth_db prevents revoking the only root."
+        ),
+    )
+
+
+def _mark_setup_v2_complete(logger) -> None:
+    """Stamp ``auth_setup_version=2`` in settings so the next
+    ``/status`` call reports the install as fully migrated. Failure
+    here is logged but does not raise - the user rows are already
+    correct; the worst case is the upgrade-split modal re-fires
+    once on the end user's next login."""
+    try:
+        from server.persistence import save_settings
+        save_settings({"auth_setup_version": 2})
+    except Exception:
+        logger.exception("Could not mark auth_setup_version=2; will retry on next setup")
+
+
+@router.post("/setup-v2")
+def auth_setup_v2(
+    body: SetupV2In, request: Request, response: Response,
+) -> Dict[str, Any]:
+    """
+    Item 1: atomic two-step first-boot setup. Creates one ``admin``
+    account (the end user's day-to-day) AND one ``root_admin``
+    account (the dedicated root credential for privileged actions),
+    then signs the end user in as their admin account.
+
+    Self-locking on ``has_any_users``: a second call against an
+    initialised install returns 403.
+
+    Validation:
+
+      * Both usernames must differ; otherwise the second create call
+        would fail with a unique-constraint error and leave the first
+        account dangling.
+      * Both passwords obey the bcrypt-safe length rules already
+        enforced by ``auth_db.create_user``.
+      * On any failure after the first user is created, the partial
+        admin row is rolled back so the install stays "needs setup".
+    """
+    if auth_db.has_any_users():
+        raise HTTPException(
+            status_code=403,
+            detail="Setup already completed - log in instead.",
+        )
+    if body.admin_username.strip() == body.root_username.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Admin and root accounts must have different usernames.",
+        )
+    try:
+        admin_user = auth_db.create_user(
+            body.admin_username, body.admin_password,
+            role="admin",
+            display_name=body.admin_display_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"admin: {exc}")
+    try:
+        auth_db.create_user(
+            body.root_username, body.root_password,
+            role="root_admin",
+            display_name=body.root_display_name,
+        )
+    except ValueError as exc:
+        # Roll back the admin row so the install is still "needs setup".
+        try:
+            auth_db.delete_user(admin_user["username"])
+        except Exception:  # pragma: no cover (defensive)
+            log.exception(
+                "setup-v2 rollback of admin row failed for %r",
+                admin_user["username"],
+            )
+        raise HTTPException(status_code=400, detail=f"root: {exc}")
+    _mark_setup_v2_complete(log)
+    # Sign the end user in as the admin account they just created.
+    auth_db.update_last_login(admin_user["username"])
+    refresh_id = auth_db.create_refresh_token(admin_user["username"])
+    _set_refresh_cookie(response, refresh_id, secure=request.url.scheme == "https")
+    token = issue_token(
+        admin_user["username"], admin_user["role"], admin_user.get("display_name"),
+        sid=refresh_id,
+    )
+    log.info(
+        "setup-v2: created admin=%r + root=%r, signed admin in",
+        admin_user["username"], body.root_username,
+    )
+    return {
+        "user": {
+            "username": admin_user["username"],
+            "role": admin_user["role"],
+            "display_name": admin_user.get("display_name"),
+        },
+        **token,
+    }
+
+
+@router.post("/upgrade-split")
+def auth_upgrade_split(
+    body: UpgradeSplitIn,
+    user: Dict[str, Any] = Depends(require_role("root_admin")),
+) -> Dict[str, Any]:
+    """
+    Item 1: forced legacy-install split. A legacy install has exactly
+    one ``root_admin`` (the end user's single account). This endpoint
+    creates a NEW dedicated ``root_admin`` account, demotes the
+    caller to ``admin``, and marks the install as fully migrated.
+
+    The order matters: create new root FIRST (so the install always
+    has at least one root_admin), then demote the caller. The
+    auth_db last-root-admin floor enforces this independently as a
+    belt-and-suspenders.
+
+    Returns ``{caller_demoted_to, new_root_username}``. The caller's
+    JWT still claims ``root_admin`` for the rest of this request
+    cycle; require_role's immediacy guarantee picks up the new
+    ``admin`` role on the next request. The frontend should prompt a
+    fresh login after this call so the JWT matches the new role.
+
+    Returns 409 if the install is already on setup_version 2, or if
+    there is more than one root_admin already (the end user likely
+    completed the split from a different session - reload and the
+    modal will be gone).
+    """
+    try:
+        from server.persistence import load_settings
+        setup_version = int((load_settings() or {}).get("auth_setup_version", 1))
+    except Exception:
+        setup_version = 1
+    if setup_version >= 2:
+        raise HTTPException(
+            status_code=409,
+            detail="The install is already on the v2 auth model; no split is needed.",
+        )
+    root_count = auth_db.count_role("root_admin")
+    if root_count > 1:
+        raise HTTPException(
+            status_code=409,
+            detail="More than one root_admin already exists; the split has already happened elsewhere.",
+        )
+    # Caller must prove their own password (defence against an
+    # end user stealing a session and forcing a split).
+    verified = auth_db.verify_password(user["username"], body.caller_password)
+    if verified is None or verified.get("role") != "root_admin":
+        raise HTTPException(status_code=401, detail="Invalid password.")
+    if body.root_username.strip() == user["username"]:
+        raise HTTPException(
+            status_code=400,
+            detail="The new root account must have a different username from your own.",
+        )
+    # Step 1: create the new root_admin. The install now has 2 roots.
+    try:
+        auth_db.create_user(
+            body.root_username, body.root_password,
+            role="root_admin",
+            display_name=body.root_display_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"new root: {exc}")
+    # Step 2: demote the caller. Last-root-admin floor is satisfied
+    # because step 1 just created a second root.
+    try:
+        auth_db.update_role(user["username"], "admin")
+    except ValueError as exc:
+        # Roll back the new root so we don't leave the install in a
+        # weird half-state with two root_admins.
+        try:
+            auth_db.delete_user(body.root_username)
+        except Exception:  # pragma: no cover (defensive)
+            log.exception(
+                "upgrade-split rollback of new root %r failed",
+                body.root_username,
+            )
+        raise HTTPException(status_code=400, detail=f"demote: {exc}")
+    # Step 3: mark setup complete.
+    _mark_setup_v2_complete(log)
+    log.info(
+        "upgrade-split: created new root=%r and demoted %r to admin",
+        body.root_username, user["username"],
+    )
+    return {
+        "caller_demoted_to": "admin",
+        "new_root_username": body.root_username,
+    }
+
+
+@router.post("/users/{username}/grant-root")
+def auth_grant_root(
+    username: str,
+    request: Request,
+    _: Dict[str, Any] = Depends(require_elevation()),
+) -> Dict[str, Any]:
+    """
+    Item 1: promote a user to root_admin. Requires a fresh sudo-style
+    elevation (caller proved password within the last 10 minutes via
+    /api/auth/elevate). Bypasses the PATCH /users/{u} "no promotion
+    to root_admin" guard intentionally - this is the dedicated
+    promotion path.
+    """
+    target = auth_db.get_user(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"No user named {username!r}.")
+    if target["role"] == "root_admin":
+        return {"username": username, "role": "root_admin", "noop": True}
+    if target["role"] == "db_admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot promote a db_admin row to root_admin.",
+        )
+    try:
+        auth_db.update_role(username, "root_admin")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    log.info("grant-root: %r promoted to root_admin", username)
+    return {"username": username, "role": "root_admin", "noop": False}
+
+
+@router.post("/users/{username}/revoke-root")
+def auth_revoke_root(
+    username: str,
+    body: GrantRevokeRootIn,
+    request: Request,
+    _: Dict[str, Any] = Depends(require_elevation()),
+) -> Dict[str, Any]:
+    """
+    Item 1: demote a root_admin user to a lower role. Requires a
+    fresh sudo-style elevation. The last-root-admin floor in
+    ``auth_db.update_role`` independently protects against removing
+    the only root.
+    """
+    if body.new_role == "root_admin":
+        raise HTTPException(
+            status_code=400,
+            detail="Use grant-root to promote; revoke-root must demote.",
+        )
+    target = auth_db.get_user(username)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"No user named {username!r}.")
+    if target["role"] != "root_admin":
+        raise HTTPException(
+            status_code=400,
+            detail=f"User {username!r} is not currently a root_admin.",
+        )
+    try:
+        auth_db.update_role(username, body.new_role)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    log.info("revoke-root: %r demoted to %r", username, body.new_role)
+    return {"username": username, "role": body.new_role}
 
 
 @router.post("/login")
@@ -784,7 +1220,7 @@ def auth_login(body: LoginIn, request: Request, response: Response) -> Dict[str,
     if user.get("role") not in _ROLE_RANK:
         raise HTTPException(status_code=401, detail="Invalid username or password.")
     # Best-effort: stamp last_login. Failure here must not block the
-    # response - the operator already authenticated successfully.
+    # response - the end user already authenticated successfully.
     try:
         auth_db.update_last_login(user["username"])
     except Exception:  # pragma: no cover (defensive)
@@ -942,7 +1378,7 @@ def auth_verify_password(
     Used by the change-password forms to confirm the current password
     before applying changes.
 
-    Username is read from the JWT - the operator can never verify
+    Username is read from the JWT - the end user can never verify
     anyone else's credentials through this endpoint. The role check
     compares against ``real_role`` (the DB row) rather than
     ``effective_role`` so a user currently in View Mode can still
@@ -954,6 +1390,102 @@ def auth_verify_password(
         and verified.get("role") == user["real_role"]
     )
     return {"valid": bool(valid)}
+
+
+# ── Sudo-style elevation (Item 1 of admin-management plan) ──────────────────
+
+class ElevateIn(BaseModel):
+    password: str = Field(
+        description=(
+            "Caller's own current password. Verified against the DB; "
+            "on success, an elevation flag is stamped on the caller's "
+            "session for the configured TTL (default 10 minutes)."
+        ),
+    )
+
+
+@router.post("/elevate")
+def auth_elevate(
+    body: ElevateIn,
+    request: Request,
+    user: Dict[str, Any] = Depends(require_role("root_admin")),
+) -> Dict[str, Any]:
+    """
+    Prove possession of the caller's password and grant a time-limited
+    elevation flag on the current session. Elevated sessions can call
+    endpoints gated by :func:`require_elevation` (root_admin-only
+    destructive writes that touch user accounts).
+
+    Requires the caller's real role to be ``root_admin`` (View Mode
+    drops do not elevate the lower view). Failure cases (wrong
+    password, View Mode active) return 401 / 403 respectively without
+    stamping the elevation.
+
+    Returns ``{elevated_until}`` as a unix timestamp so the frontend
+    can render a countdown or pre-warn the end user before expiry.
+    """
+    if user["real_role"] != "root_admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the root_admin role can elevate.",
+        )
+    # The password check uses the live DB row, like /verify-password.
+    verified = auth_db.verify_password(user["username"], body.password)
+    if verified is None or verified.get("role") != "root_admin":
+        # Same generic 401 as /login so we don't leak any oracle.
+        raise HTTPException(status_code=401, detail="Invalid password.")
+    ctx = getattr(request.state, "auth", None) or {}
+    sid = ctx.get("sid") if isinstance(ctx, dict) else None
+    if not isinstance(sid, str) or not sid:
+        # Defensive: a JWT without a sid can't be elevation-tracked.
+        # Force the end user to log in again so a real sid is minted.
+        raise HTTPException(
+            status_code=400,
+            detail="Session has no id; log out and back in, then retry.",
+        )
+    expires_at = _elevation_stamp(sid)
+    log.info(
+        "Elevation granted to %r (sid=%s, expires_at=%.0f)",
+        user["username"], sid, expires_at,
+    )
+    return {"elevated_until": expires_at}
+
+
+@router.get("/elevation/status")
+def auth_elevation_status(
+    request: Request,
+    user: Dict[str, Any] = Depends(require_role("root_admin")),
+) -> Dict[str, Any]:
+    """
+    Report whether the caller's session currently holds a valid
+    elevation, and if so when it expires. Used by the frontend to
+    decide whether to show the ElevationModal before a root action
+    or proceed directly.
+    """
+    ctx = getattr(request.state, "auth", None) or {}
+    sid = ctx.get("sid") if isinstance(ctx, dict) else None
+    expires_at = _elevation_expires_at(sid if isinstance(sid, str) else None)
+    return {
+        "elevated": expires_at is not None,
+        "elevated_until": expires_at,
+        "ttl_seconds": _elevation_ttl_seconds(),
+    }
+
+
+@router.post("/elevation/clear")
+def auth_elevation_clear(
+    request: Request,
+    user: Dict[str, Any] = Depends(require_role("root_admin")),
+) -> Dict[str, Any]:
+    """
+    Drop the caller's elevation immediately. Equivalent to ``sudo -k``.
+    Idempotent: succeeds whether or not an elevation was active.
+    """
+    ctx = getattr(request.state, "auth", None) or {}
+    sid = ctx.get("sid") if isinstance(ctx, dict) else None
+    if isinstance(sid, str) and sid:
+        _elevation_clear(sid)
+    return {"ok": True}
 
 
 # ── View Mode entry / exit ──────────────────────────────────────────────────
@@ -986,12 +1518,12 @@ def view_mode_enter(
         effective role, the password is required (re-verified against
         the DB).
       * If the new target ranks at or below the effective role, no
-        password check runs. The operator already has the higher
+        password check runs. The end user already has the higher
         privilege, so dropping further is free.
 
     Other validation:
       * ``target_role`` must be in the caller's drop set
-        (operator/manager/admin/root_admin only; viewer has no
+        (end user/manager/admin/root_admin only; viewer has no
         targets and is rejected outright).
 
     The session entry is keyed by the JWT's ``sid`` (= refresh-token
@@ -1033,7 +1565,7 @@ def view_mode_enter(
     sid = ctx.get("sid")
     if not isinstance(sid, str) or not sid:
         # JWTs minted before the sid claim landed won't have one.
-        # Tell the operator to log out and back in so a fresh JWT
+        # Tell the end user to log out and back in so a fresh JWT
         # with a real session id is issued.
         raise HTTPException(
             status_code=409,
@@ -1057,7 +1589,7 @@ def view_mode_exit(
     Close the caller's active View Mode session, restoring full real-
     role access. Password is always required - exit always raises the
     visible role, and a hostile page in another tab must not be able
-    to silently elevate the operator out of their dropped view.
+    to silently elevate the end user out of their dropped view.
     Idempotent: if there is no entry to clear, returns 200 anyway.
     """
     if not body.password:
@@ -1104,10 +1636,10 @@ def auth_list_users(
 @router.post("/users")
 def auth_create_user(
     body: CreateUserIn,
-    user: Dict[str, Any] = Depends(require_role("admin")),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
-    Create a viewer / operator / manager / admin account. The
+    Create a viewer / end user / manager / admin account. The
     ``root_admin`` role cannot be created here - the only way to mint
     one is the one-time ``/setup`` flow on first boot.
     """
@@ -1137,7 +1669,7 @@ def auth_create_user(
 def auth_update_user(
     username: str,
     body: PatchUserIn,
-    user: Dict[str, Any] = Depends(require_role("admin")),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
     Update role and/or display_name for a user. admin + root_admin.
@@ -1195,7 +1727,7 @@ def auth_update_user(
 def auth_reset_password(
     username: str,
     body: ResetPasswordIn,
-    user: Dict[str, Any] = Depends(require_role("admin")),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
     Set a user's password. admin + root_admin. admin cannot reset
@@ -1227,7 +1759,7 @@ def auth_reset_password(
 @router.delete("/users/{username}")
 def auth_delete_user(
     username: str,
-    user: Dict[str, Any] = Depends(require_role("admin")),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
     Delete a user. admin + root_admin. Refuses to delete any
@@ -1309,7 +1841,7 @@ class UserPermissionsPatchIn(BaseModel):
 def auth_set_user_permissions(
     username: str,
     body: UserPermissionsPatchIn,
-    user: Dict[str, Any] = Depends(require_role("root_admin")),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
     Replace the per-user grant + revoke lists for ``username``.
@@ -1355,9 +1887,34 @@ def auth_set_user_permissions(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     log.info(
-        "Permissions updated for user %r by %r (extra=%d, revoked=%d)",
+        "Permissions updated for user %r by %r (extra=%d, revoked=%d, "
+        "elevate_confirmed=True)",
         username, user.get("username"), len(body.extra), len(body.revoked),
     )
+    # Phase 6 of the dashboard / log reorg: explicitly audit-log the
+    # grant via db_access_log so the entry lands in db_access.log
+    # alongside other privilege-relevant writes. The elevate-confirmed
+    # flag is unconditionally True at this point because the endpoint
+    # is gated on ``require_elevation()`` - we cannot reach this line
+    # without a fresh password re-confirmation within the elevation
+    # TTL window. Capturing both lists explicitly lets a future audit
+    # query trace WHICH permissions changed, not just that something
+    # changed.
+    try:
+        from services import db_access_log
+        db_access_log.log_event(
+            "PERMISSIONS_GRANT grantor=%r grantee=%r extra=%r revoked=%r "
+            "elevate_confirmed=true",
+            user.get("username"),
+            username,
+            list(body.extra),
+            list(body.revoked),
+        )
+    except Exception:
+        # Audit log is best-effort - never fail the grant on a
+        # logging hiccup. The application logger above still carries
+        # the same information for forensic recovery.
+        log.exception("permissions-grant audit_log write failed")
     grants = auth_db.get_user_permission_grants(username)
     effective = effective_permissions_for(username, target["role"])
     return {
@@ -1433,7 +1990,7 @@ def auth_change_own_password(
 # ── Database Admin account (role='db_admin') - PR-9.1 + PR-A2 hardening ─────
 #
 # A SEPARATE row from the root_admin login row. Decoupled so the
-# operator can authorise destructive User Management writes (PR-10)
+# end user can authorise destructive User Management writes (PR-10)
 # with a credential they don't use for everyday login.
 #
 # PR-A2 tightens access: every endpoint here now requires a
@@ -1536,7 +2093,7 @@ def admin_verify(
 # PR-A1). PR-A2 tightens access to require a root_admin JWT; the
 # current-password requirement stays as defence-in-depth. With PR-A5
 # the Account Settings panel will offer the same surface as a
-# self-service alternative for the logged-in operator.
+# self-service alternative for the logged-in end user.
 
 @router.get("/login-account/status")
 def login_account_status(

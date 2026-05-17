@@ -34,6 +34,9 @@ from services.dashboard import (
     submit_with_context,
 )
 from services.logging_ops import _fmt_media_line
+from services.run_timer import (
+    SCOPE_LIBRARY, SCOPE_OPERATION, SCOPE_USER, time_operation,
+)
 from services.resolver import (
     _all_guids,
     _disable_autoreload,
@@ -43,6 +46,7 @@ from services.resolver import (
     serialize_collection,
 )
 from services.auth import get_home_users
+from services.user_labels import owner_display_label
 
 
 def _log_serialize_diag(
@@ -102,7 +106,7 @@ def _should_cache_payload_to_media_db(
     ingested into media.db.
 
     Resolution rule:
-      1. Operator explicitly opted in via the
+      1. End user explicitly opted in via the
          ``cache_snapshot_payloads_to_media_db`` tunable → cache.
       2. Tunable left at default false, but media.db has NO rows
          tagged with this server_id → auto-seed (one-shot ingest to
@@ -144,6 +148,122 @@ def _should_cache_payload_to_media_db(
     return False
 
 
+def _resolve_smart_bulk_threshold(logger: logging.Logger) -> int:
+    """
+    Return the end user-tuned smart-mode size threshold. Reads from
+    ``settings.smart_bulk_threshold_items`` with a hard-coded fallback
+    of 5000 so a stale settings.json from before this setting existed
+    keeps working. Negative or non-int values fall through to the
+    default.
+    """
+    try:
+        from server.persistence import load_settings
+        settings = load_settings() or {}
+        raw = settings.get("smart_bulk_threshold_items")
+        if isinstance(raw, int) and raw >= 0:
+            return raw
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+    except Exception:
+        # Best-effort: any failure reading settings falls through to
+        # the default. Log at debug so the end user can still trace
+        # this if they enable verbose logging.
+        logger.debug("smart_bulk_threshold_items lookup failed; using default",
+                     exc_info=True)
+    return 5000
+
+
+def _should_use_bulk(
+    *,
+    strategy: str,
+    section: Any,
+    include_watch_history: bool,
+    include_ratings: bool,
+    smart_bulk_threshold_items: int,
+) -> bool:
+    """
+    Decide whether the watch+ratings capture for a single library
+    section should use the shared bulk-fetch path or the server-side
+    filter path.
+
+    Decision table (smart-mode):
+
+      * Neither metric requested        -> False (no work to share)
+      * Library type with a leaf /      -> True  (size threshold based
+        container mismatch (show,                on section.totalSize
+        artist)                                  is misleading here:
+                                                 totalSize counts
+                                                 containers (shows /
+                                                 artists) but the
+                                                 server-side filter
+                                                 scans LEAVES
+                                                 (episodes / tracks),
+                                                 typically 5-30x more.
+                                                 A "small" container
+                                                 library is often a
+                                                 large leaf library
+                                                 and the filtered
+                                                 scan dominates.
+                                                 Always-bulk for
+                                                 these types matches
+                                                 actual cost.)
+      * Section size < threshold        -> False (bulk would pull the
+                                          whole library for a handful
+                                          of matches)
+      * Both watch + ratings requested  -> True  (amortize the bulk
+                                          fetch across both metrics)
+      * Single metric on a large lib    -> False (one targeted query
+                                          beats pulling everything)
+
+    Force overrides bypass the decision table:
+
+      * strategy == "force_bulk"        -> True
+      * strategy == "force_server_side" -> False
+
+    ``smart_bulk_threshold_items`` is passed in (not read from
+    settings here) so the caller can resolve it once per run.
+    ``section`` is the live plexapi LibrarySection; only ``.type`` and
+    ``.totalSize`` are read, both cached attributes.
+    """
+    if strategy == "force_bulk":
+        return True
+    if strategy == "force_server_side":
+        return False
+    # "smart" (or anything we don't recognise - defensive fallthrough).
+    if not (include_watch_history or include_ratings):
+        return False
+    libtype = str(getattr(section, "type", "") or "")
+    # Library types with a leaf / container mismatch: section.totalSize
+    # is the CONTAINER count (shows for "show", artists for "artist")
+    # but the data being filtered or fetched is at the LEAF level
+    # (episodes or tracks), typically 5-30x larger than totalSize.
+    # Comparing leaf-level cost against a container-level threshold is
+    # apples-to-oranges and routes these libraries to the server-side
+    # path even when bulk would be dramatically cheaper. Observed on a
+    # production run: a 1151-artist music library (totalSize < 5000
+    # threshold) took ~60s on the server-side filtered scan because
+    # the underlying track count was ~10k-30k. Always-bulk for these
+    # types matches actual cost.
+    if libtype in ("show", "artist"):
+        return True
+    try:
+        size = int(getattr(section, "totalSize", 0) or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size < int(smart_bulk_threshold_items):
+        # Small library: bulk would pull every item over the wire
+        # to filter for a handful of matches. The server-side path
+        # returns just the matches in 1-2 targeted queries.
+        return False
+    if include_watch_history and include_ratings:
+        # Large library with both metrics: bulk amortizes across
+        # both, saving one full server-side filter scan.
+        return True
+    # Large library with only one metric: one targeted server-side
+    # query is cheaper than fetching the whole library.
+    return False
+
+
 def _resolve_watch_ratings_strategy(
     *,
     server_id: Optional[str],
@@ -158,7 +278,7 @@ def _resolve_watch_ratings_strategy(
       0. Per-job override from
          ``state._watch_ratings_strategy_override_var`` - set by the
          job runner from the JobIn / ScheduleIn payload when the
-         operator picked something other than "Inherit" on the
+         end user picked something other than "Inherit" on the
          Per-Run Settings ▸ Advanced sub-tab.
       1. Per-server override at
          ``settings.snapshot_defaults_per_server[server_id]
@@ -257,7 +377,7 @@ def _bulk_fetch_for_filters(
     #
     # Best-effort: the helper is silent on objects that don't expose
     # ``_autoReload`` and a no-op when the tunable
-    # ``plexapi_autoreload_enabled`` is true (operator opt-in to
+    # ``plexapi_autoreload_enabled`` is true (end user opt-in to
     # vanilla plexapi behaviour for diagnostics).
     if ok:
         try:
@@ -530,7 +650,8 @@ def build_playlist_cache(
     if state.get_dashboard():
         state.get_dashboard().push_activity(
             "phase", "-",
-            f"Warming playlist cache for '{server_label}' ({len(all_playlists)} playlists)…",
+            f"Warming playlist cache for '{server_label}' "
+            f"({owner_display_label()}, {len(all_playlists)} playlists)…",
         )
     for pl in all_playlists:
         # Throttle-reduction: skip smart playlists entirely. ``pl.items()``
@@ -1102,6 +1223,15 @@ def snapshot_library(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric map. When provided AND this library has an entry, the
+    # entry's flags OVERRIDE the four include_* booleans above for
+    # this library only. Keys are library section titles; values are
+    # dicts with ``watch_history``, ``ratings``, ``playlists``,
+    # ``collections`` boolean fields (the LibraryMetrics shape).
+    # ``run_snapshot`` builds this map from the JobRecord params and
+    # passes it through here.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
     # ── Testability seams ────────────────────────────────────────────
     # Both keyword-only, both default to None and fall back to the
     # services.state run-state globals, so the positional call sites in
@@ -1139,6 +1269,38 @@ def snapshot_library(
     # fan-out runs make it obvious which server's data a line belongs
     # to (and which home users are being assigned to which server).
     server_name = getattr(server, "friendlyName", "") or "?"
+
+    # Backfill the server_id from the module-global the job runner
+    # sets before run_snapshot fires (state._snapshot_server_id).
+    # The per-library dispatch in run_snapshot doesn't pass this kwarg
+    # through, so without this fallback every time_operation block
+    # inside this function lands in run_timings with server_id=NULL,
+    # and the ETA trainer's _key_from_entry drops the row on the
+    # floor (it requires non-empty server_id to build a BucketKey).
+    # Bug observed 2026-05-16: 2174 of 2200 timing entries had
+    # server_id=NULL because of this gap; the trainer trained
+    # essentially nothing across 29 runs.
+    if not server_id:
+        server_id = getattr(state, "_snapshot_server_id", "") or ""
+
+    # Phase C (admin-management follow-up, 2026-05-15): if a per-library
+    # metric map was passed in AND this library has an entry, the
+    # entry's flags OVERRIDE the four include_* booleans for this
+    # library only. Every internal read below (49+ call sites) keeps
+    # using the local include_* names; we just point them at the
+    # per-library values here.
+    if library_metrics and lib_name in library_metrics:
+        _lm_row = library_metrics[lib_name]
+        if isinstance(_lm_row, dict):
+            include_watch_history = bool(_lm_row.get("watch_history", include_watch_history))
+            include_ratings = bool(_lm_row.get("ratings", include_ratings))
+            include_playlists = bool(_lm_row.get("playlists", include_playlists))
+            include_collections = bool(_lm_row.get("collections", include_collections))
+            logger.info(
+                "Per-library metric override for %r: watch_history=%s ratings=%s playlists=%s collections=%s",
+                lib_name, include_watch_history, include_ratings, include_playlists, include_collections,
+            )
+
     logger.info(f"Capturing snapshot library: {lib_name} [server: {server_name}]")
     # v0.9.6 Feature 2: tag every Plex API call this library makes
     # with the library name so the Network panel can attribute traffic
@@ -1179,51 +1341,65 @@ def snapshot_library(
     #                         prefetch). Best when wire-traffic back
     #                         from the server is the constraint.
     strategy = _resolve_watch_ratings_strategy(server_id=server_id, logger=logger)
-    if strategy == "force_server_side":
-        # Skip the prefetch entirely; each gather will use its
-        # per-task server-side-filter path.
-        shared_prefetch: Optional[Dict[str, Any]] = None
+    smart_bulk_threshold = _resolve_smart_bulk_threshold(logger)
+    want_prefetch = _should_use_bulk(
+        strategy=strategy,
+        section=section,
+        include_watch_history=include_watch_history,
+        include_ratings=include_ratings,
+        smart_bulk_threshold_items=smart_bulk_threshold,
+    )
+    shared_prefetch: Optional[Dict[str, Any]] = None
+    if not want_prefetch:
+        # Server-side path. Each gather will use its per-task
+        # server-side-filter call. Log the decision so end users
+        # tracing slow runs can see which path was chosen and why.
         logger.info(
-            "[%s] watch+ratings strategy=force_server_side - skipping shared bulk-fetch",
-            lib_name,
+            "[%s] watch+ratings: server-side path (strategy=%s, type=%s, "
+            "size=%d, threshold=%d)",
+            lib_name, strategy, getattr(section, "type", "") or "",
+            int(getattr(section, "totalSize", 0) or 0),
+            smart_bulk_threshold,
         )
     else:
-        want_prefetch = (
-            strategy == "force_bulk"
-            or (include_watch_history and include_ratings)
-        )
-        shared_prefetch = None
-        if want_prefetch:
-            # Only show libraries need the show-level container in
-            # addition to episodes; artist/movie ratings live on the
-            # same leaf list watch-history reads. For force_bulk we
-            # still bulk-fetch even when only one type is wanted -
-            # the user opted into the API-call-saving trade-off.
-            _want_shows = (section.type == "show")
+        # Bulk path. Only show libraries need the show-level container
+        # in addition to episodes; artist/movie ratings live on the
+        # same leaf list watch-history reads.
+        _want_shows = (section.type == "show")
+        with time_operation(
+            "bulk_fetch_for_filters",
+            scope=SCOPE_OPERATION,
+            server_id=server_id,
+            library=lib_name,
+        ) as _bf_t:
             shared_prefetch = _bulk_fetch_for_filters(
                 section, logger, want_shows=_want_shows,
             )
-            if shared_prefetch.get("ok"):
-                logger.info(
-                    "[%s] shared bulk-fetch for watch+ratings "
-                    "(strategy=%s): %d item(s)%s in %.1fs, %d Plex HTTP call(s)",
-                    lib_name, strategy,
-                    len(shared_prefetch.get("items") or []),
-                    f" + {len(shared_prefetch.get('shows') or [])} show(s)"
-                        if shared_prefetch.get("shows") else "",
-                    shared_prefetch.get("fetch_seconds", 0.0),
-                    shared_prefetch.get("http_calls", 0),
-                )
-            else:
-                # Failed bulk fetch → don't pass partial / empty lists
-                # to the gathers; let them use the per-task
-                # server-side-filter path so a transient Plex hiccup
-                # doesn't silently lose data.
-                shared_prefetch = None
+            _bf_t["items_processed"] = len(shared_prefetch.get("items") or [])
+            _bf_t["extra"]["strategy"] = strategy
+            _bf_t["extra"]["ok"] = bool(shared_prefetch.get("ok"))
+            _bf_t["extra"]["http_calls"] = int(shared_prefetch.get("http_calls", 0) or 0)
+        if shared_prefetch.get("ok"):
+            logger.info(
+                "[%s] shared bulk-fetch for watch+ratings "
+                "(strategy=%s): %d item(s)%s in %.1fs, %d Plex HTTP call(s)",
+                lib_name, strategy,
+                len(shared_prefetch.get("items") or []),
+                f" + {len(shared_prefetch.get('shows') or [])} show(s)"
+                    if shared_prefetch.get("shows") else "",
+                shared_prefetch.get("fetch_seconds", 0.0),
+                shared_prefetch.get("http_calls", 0),
+            )
+        else:
+            # Failed bulk fetch -> don't pass partial / empty lists to
+            # the gathers; let them use the per-task server-side-filter
+            # path so a transient Plex hiccup doesn't silently lose
+            # data.
+            shared_prefetch = None
 
     def gather_watch():
         if not include_watch_history:
-            # PR-6: per-library skip notices are INFO. The operator
+            # PR-6: per-library skip notices are INFO. The end user
             # uncheckd this type and seeing one confirmation per
             # library is the expected normal-operations output -
             # not noise. The redundant top-level summary line is
@@ -1232,7 +1408,13 @@ def snapshot_library(
             _advance()
             return
         cat = "play_count" if section.type == "artist" else "watched"
-        with _thread_category(cat):
+        with _thread_category(cat), time_operation(
+            "snapshot_watch_history",
+            scope=SCOPE_LIBRARY,
+            server_id=server_id,
+            library=lib_name,
+            push_to_activity_feed=True,
+        ) as _wh_t:
             results["watch_history"] = snapshot_watch_history(
                 section, logger, user=state._plex_owner_name,
                 stop_event=stop_event,
@@ -1240,9 +1422,16 @@ def snapshot_library(
                     shared_prefetch.get("items") if shared_prefetch else None
                 ),
             )
+            _wh_t["items_processed"] = len(results["watch_history"])
+            _wh_t["extra"]["bulk_used"] = bool(shared_prefetch)
+            _wh_t["extra"]["library_type"] = section.type
+            _wh_t["extra"]["strategy"] = strategy
         if state.get_dashboard():
             state.get_dashboard().set_library_phase(lib_name, "Watch History ✓")
-            state.get_dashboard().push_activity("phase", lib_name, f"Watch History → {len(results['watch_history'])} items")
+            state.get_dashboard().push_activity(
+                "phase", lib_name,
+                f"Watch History → {len(results['watch_history'])} items ({owner_display_label()})",
+            )
         _advance()
 
     def gather_playlists():
@@ -1253,15 +1442,27 @@ def snapshot_library(
             _advance()
             return
         cache = playlist_caches.get(id(server)) if playlist_caches else None
-        with _thread_category("playlists"):
+        with _thread_category("playlists"), time_operation(
+            "snapshot_playlists",
+            scope=SCOPE_LIBRARY,
+            server_id=server_id,
+            library=lib_name,
+            push_to_activity_feed=True,
+        ) as _pl_t:
             results["playlists"] = snapshot_playlists(
                 server, section.key, logger, lib_name=lib_name, playlist_cache=cache,
                 skip_playlists=skip_playlists, run_caches=run_lazy_caches,
                 stop_event=stop_event,
             )
+            _pl_t["items_processed"] = len(results["playlists"])
+            _pl_t["extra"]["library_type"] = section.type
+            _pl_t["extra"]["strategy"] = strategy
         if state.get_dashboard():
             state.get_dashboard().set_library_phase(lib_name, "Playlists ✓")
-            state.get_dashboard().push_activity("phase", lib_name, f"Playlists → {len(results['playlists'])} items")
+            state.get_dashboard().push_activity(
+                "phase", lib_name,
+                f"Playlists → {len(results['playlists'])} items ({owner_display_label()})",
+            )
         _advance()
 
     def gather_collections():
@@ -1269,13 +1470,25 @@ def snapshot_library(
             logger.info("[%s] Collections skipped (include_collections=False)", lib_name)
             _advance()
             return
-        with _thread_category("collections"):
+        with _thread_category("collections"), time_operation(
+            "snapshot_collections",
+            scope=SCOPE_LIBRARY,
+            server_id=server_id,
+            library=lib_name,
+            push_to_activity_feed=True,
+        ) as _co_t:
             results["collections"] = snapshot_collections(
                 section, logger, stop_event=stop_event,
             )
+            _co_t["items_processed"] = len(results["collections"])
+            _co_t["extra"]["library_type"] = section.type
+            _co_t["extra"]["strategy"] = strategy
         if state.get_dashboard():
             state.get_dashboard().set_library_phase(lib_name, "Collections ✓")
-            state.get_dashboard().push_activity("phase", lib_name, f"Collections → {len(results['collections'])} items")
+            state.get_dashboard().push_activity(
+                "phase", lib_name,
+                f"Collections → {len(results['collections'])} items ({owner_display_label()})",
+            )
         _advance()
 
     def gather_ratings():
@@ -1283,7 +1496,13 @@ def snapshot_library(
             logger.info("[%s] Ratings skipped (include_ratings=False)", lib_name)
             _advance()
             return
-        with _thread_category("ratings"):
+        with _thread_category("ratings"), time_operation(
+            "snapshot_ratings",
+            scope=SCOPE_LIBRARY,
+            server_id=server_id,
+            library=lib_name,
+            push_to_activity_feed=True,
+        ) as _ra_t:
             results["ratings"] = snapshot_ratings(
                 section, logger, user=state._plex_owner_name,
                 stop_event=stop_event,
@@ -1294,9 +1513,16 @@ def snapshot_library(
                     shared_prefetch.get("shows") if shared_prefetch else None
                 ),
             )
+            _ra_t["items_processed"] = len(results["ratings"])
+            _ra_t["extra"]["bulk_used"] = bool(shared_prefetch)
+            _ra_t["extra"]["library_type"] = section.type
+            _ra_t["extra"]["strategy"] = strategy
         if state.get_dashboard():
             state.get_dashboard().set_library_phase(lib_name, "Ratings ✓")
-            state.get_dashboard().push_activity("phase", lib_name, f"Ratings → {len(results['ratings'])} items")
+            state.get_dashboard().push_activity(
+                "phase", lib_name,
+                f"Ratings → {len(results['ratings'])} items ({owner_display_label()})",
+            )
         _advance()
 
     def gather_user(username: str, user_server: PlexServer):
@@ -1321,7 +1547,69 @@ def snapshot_library(
                 )
                 return
             user_cache = playlist_caches.get(id(user_server)) if playlist_caches else None
-            with _thread_category("home_user"):
+            # Per-user bulk prefetch (v0.15+). Mirrors the owner-phase
+            # decision: when the strategy + library shape say bulk is
+            # cheaper, fetch the user's view of the library once and
+            # share it across the user's watch + ratings gathers.
+            # Without this, the per-home-user phase was paying the
+            # 2-3 server-side-filter scans cost for every user
+            # regardless of the end user's force_bulk setting - the
+            # single biggest missed optimisation on multi-user servers.
+            user_prefetch: Optional[Dict[str, Any]] = None
+            if include_watch_history or include_ratings:
+                if _should_use_bulk(
+                    strategy=strategy,
+                    section=user_section,
+                    include_watch_history=include_watch_history,
+                    include_ratings=include_ratings,
+                    smart_bulk_threshold_items=smart_bulk_threshold,
+                ):
+                    _user_want_shows = (
+                        getattr(user_section, "type", "") == "show"
+                    )
+                    with time_operation(
+                        "bulk_fetch_for_filters",
+                        scope=SCOPE_OPERATION,
+                        server_id=server_id,
+                        library=lib_name,
+                        user_handle=username,
+                    ) as _ubf_t:
+                        user_prefetch = _bulk_fetch_for_filters(
+                            user_section, logger, want_shows=_user_want_shows,
+                        )
+                        _ubf_t["items_processed"] = len(
+                            (user_prefetch or {}).get("items") or []
+                        )
+                        _ubf_t["extra"]["ok"] = bool(
+                            (user_prefetch or {}).get("ok")
+                        )
+                        _ubf_t["extra"]["http_calls"] = int(
+                            (user_prefetch or {}).get("http_calls", 0) or 0
+                        )
+                    if user_prefetch and user_prefetch.get("ok"):
+                        logger.info(
+                            "[%s] home-user '%s' bulk-fetch: %d item(s)%s "
+                            "in %.1fs, %d Plex HTTP call(s)",
+                            lib_name, username,
+                            len(user_prefetch.get("items") or []),
+                            f" + {len(user_prefetch.get('shows') or [])} show(s)"
+                                if user_prefetch.get("shows") else "",
+                            user_prefetch.get("fetch_seconds", 0.0),
+                            user_prefetch.get("http_calls", 0),
+                        )
+                    else:
+                        # Transient failure -> fall back to server-side
+                        # filter rather than passing a partial / empty
+                        # list to the gathers.
+                        user_prefetch = None
+            with _thread_category("home_user"), time_operation(
+                "gather_user",
+                scope=SCOPE_USER,
+                server_id=server_id,
+                library=lib_name,
+                user_handle=username,
+                push_to_activity_feed=True,
+            ) as _u_t:
                 # PR-3 / Phase D - each include_* flag gates its
                 # corresponding per-user gather. Defaults preserve
                 # pre-Phase-D behaviour exactly.
@@ -1329,6 +1617,9 @@ def snapshot_library(
                     snapshot_watch_history(
                         user_section, logger, user=username,
                         stop_event=stop_event,
+                        prefetched_items=(
+                            user_prefetch.get("items") if user_prefetch else None
+                        ),
                     )
                     if include_watch_history else []
                 )
@@ -1336,6 +1627,12 @@ def snapshot_library(
                     snapshot_ratings(
                         user_section, logger, user=username,
                         stop_event=stop_event,
+                        prefetched_items=(
+                            user_prefetch.get("items") if user_prefetch else None
+                        ),
+                        prefetched_shows=(
+                            user_prefetch.get("shows") if user_prefetch else None
+                        ),
                     )
                     if include_ratings else []
                 )
@@ -1370,6 +1667,15 @@ def snapshot_library(
                         stop_event=stop_event,
                     )
                 )
+                _u_t["items_processed"] = (
+                    len(u_watch) + len(u_ratings)
+                    + len(u_playlists) + len(u_collections)
+                )
+                _u_t["extra"]["bulk_used"] = bool(user_prefetch)
+                _u_t["extra"]["watched"] = len(u_watch)
+                _u_t["extra"]["rated"] = len(u_ratings)
+                _u_t["extra"]["playlists"] = len(u_playlists)
+                _u_t["extra"]["collections"] = len(u_collections)
             users_data[username] = {
                 "watch_history": u_watch,
                 "ratings": u_ratings,
@@ -1428,7 +1734,7 @@ def snapshot_library(
     #   collections need the owner's collection set computed from
     #   Phase 1's output, so Phase 2 can't start until Phase 1 ends.
     #
-    # v0.14 - when ``owner_included`` is False (the operator excluded
+    # v0.14 - when ``owner_included`` is False (the end user excluded
     # the owner via user_filter), Phase 1 is skipped entirely. Phase
     # 2 still fires for every managed user that survived the filter.
     if owner_included:
@@ -1566,7 +1872,7 @@ def snapshot_library(
     # for playlists and collections. No JSON file is written here -
     # the on-demand serialiser in ``server/snapshot_serializer.py``
     # rebuilds the JSON shape from the snapshot ``.db`` when the
-    # operator clicks Download in the Exports panel.
+    # end user clicks Download in the Exports panel.
     #
     # ``server_id`` comes from ``state._snapshot_server_id`` (the
     # job runner / CLI sets it before run_snapshot fires). When it's
@@ -1708,6 +2014,11 @@ def run_snapshot(
     # yet. A positive value caps libraries-in-parallel without
     # touching the per-library worker count.
     library_workers: int = 0,
+    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # metric map sourced from the end user's selection. Forwarded to
+    # ``snapshot_library`` for each library; entries override the
+    # global include_* flags for that library specifically.
+    library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
 ) -> None:
     """
     Runs the full multi-threaded snapshot pipeline for all selected libraries.
@@ -1733,7 +2044,7 @@ def run_snapshot(
     """
     # One-line summary of what this run covers. The per-library /
     # per-user "skipped" notices are DEBUG so this is the only INFO
-    # surface for the operator's data-type filter choices.
+    # surface for the end user's data-type filter choices.
     _included = [
         n for n, v in (
             ("watch_history", include_watch_history),
@@ -1766,8 +2077,15 @@ def run_snapshot(
         "settings.snapshot_library_workers" if library_workers > 0 else "settings.workers",
     )
 
-    home_users = get_home_users(server, base_url, logger)
-    # v0.14 - apply the operator's user filter. The owner is handled
+    # 2026-05-17 (operator request): pass user_filter into get_home_users
+    # so we authenticate ONLY the picked users instead of every home
+    # user. The post-fetch filter below still runs as a belt-and-braces
+    # check (handles the owner-included case + final whittling).
+    home_users = get_home_users(
+        server, base_url, logger,
+        user_filter=user_filter,
+    )
+    # v0.14 - apply the end user's user filter. The owner is handled
     # by ``owner_included`` below (it isn't in home_users to begin
     # with - owner-level data flows through the library-wide gather
     # paths). When user_filter is None, every user on the server is
@@ -1921,6 +2239,10 @@ def run_snapshot(
                         include_ratings,
                         include_playlists,
                         include_collections,
+                        # Phase C: per-library metric map. snapshot_library
+                        # uses the entry for ``sec.title`` to override the
+                        # global include_* flags for this library only.
+                        library_metrics=library_metrics,
                     ): sec.title
                     for sec in selected_libs
                 }
@@ -1969,6 +2291,11 @@ def run_snapshot(
                             include_ratings,
                             include_playlists,
                             include_collections,
+                            # Phase C: forward the per-library metric
+                            # map. snapshot_library overrides the
+                            # global include_* booleans per library
+                            # using this map.
+                            library_metrics=library_metrics,
                         ): sec.title
                         for sec in selected_libs
                     }
@@ -2023,6 +2350,8 @@ def run_snapshot(
                         include_ratings,
                         include_playlists,
                         include_collections,
+                        # Phase C: per-library metric map.
+                        library_metrics=library_metrics,
                     ): sec.title
                     for sec in selected_libs
                 }

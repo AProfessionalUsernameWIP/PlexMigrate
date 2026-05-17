@@ -17,8 +17,16 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api, LibraryDescriptor, PingResult, ProbeUnsavedResult, ServerUser, ServerUsersResponse, ServerDeleteSummary, ServerView } from '../api';
-import type { ServerManagedUser } from '../api';
+import type { PinMigrationSuggestion, ServerManagedUser } from '../api';
 import { usePermission } from '../hooks/usePermission';
+import { PinMigrationModal } from './PinMigrationModal';
+import { RecentRuntimesPanel } from './RecentRuntimesPanel';
+import {
+  BackendTabStrip,
+  BackendType,
+  backendCounts,
+  serversForBackend,
+} from './BackendTabStrip';
 
 // Default poll cadence for the live status indicator, in milliseconds.
 // The actual cadence is loaded from settings.tunables.frontend_server_ping_interval_ms
@@ -27,7 +35,7 @@ import { usePermission } from '../hooks/usePermission';
 const PING_INTERVAL_MS_DEFAULT = 30_000;
 
 export function ServersPanel() {
-  // PR-A4 - viewers / operators / managers see this panel read-only.
+  // PR-A4 - viewers / end users / managers see this panel read-only.
   // Add / Edit / Remove buttons are hidden when ``servers.edit`` is
   // absent. The backend (require_role('root_admin') on the CRUD
   // routes) is the authoritative gate.
@@ -35,12 +43,83 @@ export function ServersPanel() {
 
   const [servers, setServers] = useState<ServerView[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Top-level sub-tab routing inside the Servers page. Each tab
+  // scopes which panel renders below; the tabbar itself stays
+  // visible across all tabs so the end user can pivot without
+  // scrolling. The four tabs mirror what existed previously as
+  // stacked panels - Overview (registered Plex servers + add/edit
+  // controls), Library Catalogues, Server Users, and Recent
+  // Runtimes - so no information is hidden, only organised.
+  const [activeTab, setActiveTab] = useState<
+    'overview' | 'libraries' | 'users' | 'runtimes'
+  >('overview');
+  // Phase A of the backend-filter UI restructure (see
+  // Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). One backend tier
+  // shared across all four sub-tabs so the end user stays in the
+  // chosen backend's context as they pivot. Defaults to 'plex' since
+  // every install today has at least one Plex server.
+  const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
+
+  // Auto-correct activeBackend when it points at an empty backend
+  // and another backend has servers. Fires after the server list
+  // refreshes (e.g. end user deleted the last Plex server while on
+  // the Plex tab). Without this, the panel would render its empty
+  // state forever even though Jellyfin servers are registered.
+  useEffect(() => {
+    if (servers.length === 0) return;
+    const counts = backendCounts(servers);
+    if (counts[activeBackend] === 0) {
+      const fallback = (['plex', 'jellyfin', 'emby'] as BackendType[])
+        .find((b) => counts[b] > 0);
+      if (fallback) setActiveBackend(fallback);
+    }
+  }, [servers, activeBackend]);
+
+  // Derived: the registered-server list filtered to the active backend.
+  // Used by the Overview table + passed down to per-backend sub-panels.
+  const backendServers = serversForBackend(servers, activeBackend);
+  // End user-facing label for the active backend's panel heading.
+  const backendLabel = activeBackend === 'plex' ? 'Plex'
+    : activeBackend === 'jellyfin' ? 'Jellyfin'
+    : 'Emby';
   const [editing, setEditing] = useState<ServerView | 'new' | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  // Tracks which servers have a playlist-cache warm in flight (kicked
+  // off as a fire-and-forget side effect of Refresh). The cache warm
+  // can take 10-30s for a multi-user Plex Home, so we surface a tiny
+  // "warming cache..." chip on the row while it runs rather than block
+  // the Refresh button. Cleared when the bulk refresh promise settles.
+  const [cacheWarmingIds, setCacheWarmingIds] = useState<Set<string>>(new Set());
   // Last cascade summary from a successful delete. Rendered as a
   // green toast banner at the top of the panel and dismissed by the
-  // operator (or by the next action).
+  // end user (or by the next action).
   const [cascadeToast, setCascadeToast] = useState<ServerDeleteSummary | null>(null);
+  // Item 2: refresh-button token-capture toast. Cleared by Dismiss or
+  // by a subsequent refresh that does no work (the toast only renders
+  // when there's something worth saying).
+  const [refreshToast, setRefreshToast] = useState<{ name: string; message: string } | null>(null);
+
+  // Item 3: cross-server PIN migration modal state. Triggered after
+  // Add-Server and Refresh-Server flows discover an overlap between
+  // this server's managed users and another server's stored PINs.
+  const [pinMigration, setPinMigration] = useState<
+    | null
+    | { serverId: string; serverName: string; suggestions: PinMigrationSuggestion[] }
+  >(null);
+
+  // Probe the suggestions endpoint and open the modal if non-empty.
+  // Failure is silent: the prompt is a nicety, not a blocking
+  // requirement, and the end user can still capture PINs manually.
+  const probeAndMaybeOpenPinMigration = async (serverId: string, serverName: string) => {
+    try {
+      const res = await api.pinMigrationSuggestions(serverId);
+      if (res.suggestions && res.suggestions.length > 0) {
+        setPinMigration({ serverId, serverName, suggestions: res.suggestions });
+      }
+    } catch {
+      /* role likely insufficient; nothing to show */
+    }
+  };
 
   // Live ping state, keyed by server id. We keep this *separate* from
   // ``servers`` so a ping update can happen without re-rendering the
@@ -76,12 +155,16 @@ export function ServersPanel() {
   // Track the polling timer so we can clear it on unmount.
   const pollTimerRef = useRef<number | null>(null);
 
-  // Live ping cadence. Loaded once from settings on mount so an operator
+  // Live ping cadence. Loaded once from settings on mount so an end user
   // who bumps it via Settings ▸ Tunables doesn't need a code change.
   // A panel re-mount picks up subsequent changes; the effect that arms
   // the timer below depends on this value, so a new cadence rearms
   // automatically once the load completes.
   const [pingIntervalMs, setPingIntervalMs] = useState<number>(PING_INTERVAL_MS_DEFAULT);
+  // Optional UID column toggle. Reads `servers_panel_show_server_uid`
+  // (developer tunable, 2026-05-16). Off by default — flip via
+  // Settings ▸ Tunables ▸ UI & Display ▸ Admin & UX toggles.
+  const [showServerUid, setShowServerUid] = useState(false);
   useEffect(() => {
     api.getSettings()
       .then((s) => {
@@ -91,13 +174,37 @@ export function ServersPanel() {
         if (typeof v === 'number' && v >= 1000) {
           setPingIntervalMs(v);
         }
+        const uidFlag = tunables['servers_panel_show_server_uid'];
+        if (typeof uidFlag === 'boolean') {
+          setShowServerUid(uidFlag);
+        }
       })
       .catch(() => { /* non-fatal - fall back to the default */ });
   }, []);
 
   const refresh = async () => {
     try {
-      setServers(await api.listServers());
+      const next = await api.listServers();
+      // 2026-05-17 defensive (operator report — servers vanished after
+      // Refresh): only commit the new list when it's non-empty OR when
+      // we KNOW the registry is genuinely empty (no servers existed
+      // before either). A transient empty response — e.g. because the
+      // parallel playlist refresh briefly tied up the registry read —
+      // used to wipe every row from the UI until a hard reload.
+      setServers((prev) => {
+        if (next.length === 0 && prev.length > 0) {
+          // Suspicious — keep the prior list rather than blank the UI.
+          // The next refresh tick repopulates correctly.
+          // eslint-disable-next-line no-console
+          console.warn(
+            'ServersPanel.refresh: listServers returned empty but prior '
+            + 'state had %d server(s); keeping prior state.',
+            prev.length,
+          );
+          return prev;
+        }
+        return next;
+      });
     } catch (e) {
       setError(String(e));
     }
@@ -155,7 +262,7 @@ export function ServersPanel() {
       }
     };
     // Re-arm when the server list changes (the closure binds the
-    // current list) or when the operator changes the ping cadence
+    // current list) or when the end user changes the ping cadence
     // via Settings ▸ Tunables.
   }, [servers, pingIntervalMs]);
 
@@ -191,7 +298,7 @@ export function ServersPanel() {
       }
       // PR-11 diff. If the live API surfaced users that aren't in
       // the local managed_users DB (visible OR hidden), fire a
-      // background sync and queue a toast for the operator. Only
+      // background sync and queue a toast for the end user. Only
       // "additions" trigger this - removals never auto-fire deletes
       // (additive-only rule from clp.md). The DB call failing is
       // non-fatal; we just skip the diff and let the next visit retry.
@@ -215,7 +322,7 @@ export function ServersPanel() {
             inFlightSyncsRef.current.add(s.id);
             api.syncServerManagedUsers(s.id)
               .catch(() => {
-                /* operator can hit the manual sync button if this fails */
+                /* end user can hit the manual sync button if this fails */
               })
               .finally(() => {
                 inFlightSyncsRef.current.delete(s.id);
@@ -252,8 +359,46 @@ export function ServersPanel() {
   const test = async (id: string) => {
     setBusyId(id);
     try {
-      await api.testServer(id);
+      const result = await api.testServer(id);
       await refresh();
+      // Item 2: surface the token-capture sweep result. captured > 0
+      // means new tokens landed; throttled true means the end user
+      // clicked Refresh faster than the throttle allows (rare, since
+      // Refresh bypasses the throttle by design); errors get a quiet
+      // mention but don't fail the refresh.
+      const cap = result?.token_capture;
+      if (cap && (cap.captured > 0 || cap.errors.length > 0)) {
+        const name = result?.name ?? 'server';
+        const parts: string[] = [];
+        if (cap.captured > 0) parts.push(`captured ${cap.captured} new user token(s)`);
+        if (cap.skipped_existing > 0) parts.push(`${cap.skipped_existing} already stored`);
+        if (cap.errors.length > 0) parts.push(`${cap.errors.length} error(s) - see runtime.log`);
+        setRefreshToast({ name, message: parts.join('; ') });
+      }
+      // Item 3: after a refresh, also probe for cross-server PIN
+      // overlaps. The refresh might have discovered a new managed
+      // user that matches a stored PIN on another server.
+      const serverName = (result && result.name) || id;
+      void probeAndMaybeOpenPinMigration(id, serverName);
+      // 2026-05-17 (operator bug report — servers disappearing after
+      // Refresh): the playlist-cache warm now fires AFTER the synchronous
+      // testServer + listServers refresh completes, NOT in parallel
+      // with it. The parallel version contended with the registry sync
+      // and surfaced as an empty server list until the page was reloaded.
+      // The bulk refresh now runs strictly in the background once the
+      // server-list state is stable.
+      setCacheWarmingIds((prev) => new Set(prev).add(id));
+      void api.playlistMgmtRefreshServer(id, 'servers-refresh')
+        .catch(() => {
+          /* best-effort — failures are visible in Settings ▸ Application Logs ▸ Playlist Cache */
+        })
+        .finally(() => {
+          setCacheWarmingIds((prev) => {
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -265,7 +410,7 @@ export function ServersPanel() {
     // v0.9.5: fetch the cascade preview first so the confirmation
     // dialog can show concrete counts. If the preview call itself
     // fails (e.g. server is mid-cascade by another request), fall
-    // back to the previous text-only prompt so the operator can
+    // back to the previous text-only prompt so the end user can
     // still cancel the action safely.
     let previewLine = '';
     try {
@@ -297,6 +442,19 @@ export function ServersPanel() {
   return (
     <>
       {error && <div className="banner error">{error}</div>}
+
+      {refreshToast && (
+        <div
+          className="banner good"
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}
+        >
+          <div>
+            <strong>Refreshed {refreshToast.name}.</strong>{' '}
+            {refreshToast.message}.
+          </div>
+          <button onClick={() => setRefreshToast(null)} style={{ flexShrink: 0 }}>Dismiss</button>
+        </div>
+      )}
 
       {cascadeToast && (
         <div
@@ -343,6 +501,45 @@ export function ServersPanel() {
         </div>
       ))}
 
+      {/* Top-level sub-tab nav. Stays visible regardless of which tab
+          is active so a single click switches surface without
+          scrolling. The Overview tab carries the registered-server
+          table + add/edit controls; the others carry the panels that
+          used to stack below it. */}
+      <nav className="tabs sub-tabs" style={{ marginBottom: 8 }}>
+        <button
+          className={activeTab === 'overview' ? 'active' : ''}
+          onClick={() => setActiveTab('overview')}
+        >
+          Overview
+        </button>
+        <button
+          className={activeTab === 'libraries' ? 'active' : ''}
+          onClick={() => setActiveTab('libraries')}
+          disabled={servers.length === 0}
+          title={servers.length === 0 ? 'Register a server first.' : undefined}
+        >
+          Library Catalogues
+        </button>
+        <button
+          className={activeTab === 'users' ? 'active' : ''}
+          onClick={() => setActiveTab('users')}
+          disabled={servers.length === 0}
+          title={servers.length === 0 ? 'Register a server first.' : undefined}
+        >
+          Server Users
+        </button>
+        <button
+          className={activeTab === 'runtimes' ? 'active' : ''}
+          onClick={() => setActiveTab('runtimes')}
+          disabled={servers.length === 0}
+          title={servers.length === 0 ? 'Register a server first.' : undefined}
+        >
+          Recent Runtimes
+        </button>
+      </nav>
+
+      {activeTab === 'overview' && (
       <div className="banner info">
         <strong>Threading note:</strong> Every registered server adds API load when used.
         Running transfers to or from multiple servers at the same time multiplies that load
@@ -350,10 +547,18 @@ export function ServersPanel() {
         than the same minute, and see the README's <em>Understanding Performance and Threading</em>
         section for guidance on worker counts.
       </div>
+      )}
 
+      {activeTab === 'overview' && (
+      <>
+      <BackendTabStrip
+        servers={servers}
+        activeBackend={activeBackend}
+        onChange={setActiveBackend}
+      />
       <div className="panel">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-          <h2 style={{ margin: 0 }}>Registered Plex Servers</h2>
+          <h2 style={{ margin: 0 }}>Registered {backendLabel} Servers</h2>
           {canEditServers && (
             <button className="primary" onClick={() => setEditing('new')}>+ Add Server</button>
           )}
@@ -361,7 +566,12 @@ export function ServersPanel() {
 
         {servers.length === 0 ? (
           <div className="empty">
-            No servers registered. Click <strong>+ Add Server</strong> to register your first Plex.
+            No servers registered. Click <strong>+ Add Server</strong> to register your first server.
+          </div>
+        ) : backendServers.length === 0 ? (
+          <div className="empty">
+            No {backendLabel} servers registered. Click <strong>+ Add Server</strong>{' '}
+            to add one, or switch to a backend with registered servers above.
           </div>
         ) : (
           <table className="list">
@@ -369,6 +579,8 @@ export function ServersPanel() {
               <tr>
                 <th style={{ width: 24 }}></th>
                 <th>Name</th>
+                <th>Backend</th>
+                {showServerUid && <th>UID</th>}
                 {/* Bugfix: URL column hidden from viewer / operator.
                     Same rationale as the View-button removal: lower
                     roles can SEE the Servers tab so they know which
@@ -383,7 +595,7 @@ export function ServersPanel() {
               </tr>
             </thead>
             <tbody>
-              {servers.map((s) => {
+              {backendServers.map((s) => {
                 const ping = pings[s.id];
                 // The live ping result, when we have one, supersedes
                 // the cached status on the registry row - it's
@@ -394,6 +606,30 @@ export function ServersPanel() {
                   <tr key={s.id}>
                     <td><StatusDot status={effectiveStatus} detail={ping?.detail ?? s.last_status_detail} /></td>
                     <td><strong>{s.name}</strong></td>
+                    <td>{(() => {
+                      const t = (s.service_type as 'plex' | 'jellyfin' | 'emby' | undefined) ?? 'plex';
+                      return t === 'plex' ? 'Plex' : t === 'jellyfin' ? 'Jellyfin' : 'Emby';
+                    })()}</td>
+                    {showServerUid && (
+                      <td className="mono" style={{ fontSize: 11 }}>
+                        <button
+                          type="button"
+                          onClick={() => { void navigator.clipboard?.writeText(s.id); }}
+                          title="Click to copy"
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            padding: 0,
+                            color: 'inherit',
+                            font: 'inherit',
+                            cursor: 'pointer',
+                            textAlign: 'left',
+                          }}
+                        >
+                          {s.id}
+                        </button>
+                      </td>
+                    )}
                     {canEditServers && <td className="mono">{s.url}</td>}
                     <td className="num">
                       {effectiveMs !== null && effectiveStatus === 'ok'
@@ -408,10 +644,31 @@ export function ServersPanel() {
                     <td>{s.last_checked_at ? new Date(s.last_checked_at * 1000).toLocaleString() : '-'}</td>
                     <td>
                       <div className="row-buttons">
-                        <button onClick={() => test(s.id)} disabled={busyId === s.id} title="Refresh status and re-enumerate libraries">
+                        <button
+                          onClick={() => test(s.id)}
+                          disabled={busyId === s.id}
+                          title="Refresh status, re-enumerate libraries, and warm the playlist cache."
+                        >
                           {busyId === s.id ? 'Refreshing…' : 'Refresh'}
                         </button>
+                        {cacheWarmingIds.has(s.id) && (
+                          <span
+                            className="tag"
+                            style={{ fontSize: 10, background: 'var(--bg-panel-alt, rgba(74, 122, 252, 0.10))' }}
+                            title="Playlist cache rebuild in progress. Each user's playlists are being re-fetched from the live server; lines appear in Settings ▸ Application Logs ▸ Playlist Cache as they complete. Bulk refresh typically takes 10-30s for a Plex Home with 5+ users."
+                          >
+                            warming cache…
+                          </span>
+                        )}
                         <WalkButton serverId={s.id} />
+                        {canEditServers && s.has_pending_token && (
+                          <PendingTokenChip
+                            serverId={s.id}
+                            firstSeenAt={s.pending_token_first_seen_at}
+                            lastProbedAt={s.pending_token_last_probed_at}
+                            onSwapped={() => { void refresh(); }}
+                          />
+                        )}
                         {canEditServers && (
                           <>
                             <button onClick={() => setEditing(s)}>Edit</button>
@@ -419,7 +676,7 @@ export function ServersPanel() {
                           </>
                         )}
                         {/* Bugfix: pre-PR-13 there was a ``View`` button
-                            rendered for viewer / operator that opened
+                            rendered for viewer / end user that opened
                             the same ``ServerEditor`` used for Edit. The
                             editor's input fields aren't read-only, so a
                             lower-privilege role could see (and try to
@@ -437,6 +694,8 @@ export function ServersPanel() {
           </table>
         )}
       </div>
+      </>
+      )}
 
       {editing && (
         <ServerEditor
@@ -446,19 +705,81 @@ export function ServersPanel() {
             setEditing(null);
             if (changed) await refresh();
           }}
+          onAddedServerId={(id, name) => {
+            // Item 3: after a successful Add-Server, probe for cross-
+            // server PIN overlaps. The backend already ran the
+            // initial token-capture sweep at add time; this surfaces
+            // any PIN-on-another-server matches the end user may
+            // want to migrate over.
+            void probeAndMaybeOpenPinMigration(id, name);
+          }}
         />
       )}
 
-      {servers.length > 0 && (
-        <LibraryCataloguesPanel servers={servers} />
+      {/* Item 3: cross-server PIN migration modal. Triggered by both
+          Add-Server and Refresh-Server paths via probeAndMaybeOpenPinMigration. */}
+      {pinMigration && (
+        <PinMigrationModal
+          open={true}
+          serverId={pinMigration.serverId}
+          serverName={pinMigration.serverName}
+          suggestions={pinMigration.suggestions}
+          onCancel={() => setPinMigration(null)}
+          onApplied={(result) => {
+            setPinMigration(null);
+            const parts: string[] = [];
+            if (result.applied.length > 0) parts.push(`migrated ${result.applied.length} PIN(s)`);
+            if (result.skipped.length > 0) parts.push(`${result.skipped.length} already stored`);
+            if (result.errors.length > 0) parts.push(`${result.errors.length} error(s)`);
+            setRefreshToast({
+              name: pinMigration.serverName,
+              message: parts.join('; ') || 'no changes',
+            });
+            void refresh();
+          }}
+        />
       )}
 
-      {servers.length > 0 && (
-        <ServerUsersPanel
-          servers={servers}
-          users={users}
-          onPatched={applyServerPatch}
-        />
+      {activeTab === 'libraries' && servers.length > 0 && (
+        <>
+          <BackendTabStrip
+            servers={servers}
+            activeBackend={activeBackend}
+            onChange={setActiveBackend}
+          />
+          <LibraryCataloguesPanel servers={backendServers} />
+        </>
+      )}
+
+      {activeTab === 'users' && servers.length > 0 && (
+        <>
+          <BackendTabStrip
+            servers={servers}
+            activeBackend={activeBackend}
+            onChange={setActiveBackend}
+          />
+          <ServerUsersPanel
+            servers={backendServers}
+            users={users}
+            onPatched={applyServerPatch}
+          />
+        </>
+      )}
+
+      {/* Phase 4: per-run history surface. Reads from /api/runs/recent
+          which carries one row per completed job (snapshot / restore
+          / direct / fan-out). Lives in its own sub-tab so the
+          historical view doesn't compete with the Overview surface
+          for screen space. */}
+      {activeTab === 'runtimes' && servers.length > 0 && (
+        <>
+          <BackendTabStrip
+            servers={servers}
+            activeBackend={activeBackend}
+            onChange={setActiveBackend}
+          />
+          <RecentRuntimesPanel servers={backendServers} />
+        </>
       )}
     </>
   );
@@ -469,19 +790,20 @@ export function ServersPanel() {
 function UsersForServer({
   server,
   payload,
-  onPatched,
+  // 2026-05-17 (operator request): display-name editing moved to the
+  // User Management tab so we have one source of truth across the app.
+  // The previous inline owner-edit affordance + ``onPatched`` callback
+  // were removed from this sub-tab; it's now a view-only roster.
+  // ``onPatched`` is kept as an unused prop so the call-site at
+  // ``ServerUsersPanel`` doesn't need to change; safe to delete in a
+  // later cleanup pass.
+  onPatched: _onPatched,
 }: {
   server: ServerView;
   payload?: ServerUsersResponse | { error: string };
-  onPatched: (next: ServerView) => void;
+  onPatched?: (next: ServerView) => void;
 }) {
-  // The owner row's "edit display name" input is local UI state.
-  // Stored separately so each server's editor opens / closes
-  // independently.
-  const [editingOwner, setEditingOwner] = useState(false);
-  const [draft, setDraft] = useState('');
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  void _onPatched;
 
   if (!payload) {
     return (
@@ -499,7 +821,7 @@ function UsersForServer({
     // ConnectionError catch-all in server_registry.sync_managed_users_from_live
     // can't distinguish bad credentials from network failure. Show a
     // short hint inline and a richer diagnostic list on hover so the
-    // operator knows where else to look.
+    // end user knows where else to look.
     const diagnosticHint =
       'Things to check:\n' +
       '  1. Plex Media Server is running on the host (open its web UI directly).\n' +
@@ -532,48 +854,14 @@ function UsersForServer({
   const owner = resp.users.find((u) => u.kind === 'owner') || null;
   const managed = resp.users.filter((u) => u.kind === 'managed');
 
-  const startOwnerEdit = () => {
-    if (!owner) return;
-    setDraft(owner.display_name || '');
-    setEditingOwner(true);
-    setSaveError(null);
-  };
-
-  const cancelOwnerEdit = () => {
-    setEditingOwner(false);
-    setDraft('');
-    setSaveError(null);
-  };
-
-  const commitOwnerEdit = async () => {
-    if (!owner) return;
-    setSaving(true);
-    setSaveError(null);
-    try {
-      const updated = await api.setUserDisplayName(server.id, owner.plex_id, draft);
-      onPatched(updated);
-      setEditingOwner(false);
-    } catch (e) {
-      setSaveError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const onOwnerKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      void commitOwnerEdit();
-    } else if (e.key === 'Escape') {
-      e.preventDefault();
-      cancelOwnerEdit();
-    }
-  };
-
   return (
     <div className="col" style={{ minWidth: 280 }}>
       <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{server.name}</h3>
-      {/* Owner row with inline-editable display name. */}
+      {/* 2026-05-17 (operator request): this surface is view-only now.
+          Display-name editing was duplicated between here and the
+          User Management tab; User Management is the source of truth
+          across the app. Operators looking to set / change a display
+          name navigate to Settings ▸ User Management. */}
       {owner ? (
         <div style={{ marginBottom: 10, padding: '6px 8px', background: 'var(--panel-alt, #1b2233)', borderRadius: 4 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
@@ -582,41 +870,13 @@ function UsersForServer({
               {owner.raw_name}
             </span>
           </div>
-          <div style={{ marginTop: 4 }}>
-            {editingOwner ? (
-              <div style={{ display: 'flex', gap: 6 }}>
-                <input
-                  type="text"
-                  value={draft}
-                  onChange={(e) => setDraft(e.target.value)}
-                  onKeyDown={onOwnerKeyDown}
-                  autoFocus
-                  placeholder="Display name (Enter to save, Esc to cancel)"
-                  style={{ flex: 1 }}
-                  disabled={saving}
-                />
-                <button onClick={commitOwnerEdit} disabled={saving} className="primary" style={{ padding: '2px 8px' }}>
-                  {saving ? '…' : 'Save'}
-                </button>
-                <button onClick={cancelOwnerEdit} disabled={saving} style={{ padding: '2px 8px' }}>
-                  Cancel
-                </button>
-              </div>
+          <div style={{ marginTop: 4, fontSize: 13 }}>
+            {owner.display_name ? (
+              <strong>{owner.display_name}</strong>
             ) : (
-              <div
-                style={{ cursor: 'pointer', fontSize: 13 }}
-                title="Click to edit display name"
-                onClick={startOwnerEdit}
-              >
-                {owner.display_name ? (
-                  <strong>{owner.display_name}</strong>
-                ) : (
-                  <span style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>Click to set a display name…</span>
-                )}
-              </div>
-            )}
-            {saveError && (
-              <div className="banner error" style={{ fontSize: 12, marginTop: 4 }}>{saveError}</div>
+              <span style={{ color: 'var(--text-dim)', fontStyle: 'italic' }}>
+                (no display name set)
+              </span>
             )}
           </div>
         </div>
@@ -667,11 +927,23 @@ function ServerEditor(props: {
   server: ServerView | null;
   existingServers: ServerView[];
   onClose: (changed: boolean) => void;
+  // Item 3: optional callback fired with the id+name of a newly
+  // created server so the parent can probe for PIN-migration
+  // suggestions. Unused for the edit path.
+  onAddedServerId?: (id: string, name: string) => void;
 }) {
-  const { server, existingServers, onClose } = props;
+  const { server, existingServers, onClose, onAddedServerId } = props;
   const [name, setName] = useState(server?.name ?? '');
   const [url, setUrl] = useState(server?.url ?? 'http://host.docker.internal:32400');
   const [token, setToken] = useState('');
+  // PR-Backends backend picker. Reads from the existing row when
+  // editing (so the end user can't accidentally rebrand a Plex row as
+  // Jellyfin); fresh adds default to Plex for behavior parity with
+  // pre-picker installs. The radio is hidden in the edit path - we
+  // don't support changing a registered server's backend type today.
+  const [serviceType, setServiceType] = useState<'plex' | 'jellyfin' | 'emby'>(
+    (server?.service_type as 'plex' | 'jellyfin' | 'emby' | undefined) ?? 'plex',
+  );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -679,14 +951,14 @@ function ServerEditor(props: {
   // After a successful Test Connection the probe response includes the
   // ``owner_name`` of the Plex account the supplied token belongs to.
   // If that owner already appears under one or more other registered
-  // servers, the operator is reusing the same Plex.tv account's token
+  // servers, the end user is reusing the same Plex.tv account's token
   // across servers - valid, but worth surfacing because the servers
   // will share authentication context (revoking one revokes all).
   //
   // We can't compare raw tokens client-side because the API never
   // returns them, but ``owner_name`` is exposed on every ServerView
   // and is a reliable proxy for "this token belongs to that account."
-  // The warning is soft / informational; the operator can save anyway.
+  // The warning is soft / informational; the end user can save anyway.
 
   // ── Test Connection state ────────────────────────────────────────
   // v0.10.0: the test now uses /api/servers/test-unsaved which probes
@@ -696,17 +968,25 @@ function ServerEditor(props: {
   // the "Test Connection adds it to the list" bug.
   //
   // The probe response carries the connected server's friendly name
-  // and machine identifier; the UI surfaces them so the operator can
+  // and machine identifier; the UI surfaces them so the end user can
   // confirm they hit the right Plex install before saving (a Plex
   // account's token works on every server it owns, so a successful
   // connect does not by itself prove which server you reached).
   const [testing, setTesting] = useState(false);
   const [probe, setProbe] = useState<ProbeUnsavedResult | null>(null);
+  // When the end user clicks "Try fallback token" on the auth_error
+  // banner, this captures the borrowed-from server's id. The Save
+  // path then submits ``use_fallback_from_server_id`` so the backend
+  // borrows that server's token and stashes the typed one as pending.
+  // Cleared whenever the end user changes URL or token (the borrow
+  // offer was scoped to the original probe).
+  const [acceptedFallbackFromId, setAcceptedFallbackFromId] = useState<string | null>(null);
 
   // Reset the probe result whenever the user changes a connection
   // field - the previous "passed" result no longer applies.
   useEffect(() => {
     setProbe(null);
+    setAcceptedFallbackFromId(null);
   }, [name, url, token]);
 
   const testConnection = async () => {
@@ -737,7 +1017,12 @@ function ServerEditor(props: {
         });
         return;
       }
-      const result = await api.testUnsavedServer({ name, url, token });
+      const result = await api.testUnsavedServer({
+        name, url, token,
+        // Tell the backend which adapter to probe with. Backend
+        // defaults to 'plex' if the field is omitted (legacy clients).
+        service_type: serviceType,
+      });
       setProbe(result);
     } catch (e) {
       setError(String(e));
@@ -757,7 +1042,31 @@ function ServerEditor(props: {
         // duplicate machine_identifiers, so passing a probed-OK row
         // through here is safe. The frontend pre-test in testConnection
         // is for fast UX feedback; the backend still enforces.
-        await api.createServer({ name, url, token });
+        //
+        // Auto-fallback (2026-05-15): when the end user accepted the
+        // "Try fallback token" offer on the Test result, we submit
+        // ``use_fallback_from_server_id`` so the backend uses the
+        // borrowed token as the active credential and stashes the
+        // typed one as pending. The end user's typed token still
+        // rides along in ``token`` so the backend can encrypt it
+        // into the pending_token slot.
+        const created = await api.createServer({
+          name,
+          url,
+          token,
+          // Tell the backend which adapter to wrap this connection
+          // with. Backend persists service_type on the row so
+          // subsequent connects route to the right adapter.
+          service_type: serviceType,
+          ...(acceptedFallbackFromId
+            ? { use_fallback_from_server_id: acceptedFallbackFromId }
+            : {}),
+        });
+        // Item 3: stash the new id on the close payload so the parent
+        // panel can probe pin-migration suggestions right after.
+        if (created && typeof created === 'object' && 'id' in created) {
+          onAddedServerId?.(String((created as { id: string }).id), String((created as { name: string }).name));
+        }
       }
       onClose(true);
     } catch (e) {
@@ -770,19 +1079,169 @@ function ServerEditor(props: {
   // For *new* servers, Save is disabled until a successful test AND
   // the duplicate-machine-identifier check passes. For *editing*,
   // Save is enabled whenever the form has required fields filled.
+  //
+  // Fallback-accepted path: after the end user clicks "Try fallback
+  // token" we record ``acceptedFallbackFromId`` and the save flow
+  // submits ``use_fallback_from_server_id`` so the backend stores
+  // the borrowed token and stashes the typed one as pending. In
+  // this state ``probe.ok`` is still false (the typed token still
+  // 401s; that's the whole reason fallback was offered), so the
+  // probe.ok guard above would lock Save forever. Treat the
+  // fallback acceptance as the equivalent of a successful probe
+  // for the purpose of the canSave gate; the backend re-probes
+  // with the borrowed token at save time and rejects if anything
+  // changed between Test and Save.
+  const fallbackAcceptedAndUsable = !!(
+    acceptedFallbackFromId
+    && probe?.fallback
+    && probe.fallback.borrowed_from_server_id === acceptedFallbackFromId
+  );
   const canSave = server
     ? !!(name.trim() && url.trim())
     : !!(
         name.trim() && url.trim() && token.trim()
-        && probe?.ok
-        && !probe.duplicate_of
+        && (
+          (probe?.ok && !probe.duplicate_of)
+          || fallbackAcceptedAndUsable
+        )
       );
 
   return (
     <div className="panel">
       <h2>{server ? `Edit Server: ${server.name}` : 'Add Server'}</h2>
       {error && <div className="banner error">{error}</div>}
-      {probe && !probe.ok && (
+      {probe && !probe.ok && probe.status === 'auth_error' && !acceptedFallbackFromId && (
+        // 401/403 gets its own banner so the end user's first reaction
+        // is "wrong token" rather than "network down." The token-finder
+        // link points at Plex's own canonical docs because the
+        // procedure (browser dev tools / View XML) is Plex-specific
+        // and changes faster than anything we'd duplicate here.
+        <div className="banner error">
+          <strong>Token rejected.</strong>{' '}
+          {probe.detail || 'The server returned an authorization error.'}
+          {probe.fallback && (
+            <div style={{ marginTop: 8, padding: 8, background: 'rgba(255,165,0,0.08)', border: '1px solid var(--accent-warn, orange)', borderRadius: 4 }}>
+              <strong>Fallback available.</strong>{' '}
+              Your saved token from <strong>{probe.fallback.borrowed_from_server_name}</strong> connected
+              successfully against this URL (server reports itself as
+              <strong> {probe.fallback.friendly_name || '(no name)'}</strong>,
+              owner <code>{probe.fallback.owner_name}</code>).
+              <div style={{ fontSize: 12, marginTop: 4 }}>
+                New Plex servers can take a few minutes to propagate their
+                token to Plex.tv. You can save now with your existing
+                working token; the typed token will be stashed as a
+                retry-able pending token on this server's row.
+              </div>
+              <div style={{ marginTop: 8 }}>
+                <button
+                  onClick={() => setAcceptedFallbackFromId(
+                    probe.fallback?.borrowed_from_server_id ?? null,
+                  )}
+                  style={{ fontSize: 12 }}
+                >
+                  Try fallback token
+                </button>
+              </div>
+            </div>
+          )}
+          {serviceType === 'plex' && (
+            <div style={{ marginTop: 6, fontSize: 12 }}>
+              Common causes: the token belongs to a different Plex account,
+              the token was revoked under{' '}
+              <a
+                href="https://app.plex.tv/desktop#!/settings/account/devices"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                plex.tv &gt; Authorized Devices
+              </a>
+              , or you pasted a Plex Pass key / Home PIN instead of an
+              X-Plex-Token.{' '}
+              <a
+                href="https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                How to find your X-Plex-Token
+              </a>
+            </div>
+          )}
+          {serviceType === 'jellyfin' && (
+            <div style={{ marginTop: 6, fontSize: 12 }}>
+              Common causes: the API key was revoked or never existed.
+              Generate or copy a fresh admin API key under Dashboard &gt;
+              API Keys on the Jellyfin server, and confirm the URL points
+              at the same install where the key was issued.
+            </div>
+          )}
+          {serviceType === 'emby' && (
+            <div style={{ marginTop: 6, fontSize: 12 }}>
+              Common causes: the API key was revoked or never existed.
+              Generate or copy a fresh admin API key under Settings &gt;
+              Advanced &gt; API Keys on the Emby server, and confirm the
+              URL points at the same install where the key was issued.
+            </div>
+          )}
+        </div>
+      )}
+      {probe && probe.fallback && acceptedFallbackFromId && (
+        // After the operator clicks "Try fallback token", the original
+        // error banner stays hidden and this acceptance banner takes
+        // over. Save will submit with use_fallback_from_server_id so
+        // the backend stores the borrowed token and stashes the typed
+        // one as pending.
+        <div className="banner good">
+          <strong>Fallback accepted.</strong>{' '}
+          Saving will use the borrowed token from
+          <strong> {probe.fallback.borrowed_from_server_name}</strong>.
+          Your typed token will be stashed on this server's row as a
+          pending retry; the Servers list shows a chip with a Retry
+          button once Plex.tv propagates the new server's
+          authorization.
+          <div style={{ marginTop: 6 }}>
+            <button
+              onClick={() => setAcceptedFallbackFromId(null)}
+              style={{ fontSize: 11 }}
+            >
+              Cancel fallback
+            </button>
+          </div>
+        </div>
+      )}
+      {probe && !probe.ok && probe.status === 'ssl_error' && (
+        <div className="banner error">
+          <strong>TLS error.</strong> {probe.detail || 'Certificate verification failed.'}
+          <div style={{ marginTop: 6, fontSize: 12 }}>
+            If this is a local LAN {
+              serviceType === 'plex' ? 'Plex' :
+              serviceType === 'jellyfin' ? 'Jellyfin' :
+              'Emby'
+            } server without a public certificate, try the plain{' '}
+            <code>http://</code> URL on its LAN port (usually{' '}
+            <code>{
+              serviceType === 'plex' ? ':32400' : ':8096'
+            }</code>) instead of <code>https://</code>.
+          </div>
+        </div>
+      )}
+      {probe && !probe.ok && probe.status === 'timeout' && (
+        <div className="banner error">
+          <strong>{
+            serviceType === 'plex' ? 'Plex' :
+            serviceType === 'jellyfin' ? 'Jellyfin' :
+            'Emby'
+          } did not respond.</strong> {probe.detail || 'The connection timed out.'}
+          <div style={{ marginTop: 6, fontSize: 12 }}>
+            The server may be starting up, on a slow network, or
+            unreachable from this host. Confirm you can reach the URL
+            from a browser on the same network.
+          </div>
+        </div>
+      )}
+      {probe && !probe.ok
+        && probe.status !== 'auth_error'
+        && probe.status !== 'ssl_error'
+        && probe.status !== 'timeout' && (
         <div className="banner error">
           Connection failed: {probe.detail || probe.status}
         </div>
@@ -811,6 +1270,36 @@ function ServerEditor(props: {
           you intended.
         </div>
       )}
+      {/* Soft duplicate warning for the (name, URL, service) triple.
+          The hard duplicate check by machine_identifier (the banner
+          below) misses the case where the operator removed a server
+          and is re-adding one that has the same friendly identity
+          (same name + URL + backend) but a fresh machine_id allocation.
+          Surface the match as a warning rather than block, since the
+          two ARE different physical installs at the SQLite level. The
+          Exports panel collapses snapshots from this triple back into
+          a single tab automatically, so re-adding under the same name
+          is fine - the warning just nudges the operator in case they
+          actually meant to Edit instead of Add. */}
+      {!server && (() => {
+        const matches = (existingServers || []).filter(
+          (s) =>
+            s.name === name.trim()
+            && s.url === url.trim()
+            && (s.service || 'plex') === 'plex',
+        );
+        if (matches.length === 0) return null;
+        return (
+          <div className="banner warning">
+            <strong>Existing server matches this name + URL.</strong>{' '}
+            A registered server already has this exact friendly name and URL
+            (<strong>{matches[0].name}</strong>). Snapshots from the old
+            entry will be grouped under the same Exports sub-tab as the new
+            one, but you may have intended to <strong>edit</strong> the
+            existing row instead of adding a new one.
+          </div>
+        );
+      })()}
       {probe?.ok && probe.duplicate_of && (
         <div className="banner error">
           <strong>Already registered.</strong>{' '}
@@ -844,19 +1333,75 @@ function ServerEditor(props: {
       <label className="field">
         <span className="label">Friendly name</span>
         <span className="help">Used in CLI flags (<code>--source-server NAME</code>), schedules, and log/snapshot filenames. Must be unique.</span>
-        <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="My Plex" />
+        <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder={
+          serviceType === 'jellyfin' ? 'My Jellyfin' :
+          serviceType === 'emby' ? 'My Emby' :
+          'My Plex'
+        } />
       </label>
+      {/* PR-Backends backend picker. Hidden in the edit path - changing
+          a registered server's backend type isn't supported (the
+          adapter, stored credentials, and on-disk identifiers all
+          assume one backend). For new servers the operator picks once
+          at registration time and the form below adapts its labels +
+          placeholders. */}
+      {!server && (
+        <label className="field">
+          <span className="label">Backend</span>
+          <span className="help">
+            Pick the server software at the URL above. Plex uses the X-Plex-Token model;
+            Jellyfin and Emby use server-issued API keys (Dashboard → API Keys).
+          </span>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            {(['plex', 'jellyfin', 'emby'] as const).map((opt) => (
+              <label key={opt} style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontWeight: 'normal' }}>
+                <input
+                  type="radio"
+                  name="server-backend"
+                  value={opt}
+                  checked={serviceType === opt}
+                  onChange={() => {
+                    setServiceType(opt);
+                    // Reset the probe whenever backend changes - the
+                    // previous probe was scoped to a different adapter.
+                    setProbe(null);
+                    setAcceptedFallbackFromId(null);
+                    // Suggest a sensible default port per backend if
+                    // the operator hasn't already customised the URL.
+                    if (url === 'http://host.docker.internal:32400' || url === 'http://host.docker.internal:8096') {
+                      setUrl(opt === 'plex'
+                        ? 'http://host.docker.internal:32400'
+                        : 'http://host.docker.internal:8096');
+                    }
+                  }}
+                />
+                <span style={{ textTransform: 'capitalize' }}>{opt}</span>
+              </label>
+            ))}
+          </div>
+        </label>
+      )}
       <label className="field">
         <span className="label">Server URL</span>
-        <span className="help">Full URL including protocol and port. On a single-host setup with Plex on the same machine, use <code>http://host.docker.internal:32400</code>.</span>
+        <span className="help">
+          {serviceType === 'plex'
+            ? <>Full URL including protocol and port. On a single-host setup with Plex on the same machine, use <code>http://host.docker.internal:32400</code>.</>
+            : <>Full URL including protocol and port. Default {serviceType === 'jellyfin' ? 'Jellyfin' : 'Emby'} port is <code>8096</code> (HTTP) or <code>8920</code> (HTTPS).</>}
+        </span>
         <input type="text" value={url} onChange={(e) => setUrl(e.target.value)} />
       </label>
       <label className="field">
-        <span className="label">Plex authentication token</span>
+        <span className="label">
+          {serviceType === 'plex' ? 'Plex authentication token' : 'API key'}
+        </span>
         <span className="help">
           {server
-            ? 'A token is already saved. Leave blank to keep it; type a new value to replace it.'
-            : 'Find yours in any X-Plex-Token URL from the Plex web UI.'}
+            ? 'A credential is already saved. Leave blank to keep it; type a new value to replace it.'
+            : serviceType === 'plex'
+              ? 'Find yours in any X-Plex-Token URL from the Plex web UI.'
+              : serviceType === 'jellyfin'
+                ? 'In Jellyfin Dashboard -> API Keys, create a new key and paste it here.'
+                : 'In Emby Dashboard -> API Keys, create a new key and paste it here.'}
         </span>
         <input type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder={server ? '••••••••' : ''} />
       </label>
@@ -872,9 +1417,11 @@ function ServerEditor(props: {
         </button>
         <button onClick={() => onClose(false)}>Cancel</button>
       </div>
-      {!server && !probe?.ok && (
+      {!server && !probe?.ok && !fallbackAcceptedAndUsable && (
         <p style={{ color: 'var(--text-dim)', fontSize: 12, marginTop: 8 }}>
-          For a new server, the Save button is enabled only after a successful Test Connection.
+          For a new server, the Save button is enabled after a successful
+          Test Connection, or after clicking "Try fallback token" on the
+          auth_error banner when a fallback is on offer.
         </p>
       )}
       {!server && probe?.ok && probe.duplicate_of && (
@@ -890,6 +1437,104 @@ function ServerEditor(props: {
 // server row. Polls the server's walk status on mount so the button's
 // title reflects the most recent walk time without needing the parent
 // to thread the data down.
+// Pending-token chip + Retry button. Visible only on registry rows
+// that have ``has_pending_token=true`` (the end user's typed token
+// failed at Add-server time but a borrowed token connected; the
+// typed token is sitting in pending_token waiting for Plex.tv to
+// propagate the new server's authorization). Click Retry to re-probe
+// the pending token; on success the backend swaps it into the
+// active slot and clears the pending fields, and the parent panel
+// refreshes the row.
+function PendingTokenChip({
+  serverId,
+  firstSeenAt,
+  lastProbedAt,
+  onSwapped,
+}: {
+  serverId: string;
+  firstSeenAt?: number;
+  lastProbedAt?: number;
+  onSwapped: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<
+    | { ok: boolean; swapped: boolean; status: string; detail: string }
+    | null
+  >(null);
+
+  const ageHint = firstSeenAt && firstSeenAt > 0
+    ? ` (stashed ${new Date(firstSeenAt * 1000).toLocaleDateString()})`
+    : '';
+  const lastTriedHint = lastProbedAt && lastProbedAt > 0
+    ? ` · last tried ${new Date(lastProbedAt * 1000).toLocaleString()}`
+    : '';
+
+  const onRetry = async () => {
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await api.retryPendingToken(serverId);
+      setResult(r);
+      if (r.swapped) {
+        // Parent refresh: re-pulls the server list so this row
+        // loses its pending chip + any other identity fields update
+        // to the post-swap state.
+        onSwapped();
+      }
+    } catch (e) {
+      setResult({
+        ok: false,
+        swapped: false,
+        status: 'error',
+        detail: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <span
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '2px 6px',
+        borderRadius: 999,
+        background: 'rgba(255,165,0,0.12)',
+        border: '1px solid var(--accent-warn, orange)',
+        fontSize: 11,
+      }}
+      title={
+        'A previously-typed token is parked on this server because it '
+        + 'returned 401 at Add time. Retry it: if Plex.tv has finished '
+        + 'propagating its authorization, the pending token becomes the '
+        + 'active token and this chip disappears. Otherwise the chip '
+        + 'remains and you can try again later.'
+        + ageHint
+        + lastTriedHint
+      }
+    >
+      <span>Pending token{ageHint}</span>
+      <button
+        onClick={onRetry}
+        disabled={busy}
+        style={{ fontSize: 10, padding: '1px 6px' }}
+      >
+        {busy ? 'Probing…' : 'Retry'}
+      </button>
+      {result && !busy && (
+        <span style={{ color: result.swapped ? 'var(--accent-ok, green)' : 'var(--text-dim)' }}>
+          {result.swapped
+            ? '✓ swapped'
+            : `${result.status}: ${result.detail.slice(0, 60)}${result.detail.length > 60 ? '…' : ''}`}
+        </span>
+      )}
+    </span>
+  );
+}
+
+
 function WalkButton({ serverId }: { serverId: string }) {
   const [status, setStatus] = useState<{
     running: boolean;
@@ -961,7 +1606,7 @@ function WalkButton({ serverId }: { serverId: string }) {
 //
 // The Plex section type is a structural label ("movie", "show",
 // "artist") that doesn't read well as a unit. These helpers turn the
-// type + leaf_counts into the operator-facing strings the catalogue
+// type + leaf_counts into the end user-facing strings the catalogue
 // renders for each library row.
 
 function _topLevelUnit(type: string, count: number): string {
@@ -999,7 +1644,7 @@ function _renderServerCount(
   plural: string,
 ): string {
   // null / undefined = never captured. Render as a question mark so
-  // operators can tell stale metadata from a confirmed zero.
+  // end users can tell stale metadata from a confirmed zero.
   if (value === null || value === undefined) {
     return `? ${plural}`;
   }
@@ -1010,7 +1655,7 @@ function _renderServerCount(
 // Library Catalogues: one sub-tab per registered server, mirroring the
 // nav-strip pattern used elsewhere in the Help panel. Keeps the
 // catalogue panel a fixed height regardless of how many servers are
-// registered, and lets the operator focus on one server's libraries at
+// registered, and lets the end user focus on one server's libraries at
 // a time without scrolling past sibling cards.
 function LibraryCataloguesPanel({ servers }: { servers: ServerView[] }) {
   const [selectedId, setSelectedId] = useState<string>(servers[0]?.id ?? '');
@@ -1115,10 +1760,12 @@ function ServerUsersPanel({
     <div className="panel">
       <h2>Server Users</h2>
       <p style={{ color: 'var(--text-dim)', fontSize: 12, marginTop: 0 }}>
-        Owner + Plex Home managed users on each registered server. Edit the owner's
-        display name inline, that name propagates to the dashboard run header, the
-        activity feed, and the direct-transfer user selector. Managed users' display
-        names are not editable in this version.
+        Read-only roster of the owner + Plex Home managed users on each
+        registered server. 2026-05-17: display-name editing lives on{' '}
+        <strong>Settings ▸ User Management</strong> — the canonical
+        identity-management surface across the app. Display names set
+        there propagate to the dashboard run header, activity feed,
+        and user pickers everywhere.
       </p>
       <nav className="tabs sub-tabs" style={{ marginBottom: 12 }}>
         {servers.map((s) => (

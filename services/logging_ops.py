@@ -69,7 +69,7 @@ class _EngineOnlyFilter(logging.Filter):
     # log. The post-job snapshot-capture hook (``_capture_snapshot_after_run``)
     # is engine-adjacent work whose success / failure belongs in the
     # run log next to the engine output. Pre-fix, hook failures only
-    # surfaced in uvicorn's stdout and the operator had no visible
+    # surfaced in uvicorn's stdout and the end user had no visible
     # signal that the snapshot artifact wasn't produced.
     _EXCLUDED_PREFIXES = ("plexmigrate.server", "plexmigrate.db_access")
     _ALLOWED_PREFIXES = ("plexmigrate.server.jobs",)
@@ -273,7 +273,7 @@ def setup_logging(
         # (doesn't reference ``destination_tag``) and a shared console
         # should show every destination's records interleaved in
         # fan-out - filtering would hide siblings' output from the
-        # operator watching the terminal.
+        # end user watching the terminal.
         logger.addHandler(ch)
         state._console_handler = ch
         media_logger = logging.getLogger("plexmigrate.media")

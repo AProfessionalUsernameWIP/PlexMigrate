@@ -75,21 +75,79 @@ def _resolve_run_dir(base: Path, run_name: str) -> Path:
 
 # ── Listing ──────────────────────────────────────────────────────────────────
 
+_RUN_DIR_RE = re.compile(
+    # Engine writes run dirs as ``run_<slug>_<YYYYMMDD>_<HHMMSS>`` and
+    # appends ``_PASS`` / ``_FAIL`` on finalisation. <slug> may contain
+    # underscores (combined fan-out slugs include hyphens but no
+    # underscores between the slug and the timestamp), so we anchor on
+    # the trailing date / time tail to extract the slug greedily.
+    r"^run_(?P<slug>.+?)_(?P<date>\d{8})_(?P<time>\d{6})(?:_PASS|_FAIL)?$"
+)
+
+
+def _extract_server_slug(run_dir_name: str) -> "str | None":
+    """
+    Pull the server slug out of a per-run directory name. Returns
+    None when the name does not match the engine's run-dir format
+    (e.g. an unrelated directory dropped into ``log_dir/`` by hand).
+
+    Slugs may legitimately encode multi-server combined transfers as
+    ``<src>-to-<dst>`` (see jobs._run_direct's combined_slug); those
+    are returned verbatim so the per-server UI can decide whether to
+    surface them under both source and dest.
+    """
+    m = _RUN_DIR_RE.match(run_dir_name)
+    return m.group("slug") if m else None
+
+
 def list_runs() -> List[Dict[str, Any]]:
     """
     Return the per-run subdirectories under the configured log dir,
     newest first. Each entry has:
 
-      * ``name``       - directory name (e.g. ``20260510_135425_PASS``)
-      * ``mtime``      - modification time UNIX timestamp
-      * ``size``       - total bytes across all files in the run
-      * ``passed``     - True/False/None for the *_PASS / *_FAIL / no-suffix cases
-      * ``file_count`` - number of regular files in the run dir
+      * ``name``         - directory name (e.g. ``run_Plex1_20260510_135425_PASS``)
+      * ``mtime``        - modification time UNIX timestamp
+      * ``size``         - total bytes across all files in the run
+      * ``passed``       - True/False/None for the *_PASS / *_FAIL / no-suffix cases
+      * ``file_count``   - number of regular files in the run dir
+      * ``server_slug``  - extracted from the directory name, or None
+      * ``server_id``    - reverse-mapped to a registered server by
+                           comparing the slug to every server's
+                           safe_server_name. None when no live server
+                           matches (server removed since the run wrote).
+      * ``server_name``  - friendly name of that server when matched.
     """
     settings = load_settings()
     base = Path(settings.get("log_dir") or "./plex_logs")
     if not base.exists():
         return []
+
+    # Build the slug -> (server_id, server_name) reverse map once.
+    # Done inside list_runs (not at module level) so the map refreshes
+    # on every call; the end user may add or remove servers between
+    # log-list refreshes.
+    slug_to_server: Dict[str, Dict[str, str]] = {}
+    try:
+        from server.server_registry import list_servers, backend_aware_slug
+        for sv in list_servers():
+            service_type = (sv.get("service_type") or "plex").lower()
+            slug = backend_aware_slug(sv.get("name") or "", service_type)
+            if slug:
+                slug_to_server[slug] = {
+                    "server_id": sv.get("id") or "",
+                    "server_name": sv.get("name") or "",
+                    # TODO-AGENT-2-3 (from Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md):
+                    # ship service_type on the log-list row so the
+                    # Logs panel's backend-tier filter can join via
+                    # the response shape instead of an extra
+                    # registry round-trip per row.
+                    "service_type": service_type,
+                }
+    except Exception:
+        # Registry unavailable; degrade gracefully. The per-run
+        # entries still carry server_slug; the frontend can fall back
+        # to "(unknown server)" grouping if needed.
+        pass
 
     entries: List[Dict[str, Any]] = []
     for child in base.iterdir():
@@ -104,12 +162,23 @@ def list_runs() -> List[Dict[str, Any]]:
             passed = False
         else:
             passed = None
+        slug = _extract_server_slug(name)
+        match = slug_to_server.get(slug or "") if slug else None
         entries.append({
             "name": name,
             "mtime": child.stat().st_mtime,
             "size": total,
             "passed": passed,
             "file_count": len(files),
+            "server_slug": slug,
+            "server_id": (match or {}).get("server_id") or None,
+            "server_name": (match or {}).get("server_name") or None,
+            # TODO-AGENT-2-3: backend discriminator so the Logs panel
+            # can filter without joining through the registry per row.
+            # ``None`` when the slug doesn't resolve (server removed
+            # or run from a since-deleted registration); the frontend
+            # treats null as the legacy "Plex" bucket.
+            "service_type": (match or {}).get("service_type") or None,
         })
     entries.sort(key=lambda e: e["mtime"], reverse=True)
     return entries
@@ -185,7 +254,7 @@ def delete_log_dirs_by_slug(slug: str) -> Tuple[int, List[str]]:
     into the run dir during a job, so a cascade attempted while a
     job is in flight may legitimately fail on the live run dir.
     That's fine - the error string surfaces in the cascade summary
-    and the operator can retry once the job finishes.
+    and the end user can retry once the job finishes.
     """
     deleted = 0
     errors: List[str] = []
@@ -327,17 +396,17 @@ def delete_all_runs() -> Tuple[int, List[str]]:
 # Cap *live-tail* reads at 16 MB so a runaway client request can't
 # try to hydrate a multi-gigabyte file into the browser in one shot.
 # Files larger than this fall back to a tail-of-last-16-MB view in
-# the in-browser viewer; the operator can still fetch the complete
+# the in-browser viewer; the end user can still fetch the complete
 # file via :func:`open_for_download` (which the
 # ``GET /api/logs/{run}/{file}/download`` endpoint serves as a
 # regular HTTP attachment, bypassing this cap).
 #
 # Pre-PR-13 fix #5 this was 4 MB - too aggressive given typical
 # snapshot-run log sizes. 16 MB covers the vast majority of runs in
-# the viewer without forcing the operator to download.
+# the viewer without forcing the end user to download.
 #
 # Hot-reload (Phase 3): the cap is read from
-# ``services.tunables.log_read_max_bytes`` at each read so an operator
+# ``services.tunables.log_read_max_bytes`` at each read so an end user
 # bumping it via Settings ▸ Tunables takes effect on the next request.
 # The constant below is the historical fallback.
 _MAX_READ_BYTES_FALLBACK = 16 * 1024 * 1024

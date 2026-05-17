@@ -149,7 +149,7 @@ class _ServerBucket:
         over the trailing 60-second window. Aging is timestamp-based:
         entries older than ``_WINDOW_SECONDS`` are dropped from the
         rolling-window aggregates (but kept in cumulative counters so
-        the operator can still see "this server returned 47 429s
+        the end user can still see "this server returned 47 429s
         since the process started" elsewhere).
         """
         with self.lock:
@@ -174,7 +174,7 @@ class _ServerBucket:
                 for e in self.rate_limit_ring if e.timestamp >= cutoff
             ]
             # Window-scoped status histogram so the UI can show "in
-            # the last minute: 87% 200, 13% 429" without the operator
+            # the last minute: 87% 200, 13% 429" without the end user
             # mentally subtracting old cumulative counts.
             window_status: Dict[str, int] = {}
             for e in window_entries:
@@ -339,7 +339,7 @@ def snapshot_for_host(url_or_host: str) -> Optional[Dict[str, Any]]:
 
 def reset_all() -> None:
     """
-    Discard every bucket. Intended for tests and for an operator
+    Discard every bucket. Intended for tests and for an end user
     "clear telemetry" action; not called from any production path.
     """
     with _buckets_lock:

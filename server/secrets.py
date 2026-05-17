@@ -109,7 +109,7 @@ def _load_or_create_key() -> bytes:
     # (the directory may still hold encrypted JSON from before the
     # delete), so the warning is always emitted on creation. On a
     # genuinely fresh install the line is informational; on a
-    # post-delete install it is the actionable signal the operator
+    # post-delete install it is the actionable signal the end user
     # needs to re-enter their credentials.
     log.warning(
         "Generated new encryption key at %s. If this is NOT a fresh "

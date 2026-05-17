@@ -79,6 +79,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from server.persistence import get_data_dir
 from services.guid_translator import normalize_guid, normalize_guids
+from services.user_uuid import (
+    build_app_user_uuid,
+    generate_user_key,
+    server_uid_from_app_user_uuid,
+    slugify_host_name,
+)
 
 
 log = logging.getLogger("plexmigrate.server.media_db")
@@ -273,7 +279,7 @@ _MIGRATIONS: List[Tuple[int, str]] = [
     # sync helper never resets it). Global tombstones are a separate
     # tiny table keyed by username only: a globally-tombstoned
     # username is never upserted into managed_users, so the row
-    # disappears across every server until the operator unhides
+    # disappears across every server until the end user unhides
     # globally.
     (5, """
         ALTER TABLE managed_users
@@ -300,7 +306,7 @@ _MIGRATIONS: List[Tuple[int, str]] = [
     # when it started, when it finished, how many items were ticked,
     # whether the walk completed or aborted. The Prune Missing Items
     # UI reads this so it can warn "no walk in the last 7 days -
-    # results may be stale" before letting the operator press the
+    # results may be stale" before letting the end user press the
     # destructive button.
     #
     # ``items.last_seen_at`` exists too so an item visible on ANY
@@ -511,6 +517,192 @@ _MIGRATIONS: List[Tuple[int, str]] = [
         CREATE INDEX IF NOT EXISTS idx_collections_section
             ON collections(server_id, section_key);
     """),
+    # Migration v9: managed_users share-state columns. The user-filter
+    # work (Plan[USER-FILTER]-2026-05-15.md) needs to distinguish three
+    # row classes that look identical today:
+    #
+    #   * ``active_share=1``: user currently has an active share on
+    #     this server. ``shared_state_refreshed_at`` records when we
+    #     last confirmed this via the Plex.tv shared_servers endpoint.
+    #   * ``active_share=0``: user used to have a share but the server
+    #     no longer reports them in shared_servers. Stale - end user
+    #     removed access, or revoked them, or Plex.tv pruned. The
+    #     panel renders them greyed-out with a "No active share"
+    #     badge; the engine skips them with a clear log line.
+    #   * ``is_pin_protected=1``: user is a Plex Home account with a
+    #     PIN set. Distinguished from "no longer shared" so the engine
+    #     can emit "PIN-protected, save PIN under User Management"
+    #     instead of a generic warning.
+    #
+    # All three columns nullable / default 0 / default NULL so existing
+    # rows survive the migration. The sync flow populates them on the
+    # next sync.
+    (9, """
+        ALTER TABLE managed_users
+            ADD COLUMN active_share INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE managed_users
+            ADD COLUMN is_pin_protected INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE managed_users
+            ADD COLUMN shared_state_refreshed_at REAL;
+    """),
+    # Migration v10 (2026-05-15 follow-up #3): canonical per-user
+    # identifier. Pre-v10 the share-state refresh matched
+    # ``managed_users.username`` (sourced from ``server.systemAccounts()``,
+    # often the display name like "Crystal Jean") against the Plex.tv
+    # ``shared_servers`` payload (keyed by handle like "crystalj1"). Even
+    # with multi-alias enrichment from ``account.users()``, this remains
+    # fragile to Unicode, emoji, diacritics, punctuation variants,
+    # whitespace differences, and duplicate display names. Storing the
+    # stable Plex.tv numeric ``userID`` per row and matching by it
+    # eliminates the whole class of name-matching bugs and gives Feature
+    # 5 (live watch sync, identity links) the canonical column it needs.
+    #
+    # Additive nullable column; rows seeded before v10 carry NULL until
+    # the next refresh resolves them via alias matching, at which point
+    # the ID is backfilled. The index supports the per-server lookup
+    # path used by ``_refresh_share_state`` and (later) the sync
+    # dispatcher's identity resolver.
+    (10, """
+        ALTER TABLE managed_users
+            ADD COLUMN backend_user_id TEXT;
+        CREATE INDEX IF NOT EXISTS idx_managed_users_backend_user_id
+            ON managed_users(server_id, backend_user_id);
+    """),
+    (11, """
+        -- Plan[RUN-JOB-UI] follow-up: cross-server user identity
+        -- mapping. Pairs (server_a, handle_a) <-> (server_b, handle_b)
+        -- so the engine can resolve "same human" across servers and
+        -- backends. The pair is bidirectional; queries walk both
+        -- (a -> b) and (b -> a) lookups.
+        --
+        -- ``source`` carries the provenance: 'manual' for end user-
+        -- authored mappings, 'auto_copy' for mappings written by the
+        -- POST /api/users/copy_to_destination flow. Useful for the
+        -- mapping panel UI to badge which rows the end user added vs
+        -- which the system inferred.
+        --
+        -- The UNIQUE constraint covers exact-pair duplicates only;
+        -- a row (A, alice, B, alice) is distinct from (B, alice, A,
+        -- alice) at the table level but the read helper canonicalises
+        -- pair direction so the listing UI never shows both forms.
+        CREATE TABLE IF NOT EXISTS user_identity_map (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_a_id   TEXT NOT NULL,
+            user_a_handle TEXT NOT NULL,
+            server_b_id   TEXT NOT NULL,
+            user_b_handle TEXT NOT NULL,
+            source        TEXT NOT NULL DEFAULT 'manual'
+                                  CHECK (source IN ('manual', 'auto_copy')),
+            created_at    REAL NOT NULL,
+            UNIQUE(server_a_id, user_a_handle, server_b_id, user_b_handle)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_identity_map_a
+            ON user_identity_map(server_a_id, user_a_handle);
+        CREATE INDEX IF NOT EXISTS idx_user_identity_map_b
+            ON user_identity_map(server_b_id, user_b_handle);
+    """),
+    # Migration v12 (USER-MGMT-IDENTITY-AUDIT follow-up): app-generated
+    # stable user identifier (``app_user_uuid``) on every (server, user)
+    # row plus a re-key of ``user_identity_map`` from (server_id,
+    # user_handle) tuples to (app_user_uuid_a, app_user_uuid_b) pairs.
+    #
+    # Format of app_user_uuid is documented in
+    # :mod:`services.user_uuid`. Canonical 4-part form:
+    #     <Service>-<HostNameSlug>-<server_uid>-<userkey>
+    # Example: ``Plex-JadeTV-plex_a1b2c3d4-a3f9c2d8``.
+    #
+    # Two-step shape:
+    #
+    #   (a) ADD COLUMN app_user_uuid TEXT on ``managed_users`` +
+    #       ``server_users``. Column is nullable here; the Python
+    #       boot-time backfill (:func:`_backfill_app_user_uuids`)
+    #       fills any NULL row on first init after upgrade. The
+    #       partial UNIQUE indexes enforce uniqueness only on filled
+    #       rows so the backfill never sees a constraint conflict
+    #       between two NULLs.
+    #
+    #   (b) DROP the v11 ``user_identity_map`` table and re-create
+    #       with (``user_a_uuid``, ``user_b_uuid``, source, created_at).
+    #       Pre-release Legacy Policy applies (see CLAUDE.md): any
+    #       end user-authored rows from the v11 shape are lost in
+    #       the upgrade. The auto-link helper
+    #       (:func:`auto_link_identity_map_by_backend_user_id`) re-
+    #       derives same-backend pairs on the next managed-users sync;
+    #       cross-backend end user mappings need to be re-entered via
+    #       the Cross-Platform Preflight modal or the User Mapping
+    #       panel after upgrade. A release note in the closing
+    #       Finding[USER-MGMT-IDENTITY-IMPL] doc spells this out.
+    #
+    # Server-rename behaviour: on every server rename,
+    # :func:`rewrite_app_user_uuid_host_slug_for_server` walks every
+    # row carrying a UUID whose server_uid portion matches the renamed
+    # server and updates the HostNameSlug segment. The server_uid +
+    # userkey portion is the immutable identity anchor; the slug is
+    # cosmetic.
+    (12, """
+        ALTER TABLE managed_users ADD COLUMN app_user_uuid TEXT;
+        ALTER TABLE server_users  ADD COLUMN app_user_uuid TEXT;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_users_app_uuid
+            ON managed_users(app_user_uuid)
+            WHERE app_user_uuid IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_server_users_app_uuid
+            ON server_users(app_user_uuid)
+            WHERE app_user_uuid IS NOT NULL;
+
+        DROP TABLE IF EXISTS user_identity_map;
+        CREATE TABLE user_identity_map (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_a_uuid   TEXT NOT NULL,
+            user_b_uuid   TEXT NOT NULL,
+            source        TEXT NOT NULL DEFAULT 'manual'
+                                  CHECK (source IN ('manual', 'auto_copy')),
+            created_at    REAL NOT NULL,
+            UNIQUE(user_a_uuid, user_b_uuid)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_identity_map_a
+            ON user_identity_map(user_a_uuid);
+        CREATE INDEX IF NOT EXISTS idx_user_identity_map_b
+            ON user_identity_map(user_b_uuid);
+    """),
+    # Migration v13 (USER-MGMT-IDENTITY-IMPL follow-up): transitive
+    # closure on add_identity_map + cascade on delete.
+    #
+    # End user-reported bug: when an Emby account was manually mapped
+    # to one of three Plex owners already linked to each other via
+    # auto_copy rows (same Plex.tv backend_user_id), the new Emby row
+    # only showed ONE Plex owner in its Identity Links panel - the
+    # one it was directly mapped to. The other two Plex owners were
+    # reachable transitively through the existing equivalence class
+    # but the data model only stored direct edges.
+    #
+    # Fix: when add_identity_map writes a new edge, fan out across
+    # the bipartite product of the two equivalence classes it joins.
+    # The fanned-out rows carry ``derived_from_id`` pointing at the
+    # row they were derived from. delete_identity_map cascades that
+    # column: deleting a parent row drops every child that pointed
+    # at it. This keeps deletion semantics intuitive (end user
+    # removes the manual edge they typed, the transitive copies it
+    # spawned go away).
+    #
+    # NULL derived_from_id semantics:
+    #   * Manual rows the end user typed         -> NULL
+    #   * auto_link by backend_user_id rows      -> NULL (independent
+    #     of any other edge; the cross-server backend_user_id is the
+    #     provenance, not another identity_map row)
+    #   * Transitive fanout rows                 -> the id of the
+    #     manual row that triggered the fanout
+    #
+    # Additive only; rows from v12 keep their default NULL and behave
+    # as standalone (no cascade victims). New manual writes from v13+
+    # populate derived_from_id correctly on every fan-out row.
+    (13, """
+        ALTER TABLE user_identity_map
+            ADD COLUMN derived_from_id INTEGER;
+        CREATE INDEX IF NOT EXISTS idx_user_identity_map_derived_from
+            ON user_identity_map(derived_from_id)
+            WHERE derived_from_id IS NOT NULL;
+    """),
 ]
 
 
@@ -523,7 +715,7 @@ _MIGRATIONS: List[Tuple[int, str]] = [
 # migration runner brings a freshly-created DB up to this version.
 #
 # Bumping this constant is the trigger for the auto-archive behaviour
-# on every operator's next start. Change it only when the schema
+# on every end user's next start. Change it only when the schema
 # break is significant enough that backfill is infeasible - adding a
 # nullable column doesn't require a bump; adding a NOT NULL anchor
 # column does.
@@ -588,6 +780,18 @@ def init_media_db() -> None:
         _initialised = True
         log.info("media.db initialised at %s (schema v%d)",
                  path, get_schema_version())
+    # Best-effort backfill of any (server, user) row missing its
+    # app_user_uuid. Runs OUTSIDE _init_lock so server_registry's own
+    # lock can't deadlock against ours. Idempotent: every subsequent
+    # call no-ops on installs where every row already carries a UUID.
+    try:
+        _backfill_app_user_uuids()
+    except Exception:
+        log.exception(
+            "app_user_uuid backfill failed at init; rows will be filled "
+            "on next sync. Resolution paths fall back to handle matching "
+            "until that completes."
+        )
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
@@ -667,7 +871,7 @@ def get_stats() -> Dict[str, Any]:
     """
     Return a JSON-safe snapshot of database health: per-table row
     counts, schema version, the on-disk byte size of the DB file, and
-    the highest ``updated_at`` across content tables (so operators
+    the highest ``updated_at`` across content tables (so end users
     can spot a stale DB).
     """
     conn = _require_conn()
@@ -873,22 +1077,34 @@ def get_or_create_server_user(
     inferred_role = role or ("owner" if handle == "" else "managed")
     conn = _require_conn()
     now = time.time()
+    # Generate the app_user_uuid OUTSIDE the writer lock: the generator
+    # uses SELECT probes (WAL handles read isolation lock-free). The
+    # COALESCE inside ON CONFLICT preserves an existing UUID on update,
+    # so this freshly-generated value is only used when the conflict
+    # path picks NULL (new insert OR pre-backfill row).
+    candidate_uuid = generate_unique_app_user_uuid(
+        service_type=backend or "plex",
+        server_id=server_id,
+        server_uid=server_id,
+    )
     with _DB_LOCK:
         conn.execute(
             """
             INSERT INTO server_users (
                 server_id, user_handle, display_name, role, backend,
-                backend_user_id, created_at, last_seen_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                backend_user_id, app_user_uuid, created_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(server_id, user_handle) DO UPDATE SET
                 display_name    = COALESCE(excluded.display_name,
                                            server_users.display_name),
                 backend_user_id = COALESCE(excluded.backend_user_id,
                                            server_users.backend_user_id),
+                app_user_uuid   = COALESCE(server_users.app_user_uuid,
+                                           excluded.app_user_uuid),
                 last_seen_at    = excluded.last_seen_at
             """,
             (server_id, handle, display_name, inferred_role, backend,
-             backend_user_id, now, now),
+             backend_user_id, candidate_uuid, now, now),
         )
         row = conn.execute(
             "SELECT id FROM server_users "
@@ -1219,15 +1435,15 @@ def purge_server_data(server_id: str) -> Dict[str, int]:
 
     Called from two places:
 
-      * ``server_registry.remove_server`` when the operator deletes a
+      * ``server_registry.remove_server`` when the end user deletes a
         server with ``cascade_delete_on_server_remove = true`` and
         ``prevent_cascade_delete = false``.
       * The "Clear media.db data" UI action in the Servers panel -
-        operator-explicit request, runs regardless of the cascade
+        end user-explicit request, runs regardless of the cascade
         setting.
 
     Both sites wrap this call in a try/except so a failed purge
-    surfaces to the operator rather than being swallowed.
+    surfaces to the end user rather than being swallowed.
 
     Audit
     -----
@@ -1283,7 +1499,7 @@ def purge_server_data(server_id: str) -> Dict[str, int]:
 # ``last_seen_at`` on every (item, server) row whose item is still
 # present on the live server. The Prune Missing Items action reads
 # those timestamps to identify items the server hasn't reported in
-# more than N days - candidates the operator may want to remove.
+# more than N days - candidates the end user may want to remove.
 #
 # Critical design notes:
 #
@@ -1291,10 +1507,10 @@ def purge_server_data(server_id: str) -> Dict[str, int]:
 #   on a single scan is not proof of permanent removal (library scan
 #   could have missed, file could be temporarily offline). The walk
 #   *only* refreshes timestamps; pruning is a separate, explicit,
-#   operator-initiated action.
+#   end user-initiated action.
 # * The walk records its own provenance in ``library_walks`` so the
 #   prune UI can show "no walk in last X days, results may be stale"
-#   before the operator commits to a destructive sweep.
+#   before the end user commits to a destructive sweep.
 
 
 def start_library_walk(server_id: str) -> int:
@@ -1517,7 +1733,7 @@ def prune_stale_items(
     the same shape with the counts that WOULD be deleted but writes
     nothing.
 
-    What gets deleted (operator-confirmed, never automatic):
+    What gets deleted (end user-confirmed, never automatic):
 
     * ``server_items`` rows for the stale items on this server. The
       resolver's Tier-0 cache loses these entries for this server
@@ -1548,7 +1764,7 @@ def prune_stale_items(
 
     # H2: a destructive prune is only meaningful once a library walk
     # has actually populated last_seen_at timestamps. Refuse outright
-    # rather than silently pruning nothing, so the operator gets a
+    # rather than silently pruning nothing, so the end user gets a
     # clear reason instead of a confusing "0 items pruned" result.
     if not dry_run and get_last_walk_summary(server_id) is None:
         raise ValueError(
@@ -1736,7 +1952,7 @@ def upsert_library_section(
             """,
             (server_id, int(section_key), section_title, section_type, now, now),
         )
-    # Audit: dimension-table writes are operator-meaningful state
+    # Audit: dimension-table writes are end user-meaningful state
     # changes. Volume is low (one per library per snapshot run) so the
     # audit log doesn't bloat.
     try:
@@ -2368,7 +2584,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
 
 # ── Managed users (PR-10) ───────────────────────────────────────────────────
 #
-# Per-(server, username) records of the operators / managed users
+# Per-(server, username) records of the end users / managed users
 # known to each registered server. Stores both metadata (display name,
 # service type, machine identifier, last_seen) AND optional encrypted
 # credentials (auth token, Plex Home PIN, Emby/Jellyfin password) for
@@ -2427,6 +2643,40 @@ def _row_to_managed_user(
         hidden_scope = "server"
     else:
         hidden_scope = "none"
+    # Share-state columns (migration v9). Rows registered before v9
+    # default to active_share=1 / is_pin_protected=0, and have NULL
+    # refreshed_at. ``keys`` lookup handles the not-yet-migrated case
+    # defensively; production code paths use the migrated columns.
+    try:
+        active_share = bool(row["active_share"])
+    except (IndexError, KeyError):
+        active_share = True
+    try:
+        is_pin_protected = bool(row["is_pin_protected"])
+    except (IndexError, KeyError):
+        is_pin_protected = False
+    try:
+        shared_state_refreshed_at = row["shared_state_refreshed_at"]
+    except (IndexError, KeyError):
+        shared_state_refreshed_at = None
+    # Migration v10. Canonical per-user identifier (Plex.tv numeric
+    # userID for ``service_type == 'plex'`` rows; the equivalent
+    # backend-native id for Jellyfin / Emby once those adapters land).
+    # Null on rows that pre-date v10 or that haven't yet resolved via
+    # the share-state refresh path.
+    try:
+        backend_user_id = row["backend_user_id"]
+    except (IndexError, KeyError):
+        backend_user_id = None
+    # Migration v12. App-generated stable user identifier
+    # (USER-MGMT-IDENTITY-AUDIT follow-up). Null on rows that pre-date
+    # v12 or that the boot-time backfill has not yet processed; the
+    # resolution helper falls back to backend_user_id + username
+    # matching when this is None.
+    try:
+        app_user_uuid = row["app_user_uuid"]
+    except (IndexError, KeyError):
+        app_user_uuid = None
     return {
         "id": int(row["id"]),
         "server_id": row["server_id"],
@@ -2443,13 +2693,27 @@ def _row_to_managed_user(
         "hidden_scope": hidden_scope,
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        # Share-state (2026-05-15). UI consumers render greyed-out
+        # rows for ``active_share=False`` and a PIN badge for
+        # ``is_pin_protected=True``. ``shared_state_refreshed_at`` is
+        # surfaced in tooltips so the end user knows how fresh the
+        # determination is. ``None`` means "never refreshed since
+        # the share-state migration landed" - the next sync will
+        # populate it.
+        "active_share": active_share,
+        "is_pin_protected": is_pin_protected,
+        "shared_state_refreshed_at": shared_state_refreshed_at,
+        "backend_user_id": backend_user_id,
+        "app_user_uuid": app_user_uuid,
     }
 
 
 _MANAGED_USER_COLUMNS = (
     "id, server_id, username, display_name, service_type, kind, "
     "machine_identifier, auth_token_enc, plex_home_pin_enc, "
-    "service_password_enc, last_seen, tombstoned, created_at, updated_at"
+    "service_password_enc, last_seen, tombstoned, created_at, updated_at, "
+    "active_share, is_pin_protected, shared_state_refreshed_at, "
+    "backend_user_id, app_user_uuid"
 )
 
 
@@ -2513,7 +2777,7 @@ def upsert_managed_user(
     are NOT touched here - this is the safe path the sync helper takes
     on every server-connect probe, and preserving existing stored
     credentials across resyncs is required (otherwise a re-sync would
-    silently wipe every operator-typed PIN).
+    silently wipe every end user-typed PIN).
 
     ``service_type`` is validated against the CHECK constraint at the
     DB layer; ``kind`` likewise (PR-11 migration v4). The helpers
@@ -2527,24 +2791,35 @@ def upsert_managed_user(
         raise ValueError("username is required")
     conn = _require_conn()
     now = time.time()
+    # Generate a candidate app_user_uuid outside the writer lock. The
+    # COALESCE on the ON CONFLICT path preserves any existing UUID;
+    # the candidate is only used when the conflict picks NULL (new row
+    # OR pre-backfill row).
+    candidate_uuid = generate_unique_app_user_uuid(
+        service_type=service_type or "plex",
+        server_id=server_id,
+        server_uid=server_id,
+    )
     with _DB_LOCK:
         conn.execute(
             """
             INSERT INTO managed_users (
                 server_id, username, display_name, service_type, kind,
-                machine_identifier, last_seen, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                machine_identifier, last_seen, app_user_uuid,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(server_id, username) DO UPDATE SET
                 display_name       = COALESCE(excluded.display_name, managed_users.display_name),
                 service_type       = excluded.service_type,
                 kind               = excluded.kind,
                 machine_identifier = COALESCE(excluded.machine_identifier, managed_users.machine_identifier),
                 last_seen          = COALESCE(excluded.last_seen, managed_users.last_seen),
+                app_user_uuid      = COALESCE(managed_users.app_user_uuid, excluded.app_user_uuid),
                 updated_at         = excluded.updated_at
             """,
             (
                 server_id, username, display_name, service_type, kind,
-                machine_identifier, last_seen, now, now,
+                machine_identifier, last_seen, candidate_uuid, now, now,
             ),
         )
     out = get_managed_user(server_id, username)
@@ -2586,11 +2861,21 @@ def sync_managed_users_from_live(
     except ConnectionError as exc:
         return {"synced": 0, "source_error": None, "error": str(exc)}
 
-    machine_id = (
-        server_registry.get_server_by_id(server_id, include_token=False) or {}
-    ).get("machine_identifier") or None
+    server_row = server_registry.get_server_by_id(server_id, include_token=False) or {}
+    machine_id = server_row.get("machine_identifier") or None
+    # Read the registered backend type so Jellyfin / Emby users get the
+    # correct service_type stamped on their managed_users row. Was
+    # hardcoded 'plex' when this helper landed (live API was Plex-only
+    # at the time); after developer's adapter PRs every backend goes
+    # through here so the hardcode mislabels every Emby + Jellyfin row
+    # as Plex. The registered row's service_type column is the source of
+    # truth (servers.json drives it; the CHECK constraint on
+    # managed_users.service_type enforces the same three values).
+    server_service_type = (server_row.get("service_type") or "plex").strip().lower()
+    if server_service_type not in ("plex", "emby", "jellyfin"):
+        server_service_type = "plex"  # defensive: unknown backend falls back
     now = time.time()
-    # PR-11.1 - usernames the operator has globally tombstoned never
+    # PR-11.1 - usernames the end user has globally tombstoned never
     # get upserted. Skipping them here keeps the row count down for
     # installs with many servers and many hidden users.
     global_set = list_global_tombstone_usernames()
@@ -2611,10 +2896,7 @@ def sync_managed_users_from_live(
                 server_id=server_id,
                 username=raw_name,
                 display_name=(row.get("display_name") or None),
-                # Live API today is Plex-only. PR-11 / Feature 4 in
-                # roadmapplan4.md introduces Emby + Jellyfin probes;
-                # this defaults to 'plex' and stays correct.
-                service_type="plex",
+                service_type=server_service_type,
                 kind=kind,
                 machine_identifier=machine_id,
                 last_seen=now,
@@ -2626,12 +2908,318 @@ def sync_managed_users_from_live(
                 raw_name, server_id,
             )
             continue
+    # ── Share-state cross-reference (2026-05-15) ─────────────────────
+    # After the per-row upserts above (which keep the "do we know
+    # this user exists on this server" surface unchanged), refresh
+    # the three Plex.tv-sourced share-state columns:
+    #   * active_share        - actually has an active share on THIS server
+    #   * is_pin_protected    - has a Plex Home PIN set
+    #   * shared_state_refreshed_at - when we last confirmed via Plex.tv
+    #
+    # Best-effort. A failed fetch leaves prior state intact and a
+    # warning lands on the run log; the UI surfaces refreshed_at so
+    # the end user can tell whether the badge is fresh.
+    share_state_error: Optional[str] = None
+    try:
+        _refresh_share_state(
+            server_id=server_id, machine_id=machine_id, logger=log_,
+        )
+    except Exception as exc:  # pragma: no cover (defensive)
+        log_.exception(
+            "share-state cross-reference failed for server %r", server_id,
+        )
+        share_state_error = f"{type(exc).__name__}: {exc}"
+
+    # USER-MGMT-IDENTITY-AUDIT R-2: after every sync, re-derive
+    # auto_copy identity_map rows from same-(service_type,
+    # backend_user_id) pairs across servers. Closes the cross-server
+    # owner case (and same-human-different-username case) with zero
+    # end user action. Best-effort: a failure here never blocks the
+    # sync result. Idempotent so repeated calls write each pair once
+    # and silently skip duplicates on subsequent runs.
+    auto_link_error: Optional[str] = None
+    auto_link_pairs = 0
+    try:
+        auto_link_summary = auto_link_identity_map_by_backend_user_id()
+        auto_link_pairs = auto_link_summary.get("pairs_written") or 0
+    except Exception as exc:  # pragma: no cover (defensive)
+        log_.exception(
+            "auto_link_identity_map_by_backend_user_id failed for "
+            "server %r; identity-map auto-derivation will retry on "
+            "next sync.",
+            server_id,
+        )
+        auto_link_error = f"{type(exc).__name__}: {exc}"
+
     return {
         "synced": synced,
         "skipped_global_tombstones": skipped_global,
         "source_error": result.get("error"),
+        "share_state_error": share_state_error,
+        "auto_link_pairs_written": auto_link_pairs,
+        "auto_link_error": auto_link_error,
         "error": None,
     }
+
+
+def _refresh_share_state(
+    *,
+    server_id: str,
+    machine_id: Optional[str],
+    logger: logging.Logger,
+) -> None:
+    """
+    Cross-reference the live Plex.tv shared_servers + home/users
+    endpoints against the local managed_users table for ``server_id``
+    and stamp the three share-state columns
+    (``active_share``, ``is_pin_protected``,
+    ``shared_state_refreshed_at``).
+
+    Resolution rules per row:
+
+      * ``active_share=1`` when the username appears in
+        ``shared_servers`` for this machine identifier, OR when the
+        row is the owner row (the admin is always "shared" with
+        themselves). ``active_share=0`` otherwise.
+      * ``is_pin_protected=1`` when the username appears in
+        ``/api/home/users`` with ``protected=1``. ``0`` otherwise.
+
+    Fails soft. Missing machine_id, missing PlexAccount, network
+    failure, or empty fetch results leave prior state intact (no
+    columns updated) and we log a warning.
+    """
+    if not machine_id:
+        logger.debug(
+            "_refresh_share_state: server %r has no machine_identifier; "
+            "skipping share-state refresh.", server_id,
+        )
+        return
+
+    # Connect to Plex via the registered server's stored token so we
+    # have an account object to introspect. We use the existing
+    # connect_to_server primitive rather than building a parallel
+    # auth path; failures here mean "couldn't refresh," not "prune".
+    from server import server_registry
+    try:
+        _conn = server_registry.connect_registered_server(
+            server_id, logger=logger,
+        )
+        srv = _conn.server
+    except Exception:
+        logger.warning(
+            "_refresh_share_state: could not connect to server %r; "
+            "share-state refresh skipped.", server_id,
+        )
+        return
+
+    try:
+        account = srv.myPlexAccount()
+    except Exception:
+        logger.warning(
+            "_refresh_share_state: myPlexAccount() failed for server %r; "
+            "share-state refresh skipped.", server_id,
+        )
+        return
+
+    from services import plex_shares
+    shared = plex_shares.fetch_shared_servers(account, machine_id)
+    protected_map = plex_shares.fetch_home_users_protected_map(account)
+    # Friends index gives us {plex_user_id: {username, title, email}} for
+    # every friend on the account. SharedServer payloads from Plex.tv
+    # routinely omit `title` / `email`; the friends list always carries
+    # them. We use it both for alias enrichment (legacy path, for rows
+    # not yet ID-resolved) and as a sanity cross-check for the IDs we
+    # do see.
+    friends_index = plex_shares.fetch_friends_index(account)
+
+    # Owner's Plex.tv userID. Stored on the owner managed_users row for
+    # Feature 5 cross-server identity links; not used for active_share
+    # decisions (owner rows are unconditionally active). Best-effort
+    # against several attribute names plexapi exposes across versions.
+    owner_user_id = ""
+    for attr in ("id", "userID", "userid"):
+        val = getattr(account, attr, "") or ""
+        if val:
+            owner_user_id = str(val).strip()
+            break
+
+    # Defensive: if BOTH share + protected fetches failed, do not touch
+    # the columns - the prior state plus a stale timestamp is more
+    # honest than zeroing everything out. friends_index alone can't
+    # determine active_share so we don't gate on it.
+    if shared is None and protected_map is None:
+        logger.warning(
+            "_refresh_share_state: both shared_servers and home/users "
+            "lookups failed for server %r; share-state preserved.",
+            server_id,
+        )
+        return
+
+    # ── Build matcher indices ───────────────────────────────────────
+    # Migration v10 (2026-05-15 follow-up #3): once a row has its
+    # ``backend_user_id`` populated, we match on that and ignore the
+    # alias set entirely. The alias path is a backfill fallback for
+    # rows that pre-date v10 or haven't yet been resolved.
+    #
+    #   * ``shared_by_userid`` maps Plex.tv userID -> SharedServer
+    #     entry. The ID-first matcher is one dict lookup per row.
+    #   * ``alias_to_userid`` maps lowercased alias string ->
+    #     Plex.tv userID. When an alias hits, we both flip
+    #     active_share=1 AND backfill the row's backend_user_id so
+    #     subsequent refreshes use the definitive ID path.
+    shared_by_userid: Dict[str, Dict[str, Any]] = {}
+    alias_to_userid: Dict[str, str] = {}
+    # Defensive: a SharedServer entry without a plex_user_id (older
+    # plexapi shapes, sparse XML) still carries aliases we can match
+    # on. Track them in ``seen_aliases`` so name matching still works
+    # for the row; backfill simply can't happen in that case.
+    seen_aliases: set = set()
+    if shared is not None:
+        for entry in shared:
+            pid = (entry.get("plex_user_id") or "").strip()
+            if pid:
+                shared_by_userid[pid] = entry
+            # Direct fields straight off the SharedServer payload.
+            for key in ("username", "title", "email"):
+                val = (entry.get(key) or "").strip().lower()
+                if val:
+                    seen_aliases.add(val)
+                    if pid:
+                        alias_to_userid[val] = pid
+            # Enriched fields from the friends index (SharedServer
+            # payloads often omit title/email; friends always carries
+            # them).
+            if pid and friends_index and pid in friends_index:
+                friend = friends_index[pid]
+                for key in ("username", "title", "email"):
+                    val = (friend.get(key) or "").strip().lower()
+                    if val:
+                        seen_aliases.add(val)
+                        alias_to_userid[val] = pid
+
+    # PIN lookup is keyed by whatever name plexapi / REST returned for
+    # the home-user row. Lowercase normalised the same way so a
+    # SystemAccount display-name row resolves against a /api/home/users
+    # title row.
+    protected_lookup: Dict[str, bool] = {}
+    if protected_map is not None:
+        for k, v in protected_map.items():
+            key = (k or "").strip().lower()
+            if key:
+                protected_lookup[key] = bool(v)
+
+    now = time.time()
+    conn = _require_conn()
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT id, username, kind, backend_user_id "
+            "FROM managed_users WHERE server_id = ?",
+            (server_id,),
+        ).fetchall()
+        for r in rows:
+            uname = (r["username"] or "").strip().lower()
+            kind = r["kind"] or "managed"
+            existing_uid = (r["backend_user_id"] or "").strip()
+
+            # Three-arm decision:
+            #   * shared fetch failed -> leave active_share alone (None)
+            #   * owner -> always active; backfill ID if missing
+            #   * managed -> ID-first match, alias fallback w/ backfill
+            backfill_uid: Optional[str] = None
+            if kind == "owner":
+                active_val: Optional[int] = 1
+                if not existing_uid and owner_user_id:
+                    backfill_uid = owner_user_id
+            elif shared is None:
+                active_val = None
+            elif existing_uid:
+                # Definitive ID-based match. Immune to name variants,
+                # Unicode quirks, display-name drift, and same-name
+                # collisions.
+                active_val = 1 if existing_uid in shared_by_userid else 0
+            else:
+                matched_uid = alias_to_userid.get(uname)
+                if matched_uid:
+                    active_val = 1
+                    # Persist the ID so the next refresh skips alias
+                    # matching entirely for this row.
+                    backfill_uid = matched_uid
+                elif uname in seen_aliases:
+                    # SharedServer entry carried no plex_user_id but
+                    # the alias still matched. Stay active; just
+                    # can't backfill.
+                    active_val = 1
+                else:
+                    active_val = 0
+
+            # PIN status. None means "couldn't fetch home/users";
+            # leave the column alone. Friends never appear in
+            # /api/home/users so they fall through to the default
+            # `0` from `protected_lookup.get(uname, False)`.
+            if protected_map is None:
+                pin_val: Optional[int] = None
+            else:
+                pin_val = 1 if protected_lookup.get(uname, False) else 0
+
+            conn.execute(
+                """
+                UPDATE managed_users
+                SET active_share = COALESCE(?, active_share),
+                    is_pin_protected = COALESCE(?, is_pin_protected),
+                    shared_state_refreshed_at = ?,
+                    backend_user_id = COALESCE(?, backend_user_id)
+                WHERE id = ?
+                """,
+                (active_val, pin_val, now, backfill_uid, r["id"]),
+            )
+
+
+def set_managed_user_share_state(
+    *,
+    server_id: str,
+    username: str,
+    active_share: Optional[bool] = None,
+    is_pin_protected: Optional[bool] = None,
+    refreshed_at: Optional[float] = None,
+    backend_user_id: Optional[str] = None,
+) -> None:
+    """
+    Stamp the share-state columns on a single managed_users row.
+
+    Each parameter is independent: ``None`` means "do not change this
+    column" so the helper composes with the COALESCE-based update in
+    :func:`_refresh_share_state`. ``refreshed_at`` defaults to
+    ``time.time()`` so test seeds get a sensible non-NULL timestamp.
+    ``backend_user_id`` (migration v10) seeds the canonical Plex.tv
+    userID for tests that want to verify the ID-first matcher path.
+
+    Public surface for test seeding and the future per-server "refresh
+    shared state" path. Live sync still routes through
+    :func:`sync_managed_users_from_live` -> :func:`_refresh_share_state`.
+    Raises ``ValueError`` if the row isn't present.
+    """
+    if not server_id or not username:
+        raise ValueError("server_id and username are required")
+    conn = _require_conn()
+    ts = refreshed_at if refreshed_at is not None else time.time()
+    a_val = None if active_share is None else (1 if active_share else 0)
+    p_val = None if is_pin_protected is None else (1 if is_pin_protected else 0)
+    with _DB_LOCK:
+        cur = conn.execute(
+            """
+            UPDATE managed_users
+            SET active_share = COALESCE(?, active_share),
+                is_pin_protected = COALESCE(?, is_pin_protected),
+                shared_state_refreshed_at = ?,
+                backend_user_id = COALESCE(?, backend_user_id)
+            WHERE server_id = ? AND username = ?
+            """,
+            (a_val, p_val, ts, backend_user_id, server_id, username),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(
+                f"no managed_users row for server_id={server_id!r} username={username!r}"
+            )
 
 
 # ── Tombstones (PR-11.1) ────────────────────────────────────────────────────
@@ -2646,7 +3234,7 @@ def sync_managed_users_from_live(
 #     list query filters them out regardless of the row's per-server
 #     tombstoned flag.
 #
-# The User Management 'Hide user' modal lets the operator pick which
+# The User Management 'Hide user' modal lets the end user pick which
 # scope to apply.
 
 def set_managed_user_tombstone(
@@ -2830,7 +3418,7 @@ def set_managed_user_credential(
     out = get_managed_user(server_id, username)
     assert out is not None
     # PR-13 audit trail. Recorded regardless of plaintext/empty so the
-    # operator can also see "clear" operations.
+    # end user can also see "clear" operations.
     try:
         from services import db_access_log
         db_access_log.log_write(
@@ -2959,6 +3547,807 @@ def delete_managed_user(server_id: str, username: str) -> None:
 
 # ── Test / diagnostic helpers ────────────────────────────────────────────────
 
+# ── app_user_uuid helpers (USER-MGMT-IDENTITY-AUDIT follow-up) ──────────────
+#
+# The app-generated stable user identifier (``app_user_uuid``) is the
+# cross-server identity anchor populated on every managed_users /
+# server_users row and used as the primary key in user_identity_map
+# pairs. Format and design rationale live in :mod:`services.user_uuid`.
+
+def _server_host_name(server_id: str) -> str:
+    """Look up the friendly server name for the HostNameSlug portion of
+    an app_user_uuid. Best-effort: returns the empty string (which the
+    slugifier collapses to ``"Unnamed"``) when the registry can't be
+    read or the server id is unknown. Avoids hard-coupling media_db
+    init order to server_registry being fully available."""
+    try:
+        # Late import to avoid the legacy media_db <- server_registry
+        # cycle: server_registry already imports media_db for
+        # ``rewrite_server_ids_in_identity_map`` and friends, and
+        # importing it at module load here would invert the dependency
+        # under some test orders.
+        from server import server_registry
+        row = server_registry.get_server_by_id(server_id, include_token=False)
+        if not row:
+            return ""
+        return str(row.get("name") or "")
+    except Exception:
+        return ""
+
+
+def generate_unique_app_user_uuid(
+    *,
+    service_type: str,
+    server_id: str,
+    server_uid: str,
+    max_attempts: int = 8,
+) -> str:
+    """Generate an ``app_user_uuid`` that is not already present in
+    ``managed_users.app_user_uuid`` OR ``server_users.app_user_uuid``.
+
+    Retries up to ``max_attempts`` times on UNIQUE collision (the
+    8-hex userkey has ~4.29B distinct values per server so a single-
+    retry case is essentially never hit in practice; the loop is a
+    correctness guarantee, not a hot path).
+
+    Raises ``RuntimeError`` if every attempt collides - this only
+    happens when the database is corrupt enough that the partial
+    unique indexes are broken, in which case the caller wants the
+    loud failure rather than silently inserting a duplicate.
+
+    ``server_id`` is the registered server's id used to look up the
+    friendly name; ``server_uid`` is the same string when developer's
+    prefixed UID scheme is in play (the v9 boot migration rewrites
+    bare UUIDs to ``<service>_<uuid>`` form), so both args usually
+    carry the same value. They are kept distinct so a future caller
+    that wants to mint a UUID for a row before the server is fully
+    registered (e.g. a test fixture) can pass an explicit server_uid.
+    """
+    host_name = _server_host_name(server_id)
+    conn = _require_conn()
+    for _ in range(max(1, int(max_attempts))):
+        user_key = generate_user_key()
+        candidate = build_app_user_uuid(
+            service_type=service_type,
+            host_name=host_name,
+            server_uid=server_uid,
+            user_key=user_key,
+        )
+        # Probe both tables; either hit means we need a fresh key.
+        # Cheap O(1) lookups via the partial unique indexes.
+        hit_mu = conn.execute(
+            "SELECT 1 FROM managed_users WHERE app_user_uuid = ? LIMIT 1",
+            (candidate,),
+        ).fetchone()
+        hit_su = conn.execute(
+            "SELECT 1 FROM server_users WHERE app_user_uuid = ? LIMIT 1",
+            (candidate,),
+        ).fetchone()
+        if hit_mu is None and hit_su is None:
+            return candidate
+    raise RuntimeError(
+        "generate_unique_app_user_uuid: exhausted retries; "
+        "the app_user_uuid space appears exhausted for this server. "
+        "Inspect managed_users.app_user_uuid for duplicates."
+    )
+
+
+def _backfill_app_user_uuids() -> None:
+    """Walk ``managed_users`` and ``server_users`` for rows with NULL
+    ``app_user_uuid`` and fill them with freshly-generated UUIDs.
+
+    Idempotent: a second call after every row is filled sees an empty
+    work queue and exits immediately. Safe to call from
+    :func:`init_media_db` on every boot.
+
+    Best-effort: per-row insert failures are logged and the loop
+    continues. A row left NULL stays NULL and will be retried on the
+    next call; resolution paths fall back to handle matching until the
+    row is filled.
+    """
+    if _conn is None:
+        return  # init still in flight; caller will retry
+    rows_mu = _conn.execute(
+        "SELECT server_id, service_type, username "
+        "FROM managed_users WHERE app_user_uuid IS NULL"
+    ).fetchall()
+    rows_su = _conn.execute(
+        "SELECT server_id, backend, user_handle "
+        "FROM server_users WHERE app_user_uuid IS NULL"
+    ).fetchall()
+    if not rows_mu and not rows_su:
+        return
+    log.info(
+        "Backfilling app_user_uuid: %d managed_users row(s) + "
+        "%d server_users row(s).",
+        len(rows_mu), len(rows_su),
+    )
+    with _DB_LOCK:
+        for r in rows_mu:
+            try:
+                uuid = generate_unique_app_user_uuid(
+                    service_type=r["service_type"] or "plex",
+                    server_id=r["server_id"],
+                    server_uid=r["server_id"],
+                )
+                _conn.execute(
+                    "UPDATE managed_users SET app_user_uuid = ? "
+                    "WHERE server_id = ? AND username = ? "
+                    "AND app_user_uuid IS NULL",
+                    (uuid, r["server_id"], r["username"]),
+                )
+            except Exception:
+                log.exception(
+                    "_backfill_app_user_uuids: failed for managed_users "
+                    "(server=%r, username=%r); will retry next boot",
+                    r["server_id"], r["username"],
+                )
+        for r in rows_su:
+            try:
+                uuid = generate_unique_app_user_uuid(
+                    service_type=r["backend"] or "plex",
+                    server_id=r["server_id"],
+                    server_uid=r["server_id"],
+                )
+                _conn.execute(
+                    "UPDATE server_users SET app_user_uuid = ? "
+                    "WHERE server_id = ? AND user_handle = ? "
+                    "AND app_user_uuid IS NULL",
+                    (uuid, r["server_id"], r["user_handle"]),
+                )
+            except Exception:
+                log.exception(
+                    "_backfill_app_user_uuids: failed for server_users "
+                    "(server=%r, handle=%r); will retry next boot",
+                    r["server_id"], r["user_handle"],
+                )
+
+
+def get_managed_user_app_uuid(
+    server_id: str, username: str,
+) -> Optional[str]:
+    """Return the ``app_user_uuid`` for the ``managed_users`` row
+    matching ``(server_id, username)``, or ``None`` if the row does not
+    exist (or has not yet been backfilled - which should not happen on
+    a fully-initialised install but is defensive)."""
+    if not (server_id or "").strip() or not (username or "").strip():
+        return None
+    conn = _require_conn()
+    row = conn.execute(
+        "SELECT app_user_uuid FROM managed_users "
+        "WHERE server_id = ? AND username = ?",
+        (str(server_id), str(username)),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["app_user_uuid"]
+
+
+def get_server_user_app_uuid(
+    server_id: str, user_handle: str,
+) -> Optional[str]:
+    """``managed_users``-sibling lookup against ``server_users``."""
+    if not (server_id or "").strip():
+        return None
+    conn = _require_conn()
+    row = conn.execute(
+        "SELECT app_user_uuid FROM server_users "
+        "WHERE server_id = ? AND user_handle = ?",
+        (str(server_id), str(user_handle or "")),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["app_user_uuid"]
+
+
+def get_row_by_app_user_uuid(app_user_uuid: str) -> Optional[Dict[str, Any]]:
+    """Resolve an ``app_user_uuid`` back to its (server, user) coordinates.
+
+    Returns a dict ``{table, server_id, handle, display_name, service_type,
+    role, backend_user_id, app_user_uuid}`` or ``None`` if the UUID does
+    not exist on either table. The ``table`` field is ``"managed_users"``
+    or ``"server_users"`` so the caller knows which side to address.
+
+    Used by the resolution helper and the UI identity-links panel to
+    walk identity_map edges back to the row that holds the credentials
+    and display fields.
+    """
+    if not (app_user_uuid or "").strip():
+        return None
+    conn = _require_conn()
+    row = conn.execute(
+        "SELECT server_id, username AS handle, display_name, service_type, "
+        "kind AS role, app_user_uuid "
+        "FROM managed_users WHERE app_user_uuid = ?",
+        (app_user_uuid,),
+    ).fetchone()
+    if row is not None:
+        # Pull backend_user_id from the same row.
+        bk = conn.execute(
+            "SELECT backend_user_id FROM managed_users "
+            "WHERE app_user_uuid = ?",
+            (app_user_uuid,),
+        ).fetchone()
+        return {
+            "table":            "managed_users",
+            "server_id":        row["server_id"],
+            "handle":           row["handle"],
+            "display_name":     row["display_name"],
+            "service_type":     row["service_type"],
+            "role":             row["role"],
+            "backend_user_id":  bk["backend_user_id"] if bk else None,
+            "app_user_uuid":    row["app_user_uuid"],
+        }
+    row = conn.execute(
+        "SELECT server_id, user_handle AS handle, display_name, backend AS service_type, "
+        "role, backend_user_id, app_user_uuid "
+        "FROM server_users WHERE app_user_uuid = ?",
+        (app_user_uuid,),
+    ).fetchone()
+    if row is not None:
+        return {
+            "table":            "server_users",
+            "server_id":        row["server_id"],
+            "handle":           row["handle"],
+            "display_name":     row["display_name"],
+            "service_type":     row["service_type"],
+            "role":             row["role"],
+            "backend_user_id":  row["backend_user_id"],
+            "app_user_uuid":    row["app_user_uuid"],
+        }
+    return None
+
+
+# ── user_identity_map (v12 shape: app_user_uuid pairs) ──────────────────────
+#
+# Storage shape after migration v12: ``(user_a_uuid, user_b_uuid,
+# source, created_at)``. Lookups walk both directions
+# (a -> b and b -> a) so the caller doesn't need to know which side of
+# the pair the user lives on.
+
+def _equivalence_class_for_uuid(app_user_uuid: str) -> List[str]:
+    """Return every ``app_user_uuid`` reachable from the supplied one
+    via ``user_identity_map`` edges (BFS).
+
+    Includes the starting UUID itself. Each row in identity_map is a
+    bidirectional edge, so a single row connects both endpoints'
+    classes. Empty list when ``app_user_uuid`` is missing or itself
+    has no edges.
+
+    Used by :func:`add_identity_map` to fan out a new manual edge
+    across the bipartite product of the two classes it joins so
+    every transitively-equivalent pair lands as a row in identity_map.
+    """
+    if not (app_user_uuid or "").strip():
+        return []
+    conn = _require_conn()
+    seen: set = {app_user_uuid}
+    frontier: List[str] = [app_user_uuid]
+    while frontier:
+        next_frontier: List[str] = []
+        for uuid in frontier:
+            rows = conn.execute(
+                """
+                SELECT user_a_uuid, user_b_uuid FROM user_identity_map
+                WHERE user_a_uuid = ? OR user_b_uuid = ?
+                """,
+                (uuid, uuid),
+            ).fetchall()
+            for r in rows:
+                other = r["user_b_uuid"] if r["user_a_uuid"] == uuid else r["user_a_uuid"]
+                if other not in seen:
+                    seen.add(other)
+                    next_frontier.append(other)
+        frontier = next_frontier
+    return sorted(seen)
+
+
+def add_identity_map(
+    *,
+    user_a_uuid: Optional[str] = None,
+    user_b_uuid: Optional[str] = None,
+    server_a_id: Optional[str] = None,
+    user_a_handle: Optional[str] = None,
+    server_b_id: Optional[str] = None,
+    user_b_handle: Optional[str] = None,
+    source: str = "manual",
+) -> Optional[int]:
+    """Insert one (A, B) identity-link pair plus its transitive closure.
+
+    Two call shapes are supported so existing callers in
+    developer's CRUD endpoints (which build the pair from
+    ``(server_id, user_handle)`` tuples) keep working unchanged:
+
+      * UUID-direct:  ``add_identity_map(user_a_uuid=..., user_b_uuid=...)``
+      * Tuple-resolve: ``add_identity_map(server_a_id=..., user_a_handle=...,
+                       server_b_id=..., user_b_handle=...)``
+
+    When the tuple-resolve form is used, the helper looks up each side's
+    ``app_user_uuid`` from ``managed_users`` first, then falls back to
+    ``server_users``. Raises ``ValueError`` if either side cannot be
+    resolved to a UUID (end user must register / sync the server first).
+
+    Transitive fanout (v13+): after the primary row is written, the
+    helper walks the equivalence class of each endpoint and writes one
+    auto_copy row per missing bipartite pair. Each fanned-out row
+    carries ``derived_from_id`` pointing at the primary row so
+    :func:`delete_identity_map` can cascade-delete them cleanly when
+    the parent is removed.
+
+    Returns the new row id of the PRIMARY pair on insert, ``None``
+    when the primary pair already exists (UNIQUE conflict; the
+    transitive fanout is still attempted defensively in case the
+    equivalence class grew since the last write).
+    """
+    a_uuid = (user_a_uuid or "").strip() or None
+    b_uuid = (user_b_uuid or "").strip() or None
+    if a_uuid is None:
+        if not (server_a_id or "").strip() or not (user_a_handle or "").strip():
+            raise ValueError(
+                "add_identity_map: provide either user_a_uuid OR both "
+                "server_a_id and user_a_handle."
+            )
+        a_uuid = (
+            get_managed_user_app_uuid(server_a_id, user_a_handle)
+            or get_server_user_app_uuid(server_a_id, user_a_handle)
+        )
+        if not a_uuid:
+            raise ValueError(
+                f"add_identity_map: no app_user_uuid for "
+                f"(server={server_a_id!r}, handle={user_a_handle!r}); "
+                f"sync managed_users for that server first."
+            )
+    if b_uuid is None:
+        if not (server_b_id or "").strip() or not (user_b_handle or "").strip():
+            raise ValueError(
+                "add_identity_map: provide either user_b_uuid OR both "
+                "server_b_id and user_b_handle."
+            )
+        b_uuid = (
+            get_managed_user_app_uuid(server_b_id, user_b_handle)
+            or get_server_user_app_uuid(server_b_id, user_b_handle)
+        )
+        if not b_uuid:
+            raise ValueError(
+                f"add_identity_map: no app_user_uuid for "
+                f"(server={server_b_id!r}, handle={user_b_handle!r}); "
+                f"sync managed_users for that server first."
+            )
+    if a_uuid == b_uuid:
+        raise ValueError(
+            "add_identity_map: refuse to map a UUID to itself."
+        )
+    src = (source or "manual").strip().lower()
+    if src not in ("manual", "auto_copy"):
+        src = "manual"
+    conn = _require_conn()
+    # Compute equivalence classes BEFORE the primary insert. After the
+    # insert the two classes are merged (the new edge bridges them),
+    # so capturing each side's class beforehand is the only way to
+    # know which cross-pairs need to be fanned out.
+    class_a = _equivalence_class_for_uuid(a_uuid)
+    class_b = _equivalence_class_for_uuid(b_uuid)
+    # Primary insert.
+    primary_id: Optional[int] = None
+    try:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO user_identity_map (
+                user_a_uuid, user_b_uuid, source, created_at, derived_from_id
+            ) VALUES (?, ?, ?, ?, NULL)
+            """,
+            (a_uuid, b_uuid, src, time.time()),
+        )
+        if (cur.rowcount or 0) > 0 and cur.lastrowid:
+            primary_id = int(cur.lastrowid)
+    except Exception:
+        log.exception("add_identity_map: primary insert failed")
+        raise
+    # Transitive fanout. Even when the primary insert was a duplicate
+    # no-op (primary_id is None), we still fan out so a class that
+    # has grown since the last fan attempt catches up.
+    #
+    # The fanout target is the BIPARTITE PRODUCT of class_a and
+    # class_b minus the pair we just inserted. Each derived row
+    # carries derived_from_id pointing at the primary row when one
+    # exists; otherwise NULL (the cascade has nothing to track).
+    if class_a and class_b:
+        now = time.time()
+        # Compute the parent id used for derived_from on every
+        # fanned-out row. When the primary was a no-op, look up the
+        # existing row id for the (a, b) ordered pair so the cascade
+        # still works.
+        parent_id = primary_id
+        if parent_id is None:
+            existing = conn.execute(
+                "SELECT id FROM user_identity_map "
+                "WHERE user_a_uuid = ? AND user_b_uuid = ?",
+                (a_uuid, b_uuid),
+            ).fetchone()
+            if existing:
+                parent_id = int(existing["id"])
+        # Walk every cross-pair. Skip the primary's exact-ordered pair
+        # so we don't write a derived duplicate of the parent itself.
+        for x in class_a:
+            for y in class_b:
+                if x == y:
+                    continue
+                if x == a_uuid and y == b_uuid:
+                    continue  # the primary row
+                # Order the pair lexicographically so (X, Y) and (Y, X)
+                # collapse to one canonical row. The UNIQUE constraint
+                # on (user_a_uuid, user_b_uuid) is on the ordered pair;
+                # without canonicalisation we would write both directions.
+                lo, hi = (x, y) if x < y else (y, x)
+                try:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO user_identity_map (
+                            user_a_uuid, user_b_uuid, source, created_at,
+                            derived_from_id
+                        ) VALUES (?, ?, 'auto_copy', ?, ?)
+                        """,
+                        (lo, hi, now, parent_id),
+                    )
+                except Exception:
+                    log.exception(
+                        "add_identity_map: transitive fanout row "
+                        "(%r, %r) insert failed; continuing.",
+                        lo, hi,
+                    )
+    return primary_id
+
+
+def delete_identity_map(map_id: int) -> bool:
+    """Remove one identity-map row by id and cascade to its derived
+    children (rows with ``derived_from_id`` equal to this row's id).
+
+    The cascade only touches rows the helper itself wrote during a
+    transitive fanout; auto_link-by-backend_user_id rows and manual
+    rows the end user typed separately are never collateral damage.
+
+    Returns True when at least the named row was deleted, False when
+    ``map_id`` did not exist.
+    """
+    try:
+        map_id = int(map_id)
+    except (TypeError, ValueError):
+        return False
+    conn = _require_conn()
+    # Cascade first so the parent row's id is still valid for the
+    # children's WHERE clause. SQLite doesn't enforce ON DELETE CASCADE
+    # on FKs added via ALTER TABLE ADD COLUMN; we do it explicitly.
+    try:
+        children = conn.execute(
+            "DELETE FROM user_identity_map WHERE derived_from_id = ?",
+            (map_id,),
+        )
+        cascaded = children.rowcount or 0
+    except Exception:
+        log.exception(
+            "delete_identity_map: cascade-delete for parent id=%r "
+            "failed; continuing with parent delete.",
+            map_id,
+        )
+        cascaded = 0
+    cur = conn.execute(
+        "DELETE FROM user_identity_map WHERE id = ?", (map_id,),
+    )
+    if (cur.rowcount or 0) > 0 and cascaded:
+        log.info(
+            "delete_identity_map: removed parent id=%r and %d cascaded "
+            "child row(s).", map_id, cascaded,
+        )
+    return (cur.rowcount or 0) > 0
+
+
+def list_identity_maps() -> List[Dict[str, Any]]:
+    """Return every identity-map row in insertion order.
+
+    Each row carries both the v12 UUID pair AND the resolved
+    ``(server_id, user_handle)`` tuples on each side, so the v11-shaped
+    UI surfaces (developer's UserMappingPanel) keep rendering without a
+    payload migration. UUIDs that no longer resolve to a row
+    (server removed, user deleted) surface ``server_id=None`` /
+    ``user_handle=None`` on that side; the panel can show a dimmed
+    "unresolved" badge in that case.
+    """
+    conn = _require_conn()
+    rows = conn.execute(
+        """
+        SELECT id, user_a_uuid, user_b_uuid, source, created_at
+        FROM user_identity_map
+        ORDER BY created_at ASC, id ASC
+        """,
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        a_row = get_row_by_app_user_uuid(r["user_a_uuid"]) or {}
+        b_row = get_row_by_app_user_uuid(r["user_b_uuid"]) or {}
+        out.append({
+            "id":             int(r["id"]),
+            "user_a_uuid":    r["user_a_uuid"],
+            "user_b_uuid":    r["user_b_uuid"],
+            "server_a_id":    a_row.get("server_id"),
+            "user_a_handle":  a_row.get("handle"),
+            "server_b_id":    b_row.get("server_id"),
+            "user_b_handle":  b_row.get("handle"),
+            "source":         r["source"],
+            "created_at":     float(r["created_at"]),
+        })
+    return out
+
+
+def get_identity_maps_for_user(
+    server_id: str, user_handle: str,
+) -> List[Dict[str, Any]]:
+    """Return every (other_server, other_handle, other_uuid) row linked
+    to the supplied (server_id, user_handle).
+
+    Resolves (server_id, user_handle) -> app_user_uuid first, then
+    walks both A->B and B->A so the caller doesn't need to know which
+    side of the pair the user lives on. Empty list when the source
+    has no app_user_uuid yet (pre-backfill row) or no map entries.
+    """
+    if not (server_id or "").strip() or not (user_handle or "").strip():
+        return []
+    my_uuid = (
+        get_managed_user_app_uuid(server_id, user_handle)
+        or get_server_user_app_uuid(server_id, user_handle)
+    )
+    if not my_uuid:
+        return []
+    return get_identity_maps_for_uuid(my_uuid)
+
+
+def get_identity_maps_for_uuid(
+    app_user_uuid: str,
+) -> List[Dict[str, Any]]:
+    """Same as :func:`get_identity_maps_for_user` but takes the
+    app_user_uuid directly. Preferred entry point for the resolver:
+    one lookup instead of two."""
+    if not (app_user_uuid or "").strip():
+        return []
+    conn = _require_conn()
+    rows = conn.execute(
+        """
+        SELECT id, user_a_uuid, user_b_uuid, source, created_at
+        FROM user_identity_map
+        WHERE user_a_uuid = ? OR user_b_uuid = ?
+        ORDER BY created_at ASC, id ASC
+        """,
+        (app_user_uuid, app_user_uuid),
+    ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if r["user_a_uuid"] == app_user_uuid:
+            other_uuid = r["user_b_uuid"]
+        else:
+            other_uuid = r["user_a_uuid"]
+        other_row = get_row_by_app_user_uuid(other_uuid) or {}
+        out.append({
+            "id":                 int(r["id"]),
+            "other_user_uuid":    other_uuid,
+            "other_server_id":    other_row.get("server_id"),
+            "other_user_handle":  other_row.get("handle"),
+            "other_display_name": other_row.get("display_name"),
+            "other_service_type": other_row.get("service_type"),
+            "other_role":         other_row.get("role"),
+            "source":             r["source"],
+            "created_at":         float(r["created_at"]),
+        })
+    return out
+
+
+# ── Auto-link by backend_user_id (R-2) ──────────────────────────────────────
+#
+# Plex.tv issues stable numeric userIDs per human. Two managed_users
+# rows with the same (service_type, backend_user_id) across distinct
+# server_ids ARE the same human by the backend's own definition. This
+# helper walks for those pairs and writes auto_copy identity_map rows.
+# Idempotent (INSERT OR IGNORE) so it can run after every managed-users
+# sync without producing duplicates. Scoped by service_type so a
+# coincidental ID collision across backend ID spaces never creates a
+# false link.
+
+def auto_link_identity_map_by_backend_user_id() -> Dict[str, int]:
+    """Derive ``identity_map`` entries from same-(service_type, backend_user_id)
+    rows across distinct server_ids.
+
+    Returns ``{"pairs_written": int, "pairs_skipped_duplicate": int,
+    "groups_seen": int}``. Best-effort: per-pair failures are caught and
+    logged so a single corrupt row never blocks the rest.
+
+    Safe to call repeatedly; subsequent runs no-op on already-mapped
+    pairs via INSERT OR IGNORE.
+    """
+    conn = _require_conn()
+    # Pull every (service_type, backend_user_id, server_id, app_user_uuid)
+    # tuple where backend_user_id is populated and the row has its UUID
+    # backfilled. Group in Python (SQLite GROUP_CONCAT is awkward to
+    # parse safely).
+    rows = conn.execute(
+        """
+        SELECT service_type, backend_user_id, server_id, app_user_uuid
+        FROM managed_users
+        WHERE backend_user_id IS NOT NULL
+          AND backend_user_id <> ''
+          AND app_user_uuid IS NOT NULL
+        """,
+    ).fetchall()
+    # Group by (service_type, backend_user_id).
+    groups: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    for r in rows:
+        key = (str(r["service_type"]), str(r["backend_user_id"]))
+        groups.setdefault(key, []).append(
+            (str(r["server_id"]), str(r["app_user_uuid"])),
+        )
+    pairs_written = 0
+    pairs_skipped = 0
+    groups_with_dupes = 0
+    for (_svc, _bk_id), members in groups.items():
+        # De-duplicate by server_id: an installation should only have
+        # one managed_users row per (server_id, username), but defensively
+        # we collapse here too.
+        by_server: Dict[str, str] = {}
+        for server_id, uuid in members:
+            by_server.setdefault(server_id, uuid)
+        if len(by_server) < 2:
+            continue
+        groups_with_dupes += 1
+        # For every (A, B) ordered pair with distinct server_ids, write
+        # one identity_map row. We don't write both (A,B) and (B,A) -
+        # the bidirectional read helper handles either direction.
+        server_uuids = sorted(by_server.items())  # deterministic order
+        for i, (_srv_a, uuid_a) in enumerate(server_uuids):
+            for (_srv_b, uuid_b) in server_uuids[i + 1:]:
+                if uuid_a == uuid_b:
+                    continue
+                try:
+                    new_id = add_identity_map(
+                        user_a_uuid=uuid_a,
+                        user_b_uuid=uuid_b,
+                        source="auto_copy",
+                    )
+                    if new_id is None:
+                        pairs_skipped += 1
+                    else:
+                        pairs_written += 1
+                except Exception:
+                    log.exception(
+                        "auto_link_identity_map_by_backend_user_id: "
+                        "failed to insert (%r, %r); continuing.",
+                        uuid_a, uuid_b,
+                    )
+    if pairs_written or pairs_skipped or groups_with_dupes:
+        log.info(
+            "auto_link_identity_map_by_backend_user_id: %d new pair(s), "
+            "%d duplicate(s) skipped, %d group(s) with cross-server duplicates.",
+            pairs_written, pairs_skipped, groups_with_dupes,
+        )
+    return {
+        "pairs_written":           pairs_written,
+        "pairs_skipped_duplicate": pairs_skipped,
+        "groups_seen":             groups_with_dupes,
+    }
+
+
+# ── Slug rewriter on server rename (R-2 follow-on) ──────────────────────────
+
+def rewrite_app_user_uuid_host_slug_for_server(
+    server_uid: str, new_host_name: str,
+) -> Dict[str, int]:
+    """Refresh the HostNameSlug portion of every stored ``app_user_uuid``
+    whose ``server_uid`` portion matches ``server_uid``.
+
+    The server_uid + userkey segments are immutable: only the cosmetic
+    slug shifts so identity_map links stay valid. Walks
+    ``managed_users.app_user_uuid``, ``server_users.app_user_uuid``,
+    AND both columns of ``user_identity_map`` so every stored UUID for
+    the renamed server moves in lockstep.
+
+    Returns ``{"managed_users": int, "server_users": int,
+    "identity_map_a": int, "identity_map_b": int}`` row counts.
+    """
+    if not (server_uid or "").strip():
+        return {
+            "managed_users":   0,
+            "server_users":    0,
+            "identity_map_a":  0,
+            "identity_map_b":  0,
+        }
+    new_slug = slugify_host_name(new_host_name)
+    conn = _require_conn()
+    counts = {
+        "managed_users":   0,
+        "server_users":    0,
+        "identity_map_a":  0,
+        "identity_map_b":  0,
+    }
+    with _DB_LOCK:
+        for table, count_key in (
+            ("managed_users", "managed_users"),
+            ("server_users",  "server_users"),
+        ):
+            rows = conn.execute(
+                f"SELECT rowid, app_user_uuid FROM {table} "
+                f"WHERE app_user_uuid IS NOT NULL"
+            ).fetchall()
+            for r in rows:
+                rowid_val = r[0]
+                stored = r[1]
+                if server_uid_from_app_user_uuid(stored) != server_uid:
+                    continue
+                try:
+                    from services.user_uuid import rewrite_host_slug
+                    new_uuid = rewrite_host_slug(stored, new_host_name)
+                except Exception:
+                    continue
+                if new_uuid == stored:
+                    continue
+                conn.execute(
+                    f"UPDATE {table} SET app_user_uuid = ? WHERE rowid = ?",
+                    (new_uuid, rowid_val),
+                )
+                counts[count_key] += 1
+        # identity_map carries the UUID twice (one per side).
+        rows = conn.execute(
+            "SELECT id, user_a_uuid, user_b_uuid "
+            "FROM user_identity_map"
+        ).fetchall()
+        from services.user_uuid import rewrite_host_slug
+        for r in rows:
+            mutated_a = mutated_b = False
+            new_a = r["user_a_uuid"]
+            new_b = r["user_b_uuid"]
+            if server_uid_from_app_user_uuid(new_a) == server_uid:
+                try:
+                    candidate = rewrite_host_slug(new_a, new_host_name)
+                    if candidate != new_a:
+                        new_a = candidate
+                        mutated_a = True
+                except Exception:
+                    pass
+            if server_uid_from_app_user_uuid(new_b) == server_uid:
+                try:
+                    candidate = rewrite_host_slug(new_b, new_host_name)
+                    if candidate != new_b:
+                        new_b = candidate
+                        mutated_b = True
+                except Exception:
+                    pass
+            if not (mutated_a or mutated_b):
+                continue
+            try:
+                conn.execute(
+                    "UPDATE user_identity_map SET user_a_uuid = ?, "
+                    "user_b_uuid = ? WHERE id = ?",
+                    (new_a, new_b, r["id"]),
+                )
+                if mutated_a:
+                    counts["identity_map_a"] += 1
+                if mutated_b:
+                    counts["identity_map_b"] += 1
+            except sqlite3.IntegrityError:
+                # UNIQUE(user_a_uuid, user_b_uuid) collision means the
+                # post-rewrite pair already exists (e.g. end user
+                # renamed the server to a name that yields the same
+                # slug as an old auto_copy row). Drop this duplicate.
+                conn.execute(
+                    "DELETE FROM user_identity_map WHERE id = ?",
+                    (r["id"],),
+                )
+    if any(counts.values()):
+        log.info(
+            "rewrite_app_user_uuid_host_slug_for_server(%r): "
+            "managed_users=%d, server_users=%d, identity_map_a=%d, "
+            "identity_map_b=%d (new slug=%r)",
+            server_uid, counts["managed_users"], counts["server_users"],
+            counts["identity_map_a"], counts["identity_map_b"], new_slug,
+        )
+    return counts
+
+
 def _close_for_tests() -> None:
     """
     Close the shared connection so a test that swaps the data dir
@@ -2973,3 +4362,173 @@ def _close_for_tests() -> None:
                 pass
         _conn = None
         _initialised = False
+
+
+# ── Server-UID boot migration helpers (Plan[SERVER-UID-IDENTITY]) ───────────
+#
+# When the boot-time `migrate_server_ids_add_backend_prefix` upgrade
+# in `server/server_registry.py` rewrites bare-UUID server rows to the
+# new prefixed form (`<service_type>_<uuid>`), every other surface
+# that references those ids by string also needs to be rewritten.
+# These two helpers do the bulk SQL update for the media.db side:
+# user_identity_map (v11) and managed_users (v3+). Best-effort:
+# failures are caught + logged + non-fatal so a bad rewrite doesn't
+# crash the engine boot.
+
+def _rewrite_server_uid_inside_app_user_uuid(
+    stored: str, old_to_new: Dict[str, str],
+) -> Optional[str]:
+    """If ``stored``'s server_uid portion appears in ``old_to_new``,
+    return a new UUID with the server_uid replaced. Returns ``None``
+    when the UUID is malformed or its server_uid is not in the map."""
+    server_uid = server_uid_from_app_user_uuid(stored)
+    if not server_uid or server_uid not in old_to_new:
+        return None
+    new_uid = old_to_new[server_uid]
+    # Rebuild using the existing (Service, HostNameSlug, userkey)
+    # segments; only swap the server_uid portion.
+    try:
+        from services.user_uuid import parse_app_user_uuid, build_app_user_uuid
+        parts = parse_app_user_uuid(stored)
+    except Exception:
+        return None
+    return build_app_user_uuid(
+        service_type=parts["service"],
+        host_name=parts["host_slug"],
+        server_uid=new_uid,
+        user_key=parts["user_key"],
+    )
+
+
+def rewrite_server_ids_in_identity_map(
+    old_to_new: Dict[str, str],
+) -> int:
+    """Bulk-update ``user_identity_map`` rows whose A or B
+    ``app_user_uuid`` carries a server_uid that appears in
+    ``old_to_new``. Returns the total number of column-updates.
+
+    v12 changed the storage shape from ``(server_a_id, user_a_handle,
+    server_b_id, user_b_handle)`` to ``(user_a_uuid, user_b_uuid)``;
+    this helper now rewrites the server_uid embedded inside each
+    UUID rather than a top-level column. The server-rename helper
+    :func:`rewrite_app_user_uuid_host_slug_for_server` handles the
+    parallel slug-only refresh; this helper handles the full
+    server_uid swap performed by developer's boot migration.
+
+    Idempotent: rerunning with an empty / no-match map is a no-op.
+    Defensive: catches per-row update failure and continues."""
+    if not old_to_new:
+        return 0
+    conn = _require_conn()
+    n = 0
+    with _DB_LOCK:
+        rows = conn.execute(
+            "SELECT id, user_a_uuid, user_b_uuid FROM user_identity_map"
+        ).fetchall()
+        for r in rows:
+            new_a = _rewrite_server_uid_inside_app_user_uuid(
+                r["user_a_uuid"], old_to_new,
+            )
+            new_b = _rewrite_server_uid_inside_app_user_uuid(
+                r["user_b_uuid"], old_to_new,
+            )
+            if new_a is None and new_b is None:
+                continue
+            try:
+                conn.execute(
+                    "UPDATE user_identity_map SET user_a_uuid = ?, "
+                    "user_b_uuid = ? WHERE id = ?",
+                    (new_a or r["user_a_uuid"],
+                     new_b or r["user_b_uuid"],
+                     r["id"]),
+                )
+                if new_a is not None:
+                    n += 1
+                if new_b is not None:
+                    n += 1
+            except sqlite3.IntegrityError:
+                # UNIQUE collision: a post-rewrite pair already exists.
+                # Drop the duplicate row.
+                conn.execute(
+                    "DELETE FROM user_identity_map WHERE id = ?",
+                    (r["id"],),
+                )
+            except Exception:
+                log.exception(
+                    "rewrite_server_ids_in_identity_map: row %r update "
+                    "failed; continuing.",
+                    r["id"],
+                )
+    return n
+
+
+def rewrite_server_ids_in_managed_users(
+    old_to_new: Dict[str, str],
+) -> int:
+    """Bulk-update ``managed_users.server_id`` AND
+    ``managed_users.app_user_uuid`` rows whose server_id (or whose
+    UUID's embedded server_uid) appears in ``old_to_new``. Returns
+    the count of column-updates.
+
+    Also walks ``server_users`` for the same rewrites so both per-user
+    tables stay in lockstep. The (server_id, username) /
+    (server_id, user_handle) UNIQUE constraints are preserved because
+    the new prefixed id is unique by construction.
+    """
+    if not old_to_new:
+        return 0
+    conn = _require_conn()
+    n = 0
+    with _DB_LOCK:
+        # 1. Top-level server_id columns (unchanged from v11 semantics).
+        for old_id, new_id in old_to_new.items():
+            try:
+                cur = conn.execute(
+                    "UPDATE managed_users SET server_id = ? "
+                    "WHERE server_id = ?", (new_id, old_id),
+                )
+                n += cur.rowcount or 0
+                cur = conn.execute(
+                    "UPDATE server_users SET server_id = ? "
+                    "WHERE server_id = ?", (new_id, old_id),
+                )
+                n += cur.rowcount or 0
+            except Exception:
+                log.exception(
+                    "rewrite_server_ids_in_managed_users: pair "
+                    "(%r -> %r) server_id update failed; continuing.",
+                    old_id, new_id,
+                )
+        # 2. Embedded server_uid inside app_user_uuid (v12 addition).
+        for table in ("managed_users", "server_users"):
+            try:
+                rows = conn.execute(
+                    f"SELECT rowid, app_user_uuid FROM {table} "
+                    f"WHERE app_user_uuid IS NOT NULL"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # Pre-v12 row; column doesn't exist yet.
+                continue
+            for r in rows:
+                rowid_val = r[0]
+                old_uuid_val = r[1]
+                new_uuid = _rewrite_server_uid_inside_app_user_uuid(
+                    old_uuid_val, old_to_new,
+                )
+                if new_uuid is None:
+                    continue
+                try:
+                    conn.execute(
+                        f"UPDATE {table} SET app_user_uuid = ? "
+                        f"WHERE rowid = ?",
+                        (new_uuid, rowid_val),
+                    )
+                    n += 1
+                except Exception:
+                    log.exception(
+                        "rewrite_server_ids_in_managed_users: "
+                        "app_user_uuid rewrite for %s.rowid=%r failed; "
+                        "continuing.",
+                        table, rowid_val,
+                    )
+    return n

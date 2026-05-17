@@ -1,6 +1,6 @@
 """
 Rule 2 - Library-walk job. Periodically (and on-demand) confirm which
-items are still present on each registered server so the operator can
+items are still present on each registered server so the end user can
 identify and prune items that have permanently disappeared.
 
 Why this exists
@@ -12,7 +12,7 @@ none of those should drop the row from our cache. So instead of
 deletion we have a positive sighting trail: every walk ticks
 ``server_items.last_seen_at`` for every item the server reports
 present. Items the walk hasn't seen recently become candidates for the
-operator-confirmed Prune Missing Items action (see
+end user-confirmed Prune Missing Items action (see
 ``server/media_db.py :: prune_stale_items``).
 
 Two entry points
