@@ -1,4 +1,4 @@
-# PlexMigrate frontend container.
+# Hestia-MediaManager frontend container.
 #
 # Two-stage build:
 #   1. `build` - node:20-alpine compiles the Vite + React + TS app

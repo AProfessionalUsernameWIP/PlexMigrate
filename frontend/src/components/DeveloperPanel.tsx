@@ -11,8 +11,10 @@
 // typed confirmation phrase to acknowledge that the run will touch a
 // real Plex server.
 
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api, DevTestRunSummary } from '../api';
+import { errorText, formatTimestamp } from '../utils/format';
+import { useResourceQuery } from '../hooks/useResourceQuery';
 
 type Mode = 'synthetic' | 'structural' | 'live';
 
@@ -50,28 +52,21 @@ export function DeveloperPanel() {
   const [filter, setFilter] = useState<string>('');
   const [liveConfirm, setLiveConfirm] = useState<string>('');
   const [running, setRunning] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
   const [lastRun, setLastRun] = useState<DevTestRunSummary | null>(null);
-  const [history, setHistory] = useState<DevTestRunSummary[]>([]);
-  const [loadingHistory, setLoadingHistory] = useState<boolean>(false);
 
-  const refreshHistory = async () => {
-    setLoadingHistory(true);
-    try {
-      const resp = await api.listDevTestRuns(25);
-      setHistory(resp.runs);
-    } catch (e) {
-      // Surface but don't block the main flow; the history list is
-      // a convenience, not the primary action.
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoadingHistory(false);
-    }
-  };
-
-  useEffect(() => {
-    refreshHistory();
-  }, []);
+  // History is a convenience list; a load failure surfaces in the
+  // shared error banner but never blocks a test run.
+  const {
+    data: history,
+    loading: loadingHistory,
+    error,
+    reload: refreshHistory,
+    setError,
+  } = useResourceQuery<DevTestRunSummary[]>(
+    () => api.listDevTestRuns(25).then((r) => r.runs),
+    [],
+    [],
+  );
 
   const liveConfirmed = liveConfirm.trim() === LIVE_CONFIRM_PHRASE;
   const canRun = !running && (mode !== 'live' || liveConfirmed);
@@ -93,7 +88,7 @@ export function DeveloperPanel() {
       if (mode === 'live') setLiveConfirm('');
       refreshHistory();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
     } finally {
       setRunning(false);
     }
@@ -313,10 +308,6 @@ function formatDuration(seconds: number): string {
   return `${seconds.toFixed(2)} s`;
 }
 
-function formatTimestamp(epochSeconds: number): string {
-  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return '-';
-  return new Date(epochSeconds * 1000).toLocaleString();
-}
 
 function statusFromRun(run: DevTestRunSummary): {
   label: string;

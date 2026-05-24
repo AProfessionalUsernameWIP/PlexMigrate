@@ -1,4 +1,4 @@
-// Item 3 (admin-management plan, 2026-05-15): cross-server PIN migration modal.
+// Cross-server PIN migration modal.
 //
 // Fires when an Add-Server or Refresh-server flow surfaces one or more
 // managed users whose Plex Home PIN is stored on a DIFFERENT registered
@@ -10,6 +10,7 @@
 import { useState } from 'react';
 import { api, PinMigrationSuggestion } from '../api';
 import { useElevation } from '../contexts/ElevationContext';
+import { Modal } from './Modal';
 
 interface Props {
   open: boolean;
@@ -48,8 +49,7 @@ export function PinMigrationModal({
     // Defensive: parent should not open the modal with no suggestions,
     // but if it does, render a friendly "nothing to do" state.
     return (
-      <div onClick={onCancel} style={overlayStyle}>
-        <div onClick={(e) => e.stopPropagation()} style={panelStyle}>
+      <Modal onClose={onCancel} align="center" width={560} tone="accent">
           <h2 style={{ margin: 0 }}>No PIN migrations available</h2>
           <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
             No managed users on <strong>{serverName}</strong> have a matching
@@ -58,8 +58,7 @@ export function PinMigrationModal({
           <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
             <button onClick={onCancel}>Close</button>
           </div>
-        </div>
-      </div>
+      </Modal>
     );
   }
 
@@ -112,8 +111,7 @@ export function PinMigrationModal({
   const someChecked = selected.size > 0 && !allChecked;
 
   return (
-    <div onClick={onCancel} style={overlayStyle}>
-      <div onClick={(e) => e.stopPropagation()} style={{ ...panelStyle, maxWidth: 620 }}>
+    <Modal onClose={onCancel} align="center" width={620} tone="accent">
         <h2 style={{ margin: 0 }}>PIN-protected users detected</h2>
         <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 8, lineHeight: 1.5 }}>
           The following users on <strong>{serverName}</strong> have a Plex
@@ -198,32 +196,10 @@ export function PinMigrationModal({
             {busy ? 'Migrating…' : `Migrate ${selected.size} PIN(s)`}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
 function rowKey(s: PinMigrationSuggestion): string {
   return `${s.target_username}|${s.source_server_id}|${s.source_username}`;
 }
-
-const overlayStyle: React.CSSProperties = {
-  position: 'fixed',
-  inset: 0,
-  background: 'rgba(0,0,0,0.55)',
-  zIndex: 1000,
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  padding: 20,
-};
-
-const panelStyle: React.CSSProperties = {
-  background: 'var(--panel, #131826)',
-  border: '1px solid var(--accent, #2e7df6)',
-  borderRadius: 8,
-  maxWidth: 560,
-  width: '100%',
-  padding: 20,
-  boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-};

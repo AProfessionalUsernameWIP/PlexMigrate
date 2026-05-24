@@ -1,4 +1,4 @@
-// Plan[RUN-JOB-UI] follow-up: ad-hoc single-user copy panel.
+// Ad-hoc single-user copy panel.
 //
 // Surfaces under Servers > User Management when the end user clicks
 // a managed user row. The panel unfolds inline below the row with:
@@ -122,6 +122,11 @@ export function UserCopyPanel({
     && targetUsername.trim().length > 0
     && tempPassword.length > 0
     && isConfirmed
+    // FEUI-S-02: when the follow-up direct transfer is enabled, at
+    // least one library must be selected - otherwise submit() posts a
+    // direct job with libraries:[] that transfers nothing yet reports
+    // "queued" as success.
+    && (!runTransfer || selectedLibs.size > 0)
     && !submitting;
 
   const submit = async () => {
@@ -170,6 +175,9 @@ export function UserCopyPanel({
         `User created on destination: ${createResult.target_username} (backend id ${createResult.backend_user_id}). Identity mapping written.${transferMessage}`,
       );
       setStatusKind('success');
+      // Clear the confirm box so the now-complete create cannot be
+      // re-submitted by another click on the still-enabled button.
+      setConfirmText('');
       if (onCopySucceeded) onCopySucceeded();
     } catch (e) {
       setStatusMessage(`User creation failed: ${String(e)}`);

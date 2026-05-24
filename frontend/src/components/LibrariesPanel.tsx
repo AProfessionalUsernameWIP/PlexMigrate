@@ -43,7 +43,12 @@ export function LibrariesPanel(props: Props) {
               <div className="empty">Pick a server above to load its libraries.</div>
             ) : libraries.map((lib) => (
               <label key={lib.name} className="switch">
-                <input type="checkbox" checked={selectedLibs.has(lib.name)} onChange={() => onToggleLib(lib.name)} />
+                <input
+                  type="checkbox"
+                  data-testid={`job-library-${lib.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')}`}
+                  checked={selectedLibs.has(lib.name)}
+                  onChange={() => onToggleLib(lib.name)}
+                />
                 <span>{lib.name}</span>
                 <span className="help">({lib.type}, {lib.count.toLocaleString()})</span>
               </label>

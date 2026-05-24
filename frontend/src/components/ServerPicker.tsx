@@ -1,4 +1,4 @@
-// ── Server picker (v0.9.1) ─────────────────────────────────────────────
+// ── Server picker ──────────────────────────────────────────────────────
 //
 // Each option appears as a clickable card with a status dot, friendly
 // name, URL, and (when reachable) the current ping in milliseconds.
@@ -6,28 +6,27 @@
 // marked: red dot, "offline" instead of milliseconds, and a dimmed
 // background. Clicking selects the server.
 //
-// The previous build used a native ``<select>`` which doesn't allow
-// rich content inside <option>. The clickable-card list is required
-// by the v0.9.1 spec ("live connection status indicator next to each
-// option").
+// A clickable-card list is used rather than a native ``<select>``
+// because rich content (status indicator next to each option) is not
+// allowed inside <option>.
 //
-// v0.10.0: ServerPicker now supports both single-select (the source
-// selector, the snapshot-mode destination) and multi-select (the
-// import/direct destination, for fan-out). Mode is chosen by the
-// caller: pass ``value`` + ``onChange`` for single, ``values`` +
-// ``onMultiChange`` + ``multi`` for multi. The card layout / status
-// indicators are identical between the two modes; only the toggle
-// behaviour and selection state differ.
+// ServerPicker supports both single-select (the source selector, the
+// snapshot-mode destination) and multi-select (the import/direct
+// destination, for fan-out). Mode is chosen by the caller: pass
+// ``value`` + ``onChange`` for single, ``values`` + ``onMultiChange``
+// + ``multi`` for multi. The card layout / status indicators are
+// identical between the two modes; only the toggle behaviour and
+// selection state differ.
 //
-// Selection IDENTITY (2026-05-16 bug fix): cards are keyed by the
-// registry's stable server id, not the friendly name. The same
-// friendly name can exist across different backends ("Jade.TV" Plex
-// AND "Jade.TV" Emby); name-based selection would highlight both
-// cards on click and submit the wrong server to the backend. The
-// caller stores the id (or set of ids); display labels show the
-// name + backend icon for the end user.
+// Selection IDENTITY: cards are keyed by the registry's stable server
+// id, not the friendly name. The same friendly name can exist across
+// different backends ("Jade.TV" Plex AND "Jade.TV" Emby); name-based
+// selection would highlight both cards on click and submit the wrong
+// server to the backend. The caller stores the id (or set of ids);
+// display labels show the name + backend icon for the end user.
 
 import type { PingResult, ServerView } from '../api';
+import { useBackendHover, type BackendTint } from '../contexts/BackendTintContext';
 
 export type ServerPickerSingle = {
   multi?: false;
@@ -57,6 +56,7 @@ export type ServerPickerProps = (ServerPickerSingle | ServerPickerMulti) & {
 
 export function ServerPicker(props: ServerPickerProps) {
   const { servers, pings, excludeIds } = props;
+  const hover = useBackendHover();
   if (servers.length === 0) {
     return (
       <div className="empty" style={{ marginTop: 4 }}>
@@ -114,6 +114,7 @@ export function ServerPicker(props: ServerPickerProps) {
             onClick={() => handleClick(s.id)}
             title={ping?.detail ?? s.last_status_detail ?? ''}
             aria-pressed={selected}
+            {...hover.bind(backend as BackendTint)}
           >
             <span className={`dot ${dotClass}`} />
             <span className="server-card-body">

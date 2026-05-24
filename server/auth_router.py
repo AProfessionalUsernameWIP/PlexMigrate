@@ -1,20 +1,15 @@
 """
-Multi-user JWT authentication for the PlexMigrate web UI (PR-A2).
+Multi-user JWT authentication for the Hestia-MediaManager web UI.
 
 Always on
 ---------
-PR-A2 removes the ``PLEXMIGRATE_AUTH_ENABLED`` env var. Auth is now
-active on every install. The first time the app boots with no users
-the ``/api/auth/status`` endpoint reports ``setup_needed=true`` and
-the frontend renders ``<SetupPage />`` which calls
-``POST /api/auth/setup`` to create the root admin. Every subsequent
-boot goes straight to ``<LoginPage />``.
+Auth is active on every install. The first time the app boots with
+no users the ``/api/auth/status`` endpoint reports
+``setup_needed=true`` and the frontend renders ``<SetupPage />``
+which calls ``POST /api/auth/setup`` to create the root admin. Every
+subsequent boot goes straight to ``<LoginPage />``.
 
-Release-notes line (drop into the PR-A2 commit body):
-    "Auth is now always on. On first boot after upgrade you will be
-    prompted to log in with your existing admin credentials."
-
-Role hierarchy (PR-A1):
+Role hierarchy:
   viewer < end user < manager < root_admin  (+ db_admin non-login)
 
 Role enforcement strategy (immediacy contract from §8.7 of
@@ -27,11 +22,11 @@ affected user on their very next request without re-login.
 Why no localStorage on the client?
 ----------------------------------
 The access token is held in React component state plus optional
-sessionStorage / localStorage on the client side (PR-A4 wires the
-``Remember me`` toggle). Closing the browser tab ends the session in
-the default mode. The roadmap calls this out explicitly: the tool is
-locally hosted and the threat model favours "no persisted creds in
-the browser" over the marginal UX win of "stay logged in across
+sessionStorage / localStorage on the client side (the ``Remember me``
+toggle). Closing the browser tab ends the session in the default
+mode. The roadmap calls this out explicitly: the tool is locally
+hosted and the threat model favours "no persisted creds in the
+browser" over the marginal UX win of "stay logged in across
 reloads."
 """
 
@@ -119,6 +114,16 @@ def _load_or_create_secret() -> str:
         finally:
             os.close(fd)
 
+        # AUTH-07: the 0o600 mode above is POSIX-only. On Windows the
+        # file inherits the data-directory ACL; strip the broad-access
+        # groups so the JWT signing secret is not readable by other
+        # local accounts. Best-effort, never fatal.
+        try:
+            from server.secrets import harden_secret_file
+            harden_secret_file(path)
+        except Exception:
+            log.warning("could not harden ACL on %s", path, exc_info=True)
+
         log.warning(
             "Generated new JWT signing secret at %s. Existing tokens "
             "(if any) are now invalid; users must log in again.",
@@ -136,11 +141,11 @@ def _load_or_create_secret() -> str:
 # extending the session without a re-login as long as the refresh
 # cookie is still valid.
 #
-# Hot-reload (Phase 3): the TTL is read from
+# Hot-reload: the TTL is read from
 # ``services.tunables.jwt_access_token_ttl_seconds`` at each token
 # mint, so a save to the tunable takes effect on the next login /
-# refresh. The constant below is the historical fallback when the
-# tunables module isn't importable.
+# refresh. The constant below is the fallback when the tunables
+# module isn't importable.
 _JWT_TTL_FALLBACK = 30 * 60
 JWT_ALG = "HS256"
 
@@ -177,6 +182,41 @@ def _refresh_ttl_seconds() -> int:
 # deployment still works because the flag is simply omitted there.
 REFRESH_COOKIE_NAME = "refresh_token"
 REFRESH_COOKIE_PATH = "/api/auth"
+
+
+def verify_db_admin(username: str, password: str) -> None:
+    """
+    Re-validate db_admin credentials. Raises 401 on any failure path -
+    "no such user", "wrong password", and "username exists but is not
+    a db_admin row" all collapse to one response so an attacker cannot
+    probe for db_admin existence.
+
+    AUTH-05: this is the single shared gate. Every destructive
+    endpoint that takes a {db_admin_username, db_admin_password}
+    two-factor body funnels through here (directly, or via
+    :func:`verify_db_admin_from_body`) instead of re-implementing the
+    check inline, so a future change to the gate lands in one place.
+    """
+    if not username or not password:
+        raise HTTPException(status_code=401, detail="Database admin credentials are required.")
+    verified = auth_db.verify_password(username, password)
+    if verified is None or verified.get("role") != "db_admin":
+        raise HTTPException(status_code=401, detail="Database admin credentials are invalid.")
+
+
+def verify_db_admin_from_body(body: Dict[str, Any]) -> None:
+    """
+    Pull ``db_admin_username`` / ``db_admin_password`` out of a
+    destructive endpoint's request body and run them through
+    :func:`verify_db_admin`. Missing keys become empty strings, which
+    :func:`verify_db_admin` rejects with the same 401 as a wrong
+    password.
+    """
+    body = body or {}
+    verify_db_admin(
+        str(body.get("db_admin_username") or ""),
+        str(body.get("db_admin_password") or ""),
+    )
 
 
 def issue_token(
@@ -311,13 +351,13 @@ ALL_PERMISSIONS = (
     "logs.view",
     "exports.view",
     "settings.edit",
-    # ``settings.tunables`` gates the System Tunables page (infrastructure
-    # knobs that used to be hardcoded literals). Held by root_admin
-    # ONLY - even ``admin`` can't toggle JWT TTLs, HTTP pool sizes,
-    # SQLite busy timeouts, etc., because those values can lock every
-    # user out of the system if set wrong. The frontend hides the
-    # Tunables sub-tab when this perm is absent; the backend will
-    # gate the PATCH route on the same perm in Phase 3.
+    # ``settings.tunables`` gates the System Tunables page
+    # (infrastructure knobs). Held by root_admin ONLY - even ``admin``
+    # can't toggle JWT TTLs, HTTP pool sizes, SQLite busy timeouts,
+    # etc., because those values can lock every user out of the
+    # system if set wrong. The frontend hides the Tunables sub-tab
+    # when this perm is absent; the backend gates the PATCH route on
+    # the same perm.
     "settings.tunables",
     "users.manage",
     "db_admin.access",
@@ -360,6 +400,12 @@ def effective_permissions_for(username: str, role: str) -> List[str]:
     try:
         grants = auth_db.get_user_permission_grants(username)
     except Exception:
+        log.exception(
+            "effective_permissions_for: grants lookup failed for %r; "
+            "falling back to the role baseline (per-user grants and "
+            "revokes are NOT applied this call).",
+            username,
+        )
         return baseline
     extras = [p for p in (grants.get("extra") or []) if p in ALL_PERMISSIONS]
     revoked = set(p for p in (grants.get("revoked") or []) if p in ALL_PERMISSIONS)
@@ -440,7 +486,7 @@ _VIEW_MODE_SESSIONS: Dict[str, Dict[str, str]] = {}
 _VIEW_MODE_LOCK = threading.Lock()
 
 
-# ── Sudo-style elevation session table (Item 1 of admin plan) ───────────────
+# ── Sudo-style elevation session table ─────────────────────────────────────────
 #
 # Logging in as a root_admin is the everyday-work session. Performing a
 # root-level action (creating users, granting root, migrating PINs)
@@ -592,6 +638,25 @@ def _view_mode_clear(sid: str) -> None:
         _VIEW_MODE_SESSIONS.pop(sid, None)
 
 
+def _view_mode_migrate(old_sid: str, new_sid: str) -> None:
+    """Move a view-mode entry from one sid to another. Idempotent.
+
+    AUTH-08 rotates the refresh token on every /refresh, and the JWT
+    ``sid`` IS the refresh-token id - so the sid changes each refresh.
+    Without this migration an active View Mode override would be
+    orphaned on the old sid and silently lost on the next refresh (the
+    admin would pop back to their real role mid-session). Moving the
+    entry preserves the documented "view mode survives /refresh"
+    contract.
+    """
+    if not old_sid or not new_sid or old_sid == new_sid:
+        return
+    with _VIEW_MODE_LOCK:
+        entry = _VIEW_MODE_SESSIONS.pop(old_sid, None)
+        if entry is not None:
+            _VIEW_MODE_SESSIONS[new_sid] = entry
+
+
 def _effective_role_for(payload: Dict[str, Any], real_role: str) -> str:
     """
     Resolve the effective role for an authenticated request. If the
@@ -610,23 +675,40 @@ def _effective_role_for(payload: Dict[str, Any], real_role: str) -> str:
     return real_role
 
 
-def can_modify_user(caller_role: str, target_role: str) -> bool:
+def can_modify_user(caller: Dict[str, Any], target: Dict[str, Any]) -> bool:
     """
-    Per-row protection rule. ``admin`` has all the same permissions as
-    ``root_admin`` EXCEPT it cannot modify or delete a ``root_admin``
-    row - that's the "sudo-root that the main root user can still
-    demote and is immune to being affected by" requirement.
+    Per-row protection rule for the user-management routes. ``caller``
+    and ``target`` are user rows; each carries ``role`` + ``username``.
 
-    ``root_admin`` can modify any row including other root_admins.
-    Anything below ``admin`` doesn't manage users at all so this
-    helper is only meaningful for ``admin`` / ``root_admin`` callers.
+      * ``admin`` has every user-management permission EXCEPT it can
+        never modify or delete a ``root_admin`` row - the sudo-root
+        constraint.
+      * A ``root_admin`` may always modify a non-root row.
+      * Root-on-root is restricted: a ``root_admin`` may modify
+        another ``root_admin`` only when the caller is the PRIMARY
+        root (the lowest-id root_admin row, i.e. the first-run
+        account) or the caller IS the target (self). This stops a
+        secondary root_admin from demoting a peer or the primary
+        root; a secondary root may still demote only itself.
+      * Roles below ``admin`` do not manage users at all.
+
+    The primary root is resolved via ``auth_db.get_root_admin()``,
+    which returns the first-created (lowest-id) root_admin row.
     """
-    if caller_role == "root_admin":
-        return True
-    if caller_role == "admin" and target_role == "root_admin":
-        return False
+    caller_role = caller.get("role")
+    target_role = target.get("role")
     if caller_role == "admin":
-        return True
+        return target_role != "root_admin"
+    if caller_role == "root_admin":
+        if target_role != "root_admin":
+            return True
+        caller_name = caller.get("username")
+        target_name = target.get("username")
+        if caller_name and caller_name == target_name:
+            return True  # a root_admin may always modify itself
+        primary = auth_db.get_root_admin() or {}
+        primary_name = primary.get("username")
+        return bool(primary_name and caller_name == primary_name)
     return False
 
 
@@ -755,7 +837,7 @@ class LoginIn(BaseModel):
 
 class VerifyPasswordIn(BaseModel):
     """
-    PR-A2 - server-side verification for the Switch View Mode flow.
+    Server-side verification for the Switch View Mode flow.
     Body carries only the password; the username is read from the
     caller's JWT to prevent end users from verifying anyone else's
     credentials.
@@ -794,12 +876,10 @@ class DisplayNameIn(BaseModel):
     display_name: str = Field(default="", description="Empty string clears the display name.")
 
 
-# PR-9 - Database Admin Account request bodies. These endpoints are
-# always accessible regardless of ``PLEXMIGRATE_AUTH_ENABLED`` because
-# the admin account they manage is the per-write gate for User
-# Management (PR-10), which must work in both auth-enabled and
-# auth-disabled installs. Each mutating call carries its own admin
-# password as the request-level credential - no JWT involved.
+# Database Admin Account request bodies. The admin account these
+# endpoints manage is the per-write gate for User Management. Each
+# mutating call carries its own admin password as the request-level
+# credential - no JWT involved.
 
 class AdminSetupIn(BaseModel):
     username: str = Field(description="Admin username to create.")
@@ -825,28 +905,18 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 @router.get("/status")
 def auth_status() -> Dict[str, Any]:
     """
-    Public probe used by the frontend on first load. PR-A2 always
-    returns ``auth_enabled: true`` (auth is no longer optional).
+    Public probe used by the frontend on first load. Always returns
+    ``auth_enabled: true`` (auth is not optional).
 
     Fields:
 
       * ``setup_needed`` - True when no user rows exist yet; the
-        frontend renders ``<SetupPage />`` (or the v2 two-step variant)
+        frontend renders ``<SetupPage />`` (the two-step variant)
         instead of ``<LoginPage />``.
-      * ``setup_version`` (Item 1) - records which onboarding ran.
-        Returned for every call so the frontend can detect a legacy
-        install (``setup_version=1``, ``setup_needed=False``) and
-        force the upgrade-split modal on the first authenticated load.
     """
-    try:
-        from server.persistence import load_settings
-        setup_version = int((load_settings() or {}).get("auth_setup_version", 1))
-    except Exception:
-        setup_version = 1
     return {
         "auth_enabled": True,
         "setup_needed": not auth_db.has_any_users(),
-        "setup_version": setup_version,
     }
 
 
@@ -901,7 +971,7 @@ def auth_setup(body: SetupIn, request: Request, response: Response) -> Dict[str,
     }
 
 
-# ── Item 1: two-step setup (admin + root) and the upgrade-split flow ────────
+# ── Item 1: two-step setup (admin + root) ───────────────────────────────────
 
 class SetupV2In(BaseModel):
     """
@@ -919,25 +989,6 @@ class SetupV2In(BaseModel):
     root_display_name: Optional[str] = None
 
 
-class UpgradeSplitIn(BaseModel):
-    """
-    Forced split for legacy single-account installs. The legacy
-    end user (currently a ``root_admin``) re-authenticates with their
-    own password, names a new root_admin account, and creates it.
-    The legacy account is demoted to ``admin``.
-    """
-    caller_password: str = Field(
-        description="The legacy root_admin's own current password.",
-    )
-    root_username: str = Field(
-        description="Username for the new dedicated root_admin account.",
-    )
-    root_password: str = Field(
-        description="Password for the new dedicated root_admin account (>= 8 chars).",
-    )
-    root_display_name: Optional[str] = None
-
-
 class GrantRevokeRootIn(BaseModel):
     """Body for revoke-root: the role the demoted user should drop to.
     grant-root takes no body (the username comes from the URL path)."""
@@ -949,19 +1000,6 @@ class GrantRevokeRootIn(BaseModel):
             "floor in auth_db prevents revoking the only root."
         ),
     )
-
-
-def _mark_setup_v2_complete(logger) -> None:
-    """Stamp ``auth_setup_version=2`` in settings so the next
-    ``/status`` call reports the install as fully migrated. Failure
-    here is logged but does not raise - the user rows are already
-    correct; the worst case is the upgrade-split modal re-fires
-    once on the end user's next login."""
-    try:
-        from server.persistence import save_settings
-        save_settings({"auth_setup_version": 2})
-    except Exception:
-        logger.exception("Could not mark auth_setup_version=2; will retry on next setup")
 
 
 @router.post("/setup-v2")
@@ -1021,7 +1059,6 @@ def auth_setup_v2(
                 admin_user["username"],
             )
         raise HTTPException(status_code=400, detail=f"root: {exc}")
-    _mark_setup_v2_complete(log)
     # Sign the end user in as the admin account they just created.
     auth_db.update_last_login(admin_user["username"])
     refresh_id = auth_db.create_refresh_token(admin_user["username"])
@@ -1044,100 +1081,11 @@ def auth_setup_v2(
     }
 
 
-@router.post("/upgrade-split")
-def auth_upgrade_split(
-    body: UpgradeSplitIn,
-    user: Dict[str, Any] = Depends(require_role("root_admin")),
-) -> Dict[str, Any]:
-    """
-    Item 1: forced legacy-install split. A legacy install has exactly
-    one ``root_admin`` (the end user's single account). This endpoint
-    creates a NEW dedicated ``root_admin`` account, demotes the
-    caller to ``admin``, and marks the install as fully migrated.
-
-    The order matters: create new root FIRST (so the install always
-    has at least one root_admin), then demote the caller. The
-    auth_db last-root-admin floor enforces this independently as a
-    belt-and-suspenders.
-
-    Returns ``{caller_demoted_to, new_root_username}``. The caller's
-    JWT still claims ``root_admin`` for the rest of this request
-    cycle; require_role's immediacy guarantee picks up the new
-    ``admin`` role on the next request. The frontend should prompt a
-    fresh login after this call so the JWT matches the new role.
-
-    Returns 409 if the install is already on setup_version 2, or if
-    there is more than one root_admin already (the end user likely
-    completed the split from a different session - reload and the
-    modal will be gone).
-    """
-    try:
-        from server.persistence import load_settings
-        setup_version = int((load_settings() or {}).get("auth_setup_version", 1))
-    except Exception:
-        setup_version = 1
-    if setup_version >= 2:
-        raise HTTPException(
-            status_code=409,
-            detail="The install is already on the v2 auth model; no split is needed.",
-        )
-    root_count = auth_db.count_role("root_admin")
-    if root_count > 1:
-        raise HTTPException(
-            status_code=409,
-            detail="More than one root_admin already exists; the split has already happened elsewhere.",
-        )
-    # Caller must prove their own password (defence against an
-    # end user stealing a session and forcing a split).
-    verified = auth_db.verify_password(user["username"], body.caller_password)
-    if verified is None or verified.get("role") != "root_admin":
-        raise HTTPException(status_code=401, detail="Invalid password.")
-    if body.root_username.strip() == user["username"]:
-        raise HTTPException(
-            status_code=400,
-            detail="The new root account must have a different username from your own.",
-        )
-    # Step 1: create the new root_admin. The install now has 2 roots.
-    try:
-        auth_db.create_user(
-            body.root_username, body.root_password,
-            role="root_admin",
-            display_name=body.root_display_name,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"new root: {exc}")
-    # Step 2: demote the caller. Last-root-admin floor is satisfied
-    # because step 1 just created a second root.
-    try:
-        auth_db.update_role(user["username"], "admin")
-    except ValueError as exc:
-        # Roll back the new root so we don't leave the install in a
-        # weird half-state with two root_admins.
-        try:
-            auth_db.delete_user(body.root_username)
-        except Exception:  # pragma: no cover (defensive)
-            log.exception(
-                "upgrade-split rollback of new root %r failed",
-                body.root_username,
-            )
-        raise HTTPException(status_code=400, detail=f"demote: {exc}")
-    # Step 3: mark setup complete.
-    _mark_setup_v2_complete(log)
-    log.info(
-        "upgrade-split: created new root=%r and demoted %r to admin",
-        body.root_username, user["username"],
-    )
-    return {
-        "caller_demoted_to": "admin",
-        "new_root_username": body.root_username,
-    }
-
-
 @router.post("/users/{username}/grant-root")
 def auth_grant_root(
     username: str,
     request: Request,
-    _: Dict[str, Any] = Depends(require_elevation()),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
     Item 1: promote a user to root_admin. Requires a fresh sudo-style
@@ -1156,6 +1104,11 @@ def auth_grant_root(
             status_code=400,
             detail="Cannot promote a db_admin row to root_admin.",
         )
+    if not can_modify_user(user, target):
+        raise HTTPException(
+            status_code=403,
+            detail="You are not permitted to modify this account.",
+        )
     try:
         auth_db.update_role(username, "root_admin")
     except ValueError as exc:
@@ -1169,13 +1122,17 @@ def auth_revoke_root(
     username: str,
     body: GrantRevokeRootIn,
     request: Request,
-    _: Dict[str, Any] = Depends(require_elevation()),
+    user: Dict[str, Any] = Depends(require_elevation()),
 ) -> Dict[str, Any]:
     """
     Item 1: demote a root_admin user to a lower role. Requires a
     fresh sudo-style elevation. The last-root-admin floor in
     ``auth_db.update_role`` independently protects against removing
     the only root.
+
+    Root-on-root protection: a root_admin may demote only itself;
+    demoting a DIFFERENT root_admin requires the caller to be the
+    primary root (the first-run, lowest-id root_admin account).
     """
     if body.new_role == "root_admin":
         raise HTTPException(
@@ -1189,6 +1146,14 @@ def auth_revoke_root(
         raise HTTPException(
             status_code=400,
             detail=f"User {username!r} is not currently a root_admin.",
+        )
+    if not can_modify_user(user, target):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "A root_admin can only be demoted by itself or by the "
+                "primary root admin (the first-run root account)."
+            ),
         )
     try:
         auth_db.update_role(username, body.new_role)
@@ -1244,18 +1209,25 @@ def auth_login(body: LoginIn, request: Request, response: Response) -> Dict[str,
 
 @router.post("/refresh")
 def auth_refresh(
+    request: Request,
     response: Response,
     refresh_token: Optional[str] = Cookie(default=None, alias=REFRESH_COOKIE_NAME),
 ) -> Dict[str, Any]:
     """
-    Mint a new access JWT from a valid refresh-token cookie.
+    Mint a new access JWT from a valid refresh-token cookie, ROTATING
+    the refresh token in the process (AUTH-08).
 
     Public endpoint: no Authorization header required. The cookie is
     the sole credential, validated against the refresh_tokens table.
-    Returns 401 if the cookie is absent, expired, revoked, or points
-    at a user that no longer exists. The same refresh-token row is
-    reused for the lifetime of the cookie (no rotation) - the cookie
-    Max-Age stays fixed at the original 7-day window.
+    Returns 401 if the cookie is absent, expired, revoked, replayed,
+    or points at a user that no longer exists.
+
+    Rotation: every call consumes the presented refresh token and
+    issues a fresh one (new cookie value + new JWT ``sid``). A token
+    that was already rotated, presented again, is treated as a replay
+    - ``auth_db.rotate_refresh_token`` then revokes every refresh
+    token for that user. This shrinks a stolen cookie's usefulness
+    from the full TTL window to a single refresh cycle.
 
     The frontend calls this:
       * Once on page mount, before rendering anything, to detect
@@ -1266,27 +1238,37 @@ def auth_refresh(
     """
     if not refresh_token:
         raise HTTPException(status_code=401, detail="No refresh token.")
-    username = auth_db.validate_refresh_token(refresh_token)
-    if username is None:
-        # The cookie is junk - might as well clear it so the browser
-        # stops sending it on every subsequent call.
+    # Rotate: consume the presented token and obtain its replacement.
+    # rotate_refresh_token returns None for an unknown / expired /
+    # revoked / replayed token (and, for a replay, has already revoked
+    # every token for that user) - all collapse to one generic 401.
+    rotated = auth_db.rotate_refresh_token(refresh_token)
+    if rotated is None:
+        _view_mode_clear(refresh_token)
         _clear_refresh_cookie(response)
         raise HTTPException(status_code=401, detail="Refresh token invalid or expired.")
+    username, new_refresh_token = rotated
     user = auth_db.get_user(username)
     if user is None or user.get("role") not in _ROLE_RANK:
-        # User was deleted between issuance and now. Revoke the row
-        # defensively so future refresh attempts short-circuit at the
-        # validate step, and drop any view-mode entry tied to this
-        # session before the row goes away.
+        # User was deleted between issuance and now. The old token is
+        # already consumed by the rotation above; revoke the
+        # just-issued replacement too and drop any view-mode entry.
         _view_mode_clear(refresh_token)
-        auth_db.revoke_refresh_token(refresh_token)
+        auth_db.revoke_refresh_token(new_refresh_token)
         _clear_refresh_cookie(response)
         raise HTTPException(status_code=401, detail="Account no longer exists.")
-    # Same refresh-token id stays the JWT's sid, so the in-memory
-    # view-mode entry (if any) carries over to the new access token.
+    # Rotation changed the refresh-token id, and the JWT sid IS that
+    # id - carry any active View Mode override across to the new sid,
+    # otherwise it would be orphaned and the admin would silently pop
+    # back to their real role on this very refresh.
+    _view_mode_migrate(refresh_token, new_refresh_token)
+    _set_refresh_cookie(
+        response, new_refresh_token,
+        secure=request.url.scheme == "https",
+    )
     token = issue_token(
         user["username"], user["role"], user.get("display_name"),
-        sid=refresh_token,
+        sid=new_refresh_token,
     )
     return {
         "user": {
@@ -1571,6 +1553,11 @@ def view_mode_enter(
             status_code=409,
             detail="Stale token format; log out and back in to enable View Mode.",
         )
+    # Entering or changing View Mode is a privilege-context change, so
+    # any banked sudo elevation must be dropped (AUTH-04): otherwise an
+    # elevation minted as root_admin would survive the drop to a lower
+    # view role and still pass require_elevation() gates.
+    _elevation_clear(sid)
     _view_mode_set(sid, real_role=real_role, view_role=body.target_role, username=user["username"])
     return {
         "in_view_mode": True,
@@ -1685,10 +1672,14 @@ def auth_update_user(
     target = auth_db.get_user(username)
     if target is None:
         raise HTTPException(status_code=404, detail=f"No user named {username!r}.")
-    if not can_modify_user(user["role"], target["role"]):
+    if not can_modify_user(user, target):
         raise HTTPException(
             status_code=403,
-            detail="The admin role cannot modify the root_admin row.",
+            detail=(
+                "A root_admin row can only be modified by the primary "
+                "root admin or by itself; the admin role cannot modify "
+                "a root_admin row at all."
+            ),
         )
     if body.role is not None:
         if target["role"] == "root_admin":
@@ -1740,10 +1731,14 @@ def auth_reset_password(
     target = auth_db.get_user(username)
     if target is None:
         raise HTTPException(status_code=404, detail=f"No user named {username!r}.")
-    if not can_modify_user(user["role"], target["role"]):
+    if not can_modify_user(user, target):
         raise HTTPException(
             status_code=403,
-            detail="The admin role cannot reset the root_admin row's password.",
+            detail=(
+                "A root_admin row's password can only be reset by the "
+                "primary root admin or by itself; the admin role cannot "
+                "reset a root_admin row's password."
+            ),
         )
     try:
         auth_db.update_password(username, body.new_password)
@@ -1774,7 +1769,7 @@ def auth_delete_user(
             status_code=400,
             detail="Cannot delete a root_admin row.",
         )
-    if not can_modify_user(user["role"], target["role"]):
+    if not can_modify_user(user, target):
         raise HTTPException(
             status_code=403,
             detail="The admin role cannot delete the root_admin row.",
@@ -1891,9 +1886,9 @@ def auth_set_user_permissions(
         "elevate_confirmed=True)",
         username, user.get("username"), len(body.extra), len(body.revoked),
     )
-    # Phase 6 of the dashboard / log reorg: explicitly audit-log the
-    # grant via db_access_log so the entry lands in db_access.log
-    # alongside other privilege-relevant writes. The elevate-confirmed
+    # Explicitly audit-log the grant via db_access_log so the entry
+    # lands in db_access.log alongside other privilege-relevant
+    # writes. The elevate-confirmed
     # flag is unconditionally True at this point because the endpoint
     # is gated on ``require_elevation()`` - we cannot reach this line
     # without a fresh password re-confirmation within the elevation
@@ -1987,16 +1982,15 @@ def auth_change_own_password(
     return {"username": user["username"], "changed": True}
 
 
-# ── Database Admin account (role='db_admin') - PR-9.1 + PR-A2 hardening ─────
+# ── Database Admin account (role='db_admin') ───────────────────────────────────
 #
 # A SEPARATE row from the root_admin login row. Decoupled so the
-# end user can authorise destructive User Management writes (PR-10)
-# with a credential they don't use for everyday login.
+# end user can authorise destructive User Management writes with a
+# credential they don't use for everyday login.
 #
-# PR-A2 tightens access: every endpoint here now requires a
-# root_admin JWT (was reachable without auth in PR-9.1 because of the
-# old ``_AUTH_PUBLIC_PREFIXES`` exemption). The current-password
-# requirement on /admin/update remains as defence-in-depth.
+# Every endpoint here requires a root_admin JWT. The current-password
+# requirement on /admin/update is an additional defence-in-depth
+# layer.
 
 @router.get("/admin/status")
 def admin_status(
@@ -2078,22 +2072,20 @@ def admin_verify(
 ) -> Dict[str, Any]:
     """
     Validate a db-admin username + password without issuing a token.
-    Used by PR-10's User Management write gate. Caller must be
-    admin or root_admin (JWT); the body is the db-admin credential
-    to verify.
+    Used by the User Management write gate. Caller must be admin or
+    root_admin (JWT); the body is the db-admin credential to verify.
     """
     verified = auth_db.verify_password(body.username, body.password)
     valid = verified is not None and verified.get("role") == "db_admin"
     return {"valid": bool(valid)}
 
 
-# ── Root admin login account management (PR-9.1 → PR-A2 rename) ──────────────
+# ── Root admin login account management ────────────────────────────────────────
 #
-# Updates the row with ``role='root_admin'`` (was ``admin`` before
-# PR-A1). PR-A2 tightens access to require a root_admin JWT; the
-# current-password requirement stays as defence-in-depth. With PR-A5
-# the Account Settings panel will offer the same surface as a
-# self-service alternative for the logged-in end user.
+# Updates the row with ``role='root_admin'``. Access requires a
+# root_admin JWT; the current-password requirement is an additional
+# defence-in-depth layer. The Account Settings panel offers the same
+# surface as a self-service alternative for the logged-in end user.
 
 @router.get("/login-account/status")
 def login_account_status(

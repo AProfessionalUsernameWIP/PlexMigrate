@@ -1,9 +1,9 @@
 {
   "name": "plexmigrate-frontend",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.18.0",
   "type": "module",
-  "description": "Web UI for PlexMigrate. Mirrors the terminal dashboard and CLI flag set, talks to the FastAPI backend over REST + WebSocket.",
+  "description": "Web UI for Hestia-MediaManager. Talks to the FastAPI backend over REST + WebSocket.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

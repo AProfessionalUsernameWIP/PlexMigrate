@@ -1,5 +1,5 @@
 """
-Plex server authentication and library discovery for PlexMigrate.
+Plex server authentication and library discovery for Hestia-MediaManager.
 
 Contains token auto-discovery, server connection, library enumeration,
 home user token fetching, and the shared HTTP session / retry adapter factory.
@@ -7,23 +7,67 @@ home user token fetching, and the shared HTTP session / retry adapter factory.
 
 import concurrent.futures
 import logging
-import sys
+import os
 import threading
-import xml.etree.ElementTree as ET
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
+import plexapi.myplex
 from plexapi.server import PlexServer
 from requests.adapters import HTTPAdapter
 from rich.table import Table
 from urllib3.util.retry import Retry
 
 import services.state as state
-from services.state import PLEX_DB_PATHS, console
+from services.state import console
 
 
 log = logging.getLogger("plexmigrate.services.auth")
+
+
+# ── Plex.tv base-URL override for E2E tests ──────────────────────────────────
+#
+# plexapi's MyPlexAccount class talks to https://plex.tv via a set of
+# hardcoded class-attribute URLs. To let the E2E mock answer those calls
+# (so tests can exercise the share-state / owner-identity paths without
+# leaking traffic to the live plex.tv) we monkey-patch the class
+# attributes at import time, redirecting every plex.tv URL through a
+# configurable base read from the ``PLEXMIGRATE_PLEX_TV_BASE_URL`` env
+# var. When unset, the originals are preserved verbatim so production
+# behaviour is unchanged.
+#
+# Why patch the class (not a per-instance attribute): plexapi reads
+# ``self.KEY`` where KEY is a class attribute on every helper call,
+# so mutating the class once at import time covers every consumer
+# without us having to wrap or subclass PlexServer / MyPlexAccount.
+
+def _maybe_rebase_plexapi_plex_tv_urls() -> None:
+    """If ``PLEXMIGRATE_PLEX_TV_BASE_URL`` is set, rewrite the
+    hardcoded ``https://plex.tv`` prefix on plexapi.myplex's class
+    attributes to point at the override. Idempotent against re-imports.
+    Silently does nothing when the env var is missing / blank."""
+    override = (os.environ.get("PLEXMIGRATE_PLEX_TV_BASE_URL", "")
+                or "").strip().rstrip("/")
+    if not override:
+        return
+    real = "https://plex.tv"
+    classes = (
+        plexapi.myplex.MyPlexAccount,
+        plexapi.myplex.MyPlexUser,
+    )
+    # Walk every class attribute that is a string starting with
+    # https://plex.tv and substitute the override. This is broad on
+    # purpose (catches all known + any future plex.tv-anchored URLs)
+    # while leaving non-plex.tv class attributes (the .provider.plex.tv
+    # hub-section URLs) alone.
+    for cls in classes:
+        for attr_name in list(vars(cls)):
+            val = getattr(cls, attr_name, None)
+            if isinstance(val, str) and val.startswith(real):
+                setattr(cls, attr_name, override + val[len(real):])
+
+
+_maybe_rebase_plexapi_plex_tv_urls()
 
 
 # ── HTTP Session / Retry Adapter ──────────────────────────────────────────────
@@ -207,11 +251,29 @@ def _http_response_hook(response, *args, **kwargs):
         # that don't pull in the server package.
         try:
             from server import network_collector as _nc
+            # also capture method + per-job
+            # attribution so the Network panel can render a per-job
+            # request timeline. The ContextVar default is empty when
+            # called outside a job context (e.g. /api/servers ping).
+            try:
+                from services.dashboard import _http_job_id_var
+                _job_id = _http_job_id_var.get() or None
+            except Exception:
+                _job_id = None
+            _method = ""
+            try:
+                _req = getattr(response, "request", None)
+                if _req is not None:
+                    _method = (getattr(_req, "method", "") or "").upper()
+            except Exception:
+                _method = ""
             _nc.record_response(
                 url=str(response.url or ""),
                 status_code=int(response.status_code),
                 elapsed_ms=elapsed_ms,
                 retry_after_seconds=retry_after,
+                method=_method or None,
+                job_id=_job_id,
             )
         except Exception:
             pass
@@ -255,46 +317,6 @@ def _make_session() -> requests.Session:
 
 
 # ── Plex Server Discovery ─────────────────────────────────────────────────────
-
-def find_preferences_xml() -> Optional[Path]:
-    """
-    Scans OS-specific paths for Plex's Preferences.xml configuration file.
-
-    By finding and reading this file, we can connect to Plex without asking
-    the user to look up their token manually.
-
-    Returns:
-        Path to Preferences.xml if found, or None if not found anywhere.
-    """
-    platform = sys.platform
-    paths = PLEX_DB_PATHS.get(platform, PLEX_DB_PATHS.get("linux", []))
-
-    for base in paths:
-        candidate = Path(base) / "Preferences.xml"
-        if candidate.exists():
-            return candidate
-
-    return None
-
-
-def read_token_from_prefs(prefs_path: Path) -> Optional[str]:
-    """
-    Reads the PlexOnlineToken attribute from a Preferences.xml file.
-
-    Args:
-        prefs_path (Path): Full path to Preferences.xml.
-
-    Returns:
-        The token string if found and non-empty, or None.
-    """
-    try:
-        tree = ET.parse(prefs_path)
-        root = tree.getroot()
-        token = root.get("PlexOnlineToken")
-        return token if token else None
-    except Exception:
-        return None
-
 
 def connect_to_server(
     url: str,
@@ -424,8 +446,8 @@ def display_discovery(server: PlexServer, libs: List[Dict]) -> None:
 
 def _lookup_stored_pin(username: str, machine_identifier: str) -> Optional[str]:
     """
-    PR-13 fix #4 helper. Resolve the stored Plex Home PIN for a
-    managed user via the PR-10 ``managed_users`` table, looking the
+    Resolve the stored Plex Home PIN for a
+    managed user via the ``managed_users`` table, looking the
     server up by ``machine_identifier`` (which the engine has handy
     via ``PlexServer.machineIdentifier``) rather than friendly name.
 
@@ -434,7 +456,7 @@ def _lookup_stored_pin(username: str, machine_identifier: str) -> Optional[str]:
     decoding the ciphertext returns ``None`` so the caller falls
     back to its no-PIN path rather than crashing the per-user loop.
 
-    PR-13 audit follow-up: every PIN read is recorded in
+    Every PIN read is recorded in
     ``db_access.log`` so the end user can confirm the stored-PIN
     path is actually firing for a given user.
     """
@@ -528,7 +550,7 @@ def _share_state_for_server(machine_identifier: str) -> Dict[str, Dict[str, Any]
 
 def _tombstoned_usernames_for_server(machine_identifier: str) -> set:
     """
-    PR-13 follow-up: return the set of usernames that should be
+    Return the set of usernames that should be
     skipped on the server with the given ``machine_identifier``.
     Combines the global tombstones table with the per-server
     tombstone flags on ``managed_users``. Empty set on any error
@@ -598,8 +620,8 @@ def get_home_users(
         server (PlexServer): Admin server connection (must be linked to Plex.tv).
         base_url (str): Plex server base URL, e.g. "http://localhost:32400".
         logger (Logger): Shared logger.
-        user_filter (Iterable[str], optional): 2026-05-17 (operator
-            request): when provided, pre-filter the home-user list to
+        user_filter (Iterable[str], optional): when provided,
+            pre-filter the home-user list to
             ONLY usernames present in the iterable BEFORE authenticating.
             Saves a 5-30s burst per excluded user (each gets its own
             ``user.get_token()`` round-trip with potential PIN auth).
@@ -622,7 +644,7 @@ def get_home_users(
             logger.info("No Plex Home managed users found on this account.")
             return result
 
-        # 2026-05-17 (operator request): pre-auth user_filter. The
+        # Pre-auth user_filter. The
         # snapshotter / restorer / direct-transfer callers select a
         # subset of users on the UI side; this is the first chance to
         # narrow the auth burst to JUST those usernames. Each excluded
@@ -658,7 +680,7 @@ def get_home_users(
             )
             return result
 
-        # PR-13 follow-up - apply tombstone filters BEFORE we
+        # Apply tombstone filters BEFORE we
         # authenticate any user. Pre-fix, the engine connected to
         # every managed user including ones the end user had hidden
         # via the User Management panel; the resulting per-user
@@ -693,7 +715,7 @@ def get_home_users(
             )
             return result
 
-        # ── Share-state gate (2026-05-15; cross-server-leak fix 2026-05-17) ─
+        # ── Share-state gate ──────────────────────────────────────────────
         # ``account.users()`` returns every friend / managed user the
         # admin has *ever* shared with - GLOBALLY across every server
         # the owner has linked, including users who have NO share on
@@ -705,7 +727,7 @@ def get_home_users(
         # with access to this server IS in the cache after a successful
         # sync.
         #
-        # 2026-05-17 cross-server-leak fix: when the cache is populated
+        # When the cache is populated
         # for this server (non-empty), a user NOT in the cache is a
         # user from another server, NOT a "new user the sync hasn't
         # picked up yet". Drop them silently from the auth fan-out so
@@ -785,28 +807,23 @@ def get_home_users(
             )
 
         # ── Fetch per-user tokens in parallel ─────────────────────────────────
-        # PR-2 / Phase C (auth refactor): PIN-protected managed users.
-        # ``user.get_token()`` raises an auth error when the user has a
-        # PIN set on the server; pre-PR-2 we logged a warning and
-        # silently dropped that user from the roster.
+        # PIN-protected managed users: ``user.get_token()`` raises an
+        # auth error when the user has a server-side PIN.
         #
-        # PR-2 introduced an "admin-token fallback" that re-used the
-        # admin's PlexServer for the failed user. That was a serious
-        # data-fidelity bug: ``section.watched()`` filters by the
-        # currently-authenticated session, so the admin server returns
-        # the OWNER's watched history for every PIN-protected user,
+        # We must NOT fall back to the admin's PlexServer for a failed
+        # user: ``section.watched()`` filters by the currently-
+        # authenticated session, so the admin server would return the
+        # OWNER's watched history for every PIN-protected user,
         # producing identical play counts under each managed user's
-        # name in the snapshot. See PR-13 fix #4.
+        # name in the snapshot.
         #
-        # PR-13 fix #4 reverts to the pre-PR-2 behaviour (drop the
-        # user if we can't authenticate them) BUT first tries to use
-        # the end user-supplied PIN from ``managed_users.plex_home_pin_enc``
-        # (PR-10 storage). If a PIN is stored, we sign in as the home
-        # user via the account-level switch and obtain a real per-user
-        # token. If no PIN is stored OR sign-in still fails, the user
-        # is dropped from the roster with a warning - the pre-flight
-        # check (PR-12) surfaces this to the end user before the job
-        # commits so they can save the PIN under User Management.
+        # Instead: try the operator-supplied PIN from
+        # ``managed_users.plex_home_pin_enc`` - if a PIN is stored, sign
+        # in as the home user via the account-level switch and obtain a
+        # real per-user token. If no PIN is stored OR sign-in fails, the
+        # user is dropped from the roster with a warning; the pre-flight
+        # check surfaces this to the end user before the job commits so
+        # they can save the PIN under User Management.
         def _try_account_switch(user):
             """Use signInHomeUser when a PIN is stored. Returns a
             (token, server) tuple or raises if the switch isn't
@@ -888,13 +905,13 @@ def get_home_users(
                     else:
                         logger.info(f"Connected as home user: {title}")
                 except Exception as e:
-                    # PR-13 fix #4: drop the user, do NOT fall back to
+                    # Drop the user, do NOT fall back to
                     # the admin server. Falling back would silently
                     # attribute the owner's watch / rating / playlist
                     # data to this user's row, corrupting per-user
                     # state in every downstream snapshot. The end user
                     # can save the user's PIN under Servers -> User
-                    # Management and re-run; PR-12's pre-flight panel
+                    # Management and re-run; the pre-flight panel
                     # will surface PIN-protected users that lack stored
                     # PINs before the job commits.
                     info = share_state.get(getattr(u, "title", "") or "", {})
@@ -923,7 +940,7 @@ def get_home_users(
                         logger.warning(
                             "Home user %r could not authenticate (%s) - "
                             "user is being DROPPED from this run to avoid "
-                            "the owner-watch-bleed bug from PR-2. Save the "
+                            "the owner-watch-bleed bug. Save the "
                             "user's Plex Home PIN under Servers -> User "
                             "Management to capture their data on the next run.",
                             u.title, e,

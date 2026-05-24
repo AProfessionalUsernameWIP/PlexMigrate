@@ -1,5 +1,4 @@
-// Item 5 (admin-management plan, 2026-05-15): central registry of help
-// topics. Each entry has:
+// Central registry of help topics. Each entry has:
 //   * a stable ID used by <InfoTip topicId={...} />
 //   * a short label for the in-form abbreviation
 //   * a body rendered both inside the popover AND on the Help tab's
@@ -111,7 +110,7 @@ const TOPICS: HelpTopic[] = [
         </p>
         <p>
           Enable this only if your managed users predate Plex's
-          user-ID surface and PlexBackUp doesn't have a Plex user ID
+          user-ID surface and Hestia-MediaManager doesn't have a Plex user ID
           captured for them yet. Once enabled, PIN migration will also
           consider plain username matches.
         </p>
@@ -533,7 +532,7 @@ const TOPICS: HelpTopic[] = [
     body: (
       <>
         <p>
-          PlexBackUp ships three job modes:
+          Hestia-MediaManager ships three job modes:
         </p>
         <ul>
           <li>
@@ -630,13 +629,13 @@ const TOPICS: HelpTopic[] = [
       </>
     ),
   },
-  // 2026-05-17: identity-system primer. End users frequently ask "how
-  // does the app keep the same person straight across two servers
-  // (e.g., my Plex.tv account on Jade.TV AND Jade.Music)?" The short
-  // answer: every user added to the app gets an app-generated UUID at
-  // insert time and the cross-server identity_map keys off that UUID.
-  // This topic explains the invariant + the three identifiers in play
-  // so the dev_notes / db_schema material doesn't have to be the only
+  // Identity-system primer. End users frequently ask "how does the
+  // app keep the same person straight across two servers (e.g., my
+  // Plex.tv account on Jade.TV AND Jade.Music)?" The short answer:
+  // every user added to the app gets an app-generated UUID at insert
+  // time and the cross-server identity_map keys off that UUID. This
+  // topic explains the invariant + the three identifiers in play so
+  // the dev_notes / db_schema material doesn't have to be the only
   // source.
   {
     id: 'user-identity-uuid',
@@ -740,15 +739,15 @@ const TOPICS: HelpTopic[] = [
       </>
     ),
   },
-  // 2026-05-17: companion topic to user-identity-uuid. Where the
-  // -uuid topic explains WHAT the canonical identifier is + the
-  // invariant that every user has one, this topic explains WHY we
-  // bother keeping a cross-server link table and what scenarios it
-  // unlocks for the operator. Built around three concrete pairings
-  // operators actually hit: same-owner Plex, mixed-ownership Plex,
-  // and cross-backend Plex ↔ Jellyfin/Emby. Sibling to user-
-  // identity-uuid under the same 'servers' category so both surface
-  // together on Help ▸ Topics ▸ Servers.
+  // Companion topic to user-identity-uuid. Where the -uuid topic
+  // explains WHAT the canonical identifier is + the invariant that
+  // every user has one, this topic explains WHY we bother keeping a
+  // cross-server link table and what scenarios it unlocks for the
+  // operator. Built around three concrete pairings operators
+  // actually hit: same-owner Plex, mixed-ownership Plex, and
+  // cross-backend Plex ↔ Jellyfin/Emby. Sibling to user-identity-uuid
+  // under the same 'servers' category so both surface together on
+  // Help ▸ Topics ▸ Servers.
   {
     id: 'user-identity-map',
     title: 'Linking the same person across servers (user_identity_map)',

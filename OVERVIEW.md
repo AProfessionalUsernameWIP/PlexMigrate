@@ -1,8 +1,8 @@
-# PlexBackUp - Technical Overview
+# Hestia-MediaManager - Technical Overview
 
-This document is the **architectural reference** for PlexBackUp. It covers the technical decisions behind the engine, the databases, the API surface, the concurrency model, and the tradeoffs that come with each choice. It also collects the advanced setup and security topics that operators don't need to read to get the tool running.
+This document is the **architectural reference** for Hestia-MediaManager. It covers the technical decisions behind the engine, the databases, the API surface, the concurrency model, and the tradeoffs that come with each choice. It also collects the advanced setup and security topics that operators don't need to read to get the tool running.
 
-> **Looking for what PlexBackUp is, why it exists, or how to use it?** See [README.md](README.md), the operator manual. **Want a 5-minute setup walkthrough?** See [QUICKSTART.md](QUICKSTART.md).
+> **Looking for what Hestia-MediaManager is, why it exists, or how to use it?** See [README.md](README.md), the user manual. **Want a 5-minute setup walkthrough?** See [QUICKSTART.md](QUICKSTART.md).
 
 ---
 
@@ -31,18 +31,18 @@ If you came here from a pointer in the README, the section you want is probably 
 **Advanced setup and operations (referenced from the README)**
 
 * [Security architecture](#security-architecture) - root account model, sudo-style elevation, at-rest encryption, JWT auth, log scrubber, file permissions
-* [Exposing PlexBackUp to other devices on your network](#exposing-plexbackup-to-other-devices-on-your-network) - the optional LAN-exposure walkthrough
+* [Exposing Hestia-MediaManager to other devices on your network](#exposing-hestia-mediamanager-to-other-devices-on-your-network) - the optional LAN-exposure walkthrough
 * [Migration from v0.8.0](#migration-from-v080) - what happens to your old settings and schedules on upgrade
 
 ---
 
 ## High-level architecture
 
-PlexBackUp is a FastAPI backend with a React frontend, running typically in Docker. It communicates with Plex through `plexapi` and a shared `requests.Session` that centralises retry and throttling behaviour.
+Hestia-MediaManager is a FastAPI backend with a React frontend, running typically in Docker. It communicates with Plex through `plexapi` and a shared `requests.Session` that centralises retry and throttling behaviour.
 
 Core pieces:
 
-* **The engine** (`services/`) - one shared body of code that knows how to talk to Plex, gather metadata, resolve items, and write data back. Both the CLI driver (`plexmigrate.py`) and the FastAPI server call into it.
+* **The engine** (`services/`) - one shared body of code that knows how to talk to Plex, gather metadata, resolve items, and write data back. The FastAPI server calls into it.
 * **The web layer** (`server/` FastAPI backend + `frontend/` React UI) - wraps the engine in a single-worker job queue, a multi-user auth layer, a live WebSocket dashboard, scheduling, log browsing, and snapshot browsing.
 * **The SQLite trio** (`auth.db`, `media.db`, `snapshots.db` under `server_data/`) - three deliberately separated stores with different ownership patterns.
 
@@ -52,9 +52,9 @@ The defining architectural choice: the data model is consciously **Plex-agnostic
 
 ## Why GUIDs, not ratingKeys
 
-Plex's internal `ratingKey` is **ephemeral**. It is unique inside one Plex install at one point in time. Rebuild the database, or move to a new server, and every `ratingKey` changes. Snapshots that referenced those keys would be useless after a rebuild, which is exactly the failure mode PlexBackUp exists to prevent.
+Plex's internal `ratingKey` is **ephemeral**. It is unique inside one Plex install at one point in time. Rebuild the database, or move to a new server, and every `ratingKey` changes. Snapshots that referenced those keys would be useless after a rebuild, which is exactly the failure mode Hestia-MediaManager exists to prevent.
 
-PlexBackUp keys on upstream metadata identifiers instead:
+Hestia-MediaManager keys on upstream metadata identifiers instead:
 
 * `imdb://tt0133093` (The Matrix)
 * `tmdb://1399` (Game of Thrones)
@@ -69,10 +69,10 @@ The four-tier matcher in `services/resolver.py` falls back through GUID, exact f
 
 ## The snapshot lifecycle
 
-When the operator clicks **Submit** on a snapshot job, here is the full path:
+When the user clicks **Submit** on a snapshot job, here is the full path:
 
 1. **HTTP validation.** `POST /api/job/snapshot` is validated against a Pydantic model (`SnapshotJobIn`). Legacy flag names from older releases are normalised into the modern `include_*` fields by a `model_validator`, so old clients still work.
-2. **Preflight.** A separate endpoint (`POST /api/job/preflight-pin-check`) is called first by the frontend. If any managed users have a Plex Home PIN set with no captured token, the response lists them and the UI shows the "PIN-protected users detected" modal. The operator either acknowledges and continues, or cancels and fixes the missing PINs first.
+2. **Preflight.** A separate endpoint (`POST /api/job/preflight-pin-check`) is called first by the frontend. If any managed users have a Plex Home PIN set with no captured token, the response lists them and the UI shows the "PIN-protected users detected" modal. The user either acknowledges and continues, or cancels and fixes the missing PINs first.
 3. **Enqueue.** A `JobRecord` is appended to the in-process FIFO queue. **Only one engine call runs at a time** (see "Why a single-worker engine" below).
 4. **Worker picks it up.** The job worker decrypts the host's Plex token from `servers.json` (Fernet, see `server/secrets.py`), opens a `PlexServer` connection through `plexapi`, and builds a per-run logger that writes into `plex_logs/run_<slug>_<timestamp>/`.
 5. **Engine entry.** `run_snapshot()` resets per-run counters, applies library/user filters, and decides whether to run the owner phase, the per-user phase, or both.
@@ -106,7 +106,7 @@ Direct transfer is "snapshot into memory + restore from memory" packaged as one 
 
 If the direct path fails for a given library (a network blip, an OOM on a very large library, an unexpected API response), the engine falls back automatically to a **chained path for that library only**: write a temporary `.tmp.plexexport.json`, restore from it, delete the temp on success. Sibling libraries keep going on the direct path. The dashboard activity feed notes the fallback so it is auditable.
 
-The "per library" granularity matters. A naive design would either abort the whole job on the first error or fall back the whole job, both of which produce worse operator outcomes than mixed-path success.
+The "per library" granularity matters. A naive design would either abort the whole job on the first error or fall back the whole job, both of which produce worse user outcomes than mixed-path success.
 
 ---
 
@@ -128,21 +128,21 @@ Currently, three of the run-level log files (`runtime.log`, `errors.log`, `media
 
 ## The live dashboard data flow
 
-The 4 Hz WebSocket dashboard is the part of PlexBackUp that feels alive. The data flow:
+The 4 Hz WebSocket dashboard is the part of Hestia-MediaManager that feels alive. The data flow:
 
 1. **Mutation.** A worker thread increments a counter or appends a line to the activity feed by calling a method on the dashboard handle in its current `ContextVar`. The handle holds an internal lock so concurrent writes from sibling threads don't race.
 2. **Broadcaster.** A separate thread, started by `server/ws.py`, ticks at 4 Hz. On each tick it captures a `DashboardState` snapshot, builds a JSON frame via `DashboardState.to_dashboard_frame()`, and sends it to every connected WebSocket client.
 3. **Browser.** The React WebSocket handler pushes the frame into the dashboard's state store. React re-renders the affected panels.
 
-The 4 Hz cadence is deliberate. Lower than that and the dashboard feels laggy; higher and you saturate the browser's render loop on slow machines without giving the operator any real new information.
+The 4 Hz cadence is deliberate. Lower than that and the dashboard feels laggy; higher and you saturate the browser's render loop on slow machines without giving the user any real new information.
 
-This is also the path that surfaces Plex API health to the operator. A response hook on the shared `requests.Session` captures every 429 status code and the `Retry-After` header into the dashboard's HTTP telemetry panel. If 429s climb during a run, the operator can see it in real time and drop the worker count.
+This is also the path that surfaces Plex API health to the user. A response hook on the shared `requests.Session` captures every 429 status code and the `Retry-After` header into the dashboard's HTTP telemetry panel. If 429s climb during a run, the user can see it in real time and drop the worker count.
 
 ---
 
 ## Databases
 
-PlexBackUp keeps state in three SQLite files under `server_data/`. Each one has a distinct responsibility, which is the architectural reason any one of them can fail or be rebuilt without taking the others down.
+Hestia-MediaManager keeps state in three SQLite files under `server_data/`. Each one has a distinct responsibility, which is the architectural reason any one of them can fail or be rebuilt without taking the others down.
 
 | File | What it stores | Sensitivity | Write cadence |
 |---|---|---|---|
@@ -155,7 +155,7 @@ PlexBackUp keeps state in three SQLite files under `server_data/`. Each one has 
 Operationally, this split lets you:
 
 * Scrub `media.db` and rebuild it from the snapshot files on disk.
-* Delete `snapshots.db` and have PlexBackUp regenerate it by walking the `snapshots/` directory on next boot.
+* Delete `snapshots.db` and have Hestia-MediaManager regenerate it by walking the `snapshots/` directory on next boot.
 * Back up `auth.db` independently on its own cadence, because it changes for different reasons than the others.
 
 Architecturally, it matches the **failure isolation** principle. A corrupted `media.db` should never lock you out of the UI. A lost `snapshots.db` should never lose your captured data. A wiped `auth.db` should not destroy your library state.
@@ -176,7 +176,7 @@ If write volume ever climbs significantly (for example, if the per-user PIN auth
 
 ## The Plex API contact surface
 
-Every call PlexBackUp makes to Plex goes through one shared `requests.Session` built in `services/auth.py`. The session is mounted on both PlexBackUp's own HTTP client **and** `plexapi`'s internal session, so `getByGuid()`, `section.search()`, `section.all()`, and any direct REST call share the same policy.
+Every call Hestia-MediaManager makes to Plex goes through one shared `requests.Session` built in `services/auth.py`. The session is mounted on both Hestia-MediaManager's own HTTP client **and** `plexapi`'s internal session, so `getByGuid()`, `section.search()`, `section.all()`, and any direct REST call share the same policy.
 
 ### Retry policy
 
@@ -189,7 +189,7 @@ urllib3.Retry(
 )
 ```
 
-The `respect_retry_after_header=True` part is the load-bearing line. Plex's 429 responses carry a `Retry-After` header that tells the client when to come back. PlexBackUp obeys it instead of pounding the server until it works. The `backoff_factor=0.5` is used as the fallback when there is no header, producing exponential backoff with jitter at 0.5, 1.0, 2.0, and 4.0 second waits.
+The `respect_retry_after_header=True` part is the load-bearing line. Plex's 429 responses carry a `Retry-After` header that tells the client when to come back. Hestia-MediaManager obeys it instead of pounding the server until it works. The `backoff_factor=0.5` is used as the fallback when there is no header, producing exponential backoff with jitter at 0.5, 1.0, 2.0, and 4.0 second waits.
 
 ### Pool sizing
 
@@ -197,7 +197,7 @@ Pool connections and pool max size are tunables (defaults 4 and 10). Set too low
 
 ### Telemetry hook
 
-A response hook captures 429 status codes and `Retry-After` header values into the dashboard's HTTP telemetry panel. This is the operator-visible signal that Plex is throttling and how hard.
+A response hook captures 429 status codes and `Retry-After` header values into the dashboard's HTTP telemetry panel. This is the user-visible signal that Plex is throttling and how hard.
 
 ### Managed user authentication
 
@@ -213,9 +213,9 @@ The "no silent admin impersonation" behaviour fixed a bug from earlier prereleas
 
 ## Concurrency, Python, and the GIL
 
-PlexBackUp uses Python threads not despite the GIL but in recognition of the workload. To make it concrete: in a typical 4-library snapshot, the engine spends roughly **99% of its wall-clock time waiting** for Plex HTTP responses (gather phase) or for SQLite fsync (capture phase). Both of those waits **release** the GIL. A `ThreadPoolExecutor(max_workers=16)` against Plex is genuinely 16x parallel for the part that matters.
+Hestia-MediaManager uses Python threads not despite the GIL but in recognition of the workload. To make it concrete: in a typical 4-library snapshot, the engine spends roughly **99% of its wall-clock time waiting** for Plex HTTP responses (gather phase) or for SQLite fsync (capture phase). Both of those waits **release** the GIL. A `ThreadPoolExecutor(max_workers=16)` against Plex is genuinely 16x parallel for the part that matters.
 
-What the GIL **would** hurt is CPU-bound work like image resizing, complex regex on huge strings, or deserialising multi-gigabyte JSON. PlexBackUp doesn't have any of that on a hot path. The serializer in `server/snapshot_serializer.py` would warrant attention if a snapshot ballooned past a few hundred MB, but that is far beyond any real library.
+What the GIL **would** hurt is CPU-bound work like image resizing, complex regex on huge strings, or deserialising multi-gigabyte JSON. Hestia-MediaManager doesn't have any of that on a hot path. The serializer in `server/snapshot_serializer.py` would warrant attention if a snapshot ballooned past a few hundred MB, but that is far beyond any real library.
 
 The deeper point: the choice that matters isn't threads vs asyncio vs multiprocessing. It is **I/O concurrency vs serial I/O**. Once you have decided to fire 16 Plex requests at once, the choice of how you wait on them is mostly stylistic. Threads with `requests` are easier to read for new contributors than `asyncio` with `httpx`, so threads it is.
 
@@ -255,7 +255,7 @@ The kind of thing a careful reviewer would call out. Operators do not need to ac
 
 ## Status and roadmap
 
-Today PlexBackUp is focused on Plex, but the model is explicitly backend-agnostic. Every media row in `media.db` carries a `backend` field. The engine is structured so that gather/restore primitives are swappable per backend. Emby and Jellyfin can be added without rewriting the core reconciliation logic.
+Today Hestia-MediaManager is focused on Plex, but the model is explicitly backend-agnostic. Every media row in `media.db` carries a `backend` field. The engine is structured so that gather/restore primitives are swappable per backend. Emby and Jellyfin can be added without rewriting the core reconciliation logic.
 
 What's still needed for a new backend is two pieces of code, not a rewrite:
 
@@ -289,18 +289,18 @@ The web UI's basics (always-on login, encrypted tokens at rest) are described in
 
 Modeled on a Linux-style separation of `user` and `root`:
 
-* **Two-account onboarding.** Fresh installs create both accounts atomically (`POST /api/auth/setup-v2`). Legacy single-admin installs go through the forced upgrade-split (`POST /api/auth/upgrade-split`) on first post-upgrade login.
-* **One root account per person.** Granting another operator root permission is done by promoting their existing admin row to `root_admin` via `POST /api/auth/users/{u}/grant-root` (which itself requires sudo-style elevation). There is no shared root password.
+* **Two-account onboarding.** Fresh installs create both accounts atomically (`POST /api/auth/setup-v2`).
+* **One root account per person.** Granting another user root permission is done by promoting their existing admin row to `root_admin` via `POST /api/auth/users/{u}/grant-root` (which itself requires sudo-style elevation). There is no shared root password.
 * **Sudo-style elevation.** Privileged actions (creating or modifying other user accounts, granting/revoking root, applying a cross-server PIN migration) require the caller to re-enter their own password via `POST /api/auth/elevate`. The elevation is cached on the JWT's session id for a configurable TTL (default 600 seconds, clamped 60-3600 by the helper). During that window further privileged calls in the same session don't re-prompt.
 * **Drop on demand.** `POST /api/auth/elevation/clear` (sudo -k equivalent) drops the elevation immediately. The topbar exposes a one-click chip when elevation is live.
-* **Endpoint gates.** Five user-touching endpoints (`POST /users`, `PATCH /users/{u}`, `POST /users/{u}/reset-password`, `DELETE /users/{u}`, `PATCH /users/{u}/permissions`) require elevation. Two self-service endpoints (`POST /users/me/display-name`, `POST /users/me/password`) do not - the operator policy explicitly carved out "any user can change their own password". The full audit matrix lives in [CODEREVIEW[ADMINAUDIT]-2026-05-15.md](CODEREVIEW[ADMINAUDIT]-2026-05-15.md).
+* **Endpoint gates.** Five user-touching endpoints (`POST /users`, `PATCH /users/{u}`, `POST /users/{u}/reset-password`, `DELETE /users/{u}`, `PATCH /users/{u}/permissions`) require elevation. Two self-service endpoints (`POST /users/me/display-name`, `POST /users/me/password`) do not - the access policy explicitly carved out "any user can change their own password".
 * **Recovery if all root passwords are lost.** Stop the container, delete `server_data/auth.db`, restart. The first-boot two-step wizard runs again and you create new admin + root accounts. **`media.db`, `snapshots.db`, `.keyfile`, and `servers.json` are preserved** so no Plex data, no captured snapshots, and no stored Plex tokens are lost - only the app-user identities are reset. The keyfile (still on disk) decrypts the existing servers.json tokens after the new accounts are created. There is no CLI escape hatch by design: adding one would create an extra attack surface for the same outcome that already exists implicitly via filesystem access.
 
 ### Tokens encrypted at rest (v0.9.5+)
 
 * A 256-bit Fernet key is generated on first boot and stored at `server_data/.keyfile` (raw bytes, mode `0o600`).
 * Every Plex token in `servers.json` and the legacy `settings.json` is encrypted with that key; on disk you'll see `gAAAAAB...` ciphertexts rather than the raw tokens, and each row carries an `"_encrypted": true` marker.
-* If the keyfile is deleted or replaced, existing encrypted tokens become unrecoverable. The operator gets an actionable "re-enter credentials" message in the UI rather than a crash.
+* If the keyfile is deleted or replaced, existing encrypted tokens become unrecoverable. The user gets an actionable "re-enter credentials" message in the UI rather than a crash.
 * Decryption happens only at the point a token is handed to plexapi; the plaintext never lands in any log line, API response, or export file.
 
 ### Log scrubber
@@ -328,9 +328,9 @@ Credential-bearing files under `server_data/` (`settings.json`, `servers.json`, 
 
 ---
 
-## Exposing PlexBackUp to other devices on your network
+## Exposing Hestia-MediaManager to other devices on your network
 
-Out of the box, PlexBackUp is reachable only from the Docker host. If you want to run the web UI from a **phone, tablet, or another desktop** on your home network without setting up a full reverse proxy, there's a two-step path: turn on the built-in auth layer, then expose the frontend port. This walkthrough does both.
+Out of the box, Hestia-MediaManager is reachable only from the Docker host. If you want to run the web UI from a **phone, tablet, or another desktop** on your home network without setting up a full reverse proxy, there's a two-step path: turn on the built-in auth layer, then expose the frontend port. This walkthrough does both.
 
 **Strong recommendation: enable auth FIRST, port-bind SECOND.** Exposing the frontend to your LAN without authentication means anyone on the same network can open the UI, register your Plex servers, dump your watch history, or worse. The auth layer adds a login screen, gates every API call on a JWT, and stays passive when you don't need it. There is no good reason to do this in the opposite order.
 
@@ -338,7 +338,7 @@ Out of the box, PlexBackUp is reachable only from the Docker host. If you want t
 
 * Submit and watch jobs from any device, useful when a long fan-out is running on your headless server and you'd rather check on it from the couch.
 * Operate the UI from a screen larger than the host's (e.g. tablet on a desk while the Docker host is a NUC under the TV).
-* Multiple people in the household can have their own logins (use `POST /api/auth/users` from an admin account to create operator-role accounts).
+* Multiple people in the household can have their own logins (use `POST /api/auth/users` from an admin account to create user accounts).
 
 **Cons / things to know:**
 
@@ -377,7 +377,7 @@ docker compose up -d
 | Linux   | `ip addr` | `inet 192.168.x.x` under the active interface |
 | macOS   | `ifconfig` or System Settings -> Network | The IP under the active adapter |
 
-Visit `http://<that-IP>:8080` in the device's browser. You should see the PlexBackUp login screen. Sign in with the admin you created in Step 1.
+Visit `http://<that-IP>:8080` in the device's browser. You should see the Hestia-MediaManager login screen. Sign in with the admin you created in Step 1.
 
 **If it doesn't connect:**
 
@@ -410,7 +410,7 @@ If you already had servers registered and the legacy fields are still set (shoul
 | Snapshot pipeline (`run_snapshot()`) | `services/snapshotter.py` |
 | Restore pipeline (`run_restore()`, Merge and Replace) | `services/restorer.py` |
 | Dashboard, `submit_with_context()` helper | `services/dashboard.py` |
-| Operator-tunable knobs | `services/tunables.py` |
+| User-tunable knobs | `services/tunables.py` |
 | Job queue and worker | `server/jobs.py` |
 | FastAPI routes | `server/app.py` |
 | 4 Hz WebSocket broadcaster | `server/ws.py` |

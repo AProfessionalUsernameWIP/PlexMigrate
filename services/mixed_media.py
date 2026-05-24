@@ -1,6 +1,5 @@
 """
-Mixed-media playlist classification + strategy driver
-(Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16, section B).
+Mixed-media playlist classification + strategy driver.
 
 Background
 ----------

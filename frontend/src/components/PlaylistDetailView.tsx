@@ -2,9 +2,8 @@
 // titles + types + durations so the end user can verify they're
 // about to copy what they think.
 //
-// Smart-playlist refusal: per Plan[PLAYLIST-MANAGEMENT] section 8a
-// (end user decision #7) we refuse smart-playlist copies. This view
-// surfaces the refusal with a clear banner; the parent's Deploy
+// Smart-playlist refusal: smart-playlist copies are refused. This
+// view surfaces the refusal with a clear banner; the parent's Deploy
 // button is also gated on `!detail.is_smart`.
 
 import type { PlaylistDetail } from '../api';

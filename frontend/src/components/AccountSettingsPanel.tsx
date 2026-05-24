@@ -15,10 +15,11 @@
 // No role / username changes here - those are root_admin operations
 // in the User Accounts explorer.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useAuthContext } from '../contexts/AuthContext';
 import { useClockDisplay } from '../contexts/ClockContext';
+import { useNowTick } from '../hooks/useNowTick';
 import { InfoTip } from './InfoTip';
 
 
@@ -39,13 +40,9 @@ export function AccountSettingsPanel() {
 function AccountIdentitySection() {
   const auth = useAuthContext();
   // Live tick so "Session duration" updates without a snapshot refresh.
-  // Re-render once per second. ~24 bytes of state per re-render; the
-  // end user usually leaves this panel after a few seconds.
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const id = window.setInterval(() => setTick((x) => x + 1), 1000);
-    return () => window.clearInterval(id);
-  }, []);
+  // useNowTick re-renders once per second and pauses while the tab is
+  // hidden.
+  useNowTick(1000);
 
   const lastLoginText = auth.lastLogin
     ? new Date(auth.lastLogin * 1000).toLocaleString()
@@ -162,6 +159,21 @@ function DisplayNameSection() {
 function ClockDisplaySection() {
   const clock = useClockDisplay();
 
+  // FEUI-11: the custom offset is later applied to the SERVER clock
+  // (serverNowMs + customOffsetMs), so it must be computed relative to
+  // server time, not the browser's. ClockContext doesn't expose the
+  // skew (App.tsx keeps it in a local ref), so fetch server time here
+  // and derive the skew the same way App.tsx does:
+  // st.now * 1000 - Date.now(). Defaults to 0 until the fetch lands.
+  const clockSkewRef = useRef<number>(0);
+  useEffect(() => {
+    let cancelled = false;
+    api.getServerTime()
+      .then((st) => { if (!cancelled) clockSkewRef.current = st.now * 1000 - Date.now(); })
+      .catch(() => { /* keep 0; offset degrades to the pre-fix behaviour */ });
+    return () => { cancelled = true; };
+  }, []);
+
   // For the ``custom`` mode the operator types the HH:MM they want
   // the topbar to read right now. We translate that into an offset
   // from the server's current time and stash it. Stored offset is
@@ -187,11 +199,14 @@ function ClockDisplaySection() {
       return;
     }
     // Compute the offset that maps server-now → typed HH:MM today.
-    // We anchor the target to today's date in the browser's local
-    // timezone - that's what the end user's eyes are on.
-    const target = new Date();
+    // FEUI-11: anchor the target to SERVER time so both terms of the
+    // subtraction are on the server clock. Previously ``target`` was
+    // built from the browser's new Date(), so the stored offset was
+    // wrong by the server/browser clock skew.
+    const serverNow = Date.now() + clockSkewRef.current;
+    const target = new Date(serverNow);
     target.setHours(hh, mm, 0, 0);
-    const offsetMs = target.getTime() - Date.now();
+    const offsetMs = target.getTime() - serverNow;
     clock.setCustomOffsetMs(offsetMs);
     clock.setMode('custom');
     setOk('Custom clock applied. The topbar now shows this offset from server time.');
@@ -349,8 +364,8 @@ function PasswordSection() {
         Changes the password for <strong>{auth.username}</strong>. Your existing
         session stays valid; future logins will require the new password.
       </span>
-      {error && <div className="banner error">{error}</div>}
-      {ok && <div className="banner good">{ok}</div>}
+      {error && <div className="banner error" data-testid="account-change-error">{error}</div>}
+      {ok && <div className="banner good" data-testid="account-success-msg">{ok}</div>}
       <label className="field">
         <span className="label">Current password</span>
         <input
@@ -358,6 +373,7 @@ function PasswordSection() {
           value={currentPassword}
           onChange={(e) => setCurrentPassword(e.target.value)}
           autoComplete="current-password"
+          data-testid="account-current-password"
         />
       </label>
       <div className="grid-2">
@@ -368,6 +384,7 @@ function PasswordSection() {
             value={newPassword}
             onChange={(e) => setNewPassword(e.target.value)}
             autoComplete="new-password"
+            data-testid="account-new-password"
           />
         </label>
         <label className="field">
@@ -377,11 +394,12 @@ function PasswordSection() {
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
             autoComplete="new-password"
+            data-testid="account-confirm-password"
           />
         </label>
       </div>
       <div className="row-buttons">
-        <button className="primary" disabled={!canSubmit} onClick={save}>
+        <button className="primary" disabled={!canSubmit} onClick={save} data-testid="account-change-submit">
           {submitting ? 'Saving…' : 'Change password'}
         </button>
       </div>

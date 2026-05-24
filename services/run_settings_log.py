@@ -18,7 +18,7 @@ extension is ``.log`` rather than ``.md`` because it lives in the
 per-run log directory and the log-browser is the end user's primary
 reader. Markdown renders cleanly as plain text and stays grep-friendly.
 
-Layout (full rework, 2026-05-15):
+Layout:
 
 * Top matter: captured timestamp, job type, trigger.
 * ``## At a glance`` - a 6-8 line summary answering the end user's
@@ -104,7 +104,6 @@ _PERSISTENT_GROUPS: List[Tuple[str, Tuple[str, ...]]] = [
         "validate_snapshot_before_restore",
     )),
     ("Auth", (
-        "auth_setup_version",
         "audit_log_enabled",
         "elevation_ttl_seconds",
         "auto_rotate_tokens_on_refresh",

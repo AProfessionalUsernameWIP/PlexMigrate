@@ -44,7 +44,7 @@ Features 4–5, not a string-rewrite concern. We only canonicalise the
 from __future__ import annotations
 
 import re
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 
 # Each entry is ``(legacy_pattern, canonical_replacement)``. Patterns
@@ -90,8 +90,17 @@ _AGENT_PATTERNS: List[tuple] = [
 # permissive on the id portion - Plex sometimes emits ratings-style
 # IDs that look unlike typical IMDb/TVDB IDs, and we'd rather pass
 # them through than reject them.
+#
+# mbtrack / mbalbum / mbartist / mbreleasegroup are the entity-distinct
+# MusicBrainz schemes. Jellyfin and Emby emit them natively (recording
+# vs release vs release-group vs artist are separate MBID namespaces);
+# the Plex adapter rewrites its generic ``musicbrainz://`` to the
+# matching mb* scheme by item type. Both must survive normalization as
+# first-class schemes so a Plex track and a Jellyfin track compare
+# equal - and a track id never collides with an album/artist id.
 _CANONICAL_RE = re.compile(
-    r"^(imdb|tvdb|tmdb|musicbrainz|plex|local|jellyfin|emby)://[^?]+(?:\?.*)?$"
+    r"^(imdb|tvdb|tmdb|musicbrainz|mbtrack|mbalbum|mbartist|mbreleasegroup"
+    r"|plex|local|jellyfin|emby)://[^?]+(?:\?.*)?$"
 )
 
 
@@ -143,3 +152,53 @@ def normalize_guids(guids: Iterable[str]) -> List[str]:
         if canon and canon not in seen:
             seen[canon] = None
     return list(seen.keys())
+
+
+_CANONICAL_TO_LEGACY_AGENT = {
+    "imdb": "com.plexapp.agents.imdb",
+    "tmdb": "com.plexapp.agents.themoviedb",
+    "tvdb": "com.plexapp.agents.thetvdb",
+    "musicbrainz": "com.plexapp.agents.musicbrainz",
+}
+
+
+# The entity-distinct MusicBrainz schemes Jellyfin/Emby emit (and that
+# _music_aware_guids mirrors onto Plex snapshots). A live Plex server
+# does not index these; it knows the generic ``musicbrainz://`` form
+# and the legacy ``com.plexapp.agents.musicbrainz://`` agent form.
+_MB_ENTITY_SCHEMES = ("mbtrack", "mbalbum", "mbartist", "mbreleasegroup")
+
+
+def _mb_searchable_guids(guid: str) -> List[str]:
+    """For an entity-distinct MusicBrainz GUID (mbtrack / mbalbum /
+    mbartist / mbreleasegroup), return the GUID forms a Plex server
+    actually resolves for that MBID: the generic ``musicbrainz://``
+    scheme and its legacy ``com.plexapp.agents.musicbrainz://`` agent
+    form. This is the resolve-side reverse of ``_music_aware_guids``:
+    a snapshot taken on Jellyfin/Emby carries ``mbtrack://X``, and a
+    Plex destination must look the same track up under the schemes
+    Plex itself indexes. Returns [] for any non-mb* GUID."""
+    head, sep, rest = guid.partition("://")
+    if sep and head in _MB_ENTITY_SCHEMES and rest:
+        return [
+            f"musicbrainz://{rest}",
+            f"com.plexapp.agents.musicbrainz://{rest}",
+        ]
+    return []
+
+
+def _to_legacy_agent(canonical_guid: str) -> Optional[str]:
+    """Reverse of ``services/guid_translator.normalize_guids`` for the
+    handful of Plex agents that have legacy forms. Used by
+    :meth:`PlexAdapter.resolve_by_guids` to probe a destination that
+    hasn't migrated its metadata to the modern agent set.
+
+    Returns ``None`` when there's no known legacy mapping (passes
+    through unchanged for ``plex://`` / ``mbtrack://`` etc.)."""
+    scheme, _, value = canonical_guid.partition("://")
+    if not scheme or not value:
+        return None
+    legacy_scheme = _CANONICAL_TO_LEGACY_AGENT.get(scheme.lower())
+    if not legacy_scheme:
+        return None
+    return f"{legacy_scheme}://{value}"

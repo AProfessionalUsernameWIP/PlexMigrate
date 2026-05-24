@@ -1,4 +1,4 @@
-// ── Registered-snapshot picker (PR-13 follow-up) ───────────────────────
+// ── Registered-snapshot picker ─────────────────────────────────────────
 //
 // Lists rows from snapshots.db, newest first. When a destination is
 // picked, each row carries an overlap chip showing how many of its
@@ -58,6 +58,7 @@ export function SnapshotPicker({
             return (
               <tr
                 key={row.id}
+                data-testid={`job-snapshot-picker-row-${row.id}`}
                 onClick={() => onSelect(row.id)}
                 style={{
                   cursor: 'pointer',

@@ -1,5 +1,5 @@
 """
-Pydantic request / response schemas for the PlexMigrate server API.
+Pydantic request / response schemas for the Hestia-MediaManager server API.
 
 Every endpoint in :mod:`server.app` validates its inbound JSON against
 one of these models and (where applicable) shapes its outbound JSON
@@ -9,12 +9,12 @@ validation.
 
 Field naming
 ------------
-* Public field names use ``snake_case`` exactly matching the CLI flag
-  names (e.g. ``strict_match`` mirrors ``--strict-match``). This means
+* Public field names use ``snake_case`` matching the engine's
+  keyword parameters one-to-one (e.g. ``strict_match``). This means
   there is a 1:1 mapping between the form controls the frontend
   renders and the parameters the engine accepts - no translation
   table needed.
-* Defaults match the CLI defaults in :func:`plexmigrate.build_parser`.
+* Defaults match the engine's parameter defaults.
 
 Note on optional fields:
 We use ``Optional[X] = None`` rather than ``X | None = None`` to keep
@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, model_validator
 
 
-# ── Server-UID validator (Plan[SERVER-UID-IDENTITY] 2026-05-16) ─────────────
+# ── Server-UID validator ─────────────────────────────────────────────────────
 #
 # Shared validator that rejects malformed server_id values at the API
 # boundary. The runtime resolver gates separately on registry
@@ -74,20 +74,20 @@ def _validate_server_id_list_or_none(value: Any) -> Any:
     return value
 
 
-# ── Phase C (admin-management follow-up, 2026-05-15) - per-library metrics ──
+# ── Per-library metrics ──────────────────────────────────────────────────────
 #
 # library_metrics: Optional[Dict[library_name, LibraryMetrics]] is the
 # end user-controlled per-library matrix that replaces the four global
 # include_* checkboxes. When set, library_metrics is the SOURCE OF
 # TRUTH: the engine consults library_metrics[lib_name] to decide which
-# metric tables to capture for that specific library. The legacy global
+# metric tables to capture for that specific library. The global
 # include_* flags are retained for backward-compat input from older
 # clients - the validator below expands them into library_metrics at
 # parse time so internal code only ever has to look at the map.
 
 class LibraryMetrics(BaseModel):
-    """Per-library data-type filter. Default true everywhere (the
-    pre-Phase-C default of "migrate every type for every library")."""
+    """Per-library data-type filter. Default true everywhere ("migrate
+    every type for every library")."""
     watch_history: bool = Field(default=True)
     ratings: bool = Field(default=True)
     playlists: bool = Field(default=True)
@@ -96,9 +96,9 @@ class LibraryMetrics(BaseModel):
 
 class UserCreateSpec(BaseModel):
     """
-    Plan[RUN-JOB-UI] D-OWNER: one row from the user-creation preflight
-    modal. The end user confirms each row before a cross-backend job
-    submit; ``server/jobs.py`` (via ``services/user_creation.py``) walks
+    One row from the user-creation preflight modal. The end user
+    confirms each row before a cross-backend job submit;
+    ``server/jobs.py`` (via ``services/user_creation.py``) walks
     the list at run start, calls ``adapter.create_user`` per row,
     persists the resulting ``backend_user_id`` into ``managed_users``,
     and only then lets the engine proceed to item-state writes.
@@ -144,9 +144,8 @@ class UserCreateSpec(BaseModel):
         default=None,
         description=(
             "Optional Jellyfin / Emby user policy. Omit to accept the "
-            "destination's default. See Plan[MULTI-BACKEND] section 2.8 "
-            "for the fields the adapter forwards (IsAdministrator, "
-            "EnableAllFolders, EnabledFolders, etc.)."
+            "destination's default. The adapter forwards fields such as "
+            "IsAdministrator, EnableAllFolders, EnabledFolders, etc."
         ),
     )
 
@@ -252,19 +251,17 @@ def metrics_for_library(
     }
 
 
-# ── PR-3 / Phase D - data-type filter (include_* family) ──────────────────────
+# ── Data-type filter (include_* family) ──────────────────────────────────────
 #
 # The four boolean checkboxes the end user sees on every Run-Job and
 # Schedules form. ``True`` (the default) means "migrate this data type;"
 # ``False`` means "skip the gather AND any merge on the destination."
-# Defaults reproduce v0.12.x behaviour exactly when no field is sent.
 #
 # Backward compat: existing API clients send ``skip_collections`` /
-# ``skip_playlists`` (PR-1 / Phase B and earlier). A model_validator
-# attached to each request schema maps those legacy fields onto the
-# new include_* equivalents when the client didn't supply the include
-# fields explicitly. The legacy fields stay on the model so old
-# clients keep working unchanged.
+# ``skip_playlists``. A model_validator attached to each request schema
+# maps those legacy fields onto the new include_* equivalents when the
+# client didn't supply the include fields explicitly. The legacy fields
+# stay on the model so old clients keep working unchanged.
 
 def _apply_legacy_skip_flags(values: Any) -> Any:
     """
@@ -395,9 +392,8 @@ class SettingsIn(BaseModel):
         default=None,
         description="Require exactly one fuzzy title match (--strict-match / --no-strict-match)",
     )
-    # PR-13 - snapshot retention. ``global`` is a ceiling; the
-    # per-server map only applies when an entry is strictly LOWER
-    # than the global.
+    # Snapshot retention. ``global`` is a ceiling; the per-server map
+    # only applies when an entry is strictly LOWER than the global.
     snapshot_retention_global: Optional[int] = Field(
         default=None, ge=1, le=10000,
         description="Maximum snapshots kept per server before retention sweep deletes the oldest.",
@@ -568,7 +564,7 @@ class SettingsIn(BaseModel):
             "value of the Prune Missing Items day-threshold slider)."
         ),
     )
-    # PR-12: per-server rate limit for user-token capture. See the
+    # Per-server rate limit for user-token capture. See the
     # ``user_token_capture_throttle_per_hour`` entry in
     # ``server.persistence._DEFAULT_SETTINGS`` for the full rationale.
     user_token_capture_throttle_per_hour: Optional[int] = Field(
@@ -584,10 +580,10 @@ class SettingsIn(BaseModel):
             "limit, not a recommended value."
         ),
     )
-    # System Tunables - infrastructure-level knobs that used to be
-    # hardcoded literals (HTTP timeouts, retry budgets, JWT TTLs,
-    # SQLite busy timeouts, pool sizes, etc.). Free-form dict because
-    # the list of recognised keys grows over time and the
+    # System Tunables - infrastructure-level knobs (HTTP timeouts,
+    # retry budgets, JWT TTLs, SQLite busy timeouts, pool sizes, etc.).
+    # Free-form dict because the list of recognised keys grows over
+    # time and the
     # ``services.tunables`` module is the single source of truth for
     # defaults + clamps. The Tunables UI is gated by
     # ``settings.tunables`` (root_admin only); a plain
@@ -624,13 +620,12 @@ class SettingsIn(BaseModel):
             "stall thresholds. Clamped to [0.5, 2.0]. Default 1.0."
         ),
     )
-    # v0.13.x: library-level concurrency cap on the file-mediated restore
-    # path. Replaces a hardcoded ``min(3, libraries)``. End users that
-    # see Plex 429s during multi-library restores lower this; end users
-    # with idle destinations and plenty of headroom can raise it. The
-    # ``min(value, library_count)`` clamp still applies so setting this
-    # above the actual library count has no effect beyond capping at
-    # the count. Direct transfer is still serial in this release.
+    # Library-level concurrency cap on the file-mediated restore path.
+    # End users that see Plex 429s during multi-library restores lower
+    # this; end users with idle destinations and plenty of headroom can
+    # raise it. The ``min(value, library_count)`` clamp still applies so
+    # setting this above the actual library count has no effect beyond
+    # capping at the count. Direct transfer is serial.
     restore_library_workers: Optional[int] = Field(
         default=None, ge=1, le=16,
         description=(
@@ -639,11 +634,11 @@ class SettingsIn(BaseModel):
             "to 1) when Plex rate-limits the multi-library API bursts."
         ),
     )
-    # v0.13.x: same decoupling story as restore_library_workers, but for
-    # snapshot. Snapshot today reuses the ``workers`` field as the
-    # library-level pool size, so the two concurrency axes are
-    # entangled. ``0`` inherits from ``workers`` (today's behavior);
-    # any positive value caps libraries-in-parallel separately.
+    # Same decoupling as restore_library_workers, but for snapshot.
+    # Snapshot reuses the ``workers`` field as the library-level pool
+    # size, so the two concurrency axes are entangled. ``0`` inherits
+    # from ``workers``; any positive value caps libraries-in-parallel
+    # separately.
     snapshot_library_workers: Optional[int] = Field(
         default=None, ge=0, le=16,
         description=(
@@ -653,11 +648,11 @@ class SettingsIn(BaseModel):
             "the per-library HTTP worker count."
         ),
     )
-    # v0.13.x: per-fan-out destination concurrency cap. ``0`` (default)
-    # means no cap - every destination runs in its own thread, matching
-    # today's behavior. A positive integer caps the destination pool.
-    # Independent of restore_library_workers: each destination still
-    # uses its own within-job library concurrency separately.
+    # Per-fan-out destination concurrency cap. ``0`` (default) means no
+    # cap - every destination runs in its own thread. A positive
+    # integer caps the destination pool. Independent of
+    # restore_library_workers: each destination still uses its own
+    # within-job library concurrency separately.
     fan_out_destination_workers: Optional[int] = Field(
         default=None, ge=0, le=32,
         description=(
@@ -670,12 +665,12 @@ class SettingsIn(BaseModel):
     )
 
 
-# ── PR-12 preflight acknowledgement (shared by every job-input model) ───────
+# ── Preflight acknowledgement (shared by every job-input model) ──────────────
 
 class _PinPreflightAckFields(BaseModel):
     """
     Fields the frontend stamps onto a job submission when the end user
-    has cleared the PR-12 PIN-preflight warning modal.
+    has cleared the PIN-preflight warning modal.
 
     The job endpoints re-map these to underscore-prefixed synthetic
     params on the JobRecord (see ``server.app._apply_preflight_ack``)
@@ -707,21 +702,21 @@ class SnapshotJobIn(_PinPreflightAckFields):
     side is mirrored here. Anything left blank falls back to the
     corresponding value in the saved settings.
 
-    Multi-server (v0.9.0): the ``source_server_name`` field is the
-    friendly name of a registered server (see ``GET /api/servers``).
-    Required unless the request is being processed by the legacy
-    ad-hoc CLI path that supplies ``plex_url`` + ``plex_token`` directly.
+    The ``source_server_name`` field is the friendly name of a
+    registered server (see ``GET /api/servers``). Required unless the
+    request is being processed by the legacy ad-hoc CLI path that
+    supplies ``plex_url`` + ``plex_token`` directly.
     """
 
     source_server_name: Optional[str] = Field(
         default=None,
         description="Friendly name of the registered server to snapshot from.",
     )
-    # Plan[SERVER-UID-IDENTITY] 2026-05-16: stable per-row identifier
-    # assigned at add_server time. Format `<service_type>_<uuid4_hex>`
-    # (e.g., `emby_a1b2c3...`). PREFERRED over source_server_name;
-    # disambiguates same-named servers across backends and survives
-    # rename. None falls back to name-based lookup with a warning.
+    # Stable per-row identifier assigned at add_server time. Format
+    # `<service_type>_<uuid4_hex>` (e.g., `emby_a1b2c3...`). PREFERRED
+    # over source_server_name; disambiguates same-named servers across
+    # backends and survives rename. None falls back to name-based
+    # lookup with a warning.
     source_server_id: Optional[str] = Field(
         default=None,
         description=(
@@ -771,7 +766,7 @@ class SnapshotJobIn(_PinPreflightAckFields):
             "sacrificing playlist data."
         ),
     )
-    # PR-3 / Phase D - four-flag data-type filter (default-true).
+    # Four-flag data-type filter (default-true).
     include_watch_history: bool = Field(
         default=True,
         description="Include watch history (view counts + resume positions) in the snapshot.",
@@ -827,11 +822,10 @@ class SnapshotJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Phase C (admin-management follow-up): per-library metric filter.
-    # When set, this is the source of truth for which metrics each
-    # library captures. Legacy global include_* flags are still
-    # accepted on input and expanded into library_metrics by the
-    # validator below.
+    # Per-library metric filter. When set, this is the source of truth
+    # for which metrics each library captures. Legacy global include_*
+    # flags are still accepted on input and expanded into
+    # library_metrics by the validator below.
     library_metrics: Optional[Dict[str, LibraryMetrics]] = Field(
         default=None,
         description=(
@@ -843,10 +837,10 @@ class SnapshotJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[RUN-JOB-UI] work item 4: per-user fan-out toggle. Default
-    # matches the adapter snapshotter's include_managed_users=True
-    # kwarg. When False, the engine captures owner-only and skips
-    # managed users; user_filter (above) is then effectively a no-op.
+    # Per-user fan-out toggle. Default matches the adapter
+    # snapshotter's include_managed_users=True kwarg. When False, the
+    # engine captures owner-only and skips managed users; user_filter
+    # (above) is then effectively a no-op.
     include_managed_users: bool = Field(
         default=True,
         description=(
@@ -858,12 +852,12 @@ class SnapshotJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-run overrides for
-    # the mixed-media playlist strategy. None means inherit from the
-    # global tunable. Captured here so the snapshot UI can also expose
-    # them for symmetry with restore + direct; the snapshotter doesn't
-    # use them today (capture is media-type-agnostic), but the end user
-    # frequently re-runs snapshot + restore as one logical action.
+    # Per-run overrides for the mixed-media playlist strategy. None
+    # means inherit from the global tunable. Captured here so the
+    # snapshot UI can also expose them for symmetry with restore +
+    # direct; the snapshotter doesn't use them (capture is media-type-
+    # agnostic), but the end user frequently re-runs snapshot + restore
+    # as one logical action.
     mixed_media_behavior: Optional[Literal["skip", "dominant", "split"]] = None
     mixed_media_dominance_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     mixed_media_video_routing: Optional[Literal["library_agnostic", "library_dominant"]] = None
@@ -887,15 +881,15 @@ class RestoreJobIn(_PinPreflightAckFields):
     """
     Body of ``POST /api/job/restore``. Mirrors the restore side of the CLI.
 
-    Multi-server (v0.9.0): ``dest_server_name`` selects which registered
-    server receives the imported data.
+    ``dest_server_name`` selects which registered server receives the
+    imported data.
 
-    Fan-out (v0.10.0, Feature 1): ``dest_server_names`` may carry a list
-    of registered server names to import the same export into every
-    target in one job. The single-server ``dest_server_name`` field is
-    still accepted for backward compat; the validator below coalesces
-    both inputs into ``dest_server_names`` so downstream code only ever
-    reads the list form.
+    ``dest_server_names`` may carry a list of registered server names
+    to import the same export into every target in one fan-out job. The
+    single-server ``dest_server_name`` field is still accepted for
+    backward compat; the validator below coalesces both inputs into
+    ``dest_server_names`` so downstream code only ever reads the list
+    form.
     """
 
     dest_server_name: Optional[str] = Field(
@@ -911,11 +905,11 @@ class RestoreJobIn(_PinPreflightAckFields):
             "field is accepted for backward compat and folded into this list)."
         ),
     )
-    # Plan[SERVER-UID-IDENTITY] 2026-05-16: stable per-row identifiers.
-    # Preferred over the name variants; disambiguates same-named
-    # servers across backends. None falls back to name lookup with a
-    # warning. source_server_id is implicit for RestoreJobIn (no
-    # source connection needed; the snapshot file IS the source).
+    # Stable per-row identifiers. Preferred over the name variants;
+    # disambiguates same-named servers across backends. None falls back
+    # to name lookup with a warning. source_server_id is implicit for
+    # RestoreJobIn (no source connection needed; the snapshot file IS
+    # the source).
     dest_server_id: Optional[str] = Field(
         default=None,
         description=(
@@ -960,14 +954,14 @@ class RestoreJobIn(_PinPreflightAckFields):
         default=None,
         description="Backward-compat flag - no effect (all imports are additive since v0.2.0).",
     )
-    # PR-1 / Phase B (skip-playlists end-to-end). Mirrors the existing
-    # ``skip_playlists`` field on SnapshotJobIn and DirectTransferIn so
-    # the import path can be told to skip the playlist phase entirely
-    # - both the per-library restore_playlists call AND the wasted
-    # top-level destination ``server.playlists()`` prefetch that used
-    # to fire even with an empty playlist payload. Phase D supersedes
-    # this with the four-flag ``include_*`` family below; the legacy
-    # ``skip_playlists`` field stays accepted via the validator.
+    # Mirrors the ``skip_playlists`` field on SnapshotJobIn and
+    # DirectTransferIn so the import path can be told to skip the
+    # playlist phase entirely - both the per-library restore_playlists
+    # call AND the top-level destination ``server.playlists()``
+    # prefetch, which would otherwise fire even with an empty playlist
+    # payload. Superseded by the four-flag ``include_*`` family below;
+    # the legacy ``skip_playlists`` field stays accepted via the
+    # validator.
     skip_playlists: Optional[bool] = Field(
         default=None,
         description=(
@@ -983,7 +977,7 @@ class RestoreJobIn(_PinPreflightAckFields):
             "collection phase of the import."
         ),
     )
-    # PR-3 / Phase D - four-flag data-type filter (default-true).
+    # Four-flag data-type filter (default-true).
     include_watch_history: bool = Field(
         default=True,
         description="Include watch history (view counts + resume positions) in the import.",
@@ -1000,15 +994,45 @@ class RestoreJobIn(_PinPreflightAckFields):
         default=True,
         description="Include collections in the import. Supersedes legacy skip_collections.",
     )
-    # v0.13.x: restore mode. "merge" (default) is the legacy additive
-    # behaviour: view counts only increase, ratings only set when target
-    # has none, playlists/collections create-or-append. "replace" is the
-    # opt-in point-in-time overwrite: view counts and ratings set to
-    # exactly the snapshot's value (markUnplayed + re-scrobble when the
-    # destination is currently higher), playlists/collections diff against
-    # the snapshot and members not in the snapshot are removed. The
-    # "no data deletions ever" project rule is honored only for "merge"
-    # mode; "replace" carves an explicit, end user-gated exception.
+    # Per-run power-user override. When True, the restorer ignores
+    # library_mappings and falls back to exact-name matching only.
+    # Surfaced in the UI only when the
+    # ``reveal_ignore_library_mapping_toggle`` tunable is True.
+    ignore_library_mapping: bool = Field(
+        default=False,
+        description=(
+            "Power-user override: ignore saved library mappings for "
+            "this run. Default False so mappings always apply unless "
+            "explicitly overridden. Hidden in the UI unless the "
+            "reveal-toggle tunable is set."
+        ),
+    )
+    # Per-run library mapping overrides. Map of source_library_name →
+    # dest_library_name (or "" for an explicit skip). The engine
+    # consults this map BEFORE falling through to the saved
+    # library_mappings table. Use case: restoring from a snapshot when
+    # the source server is offline so the operator can't open Server
+    # Syncing > Library Mapping to declare a permanent mapping. Edits
+    # made here do NOT persist; they apply to this run only.
+    library_mapping_overrides: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Per-run library name overrides. Keys are source library "
+            "names; values are destination library names ('' for an "
+            "explicit skip). Consumed before the saved mapping table; "
+            "does not persist."
+        ),
+    )
+    # Restore mode. "merge" (default) is additive: view counts only
+    # increase, ratings only set when target has none,
+    # playlists/collections create-or-append. "replace" is the opt-in
+    # point-in-time overwrite: view counts and ratings set to exactly
+    # the snapshot's value (markUnplayed + re-scrobble when the
+    # destination is currently higher), playlists/collections diff
+    # against the snapshot and members not in the snapshot are removed.
+    # The "no data deletions ever" project rule is honored only for
+    # "merge" mode; "replace" carves an explicit, end user-gated
+    # exception.
     mode: str = Field(
         default="merge",
         pattern="^(merge|replace)$",
@@ -1018,11 +1042,11 @@ class RestoreJobIn(_PinPreflightAckFields):
             "destination match the snapshot exactly."
         ),
     )
-    # v0.13.x: safety belt that auto-captures a snapshot of the
-    # destination BEFORE a Replace restore fires. When the restore
-    # finishes, the end user has the pre-replace snapshot to roll back
-    # if the wrong source snapshot was picked. Defaults to True; only
-    # consulted when mode == 'replace'.
+    # Safety belt that auto-captures a snapshot of the destination
+    # BEFORE a Replace restore fires. When the restore finishes, the
+    # end user has the pre-replace snapshot to roll back if the wrong
+    # source snapshot was picked. Defaults to True; only consulted when
+    # mode == 'replace'.
     auto_capture_before_replace: bool = Field(
         default=True,
         description=(
@@ -1031,7 +1055,7 @@ class RestoreJobIn(_PinPreflightAckFields):
             "recovery point. Ignored when mode == 'merge'."
         ),
     )
-    # v0.13.x: required confirmation for Replace mode. The frontend's
+    # Required confirmation for Replace mode. The frontend's
     # typed-REPLACE modal sets this; an API caller wanting Replace must
     # set it explicitly. Submitting mode == 'replace' without this flag
     # set to true returns 400 from the API layer.
@@ -1043,10 +1067,10 @@ class RestoreJobIn(_PinPreflightAckFields):
             "confirmation modal. API callers must set it explicitly."
         ),
     )
-    # v0.13.x: sub-strategy for Merge mode's watch-count math.
+    # Sub-strategy for Merge mode's watch-count math.
     #   "higher" (default) - destination view count ends at
     #       max(stored, current). Add only the positive delta.
-    #       Idempotent across re-runs (the legacy behaviour).
+    #       Idempotent across re-runs.
     #   "sum"   - destination view count ends at current + stored.
     #       Every captured play is added on top. NOT idempotent: a
     #       second run of the same job will double-count. End user
@@ -1081,12 +1105,12 @@ class RestoreJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Phase C: per-library metric filter. The restore engine looks
-    # up each library it finds in the snapshot file; if the map has
-    # an entry it's authoritative, otherwise the global include_*
-    # flags apply. Restore doesn't get the legacy-expansion validator
-    # because there is no input-time library list - libraries are
-    # discovered at gather time from the snapshot payload.
+    # Per-library metric filter. The restore engine looks up each
+    # library it finds in the snapshot file; if the map has an entry
+    # it's authoritative, otherwise the global include_* flags apply.
+    # Restore doesn't get the legacy-expansion validator because there
+    # is no input-time library list - libraries are discovered at
+    # gather time from the snapshot payload.
     library_metrics: Optional[Dict[str, LibraryMetrics]] = Field(
         default=None,
         description=(
@@ -1097,15 +1121,15 @@ class RestoreJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[RUN-JOB-UI] work item 3: D-RATE per-job mode picker. The
-    # adapter restorer maps a source numeric rating onto BOTH a
-    # numeric Rating AND an IsFavorite=true write on the destination
-    # when the source value is at or above this threshold. Mapping:
+    # D-RATE per-job mode picker. The adapter restorer maps a source
+    # numeric rating onto BOTH a numeric Rating AND an IsFavorite=true
+    # write on the destination when the source value is at or above
+    # this threshold. Mapping:
     #   "Favorite >= 5 (default)" -> 5.0
     #   "Threshold-tunable"       -> end user-picked number
     #   "Numeric only"            -> 11.0 (above the max rating;
     #                                IsFavorite is never written)
-    # ``None`` means "let the engine default fire" (5.0 today).
+    # ``None`` means "let the engine default fire" (5.0).
     favorite_threshold: Optional[float] = Field(
         default=None,
         description=(
@@ -1116,9 +1140,8 @@ class RestoreJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[RUN-JOB-UI] work item 4: per-user fan-out toggle. Same
-    # semantics as on SnapshotJobIn; the adapter restorer also
-    # iterates managed users when True.
+    # Per-user fan-out toggle. Same semantics as on SnapshotJobIn; the
+    # adapter restorer also iterates managed users when True.
     include_managed_users: bool = Field(
         default=True,
         description=(
@@ -1129,11 +1152,10 @@ class RestoreJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[RUN-JOB-UI] work item 2: D-OWNER user-creation specs.
-    # End user-confirmed list of users to create on the destination
-    # before the engine fires any item-state write. Empty / None is
-    # the no-op; jobs.py only invokes services/user_creation.py when
-    # this is non-empty.
+    # D-OWNER user-creation specs. End user-confirmed list of users to
+    # create on the destination before the engine fires any item-state
+    # write. Empty / None is the no-op; jobs.py only invokes
+    # services/user_creation.py when this is non-empty.
     user_create_specs: Optional[List[UserCreateSpec]] = Field(
         default=None,
         description=(
@@ -1144,15 +1166,14 @@ class RestoreJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[CROSS-PLATFORM-PREFLIGHT] follow-up: end user-authored
-    # per-job resolutions from the preflight modal. Keyed by
-    # destination_server_id; same shape stored on schedule rows. Each
-    # decision the modal collected (Map / Create / Drop / Accept) is
-    # applied at write time by the engine: Drop decisions augment
-    # user_filter to skip the user; Map decisions act as in-memory
-    # per-job overrides consulted before the identity_map lookup.
-    # None means the end user either had no cross-platform concerns
-    # OR bypassed the modal entirely.
+    # End user-authored per-job resolutions from the cross-platform
+    # preflight modal. Keyed by destination_server_id; same shape
+    # stored on schedule rows. Each decision the modal collected (Map /
+    # Create / Drop / Accept) is applied at write time by the engine:
+    # Drop decisions augment user_filter to skip the user; Map
+    # decisions act as in-memory per-job overrides consulted before the
+    # identity_map lookup. None means the end user either had no
+    # cross-platform concerns OR bypassed the modal entirely.
     cross_platform_resolutions: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -1164,11 +1185,10 @@ class RestoreJobIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-run overrides for
-    # the mixed-media playlist strategy. None means inherit from the
-    # global tunable. Engine consults this chain at restore time:
-    # per-user override (in cross_platform_resolutions) > per-run
-    # field (here) > global tunable.
+    # Per-run overrides for the mixed-media playlist strategy. None
+    # means inherit from the global tunable. Engine consults this chain
+    # at restore time: per-user override (in cross_platform_resolutions)
+    # > per-run field (here) > global tunable.
     mixed_media_behavior: Optional[Literal["skip", "dominant", "split"]] = None
     mixed_media_dominance_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     mixed_media_video_routing: Optional[Literal["library_agnostic", "library_dominant"]] = None
@@ -1270,20 +1290,19 @@ class ScheduleIn(BaseModel):
         default=None,
         description="Friendly name of the registered server this schedule snapshots from.",
     )
-    # PR-Backends: forward-looking stable identifier (Path B from
-    # Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). The scheduler
-    # prefers ``source_server_id`` when present, falls back to
+    # Stable identifier for the source server. The scheduler prefers
+    # ``source_server_id`` when present, falls back to
     # ``source_server_name`` for legacy schedules. Renaming a server
     # then doesn't break the schedule (server_id never changes).
     source_server_id: Optional[str] = Field(
         default=None,
         description="Stable registry id of the source server (preferred over name).",
     )
-    # PR-Backends: backend discriminator for the source server. With
-    # the registry allowing duplicate names across backends, the schedule
-    # row must carry this to resolve unambiguously. Pre-PR-Backends
-    # schedules omit the field; the scheduler reads "plex" as the
-    # default on those rows so existing installs keep working.
+    # Backend discriminator for the source server. With the registry
+    # allowing duplicate names across backends, the schedule row must
+    # carry this to resolve unambiguously. Legacy schedules omit the
+    # field; the scheduler reads "plex" as the default on those rows so
+    # existing installs keep working.
     source_service_type: Literal["plex", "jellyfin", "emby"] = Field(
         default="plex",
         description="Backend of the source server (plex|jellyfin|emby).",
@@ -1291,7 +1310,7 @@ class ScheduleIn(BaseModel):
     # Same discriminator for each fan-out destination, indexed in
     # parallel with dest_server_names. ``len`` should match
     # ``len(dest_server_names)``; the scheduler defaults missing entries
-    # to "plex" for backward-compat with pre-PR-Backends rows.
+    # to "plex" for backward-compat with legacy rows.
     dest_service_types: Optional[List[Literal["plex", "jellyfin", "emby"]]] = Field(
         default=None,
         description="Per-destination backend (parallel array to dest_server_names).",
@@ -1333,11 +1352,10 @@ class ScheduleIn(BaseModel):
             "fuzzy title matches (mirrors --no-strict-match)."
         ),
     )
-    # PR-3 / Phase D - four-flag data-type filter on schedules too.
-    # Defaults preserve pre-Phase-D scheduled-snapshot behaviour exactly
-    # (every type migrated). Schedules saved before this field landed
-    # default to all-true on read because Pydantic supplies the
-    # default at load time.
+    # Four-flag data-type filter on schedules too. Defaults migrate
+    # every type. Schedules saved before this field landed default to
+    # all-true on read because Pydantic supplies the default at load
+    # time.
     include_watch_history: bool = Field(
         default=True,
         description="Include watch history in the scheduled snapshot.",
@@ -1419,13 +1437,13 @@ class ScheduleIn(BaseModel):
         ),
     )
 
-    # ── Task 2 (admin-management plan follow-up, 2026-05-15) ────────────────
+    # ── Schedule mode ───────────────────────────────────────────────────────
     # Schedules can fire snapshot OR restore OR direct-transfer jobs.
-    # Default ``snapshot`` preserves pre-Task-2 behaviour: schedules
-    # saved before this field landed read as ``snapshot`` because
-    # Pydantic supplies the default at load time. Validators below
-    # gate the per-mode requirements (restore needs input_files; direct
-    # needs dest_server_names; restore Replace needs confirm_replace).
+    # Default ``snapshot``: schedules saved before this field landed
+    # read as ``snapshot`` because Pydantic supplies the default at
+    # load time. Validators below gate the per-mode requirements
+    # (restore needs input_files; direct needs dest_server_names;
+    # restore Replace needs confirm_replace).
     mode: str = Field(
         default="snapshot",
         pattern="^(snapshot|restore|direct)$",
@@ -1512,10 +1530,9 @@ class ScheduleIn(BaseModel):
         description="New root path prefix for --remap-path (restore + direct).",
     )
 
-    # Phase C (admin-management follow-up, 2026-05-15): per-library
-    # metric filter on schedules. Same shape and semantics as the
-    # job-input models. When set, the scheduler forwards this to the
-    # fired job and the engine consults it per library.
+    # Per-library metric filter on schedules. Same shape and semantics
+    # as the job-input models. When set, the scheduler forwards this to
+    # the fired job and the engine consults it per library.
     library_metrics: Optional[Dict[str, LibraryMetrics]] = Field(
         default=None,
         description=(
@@ -1525,12 +1542,12 @@ class ScheduleIn(BaseModel):
         ),
     )
 
-    # ── Schedules-alignment additions (2026-05-16) ─────────────────────
+    # ── Run Job parity fields ───────────────────────────────────────────────
     # Fields below bring the schedule row to parity with the Run Job
     # submit payload so the Schedules editor can mirror the Run Job
-    # form 1:1. Each one carries a sensible default that matches
-    # pre-alignment behaviour, so existing schedule rows continue to
-    # fire unchanged when read back through this validator.
+    # form 1:1. Each one carries a sensible default, so existing
+    # schedule rows continue to fire unchanged when read back through
+    # this validator.
 
     # D-OWNER (a): per-user fan-out toggle. Matches the adapter
     # engines' include_managed_users kwarg. True = capture managed
@@ -1604,13 +1621,13 @@ class ScheduleIn(BaseModel):
             "inherit Run Defaults at fire time."
         ),
     )
-    # Plan[CROSS-PLATFORM-PREFLIGHT] step 5: end user-authored
-    # cross-platform resolution decisions stored on the schedule row
-    # so fires reuse them deterministically (no end user at fire time
-    # to ack ambiguities). Keyed by destination_server_id. The
-    # schedule list endpoint computes resolutions_status per row by
-    # comparing stored decisions against the current dest user
-    # roster; needs_review surfaces when stored mappings rot.
+    # End user-authored cross-platform resolution decisions stored on
+    # the schedule row so fires reuse them deterministically (no end
+    # user at fire time to ack ambiguities). Keyed by
+    # destination_server_id. The schedule list endpoint computes
+    # resolutions_status per row by comparing stored decisions against
+    # the current dest user roster; needs_review surfaces when stored
+    # mappings rot.
     cross_platform_resolutions: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -1620,9 +1637,8 @@ class ScheduleIn(BaseModel):
         ),
     )
 
-    # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-schedule overrides.
-    # Schedule fire reads schedule row > settings > global default at
-    # fire time.
+    # Per-schedule mixed-media overrides. Schedule fire reads schedule
+    # row > settings > global default at fire time.
     mixed_media_behavior: Optional[Literal["skip", "dominant", "split"]] = None
     mixed_media_dominance_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     mixed_media_video_routing: Optional[Literal["library_agnostic", "library_dominant"]] = None
@@ -1649,9 +1665,9 @@ class ScheduleIn(BaseModel):
           * restore_mode == 'replace' requires confirm_replace == True
             (end user opt-in to destructive scheduled writes).
 
-        The legacy ScheduleIn (no mode field, snapshot-only) reads
+        A legacy ScheduleIn (no mode field, snapshot-only) reads
         as ``mode == 'snapshot'`` and only the source_server_name
-        requirement applies, matching pre-Task-2 behaviour.
+        requirement applies.
         """
         m = (self.mode or "snapshot").strip()
         if m == "snapshot":
@@ -1681,8 +1697,8 @@ class ScheduleIn(BaseModel):
                 "Schedule with restore_mode='replace' must set confirm_replace=true. "
                 "Destructive scheduled writes require explicit operator opt-in."
             )
-        # 2026-05-16 alignment: tunable D-RATE needs a threshold.
-        # Other rate_mode values ignore rate_threshold entirely.
+        # Tunable D-RATE needs a threshold. Other rate_mode values
+        # ignore rate_threshold entirely.
         if (self.rate_mode or "") == "tunable" and self.rate_threshold is None:
             raise ValueError(
                 "Schedule with rate_mode='tunable' must also set rate_threshold "
@@ -1693,14 +1709,8 @@ class ScheduleIn(BaseModel):
     @model_validator(mode="after")
     def _block_non_idempotent_merge_on_schedules(self) -> "ScheduleIn":
         """
-        v0.13.x: defensive guard against ``merge_watch_strategy="sum"``
-        on a schedule.
-
-        ScheduleIn is snapshot-only today (no ``mode`` / ``merge_watch_strategy``
-        fields), so this validator is a no-op on every existing payload.
-        It exists ahead of the roadmap's scheduled-restore feature: the
-        moment those fields are added to ScheduleIn, this guard kicks in
-        without the implementer having to remember to add it.
+        Defensive guard against ``merge_watch_strategy="sum"`` on a
+        schedule.
 
         Why ``sum`` is unsafe on a schedule
         -----------------------------------
@@ -1718,17 +1728,17 @@ class ScheduleIn(BaseModel):
         creator must either pick "higher" or use Replace mode (which
         is gated by typed-REPLACE and the auto-capture safety belt).
         """
-        # Task 2 (2026-05-15): ``self.mode`` now carries the schedule's
-        # JOB mode (snapshot|restore|direct), not the merge/replace
-        # restore-mode field. The restore-side mode lives in
-        # ``self.restore_mode``; that's what gates this validator.
+        # ``self.mode`` carries the schedule's JOB mode
+        # (snapshot|restore|direct), not the merge/replace restore-mode
+        # field. The restore-side mode lives in ``self.restore_mode``;
+        # that's what gates this validator.
         #
-        # Follow-up (2026-05-15): 'sum' is no longer hard-rejected.
-        # An end user who genuinely wants additive merge on a
-        # schedule can opt in via ``confirm_additive_merge=true``.
-        # Without that flag we still refuse because the failure mode
-        # is silent and compounding (each scheduled fire adds the
-        # stored counts on top of the destination's current counts).
+        # 'sum' is not hard-rejected: an end user who genuinely wants
+        # additive merge on a schedule can opt in via
+        # ``confirm_additive_merge=true``. Without that flag we refuse
+        # because the failure mode is silent and compounding (each
+        # scheduled fire adds the stored counts on top of the
+        # destination's current counts).
         restore_mode = getattr(self, "restore_mode", None)
         strategy = getattr(self, "merge_watch_strategy", None)
         confirmed = bool(getattr(self, "confirm_additive_merge", False))
@@ -1777,10 +1787,9 @@ class DirectTransferIn(_PinPreflightAckFields):
     source_server_name: str = Field(
         description="Friendly name of the registered source server.",
     )
-    # Plan[SERVER-UID-IDENTITY] 2026-05-16: stable per-row identifier.
-    # Preferred over source_server_name; disambiguates same-named
-    # servers across backends. None falls back to name lookup with
-    # a warning.
+    # Stable per-row identifier. Preferred over source_server_name;
+    # disambiguates same-named servers across backends. None falls back
+    # to name lookup with a warning.
     source_server_id: Optional[str] = Field(
         default=None,
         description=(
@@ -1831,14 +1840,13 @@ class DirectTransferIn(_PinPreflightAckFields):
     remap_old: Optional[str] = None
     remap_new: Optional[str] = None
     strict_match: Optional[bool] = None
-    # v0.9.6 Feature 4: limit per-user data transfer to this list of
-    # raw Plex identifiers (managed-user usernames). ``None`` / absent
-    # = all users included (the existing v0.9.5 behaviour). Empty list
-    # = exclude every managed user; only the owner's data transfers.
-    # Matching is by raw identifier, not display name - display names
-    # are a pure rendering aid (Feature 3). The filter applies wholesale
-    # to each managed user's block (watch history + playlists +
-    # collections + ratings together). The owner's data always
+    # Limit per-user data transfer to this list of raw Plex identifiers
+    # (managed-user usernames). ``None`` / absent = all users included.
+    # Empty list = exclude every managed user; only the owner's data
+    # transfers. Matching is by raw identifier, not display name -
+    # display names are a pure rendering aid. The filter applies
+    # wholesale to each managed user's block (watch history + playlists
+    # + collections + ratings together). The owner's data always
     # transfers regardless of this list.
     user_filter: Optional[List[str]] = Field(
         default=None,
@@ -1861,7 +1869,7 @@ class DirectTransferIn(_PinPreflightAckFields):
         default=None,
         description="Legacy. Use include_playlists instead. Skip playlist gather/transfer.",
     )
-    # PR-3 / Phase D - four-flag data-type filter (default-true).
+    # Four-flag data-type filter (default-true).
     include_watch_history: bool = Field(
         default=True,
         description="Include watch history in the transfer.",
@@ -1878,7 +1886,7 @@ class DirectTransferIn(_PinPreflightAckFields):
         default=True,
         description="Include collections in the transfer. Supersedes legacy skip_collections.",
     )
-    # v0.13.x: restore mode for the destination write phase. Mirrors
+    # Restore mode for the destination write phase. Mirrors
     # RestoreJobIn - see the longer commentary there. Direct transfers
     # write their data using the same restore_export_file primitive,
     # so the same merge / replace semantics apply.
@@ -1907,10 +1915,10 @@ class DirectTransferIn(_PinPreflightAckFields):
             "confirmation modal. API callers must set it explicitly."
         ),
     )
-    # v0.13.x: Merge sub-strategy for watch counts. Mirrors the
-    # matching field on RestoreJobIn - see that field's docstring for
-    # the higher / sum semantics. Direct transfers write with the same
-    # restorer primitive, so the same choice applies.
+    # Merge sub-strategy for watch counts. Mirrors the matching field
+    # on RestoreJobIn - see that field's docstring for the higher / sum
+    # semantics. Direct transfers write with the same restorer
+    # primitive, so the same choice applies.
     merge_watch_strategy: str = Field(
         default="higher",
         pattern="^(higher|sum)$",
@@ -1931,7 +1939,7 @@ class DirectTransferIn(_PinPreflightAckFields):
         ),
     )
 
-    # Phase C: per-library metric filter (same semantics as SnapshotJobIn).
+    # Per-library metric filter (same semantics as SnapshotJobIn).
     library_metrics: Optional[Dict[str, LibraryMetrics]] = Field(
         default=None,
         description=(
@@ -1942,11 +1950,37 @@ class DirectTransferIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[RUN-JOB-UI] work items 2-4: same three end user-tunable
-    # knobs as RestoreJobIn (see those fields' docstrings for the
-    # full rationale). Direct transfer runs the adapter restorer
-    # under the hood when the destination is Jellyfin / Emby; the
-    # kwargs flow through identically.
+    # Same field as on RestoreJobIn. Per-run override that bypasses the
+    # library mapping table. Default False so the saved mapping table
+    # is always consulted unless the operator explicitly opts out for
+    # this run. Surfaced as a first-class checkbox on the Run Job form.
+    ignore_library_mapping: bool = Field(
+        default=False,
+        description=(
+            "Per-run override: bypass the library mapping table for "
+            "this run. Default False (saved mappings apply). True = "
+            "the engine falls back to exact-name match between source "
+            "and destination libraries, skipping libraries that have "
+            "no name match. Use sparingly; mappings are the safer "
+            "default for cross-server / cross-backend transfers."
+        ),
+    )
+    # Per-run library mapping overrides. Same shape + semantics as the
+    # matching field on RestoreJobIn.
+    library_mapping_overrides: Optional[Dict[str, str]] = Field(
+        default=None,
+        description=(
+            "Per-run library name overrides. Keys are source library "
+            "names; values are destination library names ('' for an "
+            "explicit skip). Consumed before the saved mapping table; "
+            "does not persist."
+        ),
+    )
+
+    # Same three end user-tunable knobs as RestoreJobIn (see those
+    # fields' docstrings for the full rationale). Direct transfer runs
+    # the adapter restorer under the hood when the destination is
+    # Jellyfin / Emby; the kwargs flow through identically.
     favorite_threshold: Optional[float] = Field(
         default=None,
         description=(
@@ -1970,9 +2004,9 @@ class DirectTransferIn(_PinPreflightAckFields):
             "any item-state write; partial failure aborts the run."
         ),
     )
-    # Plan[CROSS-PLATFORM-PREFLIGHT] follow-up: see RestoreJobIn for
-    # the full per-job override semantics. Same shape applies on direct
-    # transfer; Drop/Map decisions are honoured at write time.
+    # See RestoreJobIn for the full per-job override semantics. Same
+    # shape applies on direct transfer; Drop/Map decisions are honoured
+    # at write time.
     cross_platform_resolutions: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -1982,8 +2016,8 @@ class DirectTransferIn(_PinPreflightAckFields):
         ),
     )
 
-    # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-run overrides for
-    # the mixed-media playlist strategy on direct transfer.
+    # Per-run overrides for the mixed-media playlist strategy on direct
+    # transfer.
     mixed_media_behavior: Optional[Literal["skip", "dominant", "split"]] = None
     mixed_media_dominance_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     mixed_media_video_routing: Optional[Literal["library_agnostic", "library_dominant"]] = None
@@ -2039,7 +2073,7 @@ class DirectTransferIn(_PinPreflightAckFields):
         return self
 
 
-# ── PR-12 preflight ──────────────────────────────────────────────────────────
+# ── PIN preflight ────────────────────────────────────────────────────────────
 
 class PinPreflightIn(BaseModel):
     """
@@ -2071,7 +2105,7 @@ class PinPreflightIn(BaseModel):
     )
 
 
-# ── Item 3: cross-server PIN migration ──────────────────────────────────────
+# ── Cross-server PIN migration ───────────────────────────────────────────────
 
 class PinMigrationSuggestion(BaseModel):
     """
@@ -2111,10 +2145,10 @@ class ServerIn(BaseModel):
         default="",
         description="Auth token / API key. Empty on update = keep existing.",
     )
-    # PR-Backends: backend type discriminator. Existing registry rows
-    # without ``service_type`` default to "plex" on read; new
-    # registrations declare their backend explicitly. Drives which
-    # adapter class wraps the connection.
+    # Backend type discriminator. Existing registry rows without
+    # ``service_type`` default to "plex" on read; new registrations
+    # declare their backend explicitly. Drives which adapter class
+    # wraps the connection.
     service_type: Literal["plex", "jellyfin", "emby"] = Field(
         default="plex",
         description="Backend type. 'plex' (default), 'jellyfin', or 'emby'.",
@@ -2138,7 +2172,7 @@ class ServerIn(BaseModel):
 
 class TestUnsavedIn(BaseModel):
     """
-    Body of ``POST /api/servers/test-unsaved`` (v0.10.0).
+    Body of ``POST /api/servers/test-unsaved``.
 
     Probe a URL+token combination without writing anything to the
     registry. The response includes the connected server's reported
@@ -2217,74 +2251,6 @@ class DevTestRunIn(BaseModel):
     confirm_live: bool = Field(
         default=False,
         description='Must be True when mode=="live". Ignored otherwise.',
-    )
-
-
-class EtaPredictLibrarySpec(BaseModel):
-    """One library's metadata passed to the ETA predictor. The
-    frontend already has access to library name / type / item count
-    from ``/api/servers/{id}/libraries`` and forwards the same three
-    fields here; the predictor uses ``library_type`` to pick the right
-    bucket key dimension and ``items_count`` as the regression
-    variable inside the bucket."""
-    name: str = Field(default="")
-    library_type: str = Field(default="")
-    items_count: Optional[int] = Field(
-        default=None,
-        description=(
-            "Operator-visible size from the source server's library "
-            "list. The trainer regresses duration against this value, "
-            "so a larger library yields a proportionally larger "
-            "estimate. Null is acceptable (the regression falls back "
-            "to intercept-only, equivalent to the historical mean)."
-        ),
-    )
-
-
-class EtaPredictIn(BaseModel):
-    """Body of ``POST /api/eta/predict``. The job-form preview hits
-    this on every change with the current selection; the backend
-    rolls per-library + per-metric estimates into a whole-job
-    estimate plus a per-library breakdown."""
-
-    mode: str = Field(
-        default="snapshot",
-        description='One of "snapshot" / "restore" / "direct".',
-    )
-    source_server_id: str = Field(
-        default="",
-        description=(
-            "The server whose learned timings to consult. For a "
-            "snapshot or direct-transfer job the source server; "
-            "for a restore the destination server (its writes are "
-            "what the engine times)."
-        ),
-    )
-    libraries: List[EtaPredictLibrarySpec] = Field(default_factory=list)
-    metrics_enabled: Dict[str, bool] = Field(
-        default_factory=dict,
-        description=(
-            "Four-flag dict {watch_history, ratings, playlists, "
-            "collections}. Missing keys default to ON to match the "
-            "LibraryMetrics shape; explicit False suppresses that "
-            "metric's contribution to the rollup."
-        ),
-    )
-    user_count: int = Field(
-        default=1,
-        description="Owner (1) + managed users included in the run.",
-    )
-    workers: int = Field(
-        default=1,
-        description="Worker-pool size that will run the libraries in parallel.",
-    )
-    bulk_strategy: str = Field(
-        default="smart",
-        description=(
-            'Watch+ratings strategy: "smart" / "force_bulk" / '
-            '"force_server_side". Used as a bucket-key dimension so '
-            "the predictor learns per-strategy as well as per-server."
-        ),
     )
 
 
@@ -2390,44 +2356,6 @@ class UserIdentityMapIn(BaseModel):
         return self
 
 
-class EtaBackfillIn(BaseModel):
-    """Body of ``POST /api/eta/backfill``. Gap-A of the post-cutover
-    review: warm-start the new ETA engine from the historical
-    ``run_timings`` table so the predictor's tier-1 cells light up
-    without waiting for the end user to manually exercise every
-    bucket from scratch."""
-
-    reset_first: bool = Field(
-        default=False,
-        description=(
-            "True wipes every bucket before replaying history so the "
-            "weights exactly reflect run_timings. False (default) adds "
-            "to existing weights - safe to re-run on an already-trained "
-            "install."
-        ),
-    )
-
-
-class EtaResetIn(BaseModel):
-    """Body of ``POST /api/eta/reset``. End user's D-RESET escape
-    hatch for the 'I just upgraded the server's storage and the
-    old timings are wrong' case. Behind a typed-confirmation UI
-    prompt."""
-
-    server_id: str = Field(
-        default="",
-        description="Required; empty is a no-op so a typo cannot wipe everything.",
-    )
-    confirm: str = Field(
-        default="",
-        description=(
-            'Operator must type "RESET" verbatim on the UI prompt '
-            "and the frontend forwards it here. Backend rejects the "
-            "request when this does not match exactly."
-        ),
-    )
-
-
 class DbImportIn(BaseModel):
     """Body of ``POST /api/database/import/{table_id}`` and the
     archive variant. Carries the end user's typed-REPLACE
@@ -2449,30 +2377,6 @@ class DbImportIn(BaseModel):
             "The exported JSON document. For single-table imports "
             "this is the plexbackup.dbexport.v1 shape; for archive "
             "imports this is the plexbackup.archive.v1 shape."
-        ),
-    )
-
-
-class EtaFlushIn(BaseModel):
-    """Body of ``POST /api/eta/flush``. Settings ETA Training panel's
-    'Flush all training data' button: clears every bucket and
-    (optionally) the underlying run_timings history."""
-
-    include_run_timings: bool = Field(
-        default=False,
-        description=(
-            "True also wipes the run_timings table so the auto-backfill "
-            "on next boot cannot repopulate buckets from prior history. "
-            "False (default) clears buckets only; a subsequent backfill "
-            "would restore them from run_timings."
-        ),
-    )
-    confirm: str = Field(
-        default="",
-        description=(
-            'Operator must type "FLUSH" verbatim on the UI prompt and '
-            "the frontend forwards it here. Backend rejects the request "
-            "when this does not match exactly."
         ),
     )
 
@@ -2499,7 +2403,7 @@ class JobStatusOut(BaseModel):
     )
 
 
-# ── Cross-platform preflight (Plan[CROSS-PLATFORM-PREFLIGHT] step 3) ────────
+# ── Cross-platform preflight ─────────────────────────────────────────────────
 #
 # Wire types for POST /api/jobs/cross-platform-preflight,
 # POST /api/schedules/cross-platform-preflight,
@@ -2507,9 +2411,8 @@ class JobStatusOut(BaseModel):
 # and PATCH /api/schedules/{id}/resolutions.
 #
 # Mirrors the dataclasses in services/restorer_adapter.py
-# (DryRunReport, UserResolutionRecord, etc.) and the TypeScript shapes
-# documented in Plan[UI-FOR-PREFLIGHT]-2026-05-16.md.
-# developer mirrors these in frontend/src/api.ts.
+# (DryRunReport, UserResolutionRecord, etc.); the frontend mirrors
+# these shapes in frontend/src/api.ts.
 
 ProposedResolution = Literal[
     "identity_map",
@@ -2686,17 +2589,17 @@ class CrossPlatformPreflightJobIn(BaseModel):
     is a v2 follow-up.
 
     Destinations may be specified by name (legacy frontend path) OR by
-    stable UID (current frontend path; Plan[SERVER-UID-IDENTITY] 2026-05-16).
-    The resolver prefers IDs when present; name-only resolution falls
-    through to the registry's name-collision-warning path.
+    stable UID (current frontend path). The resolver prefers IDs when
+    present; name-only resolution falls through to the registry's
+    name-collision-warning path.
     """
     snapshot_id: Optional[str] = None
     input_files: List[str] = Field(default_factory=list)
     dest_server_name: Optional[str] = None
     dest_server_names: Optional[List[str]] = None
-    # Plan[SERVER-UID-IDENTITY] 2026-05-16: stable UID destinations.
-    # Frontend sends these alongside the name fields for backward compat.
-    # Validated against the shared is_valid_server_id helper.
+    # Stable UID destinations. Frontend sends these alongside the name
+    # fields for backward compat. Validated against the shared
+    # is_valid_server_id helper.
     dest_server_id: Optional[str] = None
     dest_server_ids: Optional[List[str]] = None
     include_watch_history: bool = True
@@ -2757,19 +2660,34 @@ class CrossPlatformPreflightJobIn(BaseModel):
         return out
 
 
-# ── Playlist Management (Plan[PLAYLIST-MANAGEMENT]-2026-05-16) ──────────────
+# ── Playlist Management ──────────────────────────────────────────────────────
 #
 # Wire types for the six /api/playlist-mgmt/* endpoints that let the
 # end user copy ONE playlist from a source user (column A) to a
-# destination user (column B). Same shapes developer mirrors into
+# destination user (column B). The frontend mirrors these shapes in
 # frontend/src/api.ts.
 
 class PlaylistSpec(BaseModel):
-    """End user-facing playlist row: enough to render in the picker."""
+    """End user-facing playlist row: enough to render in the picker.
+
+    Library-attribution fields:
+      * ``playlist_type``: "audio" / "video" / "photo" / "" - derived
+        from Plex's ``playlistType`` or Jellyfin/Emby's ``MediaType``
+        so the UI can group video / photo playlists separately from
+        audio.
+      * ``primary_library_id`` / ``primary_library_name``: the source
+        library that owns the majority of items. Both None when the
+        adapter couldn't determine it (e.g. Jellyfin's lightweight
+        list response doesn't carry it; the UI falls back to a
+        "(no library)" bucket or to ``playlist_type`` for grouping).
+    """
     playlist_id: str
     name: str
     item_count: int
     is_smart: bool = False
+    playlist_type: str = ""
+    primary_library_id: Optional[str] = None
+    primary_library_name: Optional[str] = None
 
 
 class PlaylistItem(BaseModel):
@@ -2797,11 +2715,11 @@ class PlaylistDetail(BaseModel):
 class PlaylistCopyIn(BaseModel):
     """Body for POST /api/playlist-mgmt/copy.
 
-    All three server ids carry the prefixed UID format from
-    Plan[SERVER-UID-IDENTITY] (`<plex|jellyfin|emby>_<uuid4_hex>`);
-    the shared validator rejects malformed values at the API
-    boundary. ``dest_playlist_name`` defaults to None (preserve
-    source name) but the end user can rename via the modal."""
+    All three server ids carry the prefixed UID format
+    (`<plex|jellyfin|emby>_<uuid4_hex>`); the shared validator rejects
+    malformed values at the API boundary. ``dest_playlist_name``
+    defaults to None (preserve source name) but the end user can
+    rename via the modal."""
     source_server_id: str
     source_user_id: str
     source_playlist_id: str
@@ -2836,15 +2754,128 @@ class PlaylistCopyResult(BaseModel):
     items_failed: int = 0
     errors: List[str] = Field(default_factory=list)
     elapsed_seconds: float = 0.0
-    # 2026-05-17 (operator request): when copy_playlist detects that
-    # source and destination resolve to the same (server, user) the
-    # orchestrator returns success=True + skipped=True without doing
-    # any work. The default is enforced by the
-    # ``playlist_mgmt_same_user_behavior`` tunable (skip vs.
+    # When copy_playlist detects that source and destination resolve to
+    # the same (server, user) the orchestrator returns success=True +
+    # skipped=True without doing any work. The default is enforced by
+    # the ``playlist_mgmt_same_user_behavior`` tunable (skip vs.
     # duplicate). ``skip_reason`` carries a human-readable string the
     # ActiveDeploysPanel surfaces inline.
     skipped: bool = False
     skip_reason: Optional[str] = None
+
+
+class PlaylistCopyBatchIn(BaseModel):
+    """Body for POST /api/playlist-mgmt/copy-batch-job.
+
+    * ``items`` - list of PlaylistCopyIn (each fully validated). Hard
+      ceiling enforced via ``playlist_mgmt_batch_max_size`` tunable
+      so a runaway client payload can't lock the queue.
+    * ``parallelism`` - optional per-submit override clamped to
+      [1, batch_max_size]. Absent -> uses ``playlist_mgmt_batch_workers``.
+    * ``label`` - optional operator-supplied label shown in the
+      activity feed (defaults to "batch of N playlist(s)" when None)."""
+    items: List[PlaylistCopyIn] = Field(default_factory=list)
+    parallelism: Optional[int] = None
+    label: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_batch(self) -> "PlaylistCopyBatchIn":
+        if not self.items:
+            raise ValueError("items must contain at least one entry.")
+        # Defer the max-size check to runtime (the tunable lives in
+        # services.tunables; we import lazily to keep this models
+        # module free of services imports).
+        from services.tunables import playlist_mgmt_batch_max_size
+        cap = playlist_mgmt_batch_max_size()
+        if len(self.items) > cap:
+            raise ValueError(
+                f"batch size {len(self.items)} exceeds the "
+                f"playlist_mgmt_batch_max_size tunable ({cap})."
+            )
+        if self.parallelism is not None and self.parallelism < 1:
+            raise ValueError("parallelism must be >= 1 when provided.")
+        return self
+
+
+class SmartMigrateItemIn(PlaylistCopyIn):
+    """One smart-playlist migration item: a :class:`PlaylistCopyIn`
+    plus the per-playlist mode.
+
+    ``hard_copy=False`` (default) re-applies the FILTER: a true smart
+    playlist re-created on a Plex destination, a static snapshot on a
+    Jellyfin / Emby destination.
+
+    ``hard_copy=True`` evaluates the filter now and transfers the
+    matched items as a normal static playlist, on ANY destination
+    backend (Plex included). The operator picks this per playlist."""
+    hard_copy: bool = False
+
+
+class SmartPlaylistMigrateIn(BaseModel):
+    """Body for POST /api/playlist-mgmt/smart-migrate-job.
+
+    Each item reuses the :class:`PlaylistCopyIn` shape (source / dest
+    server + playlist + user) plus a per-playlist ``hard_copy`` mode.
+    The job handler
+    reads each source Plex smart playlist's filter and either
+    re-creates it on the destination (filter mode) or materialises
+    its current matched items as a static playlist (hard-copy mode)."""
+    items: List[SmartMigrateItemIn] = Field(default_factory=list)
+    label: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_smart_migrate(self) -> "SmartPlaylistMigrateIn":
+        if not self.items:
+            raise ValueError("items must contain at least one entry.")
+        return self
+
+
+class PlaylistCopyBatchItemResult(BaseModel):
+    """One row of PlaylistCopyBatchResult.results. 1:1 with the input
+    items list, ordered by input index."""
+    index: int
+    success: bool
+    cancelled: bool = False
+    error_code: Optional[str] = None
+    new_playlist_id: Optional[str] = None
+    items_written: int = 0
+    items_skipped_no_match: int = 0
+    items_failed: int = 0
+    errors: List[str] = Field(default_factory=list)
+    elapsed_seconds: float = 0.0
+    skipped: bool = False
+    skip_reason: Optional[str] = None
+
+
+class PlaylistCopyBatchResult(BaseModel):
+    """Returned by POST /api/playlist-mgmt/copy-batch-job. End user-facing
+    tallies + per-item drill-down. The UI renders a collapsed header
+    (total/succeeded/failed/cancelled/skipped) with an expandable per-
+    item list keyed by ``index``."""
+    job_id: str
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    skipped: int = 0
+    cancelled: int = 0
+    elapsed_seconds: float = 0.0
+    parallelism: int = 0
+    label: Optional[str] = None
+    results: List[PlaylistCopyBatchItemResult] = Field(default_factory=list)
+
+
+class PlaylistCopyBatchCancelItemIn(BaseModel):
+    """Body for POST /api/playlist-mgmt/copy-batch-job/{job_id}/cancel-item.
+
+    Per Plan section 8a Q5: end user can cancel ONE mistakenly-selected
+    item without nuking the whole batch."""
+    item_index: int
+
+    @model_validator(mode="after")
+    def _validate_index(self) -> "PlaylistCopyBatchCancelItemIn":
+        if self.item_index < 0:
+            raise ValueError("item_index must be >= 0.")
+        return self
 
 
 class CacheStatus(BaseModel):

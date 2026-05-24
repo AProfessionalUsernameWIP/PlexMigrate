@@ -89,6 +89,7 @@ export function RestoreModeSelector({
       <label htmlFor={mergeId} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 6 }}>
         <input
           id={mergeId}
+          data-testid="job-restore-mode-merge"
           type="radio"
           name={radioName}
           value="merge"
@@ -154,6 +155,7 @@ export function RestoreModeSelector({
           >
             <input
               id={mwsHigherId}
+              data-testid="job-merge-higher"
               type="radio"
               name={mwsName}
               value="higher"
@@ -180,6 +182,7 @@ export function RestoreModeSelector({
           >
             <input
               id={mwsSumId}
+              data-testid="job-merge-sum"
               type="radio"
               name={mwsName}
               value="sum"
@@ -206,6 +209,7 @@ export function RestoreModeSelector({
       <label htmlFor={replaceId} style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
         <input
           id={replaceId}
+          data-testid="job-restore-mode-replace"
           type="radio"
           name={radioName}
           value="replace"

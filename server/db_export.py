@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from server._db_connect import open_db
 from server.persistence import get_data_dir
 
 
@@ -67,8 +68,7 @@ log = logging.getLogger("plexmigrate.server.db_export")
 # an update here.
 
 _TABLE_CATALOG: Dict[str, Tuple[str, str]] = {
-    # run_timings.db - ETA training + per-job summaries
-    "eta_buckets":         ("run_timings.db", "eta_buckets"),
+    # run_timings.db - per-job summaries + per-operation timings
     "run_history":         ("run_timings.db", "run_history"),
     "run_timings":         ("run_timings.db", "run_timings"),
     # snapshots.db - snapshot registry (the .db files themselves are
@@ -111,7 +111,6 @@ _PER_SERVER_TABLES: List[str] = [
     "media_library_sections",
     "media_user_identity_map",
     "media_library_walks",
-    "eta_buckets",
     "run_history",
     "snapshots_registry",
 ]
@@ -304,17 +303,16 @@ def export_table(table_id: str) -> Dict[str, Any]:
     }
 
 
-def restore_table(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Replace one table's contents with the supplied JSON dump.
-    Operates in a single transaction: DELETE all existing rows then
-    INSERT every row from ``rows``. Returns
-    ``{table_id, deleted, inserted}``.
+def _validate_table_payload(
+    payload: Dict[str, Any],
+) -> Tuple[str, str, str, List[str], List[Dict[str, Any]]]:
+    """Validate one single-table dump's shape and resolve it against
+    the catalog. Returns ``(table_id, db_file, table_name, schema,
+    rows)``; raises ``ValueError`` on any shape problem.
 
-    Validates the payload shape before touching the DB:
-      * ``format`` must match ``plexbackup.dbexport.v1``
-      * ``table_id`` must be in the catalog
-      * ``schema`` must match the live table's columns exactly (no
-        renames, no adds, no removes)
+    Pure pre-flight validation - it never opens or touches a database.
+    Shared by both restore paths so they reject a malformed payload
+    identically, before a connection is ever opened.
     """
     fmt = payload.get("format")
     if fmt != "plexbackup.dbexport.v1":
@@ -330,58 +328,99 @@ def restore_table(payload: Dict[str, Any]) -> Dict[str, Any]:
     rows = list(payload.get("rows") or [])
     if not schema:
         raise ValueError("payload schema must be a non-empty list of column names")
+    return table_id, db_file, table_name, schema, rows
+
+
+def _restore_table_body(
+    conn: sqlite3.Connection,
+    table_id: str,
+    table_name: str,
+    schema: List[str],
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Replace one table's contents on an ALREADY-OPEN connection,
+    inside a transaction the caller owns. Runs the live-schema drift
+    check, the DELETE, and the INSERT - but never opens the
+    connection and never issues BEGIN / COMMIT / ROLLBACK itself.
+
+    Leaving transaction control to the caller is what lets several
+    tables that share one db_file restore atomically as a unit (see
+    :func:`restore_archive`). Returns ``{table_id, deleted, inserted}``.
+    """
+    # Live-schema check: import-replace only works against the
+    # exact column set captured at export time. A new column
+    # added between export and import is a schema drift the
+    # end user should resolve explicitly (re-export + re-import)
+    # rather than silently dropping a column on restore.
+    live_cols = [
+        r[1] for r in conn.execute(
+            f"PRAGMA table_info({table_name})"
+        ).fetchall()
+    ]
+    if live_cols != schema:
+        raise ValueError(
+            "schema drift between export and live table: "
+            f"export had {schema!r}, live table has {live_cols!r}"
+        )
+
+    placeholders = ", ".join("?" for _ in schema)
+    col_list = ", ".join(schema)
+    deleted_cur = conn.execute(f"DELETE FROM {table_name}")
+    deleted = int(deleted_cur.rowcount or 0)
+    inserted = 0
+    if rows:
+        values_list = [
+            tuple(row.get(col) for col in schema)
+            for row in rows
+        ]
+        conn.executemany(
+            f"INSERT INTO {table_name} ({col_list}) "
+            f"VALUES ({placeholders})",
+            values_list,
+        )
+        inserted = len(values_list)
+    return {
+        "table_id": table_id,
+        "deleted": deleted,
+        "inserted": inserted,
+    }
+
+
+def restore_table(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace one table's contents with the supplied JSON dump.
+    Operates in a single transaction: DELETE all existing rows then
+    INSERT every row from ``rows``. Returns
+    ``{table_id, deleted, inserted}``.
+
+    Validates the payload shape before touching the DB:
+      * ``format`` must match ``plexbackup.dbexport.v1``
+      * ``table_id`` must be in the catalog
+      * ``schema`` must match the live table's columns exactly (no
+        renames, no adds, no removes)
+    """
+    table_id, db_file, table_name, schema, rows = _validate_table_payload(payload)
 
     path = get_data_dir() / db_file
     if not path.exists():
         raise FileNotFoundError(f"database file missing: {path}")
 
-    conn = sqlite3.connect(str(path), timeout=10.0, isolation_level=None)
+    # Open via the shared helper so the restore connection gets the
+    # project's standard journal-mode + synchronous + row_factory
+    # config instead of a bare connection. foreign_keys stays OFF: a
+    # bulk DELETE-then-INSERT table replace must not trip FK
+    # enforcement mid-restore.
+    conn = open_db(path, label=db_file, foreign_keys=False)
     try:
-        # Live-schema check: import-replace only works against the
-        # exact column set captured at export time. A new column
-        # added between export and import is a schema drift the
-        # end user should resolve explicitly (re-export + re-import)
-        # rather than silently dropping a column on restore.
-        live_cols = [
-            r[1] for r in conn.execute(
-                f"PRAGMA table_info({table_name})"
-            ).fetchall()
-        ]
-        if live_cols != schema:
-            raise ValueError(
-                "schema drift between export and live table: "
-                f"export had {schema!r}, live table has {live_cols!r}"
-            )
-
-        placeholders = ", ".join("?" for _ in schema)
-        col_list = ", ".join(schema)
         conn.execute("BEGIN")
         try:
-            deleted_cur = conn.execute(f"DELETE FROM {table_name}")
-            deleted = int(deleted_cur.rowcount or 0)
-            inserted = 0
-            if rows:
-                values_list = [
-                    tuple(row.get(col) for col in schema)
-                    for row in rows
-                ]
-                conn.executemany(
-                    f"INSERT INTO {table_name} ({col_list}) "
-                    f"VALUES ({placeholders})",
-                    values_list,
-                )
-                inserted = len(values_list)
+            result = _restore_table_body(conn, table_id, table_name, schema, rows)
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
     finally:
         conn.close()
-    return {
-        "table_id": table_id,
-        "deleted": deleted,
-        "inserted": inserted,
-    }
+    return result
 
 
 def export_all() -> Dict[str, Any]:
@@ -406,9 +445,21 @@ def export_all() -> Dict[str, Any]:
 
 
 def restore_archive(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Restore every table in a previously-exported archive. Each
-    table is restored independently; failures don't abort the
-    others. Returns per-table results plus an aggregate summary."""
+    """Restore every table in a previously-exported archive.
+
+    Tables are grouped by their backing ``db_file`` and each file is
+    restored in ONE transaction: if any table in a file fails (schema
+    drift, a bad row) every table in that same file rolls back as a
+    unit. This keeps intra-file foreign keys consistent - e.g.
+    ``server_items`` is never left referencing ``items`` rows a
+    half-applied restore deleted.
+
+    A single SQLite transaction cannot span multiple database files,
+    so atomicity is per-db_file, not whole-archive: a failure
+    restoring media.db does not roll back an already-committed
+    run_timings.db. The other files still restore. Returns per-table
+    results plus an aggregate summary.
+    """
     fmt = payload.get("format")
     if fmt != "plexbackup.archive.v1":
         raise ValueError(
@@ -420,15 +471,67 @@ def restore_archive(payload: Dict[str, Any]) -> Dict[str, Any]:
     total_deleted = 0
     total_inserted = 0
     errors: List[str] = []
+
+    # Pass 1: validate every table payload and bucket it by db_file.
+    # A payload that fails validation is recorded as a per-table
+    # error here and never reaches a transaction.
+    by_db_file: Dict[str, List[Tuple[str, str, List[str], List[Dict[str, Any]]]]] = {}
     for table_id, sub in tables.items():
         try:
-            res = restore_table(sub)
-            results[table_id] = res
-            total_deleted += int(res.get("deleted") or 0)
-            total_inserted += int(res.get("inserted") or 0)
+            v_table_id, db_file, table_name, schema, rows = _validate_table_payload(sub)
         except Exception as exc:
             results[table_id] = {"error": str(exc)}
             errors.append(f"{table_id}: {exc}")
+            continue
+        by_db_file.setdefault(db_file, []).append(
+            (v_table_id, table_name, schema, rows)
+        )
+
+    # Pass 2: restore each db_file's tables in a single transaction.
+    for db_file, entries in by_db_file.items():
+        path = get_data_dir() / db_file
+        if not path.exists():
+            msg = f"database file missing: {path}"
+            for (t_id, _table_name, _schema, _rows) in entries:
+                results[t_id] = {"error": msg}
+                errors.append(f"{t_id}: {msg}")
+            continue
+
+        file_results: List[Dict[str, Any]] = []
+        file_error: Optional[str] = None
+        conn = open_db(path, label=db_file, foreign_keys=False)
+        try:
+            conn.execute("BEGIN")
+            try:
+                for (t_id, table_name, schema, rows) in entries:
+                    file_results.append(
+                        _restore_table_body(conn, t_id, table_name, schema, rows)
+                    )
+                conn.execute("COMMIT")
+            except Exception as exc:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                file_error = str(exc)
+        finally:
+            conn.close()
+
+        if file_error is not None:
+            # Whole-file rollback: no table in this db_file was
+            # restored. Report the failure against every table that
+            # shared the file's transaction.
+            for (t_id, _table_name, _schema, _rows) in entries:
+                results[t_id] = {
+                    "error": f"db_file {db_file} rolled back: {file_error}"
+                }
+                errors.append(f"{t_id}: {file_error}")
+        else:
+            for res in file_results:
+                results[res["table_id"]] = res
+                total_deleted += int(res.get("deleted") or 0)
+                total_inserted += int(res.get("inserted") or 0)
+
     return {
         "per_table": results,
         "total_deleted": total_deleted,

@@ -51,9 +51,9 @@ export function ModeAndServersPanel(props: Props) {
           <strong> Direct</strong> pipes source to destination in memory.
         </span>
         <select value={mode} onChange={(e) => onModeChange(e.target.value as Mode)}>
-          <option value="snapshot">Snapshot - save data from a Plex server</option>
-          <option value="restore">Restore - restore data to a Plex server</option>
-          <option value="direct">Direct transfer - read from one server, write to another</option>
+          <option data-testid="job-mode-snapshot" value="snapshot">Snapshot - save data from a Plex server</option>
+          <option data-testid="job-mode-restore" value="restore">Restore - restore data to a Plex server</option>
+          <option data-testid="job-mode-direct" value="direct">Direct transfer - read from one server, write to another</option>
         </select>
       </label>
 
@@ -67,7 +67,7 @@ export function ModeAndServersPanel(props: Props) {
             </span>
           </div>
         ) : (
-          <div className="field">
+          <div className="field" data-testid="job-source-server-select">
             <span className="label">
               Source Server
               <InfoTip topicId="source-server" />
@@ -95,7 +95,7 @@ export function ModeAndServersPanel(props: Props) {
             </span>
           </div>
         ) : (
-          <div className="field">
+          <div className="field" data-testid="job-dest-server-select">
             <span className="label">
               Destination Server{destServerNames.size > 1 ? 's (Fan-out)' : 's'}
               <InfoTip topicId="destination-fanout" />

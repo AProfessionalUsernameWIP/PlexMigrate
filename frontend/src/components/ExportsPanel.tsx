@@ -1,4 +1,4 @@
-// PR-13 - Exports panel, registry-backed.
+// Exports panel, registry-backed.
 //
 // Two sections:
 //
@@ -10,7 +10,7 @@
 //     this server" danger button.
 //
 //   * Legacy JSON archives - pre-rename .plexexport.json files moved
-//     to snapshots/legacy/ on first boot after PR-13. Read-only
+//     to snapshots/legacy/ on first boot. Read-only
 //     browse + download; delete is db_admin gated. Hidden when
 //     the legacy directory is empty.
 //
@@ -19,13 +19,16 @@
 // destructive request. Modal style matches the User Management
 // panel's modal so end users see a consistent destructive surface.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, ExportArchive, getAccessToken, ServerView, Snapshot } from '../api';
 import {
   BackendTabStrip,
   BackendType,
   backendCounts,
 } from './BackendTabStrip';
+import { formatBytes } from '../utils/format';
+import { pausableInterval } from '../utils/pausableInterval';
+import { DbAdminAuthModal } from './DbAdminAuthModal';
 
 type PendingDestructive =
   | { kind: 'delete_snapshot'; id: string; name: string; canKeepJson: boolean }
@@ -45,21 +48,20 @@ export function ExportsPanel() {
   const [snapshots, setSnapshots] = useState<Snapshot[] | null>(null);
   // JSON archives: standalone .plexexport.json files in
   // <output_dir>/legacy/. Populated by the keep-JSON path during
-  // snapshot delete and by any pre-PR-13 files relocated at startup.
+  // snapshot delete and by any older files relocated at startup.
   const [archives, setArchives] = useState<ExportArchive[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingDestructive | null>(null);
   const [downloading, setDownloading] = useState<string | null>(null);
-  // v0.14 - per-server sub-tab. Mirrors the pattern on Servers ▸ User
+  // Per-server sub-tab. Mirrors the pattern on Servers ▸ User
   // Management: a tab strip with one button per server that has
   // snapshots; clicking shows that server's snapshots only. ``null``
   // = no selection yet (initial mount before refresh resolves, or
   // every server's snapshots have been deleted). After refresh we
   // auto-select the first server with rows.
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
-  // Phase B of the backend-filter UI restructure (Finding[BACKEND-
-  // FILTER-AUDIT]-2026-05-16.md). Snapshots are grouped by composite
+  // Snapshots are grouped by composite
   // server key below; this state filters the visible groups to a
   // single backend before they reach the SnapshotServerSelector.
   const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
@@ -74,21 +76,14 @@ export function ExportsPanel() {
   // resets to 0 between clicks. Module-level frame index is
   // ``generatingTick % GENERATING_FRAMES.length``.
   const [generatingTick, setGeneratingTick] = useState(0);
-  const tickTimerRef = useRef<number | null>(null);
   useEffect(() => {
     if (downloading === null) {
       setGeneratingTick(0);
       return;
     }
-    tickTimerRef.current = window.setInterval(() => {
+    return pausableInterval(() => {
       setGeneratingTick((t) => t + 1);
     }, GENERATING_FRAME_MS);
-    return () => {
-      if (tickTimerRef.current !== null) {
-        window.clearInterval(tickTimerRef.current);
-        tickTimerRef.current = null;
-      }
-    };
   }, [downloading]);
 
   const refresh = async () => {
@@ -131,40 +126,23 @@ export function ExportsPanel() {
   // rides along (a plain <a href> wouldn't carry the bearer token
   // and the auth middleware would 401). Receive as blob, save via
   // a synthetic <a> element.
-  //
-  // Diagnostic console.log lines are intentional: when the end user
-  // reports a download failure, the browser console gives us the
-  // status / size / first-bytes signal the network tab also shows
-  // but is easier to copy-paste back. Remove later if noise becomes
-  // an issue.
-  const downloadBlob = async (url: string, fileName: string) => {
-    setDownloading(url);
+  const downloadBlob = async (url: string, fileName: string, actionId: string) => {
+    // Busy state is keyed on a STABLE action id (e.g. "db:<id>"), not
+    // the URL string: the URL can vary in shape (cache-buster, token)
+    // between render and click, which would desync each button's
+    // per-action busy flag.
+    setDownloading(actionId);
     setError(null);
-    // eslint-disable-next-line no-console
-    console.log('[Exports] download start', { url, fileName });
     try {
       const token = getAccessToken();
       const headers: Record<string, string> = {};
       if (token) headers['Authorization'] = `Bearer ${token}`;
-      else {
-        // eslint-disable-next-line no-console
-        console.warn('[Exports] no access token in memory at click time');
-      }
       const res = await fetch(url, { headers, credentials: 'same-origin' });
-      // eslint-disable-next-line no-console
-      console.log('[Exports] response', {
-        status: res.status,
-        ok: res.ok,
-        contentType: res.headers.get('content-type'),
-        contentLength: res.headers.get('content-length'),
-      });
       if (!res.ok) {
         const text = await res.text().catch(() => res.statusText);
         throw new Error(`${res.status}: ${text}`);
       }
       const blob = await res.blob();
-      // eslint-disable-next-line no-console
-      console.log('[Exports] blob received', { size: blob.size, type: blob.type });
       if (blob.size === 0) {
         throw new Error('Server returned a zero-byte response.');
       }
@@ -176,11 +154,7 @@ export function ExportsPanel() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(objectUrl);
-      // eslint-disable-next-line no-console
-      console.log('[Exports] download triggered', fileName);
     } catch (e) {
-      // eslint-disable-next-line no-console
-      console.error('[Exports] download failed', e);
       setError(`Download failed: ${e}`);
     } finally {
       setDownloading(null);
@@ -322,7 +296,7 @@ export function ExportsPanel() {
     return grouped[a].server_name.localeCompare(grouped[b].server_name);
   });
 
-  // Phase B: derive the backend for each group so the filter strip
+  // Derive the backend for each group so the filter strip
   // can show only the active backend's groups. Each grouped entry
   // carries representative_server_id; look up the registered server
   // to get service_type. Orphans (no registry row) default to 'plex'
@@ -403,19 +377,18 @@ export function ExportsPanel() {
           </div>
         ) : (
           <>
-            {/* Phase B of the backend-filter UI restructure: backend
-                tier above the per-server tab strip. Auto-hidden when
-                only one backend has snapshots. Each backend's tab
-                renders its server-group count in parens. */}
+            {/* Backend tier above the per-server tab strip.
+                Auto-hidden when only one backend has snapshots. Each
+                backend's tab renders its server-group count in parens. */}
             <BackendTabStrip
               servers={stripServers}
               activeBackend={activeBackend}
               onChange={setActiveBackend}
             />
-            {/* v0.14 - per-server sub-tab strip. One button per server
+            {/* Per-server sub-tab strip. One button per server
                 that has snapshots, with the count in parens for at-a-
                 glance distribution. Mirrors the strip used on Servers
-                ▸ User Management and Servers ▸ Overview so end users
+                ▸ User Management and Servers ▸ Overview so users
                 see a consistent navigation pattern when they're
                 drilling into a single server. */}
             <SnapshotServerSelector
@@ -436,12 +409,14 @@ export function ExportsPanel() {
                   void downloadBlob(
                     api.snapshotDownloadUrl(snap.id),
                     `${snap.snapshot_name}.plexexport.json`,
+                    `json:${snap.id}`,
                   )
                 }
                 onDownloadDb={(snap) =>
                   void downloadBlob(
                     api.snapshotDbDownloadUrl(snap.id),
                     `${snap.snapshot_name}.db`,
+                    `db:${snap.id}`,
                   )
                 }
                 onDelete={(snap) =>
@@ -481,14 +456,17 @@ export function ExportsPanel() {
 
       {/* JSON archives panel - standalone .plexexport.json files in
           <output_dir>/legacy/. Populated by the keep-JSON path during
-          snapshot delete and by any pre-PR-13 files relocated at
+          snapshot delete and by any older files relocated at
           startup. Hidden entirely when empty. */}
       {archives.length > 0 && (
         <ArchiveSection
           items={archives}
           downloadingUrl={downloading}
           onDownload={(item) =>
-            void downloadBlob(api.legacySnapshotDownloadUrl(item.name), item.name)
+            void downloadBlob(
+              api.legacySnapshotDownloadUrl(item.name), item.name,
+              `legacy:${item.name}`,
+            )
           }
           onDelete={(item) => setPending({ kind: 'delete_archive', name: item.name })}
           onClearAll={() => setPending({ kind: 'clear_archives', count: archives.length })}
@@ -536,7 +514,7 @@ function SnapshotServerSelector({
     <nav className="tabs sub-tabs" style={{ marginTop: 12, marginBottom: 12 }}>
       {groupKeys.map((sid) => {
         const g = grouped[sid];
-        const isUnknown = sid === '__unknown__';
+        const isOrphan = sid.startsWith('__orphan__');
         return (
           <button
             key={sid}
@@ -544,7 +522,7 @@ function SnapshotServerSelector({
             className={sid === selectedId ? 'active' : ''}
             onClick={() => onSelect(sid)}
             title={
-              isUnknown
+              isOrphan
                 ? 'Snapshots whose server_id no longer maps to a registered server (orphans).'
                 : g.server_name
             }
@@ -613,10 +591,8 @@ function ServerGroup({
         </thead>
         <tbody>
           {rows.map((s) => {
-            const dbUrl = api.snapshotDbDownloadUrl(s.id);
-            const jsonUrl = api.snapshotDownloadUrl(s.id);
-            const dbBusy = downloadingUrl === dbUrl;
-            const jsonBusy = downloadingUrl === jsonUrl;
+            const dbBusy = downloadingUrl === `db:${s.id}`;
+            const jsonBusy = downloadingUrl === `json:${s.id}`;
             // Recovered rows are reconciled orphans - the file was on
             // disk but the registry row was missing (process crashed
             // between step 4 and step 5 of the snapshot pipeline). The
@@ -651,10 +627,9 @@ function ServerGroup({
                       file missing
                     </span>
                   )}
-                  {/* Phase D (admin-management follow-up, 2026-05-15):
-                      one-line summary of what the snapshot contains.
+                  {/* One-line summary of what the snapshot contains.
                       Stamped at capture time. Older snapshots without
-                      a description (pre-Phase-D) render no second
+                      a description render no second
                       line - the existing display already shows the
                       key facts. */}
                   {s.description && (
@@ -759,8 +734,8 @@ function ServerGroup({
 // ── JSON Archives section ────────────────────────────────────────────────────
 //
 // Renders standalone .plexexport.json archives - either kept from a
-// snapshot delete (end user checked "Keep JSON archive") or relocated
-// from a pre-PR-13 layout at startup. Hidden entirely when the archive
+// snapshot delete (user checked "Keep JSON archive") or relocated
+// from an older layout at startup. Hidden entirely when the archive
 // directory is empty, so a clean install doesn't show a no-op section.
 
 function ArchiveSection({
@@ -807,8 +782,7 @@ function ArchiveSection({
         </thead>
         <tbody>
           {items.map((f) => {
-            const dlUrl = api.legacySnapshotDownloadUrl(f.name);
-            const dlBusy = downloadingUrl === dlUrl;
+            const dlBusy = downloadingUrl === `legacy:${f.name}`;
             return (
               <tr key={f.name}>
                 <td title={f.source_server_url || ''}>
@@ -847,131 +821,6 @@ function describePending(p: PendingDestructive): string {
     case 'delete_archive':  return `Delete JSON archive ${p.name}`;
     case 'clear_archives':  return `Clear all ${p.count} JSON archive(s)`;
   }
-}
-
-
-function DbAdminAuthModal({
-  action,
-  onCancel,
-  onSubmit,
-  showKeepJson = false,
-  keepJsonHint,
-}: {
-  action: string;
-  onCancel: () => void;
-  // ``keepJson`` is forwarded only when ``showKeepJson`` is true; the
-  // caller can ignore it for non-snapshot delete flows.
-  onSubmit: (
-    creds: { username: string; password: string },
-    options: { keepJson: boolean },
-  ) => Promise<void>;
-  // When true, render a "Keep JSON archive" checkbox above the
-  // confirm button. Defaults off. Used by the snapshot delete flow
-  // so the operator can move the .plexexport.json sidecar into the
-  // JSON archives panel instead of deleting it with the .db.
-  showKeepJson?: boolean;
-  // Short paragraph rendered next to the checkbox to explain what
-  // it does. Caller-supplied so the wording can match the specific
-  // destructive action.
-  keepJsonHint?: string;
-}) {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [keepJson, setKeepJson] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const canSubmit = !submitting && username.length > 0 && password.length > 0;
-
-  const submit = async () => {
-    if (!canSubmit) return;
-    setError(null);
-    setSubmitting(true);
-    try {
-      await onSubmit({ username, password }, { keepJson });
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <div
-      onClick={onCancel}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 480, maxWidth: '92vw' }}
-      >
-        <h2 style={{ marginTop: 0 }}>Confirm with database admin</h2>
-        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
-          <strong>{action}</strong> requires Database Admin Account
-          credentials. Set up or rotate these under
-          Settings → Account Management → Database Admin Account.
-        </span>
-        {error && <div className="banner error">{error}</div>}
-        <label className="field">
-          <span className="label">Database admin username</span>
-          <input
-            type="text"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoComplete="username"
-            autoFocus
-          />
-        </label>
-        <label className="field">
-          <span className="label">Database admin password</span>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="current-password"
-          />
-        </label>
-        {showKeepJson && (
-          <label className="switch" style={{ marginTop: 12 }}>
-            <input
-              type="checkbox"
-              checked={keepJson}
-              onChange={(e) => setKeepJson(e.target.checked)}
-            />
-            <span>
-              Keep JSON archive
-              {keepJsonHint && (
-                <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 11, marginTop: 2 }}>
-                  {keepJsonHint}
-                </span>
-              )}
-            </span>
-          </label>
-        )}
-        <div className="row-buttons" style={{ marginTop: 12 }}>
-          <button className="primary" disabled={!canSubmit} onClick={submit}>
-            {submitting ? 'Confirming…' : 'Confirm'}
-          </button>
-          <button onClick={onCancel} disabled={submitting}>Cancel</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 

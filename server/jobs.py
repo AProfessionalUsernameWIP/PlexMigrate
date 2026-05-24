@@ -1,5 +1,5 @@
 """
-Single-worker job queue that drives the PlexMigrate engine.
+Single-worker job queue that drives the Hestia-MediaManager engine.
 
 The engine writes to global state (``services.state._dashboard``,
 ``services.state._lib_successes``, etc.) and the dashboard uses
@@ -54,6 +54,8 @@ from server.fan_out import (
     run_fan_out_restore,
 )
 from server.persistence import load_settings
+from server.log_scrubber import safe_error, scrub
+from server.run_context import _build_logger, _finalize_run, _set_run_timestamp
 from server.server_registry import (
     backend_aware_slug,
     connect_registered_server,
@@ -70,7 +72,6 @@ log = logging.getLogger("plexmigrate.server.jobs")
 
 # Possible values of JobRecord.state. Centralised so other modules
 # can import the strings rather than hard-coding magic values.
-STATE_IDLE = "idle"
 STATE_QUEUED = "queued"
 STATE_RUNNING = "running"
 # "stopping" is the intermediate state between the user clicking Stop and
@@ -80,7 +81,7 @@ STATE_RUNNING = "running"
 # itself "Stopping…" and disable, giving the user immediate feedback.
 STATE_STOPPING = "stopping"
 STATE_COMPLETED = "completed"
-# v0.13.x: terminal state for jobs that completed the engine work
+# Terminal state for jobs that completed the engine work
 # successfully (primary data is in media.db; the migration ran end to
 # end) but a non-fatal post-engine step failed. The textbook case is
 # the snapshot-artifact capture: media.db ingest succeeded, but writing
@@ -117,9 +118,22 @@ class JobRecord:
     # never started or that completed before the summary capture
     # landed in the codebase.
     summary: Optional[Dict[str, Any]] = None
+    # Item count for a ``playlist_copy_batch`` job, set once at submit
+    # time so ``cancel_batch_item`` can range-check an item index
+    # without racing the worker that builds the batch. 0 otherwise.
+    batch_items_len: int = 0
+    # Per-job cooperative stop flag. The worker creates it when the job
+    # starts running; ``request_stop`` sets it. The adapter (Jellyfin /
+    # Emby) engines read it via ``getattr(rec, "_stop_event")`` - the
+    # Plex-only ``state._active_stop_event`` keyboard-thread path does
+    # not cover them. ``repr=False`` keeps it out of log/WS payloads.
+    _stop_event: Optional[threading.Event] = field(default=None, repr=False)
 
 
 _HISTORY_MAX = 50
+# Cap on per-item error text shown inline in the activity feed; the
+# full message stays available on the per-item drill-down.
+_ACTIVITY_MSG_MAX_CHARS = 240
 
 
 # ── Job queue ────────────────────────────────────────────────────────────────
@@ -154,7 +168,7 @@ class JobQueue:
         # consistent multi-field reads.
         self._current: Optional[JobRecord] = None
         self._history: List[JobRecord] = []
-        # PR-8: queued jobs awaiting the worker. Kept alongside the
+        # Queued jobs awaiting the worker. Kept alongside the
         # internal queue.Queue so the WS broadcaster can list them
         # without poking the queue's private deque. Mutated only
         # under ``_lock``: append on submit, pop on _worker_loop
@@ -185,11 +199,10 @@ class JobQueue:
     def submit_playlist_copy(self, params: Dict[str, Any]) -> JobRecord:
         """
         Enqueue a single-playlist copy as a job. Params mirror
-        :class:`server.models.PlaylistCopyIn`. 2026-05-17 end user
-        request: routing Playlist Mgmt Deploy through the job queue
-        so deploys persist beyond page-reload, surface on the
-        Dashboard's active-jobs strip, and support clone-deploy +
-        multi-deploy queueing.
+        :class:`server.models.PlaylistCopyIn`. Routing Playlist Mgmt
+        Deploy through the job queue lets deploys persist beyond
+        page-reload, surface on the Dashboard's active-jobs strip, and
+        support clone-deploy + multi-deploy queueing.
 
         Lightweight relative to snapshot/restore/direct: the worker
         method skips the engine pre-flight (dashboard placeholder,
@@ -199,9 +212,54 @@ class JobQueue:
         """
         return self._submit("playlist_copy", params)
 
-    def _submit(self, mode: str, params: Dict[str, Any]) -> JobRecord:
-        rec = JobRecord(job_id=str(uuid.uuid4()), mode=mode, params=dict(params))
-        # PR-8: track the rec on the public pending list before queuing
+    def submit_playlist_copy_batch(self, params: Dict[str, Any]) -> JobRecord:
+        """Enqueue a batch of N playlist copies as ONE job. Params
+        mirror :class:`server.models.PlaylistCopyBatchIn`:
+
+        * ``items`` - list of dicts each carrying PlaylistCopyIn-shaped
+          fields (source_server_id / source_user_id / source_playlist_id
+          / dest_server_id / dest_user_id / dest_playlist_name).
+        * ``parallelism`` - optional override for the worker pool size;
+          falls back to ``playlist_mgmt_batch_workers`` when absent.
+        * ``label`` - optional operator-supplied label used in the
+          activity feed.
+
+        The batch runs as ONE job through the queue's single-worker
+        pump; the internal ThreadPoolExecutor inside
+        :func:`services.playlist_copy.copy_playlist_batch` provides
+        the per-item parallelism. The queue's serial guarantee is
+        preserved - only one batch executes at a time.
+        """
+        return self._submit(
+            "playlist_copy_batch", params,
+            batch_items_len=len(params.get("items") or []),
+        )
+
+    def submit_smart_playlist_migrate(
+        self, params: Dict[str, Any],
+    ) -> JobRecord:
+        """Enqueue a Smart Playlist Migration job. Params mirror
+        :class:`server.models.SmartPlaylistMigrateIn`:
+
+        * ``items`` - list of per-playlist dicts, each PlaylistCopyIn
+          shaped (source/dest server + playlist + user).
+
+        The handler reads each source smart playlist's filter,
+        translates the server-specific tag ids to names, and
+        re-creates it: a true smart playlist on a Plex destination, a
+        static materialisation on Jellyfin / Emby. Like the playlist
+        batch, this is a lightweight item-level job - it skips the
+        snapshot/restore engine pre-flight."""
+        return self._submit("smart_playlist_migrate", params)
+
+    def _submit(
+        self, mode: str, params: Dict[str, Any], *, batch_items_len: int = 0,
+    ) -> JobRecord:
+        rec = JobRecord(
+            job_id=str(uuid.uuid4()), mode=mode, params=dict(params),
+            batch_items_len=batch_items_len,
+        )
+        # Track the rec on the public pending list before queuing
         # it. The order is important - list-then-queue ensures the WS
         # broadcaster never sees the worker pulling a rec that isn't
         # yet on the pending list.
@@ -223,7 +281,7 @@ class JobQueue:
 
     def pending(self) -> List[JobRecord]:
         """
-        Snapshot of every queued JobRecord that hasn't started yet. PR-8.
+        Snapshot of every queued JobRecord that hasn't started yet.
 
         Excludes the currently-running record; combine with
         :meth:`current` to get the full active+queued list for the
@@ -234,7 +292,7 @@ class JobQueue:
 
     def active_and_queued(self) -> List[JobRecord]:
         """
-        Convenience snapshot used by the WS broadcaster (PR-8). The
+        Convenience snapshot used by the WS broadcaster. The
         running job (if any) comes first, followed by every queued
         record in FIFO order. Empty list when the worker is idle and
         nothing is queued - the WS payload then omits the sub-tab strip.
@@ -290,6 +348,11 @@ class JobQueue:
                 prec.finished_at = now
                 self._history.append(prec)
             self._pending.clear()
+            # Keep history bounded to the same cap _record_history
+            # enforces - clearing a large queue must not grow it past
+            # _HISTORY_MAX.
+            if len(self._history) > _HISTORY_MAX:
+                del self._history[: len(self._history) - _HISTORY_MAX]
 
             # ── Stop the running job ─────────────────────────────────
             # M8: the check-and-transition is atomic under the lock so
@@ -302,6 +365,15 @@ class JobQueue:
             )
             if transitioned:
                 self._current.state = STATE_STOPPING
+                # Set the per-job stop flag the adapter (Jellyfin/Emby)
+                # engines poll. The Plex engines have the separate
+                # keyboard-thread ``state._active_stop_event`` path and
+                # ``runtime_patches.signal_stop()`` below; the adapter
+                # engines have neither, so without this a Stop on a
+                # Jellyfin/Emby job would never reach the engine.
+                _ev = getattr(self._current, "_stop_event", None)
+                if _ev is not None:
+                    _ev.set()
                 if hard:
                     # Annotate so the WS payload + history surface the
                     # hard-stop cause distinctly from a clean Stop.
@@ -316,6 +388,56 @@ class JobQueue:
             else:
                 runtime_patches.signal_stop()
         return transitioned or cleared > 0
+
+    def cancel_batch_item(self, job_id: str, item_index: int) -> str:
+        """Cancel ONE item inside a running playlist_copy_batch job.
+
+        The end user can cancel a single mistakenly-selected playlist
+        without nuking the whole batch. The worker plumbs a per-item
+        cancel_event dict onto the JobRecord at start time; this method
+        finds the right event and sets it.
+
+        Returns a status string the REST handler maps to HTTP:
+          * ``"cancelled"`` - event fired (item will short-circuit at
+            its next phase boundary OR was pre-start and dropped
+            without doing work)
+          * ``"not_running"`` — job_id matches but the job has
+            finished; nothing to cancel
+          * ``"not_batch"`` — job_id matches but the job mode is
+            single-copy / snapshot / etc.; the per-item surface only
+            applies to batches
+          * ``"index_out_of_range"`` — index is negative or >= len(items)
+          * ``"not_found"`` — no job with this id (or not the current
+            job; pending jobs haven't started so per-item events
+            don't exist yet)
+        """
+        with self._lock:
+            cur = self._current
+            if cur is None or cur.job_id != job_id:
+                return "not_found"
+            if cur.state not in (STATE_RUNNING, STATE_STOPPING):
+                return "not_running"
+            if cur.mode != "playlist_copy_batch":
+                return "not_batch"
+            events: Optional[Dict[int, threading.Event]] = getattr(
+                cur, "_per_item_cancel_events", None,
+            )
+            items_len = cur.batch_items_len
+            if items_len and (item_index < 0 or item_index >= items_len):
+                return "index_out_of_range"
+            if events is None:
+                # Worker hasn't reached the batch-init stage yet; create
+                # the dict eagerly so the event-set sticks. The worker
+                # will read from this same dict when it starts the
+                # ThreadPoolExecutor.
+                events = {}
+                cur._per_item_cancel_events = events  # type: ignore[attr-defined]
+            evt = events.get(item_index)
+            if evt is None:
+                evt = threading.Event()
+                events[item_index] = evt
+            evt.set()
+            return "cancelled"
 
     # ── Worker thread ────────────────────────────────────────────────
 
@@ -363,7 +485,7 @@ class JobQueue:
                     except ValueError:
                         pass
                     continue
-                # PR-8: pop this record from the pending list now that
+                # Pop this record from the pending list now that
                 # it has been claimed. We match by identity (``is``) so
                 # there's never any ambiguity even if two queued jobs
                 # have identical params.
@@ -377,6 +499,10 @@ class JobQueue:
                 self._current = rec
                 rec.state = STATE_RUNNING
                 rec.started_at = time.time()
+                # Per-job stop flag. The adapter (Jellyfin/Emby)
+                # engines honour ``rec._stop_event``; ``request_stop``
+                # sets it. Created here so it exists for the whole run.
+                rec._stop_event = threading.Event()
 
             # ── Pre-flight: clear any leftover fan-out registry ──────
             # If the previous job was a fan-out, ``server.fan_out``'s
@@ -409,20 +535,6 @@ class JobQueue:
             except Exception:  # pragma: no cover (defensive)
                 pass
 
-            # Gap-B of the post-cutover review: pre-compute the
-            # whole-job ETA from the trained engine and stash it on
-            # the dashboard so the "Estimated remaining" field has a
-            # fallback while the live in-flight tracker warms up. The
-            # rolling tracker takes over as soon as it has enough
-            # samples to project (typically the first 10 seconds of
-            # any run). Best-effort: any failure leaves
-            # predicted_etr_seconds=None and the dashboard renders
-            # "Calculating..." exactly as it did pre-Gap-B.
-            try:
-                self._prime_dashboard_predicted_etr(rec)
-            except Exception:  # pragma: no cover (defensive)
-                log.debug("predicted ETR prime failed", exc_info=True)
-
             # Feature 1 phase 1.2: bracket the job in a run_timer
             # session so every time_operation block inside the engine
             # records into the same buffer, and the buffer flushes to
@@ -431,16 +543,22 @@ class JobQueue:
             # auto-generated form which embeds a wall-clock timestamp
             # so chronological sort of timings matches job history.
             from services import run_timer
+            from services.dashboard import job_http_context
             job_run_id = run_timer.start_run()
             try:
                 # One synthetic top-level entry per job so list_recent_runs
                 # can report wall-clock duration without scanning every
                 # entry. The inner with-block measures the full engine
                 # invocation; sub-phase entries land underneath it.
+                # job_http_context tags every HTTP
+                # response captured by the auth.py hook with rec.job_id,
+                # so the Network panel's per-job timeline (/api/network/
+                # recent-requests?job_id=...) catches every engine's
+                # requests including snapshot/restore/direct/fan-out.
                 with run_timer.time_operation(
                     f"job:{rec.mode}",
                     scope=run_timer.SCOPE_RUN,
-                ) as _job_t:
+                ) as _job_t, job_http_context(rec.job_id):
                     if rec.mode == "snapshot":
                         self._run_snapshot(rec)
                     elif rec.mode == "restore":
@@ -449,6 +567,10 @@ class JobQueue:
                         self._run_direct(rec)
                     elif rec.mode == "playlist_copy":
                         self._run_playlist_copy(rec)
+                    elif rec.mode == "playlist_copy_batch":
+                        self._run_playlist_copy_batch(rec)
+                    elif rec.mode == "smart_playlist_migrate":
+                        self._run_smart_playlist_migrate(rec)
                     else:
                         raise ValueError(f"Unknown job mode {rec.mode!r}")
                     _job_t["extra"]["job_id"] = rec.job_id
@@ -457,15 +579,14 @@ class JobQueue:
                 # stop_event was set at an item-level checkpoint - that
                 # is a CANCELLED job, not a COMPLETED one.
                 #
-                # v0.13.x: post-engine helpers (snapshot artifact
-                # capture, auto-capture safety belt) swallow their own
-                # exceptions and stamp ``rec.error`` instead of
-                # re-raising - the engine work succeeded so the rest of
-                # the job shouldn't be classified as ``failed``. But
-                # an error-stamped job isn't a clean ``completed``
-                # either. Route it to ``completed_with_errors`` so the
-                # UI can show the amber chip + error message without
-                # claiming green success.
+                # Some post-engine helpers (the auto-capture safety
+                # belt) swallow their own exceptions and stamp
+                # ``rec.error`` instead of re-raising - the engine
+                # work succeeded so the rest of the job shouldn't be
+                # classified as ``failed``. An error-stamped job is
+                # not a clean ``completed`` either, so route it to
+                # ``completed_with_errors`` for the amber chip +
+                # error message without claiming green success.
                 if rec.state == STATE_STOPPING:
                     rec.state = STATE_CANCELLED
                 elif rec.error:
@@ -483,7 +604,7 @@ class JobQueue:
                     rec.state = STATE_CANCELLED
                 else:
                     rec.state = STATE_FAILED
-                    rec.error = f"{type(exc).__name__}: {exc}"
+                    rec.error = safe_error(exc)
                     # v0.9.5: route the traceback through the standard
                     # logging framework so the X-Plex-Token scrubber
                     # (installed on every handler) can redact any
@@ -552,10 +673,10 @@ class JobQueue:
                             )
                 except Exception:  # pragma: no cover (defensive)
                     pass
-                # v0.13.x: the engine no longer nulls state._dashboard
-                # in its finally block (that was killing the dashboard
-                # before the post-engine "Finalizing …" labels could
-                # reach the WebSocket). The worker now owns the
+                # The worker, not the engine, nulls state._dashboard -
+                # nulling it inside the engine's finally block killed
+                # the dashboard before the post-engine "Finalizing ..."
+                # labels could reach the WebSocket. The worker owns the
                 # cleanup, here at the very end after summary capture
                 # is complete. Fan-out path uses its own delayed
                 # cleanup via _finalise_fan_out_state; the unconditional
@@ -577,23 +698,8 @@ class JobQueue:
                 except Exception:  # pragma: no cover (defensive)
                     log.exception("run_timer flush failed for job %s", rec.job_id)
                     flushed = []
-                # Plan[ETA-TRAINING] PR-C: fold this run's timing
-                # entries into the adaptive ETA bucket store and
-                # persist the touched buckets back. Best-effort; the
-                # trainer's batch_update swallows all exceptions
-                # internally, so the run completion path never blocks
-                # on this telemetry write.
-                if flushed:
-                    try:
-                        from services import eta_training
-                        eta_training.get_trainer().batch_update(flushed)
-                    except Exception:  # pragma: no cover (defensive)
-                        log.exception(
-                            "eta_training batch_update failed for job %s",
-                            rec.job_id,
-                        )
-                # Phase 4 of the dashboard / log reorg: insert a single
-                # per-run row into run_history. Best-effort; failures
+                # Insert a single per-run row into run_history. The
+                # dashboard and log views read it. Best-effort; failures
                 # are logged inside record_run_history and never
                 # re-raised. Reset the affected-users seam for the
                 # next run regardless.
@@ -614,135 +720,6 @@ class JobQueue:
             if len(self._history) > _HISTORY_MAX:
                 # Trim the oldest entries first.
                 del self._history[: len(self._history) - _HISTORY_MAX]
-
-    # ── Gap-B: pre-run ETA fallback for the dashboard ─────────────
-
-    def _prime_dashboard_predicted_etr(self, rec: JobRecord) -> None:
-        """
-        Resolve the job's source server, library names, and user count
-        and call ``ETATrainer.predict_for_job`` to get a whole-job ETA.
-        Stash the result on the dashboard via ``set_predicted_total``.
-
-        Best-effort: any failure (no server, no libraries, prediction
-        raises) leaves the dashboard's predicted ETR at None, which
-        the frontend renders the same as the pre-Gap-B "Calculating..."
-        copy.
-
-        Library type / item-count enrichment is read out of media.db
-        when available; missing dimensions fall to the empty-string
-        sentinel and the trainer's cascade compensates via tier 2-4
-        fallbacks.
-        """
-        params = rec.params or {}
-        # Resolve the server id - snapshot + direct use source; restore
-        # uses destination (the side actually being timed).
-        server_name = (
-            params.get("source_server_name")
-            or params.get("dest_server_name")
-            or ""
-        )
-        if not server_name and params.get("dest_server_names"):
-            dests = params.get("dest_server_names") or []
-            if isinstance(dests, list) and dests:
-                server_name = str(dests[0])
-        server_id = _resolve_server_id(server_name) if server_name else ""
-        if not server_id:
-            return
-
-        # Pull the server row so we can mirror the frontend's pre-submit
-        # prediction exactly: real library_type + leaf-aware items_count
-        # + current ping. Without this enrichment the job-start anchor
-        # diverges from the number the end user just saw on the Run Job
-        # form, and the dashboard's "Estimated remaining" starts at a
-        # value that contradicts what the submit panel promised.
-        current_ping_ms: Optional[float] = None
-        last_libs: list = []
-        try:
-            from server.server_registry import get_server_by_id
-            srv_row = get_server_by_id(server_id, include_token=False) or {}
-            last_libs = list(srv_row.get("last_libraries") or [])
-            raw_ping = srv_row.get("last_response_ms")
-            if isinstance(raw_ping, (int, float)) and raw_ping > 0:
-                current_ping_ms = float(raw_ping)
-        except Exception:
-            log.debug("predicted ETR: server row lookup failed", exc_info=True)
-
-        def _leaf_count_for(desc: Dict[str, Any]) -> Optional[int]:
-            """Mirror frontend leafCountFor: episodes for shows,
-            tracks for artists, top-level count otherwise."""
-            lib_type = str(desc.get("type") or "")
-            leaf = desc.get("leaf_counts") or {}
-            if lib_type == "show" and isinstance(leaf.get("episodes"), int):
-                return int(leaf["episodes"])
-            if lib_type == "artist" and isinstance(leaf.get("tracks"), int):
-                return int(leaf["tracks"])
-            top = desc.get("count")
-            return int(top) if isinstance(top, (int, float)) else None
-
-        # Build a name -> descriptor map so the order of params.libraries
-        # is preserved while the type/count enrichment comes from the
-        # cached library list.
-        by_name = {str(d.get("name") or ""): d for d in last_libs}
-        lib_names = list(params.get("libraries") or [])
-        libraries_for_predict = []
-        for name in lib_names:
-            desc = by_name.get(str(name), {})
-            libraries_for_predict.append({
-                "name": str(name),
-                "library_type": str(desc.get("type") or ""),
-                "items_count": _leaf_count_for(desc),
-            })
-        if not libraries_for_predict:
-            return
-
-        # Metric flags: prefer the explicit four-flag dict; fall through
-        # to all-on when none of the four keys are present in params.
-        metrics_enabled = {
-            "watch_history": bool(params.get("include_watch_history", True)),
-            "ratings":       bool(params.get("include_ratings", True)),
-            "playlists":     bool(params.get("include_playlists", True)),
-            "collections":   bool(params.get("include_collections", True)),
-        }
-
-        user_count = 1
-        try:
-            uf = params.get("user_filter")
-            if isinstance(uf, list) and len(uf) > 0:
-                user_count = len(uf)
-        except Exception:
-            pass
-
-        workers = int(params.get("workers") or 16)
-        bulk_strategy = str(params.get("watch_ratings_filter_strategy") or "smart")
-
-        try:
-            from services import eta_training
-            trainer = eta_training.get_trainer()
-            result = trainer.predict_for_job(
-                mode=str(rec.mode or "snapshot"),
-                source_server_id=server_id,
-                libraries=libraries_for_predict,
-                metrics_enabled=metrics_enabled,
-                user_count=user_count,
-                workers=workers,
-                bulk_strategy=bulk_strategy,
-                current_ping_ms=current_ping_ms,
-            )
-            point = result.get("point")
-            if isinstance(point, (int, float)) and point > 0:
-                dash = state.get_dashboard()
-                if dash is not None:
-                    dash.set_predicted_total(float(point))
-                    log.info(
-                        "eta_training: primed dashboard with predicted "
-                        "total %.1fs (tier=%d samples=%d mult=%.2f)",
-                        float(point),
-                        int(result.get("tier") or 0),
-                        int(result.get("samples") or 0),
-                        float(result.get("latency_multiplier") or 1.0),
-                    )
-        except Exception:  # pragma: no cover (defensive)
-            log.debug("predicted ETR computation failed", exc_info=True)
 
     # ── Engine invocation: snapshot ────────────────────────────────────
 
@@ -770,7 +747,7 @@ class JobQueue:
         settings["resolved_server_slug"] = server_slug
         rec.params = {k: v for k, v in settings.items() if k != "plex_token"}
 
-        # v0.13.x: resolve the requested library list BEFORE we stamp
+        # Resolve the requested library list BEFORE we stamp
         # the run timestamp so the run-dir name can include the
         # library names (`run_Plex1_Movies_TV-Shows_20260510_135425/`).
         # The full strict resolution / mismatch error happens further
@@ -795,14 +772,28 @@ class JobQueue:
         # (covers any future caller that forgets to set it).
         state._run_trigger = str(settings.get("_trigger") or "manual")
         state._run_schedule_name = str(settings.get("_schedule_name") or "")
-        # PR-13 fix #3 - publish the registered server's id into
+        # Publish the registered server's id into
         # state so the engine's per-library payload can ingest
         # straight into media.db. ``_resolve_server_id`` walks
         # server_registry to map ``source_server_name`` -> id; the
         # snapshot job hard-fails below if no row matches (engine
-        # is media.db-primary now and refuses to run without a
+        # is media.db-primary and refuses to run without a
         # registered server).
-        snapshot_server_id = _resolve_server_id(settings.get("source_server_name"))
+        #
+        # Pass prefer_id + service_type so a name collision across
+        # backends (e.g.
+        # "Jade-TV" registered both on Plex and on Jellyfin) does
+        # not land on the wrong row. Without the id + service_type
+        # disambiguation the dispatch below could read a
+        # non-"plex" service_type from the wrong row and route a
+        # Plex snapshot to ``_run_snapshot_via_adapter`` (which
+        # then calls ``adapter.server_identity()`` on a plexapi
+        # PlexServer and AttributeError-crashes).
+        snapshot_server_id = _resolve_server_id(
+            settings.get("source_server_name"),
+            prefer_id=settings.get("source_server_id"),
+            service_type=settings.get("source_service_type"),
+        )
         if not snapshot_server_id:
             raise ValueError(
                 f"Snapshot requires a registered server. {settings.get('source_server_name')!r} "
@@ -824,7 +815,7 @@ class JobQueue:
                 server_id=snapshot_server_id,
                 name=src_row.get("name") or settings.get("source_server_name") or "",
                 url=src_row.get("url") or url,
-                # PR-Backends: reflect the real backend; was hardcoded "plex".
+                # Reflect the real backend rather than assuming Plex.
                 service=(src_row.get("service_type") or "plex").lower(),
                 machine_id=(src_row.get("machine_identifier") or None) or None,
             )
@@ -834,9 +825,9 @@ class JobQueue:
                 snapshot_server_id,
             )
 
-        # PR-Backends dispatch: non-Plex backends route through the
-        # adapter engine. Plex stays on the existing plexapi-driven
-        # path so its perf-tuned code paths are untouched. The branch
+        # Non-Plex backends route through the adapter engine. Plex
+        # stays on the existing plexapi-driven path so its perf-tuned
+        # code paths are untouched. The branch
         # happens here, immediately before any plexapi-specific
         # operation (the section enumeration below would 404 on a
         # JellyfinAdapter / EmbyAdapter).
@@ -845,10 +836,47 @@ class JobQueue:
             (_src_row_for_dispatch.get("service_type") if _src_row_for_dispatch else None)
             or "plex"
         ).lower()
+        # Defensive guard. If
+        # ``server`` is a plexapi PlexServer (i.e. the connection
+        # resolution returned a Plex handle) but the registry's
+        # service_type says non-plex, treat that as misconfigured
+        # state rather than crashing inside snapshotter_adapter on
+        # ``adapter.server_identity()``. The plexapi class name is
+        # the simplest non-Plex-import-required signal we have at
+        # this layer.
+        _server_cls_name = type(server).__name__
+        if _service_type != "plex" and _server_cls_name == "PlexServer":
+            raise ValueError(
+                f"Snapshot dispatch refusing to run: server_id "
+                f"{snapshot_server_id!r} resolved to a plexapi "
+                f"PlexServer but its registry row has "
+                f"service_type={_service_type!r}. Most likely the "
+                f"server's service_type column is wrong; update it "
+                f"via the Servers panel to match the actual backend."
+            )
         if _service_type != "plex":
+            # Pull the canonical MediaServerAdapter from the
+            # server_registry cache (already built by
+            # _resolve_source_connection above). For J/E backends
+            # ``conn.server == conn.adapter`` so this is also a
+            # belt-and-braces lookup; for Plex it would catch the
+            # bug above where ``server`` is not the adapter.
+            from server import server_registry as _sr
+            try:
+                _conn = _sr.connect_registered_server(
+                    snapshot_server_id, logger,
+                )
+                _adapter_for_dispatch = _conn.adapter
+            except Exception:
+                logger.exception(
+                    "Snapshot dispatch: could not resolve adapter "
+                    "for server_id=%r; falling back to ``server``.",
+                    snapshot_server_id,
+                )
+                _adapter_for_dispatch = server
             self._run_snapshot_via_adapter(
                 rec=rec,
-                adapter=server,  # for non-Plex, `server` IS the adapter
+                adapter=_adapter_for_dispatch,
                 url=url,
                 token=token,
                 service_type=_service_type,
@@ -896,7 +924,7 @@ class JobQueue:
                 fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
                 skip_playlists=bool(settings.get("skip_playlists") or False),
                 skip_playlist_prebuild=bool(settings.get("skip_playlist_prebuild") or False),
-                # PR-3 / Phase D - four-flag data-type filter forwarded from
+                # Four-flag data-type filter forwarded from
                 # the request (or schedule). The Pydantic validator on
                 # SnapshotJobIn / ScheduleIn already mapped any legacy
                 # skip_* fields onto these include_* defaults.
@@ -904,18 +932,17 @@ class JobQueue:
                 include_ratings=bool(settings.get("include_ratings", True)),
                 include_playlists=bool(settings.get("include_playlists", True)),
                 include_collections=bool(settings.get("include_collections", True)),
-                # v0.14 - per-job user filter. None / missing = include
-                # every user the source server reports (the historical
-                # default). When provided, run_snapshot filters
+                # Per-job user filter. None / missing = include
+                # every user the source server reports (the default).
+                # When provided, run_snapshot filters
                 # home_users + derives owner_included internally.
                 user_filter=settings.get("user_filter"),
-                # v0.13.x: library-level concurrency cap. 0 (default)
-                # inherits state.MAX_WORKERS to preserve the legacy
-                # behavior; a positive value caps libraries-in-parallel
+                # Library-level concurrency cap. 0 (default)
+                # inherits state.MAX_WORKERS; a positive value caps
+                # libraries-in-parallel
                 # without affecting the per-library HTTP worker count.
                 library_workers=int(settings.get("snapshot_library_workers") or 0),
-                # Phase C (admin-management follow-up, 2026-05-15):
-                # per-library metric filter. Forwarded from the
+                # Per-library metric filter. Forwarded from the
                 # JobRecord params (set by the SnapshotJobIn
                 # validator expansion, or the end user's explicit map).
                 # The engine reads this per library and overrides the
@@ -937,13 +964,11 @@ class JobQueue:
         _dash = state.get_dashboard()
         if _dash is not None:
             _dash.set_finalizing("closing run logs")
-        _close_logger(logger, run_log_dir)
-
         # Mirror the CLI's PASS/FAIL log rename so per-run log
         # directories on disk stay consistent across CLI and server.
-        _finalise_run_dir(run_log_dir)
+        _finalize_run(logger, run_log_dir)
 
-        # PR-13: capture the snapshot .db file + register it.
+        # Capture the snapshot .db file + register it.
         # This is the heaviest post-engine step (it writes the whole
         # snapshot .db from the in-memory payloads) - the dominant
         # cause of the "stuck at the end" feeling, so it gets its own
@@ -967,7 +992,7 @@ class JobQueue:
             )
         except Exception as exc:
             msg = (
-                f"Snapshot artifact capture failed: {type(exc).__name__}: {exc}. "
+                f"Snapshot artifact capture failed: {safe_error(exc)}. "
                 "Engine data is in media.db; re-running is safe."
             )
             rec.error = msg
@@ -980,6 +1005,37 @@ class JobQueue:
                     state.get_dashboard().push_activity("error", "-", msg)
                 except Exception:
                     pass
+            # The snapshot .db artifact IS the deliverable of a
+            # snapshot job - without it the Exports panel has nothing
+            # to restore from. Fail the job rather than reporting it
+            # as amber "completed with errors".
+            raise RuntimeError(msg) from exc
+
+        # Post-snapshot mirror write-through. Reads the just-captured
+        # snapshot rows from media.db and bulk-upserts them into the
+        # mirror so resolvers + the cross-feed bootstrap have fresh
+        # data. Tunable-gated (engine_mirror_snapshot_writethrough,
+        # default true). Failure here NEVER blocks the snapshot
+        # (snapshot artifact already committed above).
+        if _dash is not None:
+            _dash.set_finalizing("writing mirror writethrough")
+        try:
+            from services import server_mirror_writethrough
+            server_mirror_writethrough.after_snapshot(
+                server_id=snapshot_server_id,
+                backend="plex",
+                logger=logging.getLogger("plexmigrate.server.jobs"),
+            )
+        except Exception:
+            logging.getLogger("plexmigrate.server.jobs").exception(
+                "server_mirror writethrough after snapshot failed "
+                "(non-blocking); job %r remains successful.",
+                rec.job_id,
+            )
+        # Clear the label once the finalize phases finish. Without this
+        # the banner persists into the post-run idle state.
+        if _dash is not None:
+            _dash.set_finalizing(None)
 
     # ── Engine invocation: adapter-driven snapshot (Jellyfin / Emby) ──
 
@@ -1002,9 +1058,8 @@ class JobQueue:
         :func:`services.snapshotter_adapter.run_snapshot_adapter`
         instead of the plexapi-driven :func:`services.snapshotter.run_snapshot`.
 
-        Plex stays on its own perf-tuned path (see PR-Backends scope
-        decision in Plan[MULTI-BACKEND]-2026-05-15.md section 11.5);
-        this helper is the parallel engine for Jellyfin / Emby."""
+        Plex stays on its own perf-tuned path; this helper is the
+        parallel engine for Jellyfin / Emby."""
         from types import SimpleNamespace
         from services.snapshotter_adapter import run_snapshot_adapter
 
@@ -1031,7 +1086,7 @@ class JobQueue:
                 include_ratings=bool(settings.get("include_ratings", True)),
                 include_playlists=bool(settings.get("include_playlists", True)),
                 include_collections=bool(settings.get("include_collections", True)),
-                # PR-Phase-3: per-user fan-out forwarded from job
+                # Per-user fan-out forwarded from job
                 # params. ``user_filter=None`` means all managed users;
                 # a list narrows to specific usernames. The owner is
                 # always captured in the owner-phase pass.
@@ -1046,8 +1101,7 @@ class JobQueue:
             logger.exception(
                 "adapter snapshot engine raised; closing run logs and bubbling up."
             )
-            _close_logger(logger, run_log_dir)
-            _finalise_run_dir(run_log_dir)
+            _finalize_run(logger, run_log_dir)
             raise
 
         # Resolved library list comes back inside the payload so the
@@ -1057,11 +1111,26 @@ class JobQueue:
             (payload.get("snapshot_meta") or {}).get("libraries") or []
         )
 
+        # The Plex
+        # snapshot path's snapshot_library() appends each per-library
+        # payload to state._snapshot_payloads as it runs; the
+        # adapter-driven path (run_snapshot_adapter) instead RETURNS
+        # the libraries inside the payload dict without ever touching
+        # state._snapshot_payloads. _capture_snapshot_after_run reads
+        # from state._snapshot_payloads and bails on empty, so the
+        # adapter path would crash every Emby/Jellyfin snapshot at the
+        # post-engine capture step. Mirror the Plex behaviour here by
+        # extending the global sink with the adapter's per-library
+        # payloads (same shape per services/snapshotter_adapter.py:
+        # snapshot_library_adapter docstring).
+        adapter_libraries = list(payload.get("libraries") or [])
+        if adapter_libraries:
+            state._snapshot_payloads.extend(adapter_libraries)
+
         _dash = state.get_dashboard()
         if _dash is not None:
             _dash.set_finalizing("closing run logs")
-        _close_logger(logger, run_log_dir)
-        _finalise_run_dir(run_log_dir)
+        _finalize_run(logger, run_log_dir)
 
         if _dash is not None:
             _dash.set_finalizing("writing snapshot to database")
@@ -1076,7 +1145,7 @@ class JobQueue:
             )
         except Exception as exc:
             msg = (
-                f"Snapshot artifact capture failed: {type(exc).__name__}: {exc}. "
+                f"Snapshot artifact capture failed: {safe_error(exc)}. "
                 "Engine data is in media.db; re-running is safe."
             )
             rec.error = msg
@@ -1091,19 +1160,38 @@ class JobQueue:
                 except Exception:
                     pass
 
+        # Adapter-path mirror write-through. Symmetric with
+        # _run_snapshot's hook so
+        # Jellyfin / Emby snapshots also keep their mirror current.
+        # Tunable-gated (engine_mirror_snapshot_writethrough, default
+        # true). Failure here NEVER blocks the snapshot.
+        try:
+            from services import server_mirror_writethrough
+            server_mirror_writethrough.after_snapshot(
+                server_id=server_id,
+                backend=service_type,
+                logger=logging.getLogger("plexmigrate.server.jobs"),
+            )
+        except Exception:
+            logging.getLogger("plexmigrate.server.jobs").exception(
+                "server_mirror writethrough after adapter snapshot "
+                "failed (non-blocking); job %r remains successful.",
+                rec.job_id,
+            )
+
     # ── Engine invocation: import ────────────────────────────────────
 
     def _run_restore(self, rec: JobRecord) -> None:
         """
         File-mediated import. The destination is named by
         ``dest_server_name`` (single) or ``dest_server_names`` (fan-out).
-        v0.10.0 dispatches to :func:`run_fan_out_restore` when more than
-        one destination is requested; the single-destination path below
-        is unchanged.
+        Dispatches to :func:`run_fan_out_restore` when more than
+        one destination is requested; otherwise takes the
+        single-destination path below.
         """
         settings = _merge_settings(rec.params, mode="restore")
 
-        # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: resolve the end user's
+        # Resolve the end user's
         # mixed-media config once and stash on state so both the Plex
         # engine and the adapter engine see it without per-call kwarg
         # plumbing. Per-user overrides from cross_platform_resolutions
@@ -1140,7 +1228,7 @@ class JobQueue:
         settings["resolved_server_slug"] = server_slug
         rec.params = {k: v for k, v in settings.items() if k != "plex_token"}
 
-        # v0.13.x: pre-Replace auto-capture safety belt. Runs BEFORE
+        # Pre-Replace auto-capture safety belt. Runs BEFORE
         # the restore so the destination has a rollback point on disk
         # by the time the engine starts overwriting data. On failure
         # the helper raises and the restore never fires - "no recovery
@@ -1155,6 +1243,29 @@ class JobQueue:
         state._plex_base_url = url
         state._plex_token = token
         state._plex_owner_name = owner
+        # Cross-backend Replace-mode refusal. Runs BEFORE the
+        # pre-Replace safety snapshot so an unrunnable job doesn't
+        # burn the auto-capture budget. Same-backend Replace continues
+        # unchanged.
+        _src_id = settings.get("source_server_id") or _resolve_server_id(
+            settings.get("source_server_name"),
+        ) or ""
+        _dst_id = settings.get("dest_server_id") or _resolve_server_id(
+            settings.get("dest_server_name") or settings.get("source_server_name"),
+        ) or ""
+        _refusal = _cross_backend_replace_requires_mappings(
+            source_server_id=_src_id,
+            source_service_type=str(settings.get("source_service_type") or "plex"),
+            dest_server_id=_dst_id,
+            dest_service_type=str(settings.get("dest_service_type") or "plex"),
+            mode=str(settings.get("mode") or "merge"),
+            ignore_library_mapping=bool(
+                settings.get("ignore_library_mapping") or False
+            ),
+        )
+        if _refusal:
+            raise ValueError(_refusal)
+
         pre_replace_snapshot_id: Optional[str] = None
         restore_mode = str(settings.get("mode") or "merge")
         auto_capture = bool(settings.get("auto_capture_before_replace", True))
@@ -1183,7 +1294,7 @@ class JobQueue:
                 "pre_replace_snapshot_id": pre_replace_snapshot_id,
             }
 
-        # v0.13.x: peek the input files' top-level ``library`` fields so
+        # Peek the input files' top-level ``library`` fields so
         # the restore run-dir name carries the libraries being restored
         # (`run_Plex1_Movies_TV-Shows_20260510_135425/`). Best-effort -
         # files we can't peek contribute nothing, and the strict
@@ -1250,7 +1361,7 @@ class JobQueue:
         if settings.get("remap_old") and settings.get("remap_new"):
             remap = (settings["remap_old"], settings["remap_new"])
 
-        # PR-Backends dispatch: non-Plex destinations route through the
+        # Non-Plex destinations route through the
         # adapter restore engine. Plex stays on the perf-tuned engine.
         dest_service = (settings.get("dest_service_type") or "plex").lower()
         if dest_service == "plex":
@@ -1278,6 +1389,28 @@ class JobQueue:
             )
             return
 
+        # The Plex restore path
+        # (run_restore -> restore_export_file) does not accept
+        # ``include_managed_users`` directly, so the flag must be
+        # translated here or it is silently dropped on Plex-to-Plex
+        # restores and every managed user in the snapshot
+        # payload still gets restored. Translate the flag into the
+        # existing ``user_filter`` mechanism: an empty filter list
+        # drops every managed user (the owner is handled separately
+        # in the owner-phase pass + the role lookup, so it still
+        # restores). Operator-supplied ``user_filter`` wins when
+        # ``include_managed_users=True``; when False we force an empty
+        # list regardless of what the operator picked in the user grid.
+        _include_managed_users = bool(settings.get("include_managed_users", True))
+        if _include_managed_users:
+            _restore_user_filter = settings.get("user_filter")
+        else:
+            _restore_user_filter = []
+            logger.info(
+                "Restore: include_managed_users=False — every managed "
+                "user in the snapshot payload will be skipped; owner-only "
+                "restore (owner data still applies)."
+            )
         run_restore(
             server,
             valid,
@@ -1287,7 +1420,7 @@ class JobQueue:
             run_log_dir,
             remap,
             bool(settings["strict_match"]),
-            # PR-3 / Phase D - four-flag data-type filter forwarded from
+            # Four-flag data-type filter forwarded from
             # the request. The Pydantic validator already mapped any
             # legacy skip_* fields onto these include_* defaults, so
             # both shapes work without translation here.
@@ -1297,21 +1430,20 @@ class JobQueue:
             include_collections=bool(settings.get("include_collections", True)),
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
-            # v0.14 - per-job user filter for restore. None = restore
+            # Per-job user filter for restore. None = restore
             # every user from the payload that also exists on the
-            # destination (historical default). When provided, the
+            # destination. When provided, the
             # importer drops managed users whose handle isn't in the list.
-            user_filter=settings.get("user_filter"),
-            # v0.13.x: end user-tunable library concurrency. Reads from
-            # settings (Run Defaults > Concurrency); default 3 preserves
-            # the legacy hardcoded cap. Lower it (e.g. to 1) when Plex
+            user_filter=_restore_user_filter,
+            # End user-tunable library concurrency. Reads from
+            # settings (Run Defaults > Concurrency); default 3. Lower it
+            # (e.g. to 1) when Plex
             # rate-limits the multi-library API bursts.
             library_workers=int(settings.get("restore_library_workers") or 3),
-            # Phase C: per-library metric filter (RestoreJobIn-supplied).
+            # Per-library metric filter (RestoreJobIn-supplied).
             # restore_export_file consults this per library before
             # firing each restore_* primitive.
             library_metrics=settings.get("library_metrics") or None,
-            # USER-MGMT-IDENTITY-AUDIT R-1 production wire-up.
             # Forward destination server id (when resolvable) so the
             # per-user fan-out's identity_map resolver actually fires
             # for Plex-to-Plex restores. Source server id is recovered
@@ -1320,6 +1452,22 @@ class JobQueue:
             dest_server_id=_resolve_server_id(
                 settings.get("dest_server_name") or settings.get("source_server_name") or ""
             ),
+            # Per-run power-user override. Hidden behind
+            # ``reveal_ignore_library_mapping_toggle`` tunable; default
+            # False so every restore consults library_mappings.
+            ignore_library_mapping=bool(
+                settings.get("ignore_library_mapping") or False
+            ),
+            # Per-run library name overrides for
+            # the engine's library-mapping consult. Operator can set
+            # these on the Run Job form when restoring from a snapshot
+            # with the source server offline (the case where they
+            # can't open Server Syncing to declare a permanent
+            # mapping). Engine reads this dict BEFORE the saved
+            # library_mappings table.
+            library_mapping_overrides=(
+                settings.get("library_mapping_overrides") or None
+            ),
         )
 
         # Part B: run-level finalize phase so the dashboard doesn't
@@ -1327,8 +1475,7 @@ class JobQueue:
         _dash = state.get_dashboard()
         if _dash is not None:
             _dash.set_finalizing("finalizing run")
-        _close_logger(logger, run_log_dir)
-        _finalise_run_dir(run_log_dir)
+        _finalize_run(logger, run_log_dir)
 
     # ── Engine invocation: adapter-driven restore (Jellyfin / Emby) ──
 
@@ -1356,7 +1503,7 @@ class JobQueue:
         from services.restorer_adapter import restore_payload_adapter
         from services.adapters import UserContext
 
-        # Plan[RUN-JOB-UI] D-OWNER: when the end user confirmed the
+        # When the end user confirmed the
         # user-creation modal at submit time, the request body
         # carries a non-empty user_create_specs list. Walk it via
         # services/user_creation.py BEFORE any item-state write
@@ -1385,12 +1532,10 @@ class JobQueue:
                     "restore (adapter): user_create_specs failed; "
                     "aborting before item-state writes. %s", exc,
                 )
-                _close_logger(logger, run_log_dir)
-                _finalise_run_dir(run_log_dir)
+                _finalize_run(logger, run_log_dir)
                 raise
 
-        # Build the owner-phase UserContext. PR-CrossPolish per-user
-        # fan-out is a follow-up; for now we restore everything under
+        # Build the owner-phase UserContext. Restore everything under
         # the destination's admin user context.
         try:
             identity = adapter.server_identity()
@@ -1451,11 +1596,10 @@ class JobQueue:
                         input_path,
                     )
                     continue
-                # Plan[RUN-JOB-UI] D-RATE (work item 3): when the
-                # end user picked a non-default rating-mode, the
-                # request body carries favorite_threshold; otherwise
-                # it falls through to the engine default (5.0) via
-                # the **only-if-set** forward below.
+                # When the end user picked a non-default rating-mode,
+                # the request body carries favorite_threshold;
+                # otherwise it falls through to the engine default
+                # (5.0) via the **only-if-set** forward below.
                 fav_threshold_kw: Dict[str, Any] = {}
                 _ft = settings.get("favorite_threshold")
                 if _ft is not None:
@@ -1463,6 +1607,17 @@ class JobQueue:
                         fav_threshold_kw["favorite_threshold"] = float(_ft)
                     except (TypeError, ValueError):
                         pass
+                # Forward the
+                # favorite-to-rating value (used when a favorited item
+                # is restored onto a rating-only backend) from its
+                # tunable.
+                try:
+                    from services import tunables as _tun
+                    fav_threshold_kw["favorite_as_rating_value"] = (
+                        _tun.favorite_as_rating_value()
+                    )
+                except Exception:
+                    pass
                 # Identity-map resolution: pass dest_server_id so the
                 # per-user fan-out can translate source handles via
                 # media_db.user_identity_map when a direct username
@@ -1479,9 +1634,9 @@ class JobQueue:
                     )
                     or ""
                 )
-                # Plan[CROSS-PLATFORM-PREFLIGHT] follow-up: forward
-                # end user-authored cross-platform resolutions (Drop /
-                # Map / Create / Accept decisions) to the engine.
+                # Forward end user-authored cross-platform
+                # resolutions (Drop / Map / Create / Accept decisions)
+                # to the engine.
                 # Engine applies them at write time so Drop and
                 # Map-no-persist actually take effect on this run.
                 _cpr = settings.get("cross_platform_resolutions") or None
@@ -1489,6 +1644,9 @@ class JobQueue:
                     adapter,
                     payload=payload,
                     user_context=ctx,
+                    merge_watch_strategy=str(
+                        settings.get("merge_watch_strategy") or "higher"
+                    ),
                     logger=logger,
                     stop_event=stop_event,
                     include_watch_history=bool(
@@ -1503,7 +1661,7 @@ class JobQueue:
                     include_collections=bool(
                         settings.get("include_collections", True)
                     ),
-                    # PR-Phase-3: per-user fan-out + filter forwarded
+                    # Per-user fan-out + filter forwarded
                     # from job params.
                     include_managed_users=bool(
                         settings.get("include_managed_users", True)
@@ -1511,6 +1669,10 @@ class JobQueue:
                     user_filter=settings.get("user_filter"),
                     dest_server_id=_dest_server_id,
                     cross_platform_resolutions=_cpr,
+                    # Forward Replace mode so the adapter
+                    # engine runs the dest-only playlist + collection
+                    # sweep. Same as on the direct-transfer path.
+                    mode=str(settings.get("mode") or "merge"),
                     **fav_threshold_kw,
                 )
                 total["libraries"] += result.libraries_processed
@@ -1537,8 +1699,7 @@ class JobQueue:
             _dash = state.get_dashboard()
             if _dash is not None:
                 _dash.set_finalizing("finalizing run")
-            _close_logger(logger, run_log_dir)
-            _finalise_run_dir(run_log_dir)
+            _finalize_run(logger, run_log_dir)
 
     # ── Engine invocation: adapter-driven direct transfer ────────────
 
@@ -1566,17 +1727,16 @@ class JobQueue:
         it parallelises per-library and shares plexapi sessions
         across reads + writes.
 
-        The MVP captures + restores watch_history + ratings only;
-        playlists + collections per-library are out of scope for this
-        cut and follow in PR-CrossPolish-extended. The engine engines
-        already populate empty arrays for those keys, so the payload
-        shape is forward-compatible."""
+        This path captures + restores watch_history + ratings only;
+        playlists + collections per-library are out of scope. The
+        engine engines already populate empty arrays for those keys,
+        so the payload shape is forward-compatible."""
         from types import SimpleNamespace
         from services.snapshotter_adapter import run_snapshot_adapter
         from services.restorer_adapter import restore_payload_adapter
         from services.adapters import UserContext
 
-        # Plan[RUN-JOB-UI] D-OWNER: same create-users-first contract
+        # Same create-users-first contract
         # as the restore-adapter path. The destination is dst_conn
         # here; specs apply per the modal's confirmation.
         _user_specs = settings.get("user_create_specs") or []
@@ -1596,8 +1756,7 @@ class JobQueue:
                     "direct (adapter): user_create_specs failed; "
                     "aborting before item-state writes. %s", exc,
                 )
-                _close_logger(logger, run_log_dir)
-                _finalise_run_dir(run_log_dir)
+                _finalize_run(logger, run_log_dir)
                 raise
 
         # Source-side connection-like for the snapshot engine.
@@ -1619,7 +1778,7 @@ class JobQueue:
                 include_ratings=bool(settings.get("include_ratings", True)),
                 include_playlists=bool(settings.get("include_playlists", True)),
                 include_collections=bool(settings.get("include_collections", True)),
-                # PR-Phase-3: per-user fan-out on source-side capture.
+                # Per-user fan-out on source-side capture.
                 user_filter=settings.get("user_filter"),
                 include_managed_users=bool(
                     settings.get("include_managed_users", True)
@@ -1631,12 +1790,10 @@ class JobQueue:
             logger.exception(
                 "adapter direct-transfer: source snapshot raised; halting.",
             )
-            _close_logger(logger, run_log_dir)
-            _finalise_run_dir(run_log_dir)
+            _finalize_run(logger, run_log_dir)
             raise
 
-        # Destination-side restore. Owner-phase only for the MVP; per-
-        # user fan-out is the PR-CrossPolish-extended follow-up.
+        # Destination-side restore. Owner-phase only.
         try:
             dst_identity = dst_conn.adapter.server_identity()
             dst_uid = dst_identity.owner_user_id or ""
@@ -1651,7 +1808,7 @@ class JobQueue:
             is_admin=True,
         )
 
-        # Plan[RUN-JOB-UI] D-RATE forwarding (same shape as
+        # Favorite-threshold forwarding (same shape as
         # _run_restore_via_adapter; only-if-set so legacy clients
         # fall through to the engine default).
         dst_fav_threshold_kw: Dict[str, Any] = {}
@@ -1661,32 +1818,49 @@ class JobQueue:
                 dst_fav_threshold_kw["favorite_threshold"] = float(_dft)
             except (TypeError, ValueError):
                 pass
+        # Forward the
+        # favorite-to-rating tunable on the direct-transfer path too.
+        try:
+            from services import tunables as _tun
+            dst_fav_threshold_kw["favorite_as_rating_value"] = (
+                _tun.favorite_as_rating_value()
+            )
+        except Exception:
+            pass
         try:
             result = restore_payload_adapter(
                 dst_conn.adapter,
                 payload=payload,
                 user_context=dst_ctx,
+                merge_watch_strategy=str(
+                    settings.get("merge_watch_strategy") or "higher"
+                ),
                 logger=logger,
                 stop_event=stop_event,
                 include_watch_history=bool(settings.get("include_watch_history", True)),
                 include_ratings=bool(settings.get("include_ratings", True)),
                 include_playlists=bool(settings.get("include_playlists", True)),
                 include_collections=bool(settings.get("include_collections", True)),
-                # PR-Phase-3: per-user fan-out on destination-side restore.
+                # Per-user fan-out on destination-side restore.
                 include_managed_users=bool(
                     settings.get("include_managed_users", True)
                 ),
                 user_filter=settings.get("user_filter"),
                 dest_server_id=str(dst_conn.row.get("id") or ""),
                 cross_platform_resolutions=settings.get("cross_platform_resolutions") or None,
+                # Forward the run-level restore mode so the
+                # adapter-side engine runs the dest-only sweep on
+                # Replace. Without this, every job through the adapter
+                # path is effectively a Merge regardless of the
+                # operator's choice on the Run Job form.
+                mode=str(settings.get("mode") or "merge"),
                 **dst_fav_threshold_kw,
             )
         finally:
             _dash = state.get_dashboard()
             if _dash is not None:
                 _dash.set_finalizing("finalizing run")
-            _close_logger(logger, run_log_dir)
-            _finalise_run_dir(run_log_dir)
+            _finalize_run(logger, run_log_dir)
 
         # Stash the aggregate result on rec.summary so the dashboard
         # + run history surface what happened.
@@ -1707,11 +1881,11 @@ class JobQueue:
     # ── Engine invocation: single-playlist copy ─────────────────────
 
     def _run_playlist_copy(self, rec: JobRecord) -> None:
-        """Single-playlist copy worker. 2026-05-17 end user request:
-        route Playlist Mgmt Deploy through the job queue + surface live
-        metrics on the Dashboard tab (same shape every other job uses).
+        """Single-playlist copy worker. Routes Playlist Mgmt Deploy
+        through the job queue and surfaces live metrics on the
+        Dashboard tab (same shape every other job uses).
 
-        Lightweight relative to direct-transfer — no library walk, no
+        Lightweight relative to direct-transfer - no library walk, no
         per-user data scope, no Plex-side cache warm. Just resolve
         source items + write a new dest playlist. The orchestrator
         lives in :func:`services.playlist_copy.copy_playlist`.
@@ -1795,6 +1969,19 @@ class JobQueue:
                         "done", "-",
                         f"Copy complete — {written} written, {skipped} skipped",
                     )
+                elif kind == "auth-chain":
+                    # Single-copy job: mirror the batch worker's auth-
+                    # chain surface so legacy single-copy deploys also
+                    # show which auth step decided their token.
+                    step = ev.get("step") or "?"
+                    outcome = ev.get("outcome") or "?"
+                    user = ev.get("user") or "?"
+                    role_str = ev.get("role") or "?"
+                    detail = ev.get("detail") or ""
+                    line = f"Auth [{role_str} {user}]: {step} -> {outcome}"
+                    if detail:
+                        line += f"  ({detail})"
+                    dash.push_activity("phase", "-", line)
             except Exception:
                 log.exception("playlist_copy progress dashboard push failed")
 
@@ -1812,7 +1999,7 @@ class JobQueue:
             # Structured error — surface code + message via rec.error so
             # the result panel can render it. State transitions to
             # FAILED via the worker_loop's general-exception path.
-            rec.error = f"{exc.code}: {exc}"
+            rec.error = scrub(f"{exc.code}: {exc}")
             rec.summary = {
                 "playlist_copy": {
                     "success": False,
@@ -1820,13 +2007,16 @@ class JobQueue:
                     "items_written": 0,
                     "items_skipped_no_match": 0,
                     "items_failed": 0,
-                    "errors": [f"{exc.code}: {exc}"],
+                    "errors": [scrub(f"{exc.code}: {exc}")],
                     "elapsed_seconds": 0.0,
                     "code": exc.code,
                 },
                 "params": dict(params),
             }
-            return
+            # Re-raise so the worker loop's exception path marks the
+            # job FAILED. A structured copy failure is a failure, not
+            # an amber "completed with errors".
+            raise
         # Successful or partial-success: stash the full result for the
         # frontend to render.
         rec.summary = {
@@ -1836,7 +2026,7 @@ class JobQueue:
                 "items_written": int(result.get("items_written") or 0),
                 "items_skipped_no_match": int(result.get("items_skipped_no_match") or 0),
                 "items_failed": int(result.get("items_failed") or 0),
-                "errors": list(result.get("errors") or []),
+                "errors": [scrub(e) for e in (result.get("errors") or [])],
                 "elapsed_seconds": float(result.get("elapsed_seconds") or 0.0),
             },
             "params": dict(params),
@@ -1845,7 +2035,792 @@ class JobQueue:
         # so the worker_loop transitions to COMPLETED_WITH_ERRORS.
         errs = result.get("errors") or []
         if errs and not result.get("success"):
-            rec.error = errs[0] if isinstance(errs, list) and errs else "playlist copy failed"
+            rec.error = scrub(errs[0]) if isinstance(errs, list) and errs else "playlist copy failed"
+
+    # ── Engine invocation: playlist copy BATCH ──────────────────────
+
+    def _run_smart_playlist_migrate(self, rec: JobRecord) -> None:
+        """Smart Playlist Migration worker.
+
+        For each item: read the source Plex smart playlist's filter,
+        translate its server-specific tag ids into portable names,
+        then re-create it on the destination - a true smart playlist
+        on a Plex destination, a static materialisation of the current
+        contents on Jellyfin / Emby. Every outcome is written to
+        smart_playlist.db and logged to smart_playlist.log (the
+        dedicated log the in-panel live view reads)."""
+        from services.smart_playlist_log import get_smart_playlist_logger
+
+        sp_log = get_smart_playlist_logger()
+        params = rec.params or {}
+        items: List[Dict[str, Any]] = [
+            dict(it) if not isinstance(it, dict) else it
+            for it in (params.get("items") or [])
+        ]
+
+        settings = _merge_settings(params, mode="smart_playlist_migrate")
+        _set_run_timestamp("smart-playlist")
+        logger, run_log_dir = _build_logger(
+            settings["log_dir"], settings.get("verbose", False),
+        )
+        rec.run_log_dir = run_log_dir
+
+        def _log(msg: str, *a: Any) -> None:
+            """Log to BOTH the per-run runtime.log (so Servers > Logs
+            picks it up) and the dedicated smart_playlist.log (the
+            in-panel live view)."""
+            try:
+                logger.info(msg, *a)
+            except Exception:
+                pass
+            try:
+                sp_log.info(msg, *a)
+            except Exception:
+                pass
+
+        _log("smart_playlist_migrate: job_id=%s items=%d",
+             rec.job_id, len(items))
+
+        stop_event = getattr(rec, "_stop_event", None)
+        if stop_event is None:
+            stop_event = state._active_stop_event
+
+        results: List[Dict[str, Any]] = []
+        succeeded = partial = failed = 0
+        for idx, item in enumerate(items):
+            if stop_event is not None and stop_event.is_set():
+                _log("smart_playlist_migrate: stop requested; halting at "
+                     "item %d of %d", idx, len(items))
+                break
+            res = self._migrate_one_smart_playlist(
+                item, rec.job_id, logger, _log,
+            )
+            results.append(res)
+            status = res.get("status")
+            if status == "success":
+                succeeded += 1
+            elif status == "partial":
+                partial += 1
+            else:
+                failed += 1
+            dash = state.get_dashboard()
+            if dash is not None:
+                try:
+                    dash.push_activity(
+                        "error" if status == "failed" else "done", "-",
+                        f"Smart playlist {idx + 1}/{len(items)}: "
+                        f"{res.get('source_playlist_name') or '?'} "
+                        f"-> {status}",
+                    )
+                except Exception:
+                    pass
+
+        rec.summary = {
+            "total": len(items),
+            "succeeded": succeeded,
+            "partial": partial,
+            "failed": failed,
+            "results": results,
+        }
+        _log("smart_playlist_migrate: done job_id=%s total=%d succeeded=%d "
+             "partial=%d failed=%d",
+             rec.job_id, len(items), succeeded, partial, failed)
+
+    def _migrate_one_smart_playlist(
+        self,
+        item: Dict[str, Any],
+        job_id: str,
+        run_logger: Any,
+        log_fn: Any,
+    ) -> Dict[str, Any]:
+        """Migrate one smart playlist. Returns a per-item result dict
+        and records the outcome in smart_playlist.db. Never raises -
+        any failure is captured into the result's ``warning``."""
+        from services import smart_playlist
+        from services.smart_playlist_log import get_smart_playlist_logger
+        from server import server_registry, smart_playlist_db
+
+        src_server_id = str(item.get("source_server_id") or "")
+        src_playlist_id = str(item.get("source_playlist_id") or "")
+        src_user_id = str(item.get("source_user_id") or "")
+        dst_server_id = str(item.get("dest_server_id") or "")
+        dst_user_id = str(item.get("dest_user_id") or "")
+        dest_name_override = item.get("dest_playlist_name")
+        # Per-playlist mode: hard_copy
+        # forces the static-materialisation path on every destination
+        # backend; otherwise a Plex destination gets the filter
+        # re-created as a true smart playlist.
+        hard_copy = bool(item.get("hard_copy"))
+
+        result: Dict[str, Any] = {
+            "source_server_id": src_server_id,
+            "source_playlist_id": src_playlist_id,
+            "dest_server_id": dst_server_id,
+            "source_playlist_name": "",
+            "dest_playlist_id": None,
+            "dest_backend": "",
+            "mode": "",
+            "status": "failed",
+            "unresolved": [],
+            "warning": "",
+            "description": "",
+        }
+        portable_dict: Optional[Dict[str, Any]] = None
+        try:
+            # 1. Source - must be Plex; read + decode the filter.
+            src_conn = server_registry.connect_registered_server(
+                src_server_id, run_logger,
+            )
+            if getattr(src_conn.adapter, "backend", "") != "plex":
+                result["warning"] = (
+                    "source is not a Plex server; only Plex has smart "
+                    "playlists to migrate"
+                )
+                log_fn("smart-migrate: %s", result["warning"])
+                return result
+            raw = src_conn.adapter.read_smart_playlist(src_playlist_id)
+            if raw is None:
+                result["warning"] = (
+                    "playlist is missing or not a smart playlist"
+                )
+                log_fn("smart-migrate: %s (id=%s)",
+                       result["warning"], src_playlist_id)
+                return result
+            result["source_playlist_name"] = raw.playlist_name
+            portable = smart_playlist.to_portable(raw)
+            portable_dict = smart_playlist.to_dict(portable)
+            result["description"] = portable_dict.get("description") or ""
+            log_fn("smart-migrate: %r decoded -> %s",
+                   raw.playlist_name, result["description"])
+
+            # 2. Destination.
+            dst_conn = server_registry.connect_registered_server(
+                dst_server_id, run_logger,
+            )
+            dest_backend = getattr(dst_conn.adapter, "backend", "") or ""
+            result["dest_backend"] = dest_backend
+            dest_title = str(
+                dest_name_override or raw.playlist_name
+                or "Migrated smart playlist"
+            )
+
+            if dest_backend == "plex" and not hard_copy:
+                # Filter mode, Plex destination: re-create as a true
+                # smart playlist OWNED BY THE
+                # DESTINATION USER. Resolve that user's write context
+                # the same way the copy path does (reusing
+                # playlist_copy's resolver): under Plex Home
+                # per_user_token mode this threads the user's saved
+                # token so the playlist is created as them and its
+                # filter evaluates against their own library access;
+                # in owner_token mode (or non-strict with no saved
+                # token) it resolves to the admin / owner context. A
+                # genuinely unknown user, or strict_identity_resolution
+                # with no saved token, raises here and the outer
+                # handler fails the item with a clear warning.
+                from services.playlist_copy import (
+                    _find_user, _user_context_for, DestUserNotFound,
+                )
+                dest_user_spec = _find_user(
+                    dst_conn.adapter, dst_user_id,
+                    on_missing=DestUserNotFound,
+                    this_server_id=dst_server_id,
+                )
+                dest_ctx = _user_context_for(
+                    dst_conn, dest_user_spec,
+                    role="dest", server_id=dst_server_id,
+                )
+                # plexapi resolves each tag NAME to this server's own
+                # id at create time.
+                spec = smart_playlist.from_portable(portable)
+                tag_fields = smart_playlist.referenced_tag_fields(
+                    raw.decoded, raw.field_types,
+                )
+                dest_choices = dst_conn.adapter.read_section_tag_choices(
+                    section_name=portable.library_name,
+                    section_type=portable.library_type,
+                    tag_fields=tag_fields,
+                    libtype=portable.libtype,
+                    user_context=dest_ctx,
+                )
+                unresolved = smart_playlist.unresolved_against(
+                    portable, dest_choices,
+                )
+                result["unresolved"] = unresolved
+                dest_pl_id = dst_conn.adapter.create_smart_playlist(
+                    title=dest_title,
+                    section_name=portable.library_name,
+                    section_type=portable.library_type,
+                    libtype=spec.get("libtype"),
+                    filters=spec.get("filters"),
+                    sort=spec.get("sort"),
+                    limit=spec.get("limit"),
+                    user_context=dest_ctx,
+                )
+                result["mode"] = "smart"
+                result["dest_playlist_id"] = dest_pl_id or None
+                if unresolved:
+                    result["status"] = "partial"
+                    result["warning"] = (
+                        f"{len(unresolved)} filter term(s) had no match on "
+                        f"the destination and were dropped"
+                    )
+                else:
+                    result["status"] = "success"
+                log_fn(
+                    "smart-migrate: re-created smart playlist %r as user "
+                    "%r on %s (id=%s, unresolved=%d)",
+                    dest_title, dst_user_id, dst_server_id, dest_pl_id,
+                    len(unresolved),
+                )
+            else:
+                # Static-materialisation path. Reached when the
+                # operator chose hard_copy (any destination), or when
+                # the destination is Jellyfin / Emby (no smart-playlist
+                # concept). copy_playlist's materialize_smart_as_static
+                # evaluates the smart playlist's current matches and
+                # writes them as a normal static playlist, handling
+                # every destination backend + per-user ownership.
+                from services import playlist_copy
+                copy_res = playlist_copy.copy_playlist(
+                    source_server_id=src_server_id,
+                    source_user_id=src_user_id,
+                    source_playlist_id=src_playlist_id,
+                    dest_server_id=dst_server_id,
+                    dest_user_id=dst_user_id,
+                    dest_playlist_name=dest_title,
+                    materialize_smart_as_static=True,
+                    logger=get_smart_playlist_logger(),
+                )
+                result["mode"] = "hard_copy" if hard_copy else "static"
+                result["dest_playlist_id"] = (
+                    str(copy_res.get("dest_playlist_id") or "") or None
+                )
+                result["status"] = "success"
+                result["warning"] = (
+                    "" if hard_copy
+                    else "destination has no smart-playlist concept; "
+                         "migrated as a static snapshot of the current "
+                         "contents"
+                )
+                log_fn(
+                    "smart-migrate: %s %r as a static playlist for user "
+                    "%r on %s (%s)",
+                    "hard-copied" if hard_copy else "materialised",
+                    dest_title, dst_user_id, dst_server_id, dest_backend,
+                )
+        except Exception as exc:
+            result["status"] = "failed"
+            result["warning"] = str(exc)
+            log_fn("smart-migrate: FAILED for playlist %s: %s",
+                   src_playlist_id, exc)
+        # Record the outcome (best-effort - never fails the migration).
+        try:
+            smart_playlist_db.record_migration(
+                job_id=job_id,
+                source_server_id=src_server_id,
+                source_playlist_id=src_playlist_id,
+                source_playlist_name=result["source_playlist_name"],
+                dest_server_id=dst_server_id,
+                dest_backend=result["dest_backend"],
+                dest_playlist_id=result["dest_playlist_id"],
+                mode=result["mode"],
+                portable_filter=portable_dict,
+                status=result["status"],
+                coverage=None,
+                unresolved=result["unresolved"],
+                warning=result["warning"],
+            )
+        except Exception:
+            pass
+        return result
+
+    def _run_playlist_copy_batch(self, rec: JobRecord) -> None:
+        """Batch-mode playlist copy worker.
+
+        Runs N copy_playlist calls in parallel via the helper's
+        internal ThreadPoolExecutor (see
+        :func:`services.playlist_copy.copy_playlist_batch`). The job
+        queue stays serial - only one batch executes at a time - but
+        per-item parallelism inside the batch is controlled by the
+        ``parallelism`` field on the params dict (falls back to the
+        ``playlist_mgmt_batch_workers`` tunable).
+
+        Per-item cancellation is wired through ``rec._per_item_cancel_events``
+        (a Dict[int, threading.Event]); the public method
+        :meth:`cancel_batch_item` sets the event for one index and the
+        helper short-circuits that item at its next phase boundary.
+        Whole-batch Stop continues to flow through the shared engine
+        stop_event (via runtime_patches) the same way every other job
+        uses it.
+
+        The job's ``summary`` carries the batch result dict so the
+        frontend can render the collapsed/expandable per-item drill-down
+        (Plan section 8a Q6) from the active-deploys panel.
+        """
+        from services import playlist_copy
+
+        params = rec.params or {}
+        raw_items = params.get("items") or []
+        # Normalise items to plain dicts (the Pydantic layer hands us
+        # validated PlaylistCopyIn instances; convert to dict here so
+        # the helper's get(key) accesses work without an isinstance
+        # branch).
+        items: List[Dict[str, Any]] = [
+            dict(it) if not isinstance(it, dict) else it
+            for it in raw_items
+        ]
+
+        # Resolve parallelism: per-submit override clamped to [1,
+        # batch_max_size_tunable]; absent -> default tunable.
+        from services.tunables import (
+            playlist_mgmt_batch_max_size,
+            playlist_mgmt_batch_workers,
+        )
+        requested = params.get("parallelism")
+        if requested is None:
+            parallelism = playlist_mgmt_batch_workers()
+        else:
+            try:
+                parallelism = max(1, int(requested))
+            except (TypeError, ValueError):
+                parallelism = playlist_mgmt_batch_workers()
+        # Cap at the global max so a runaway client payload can't
+        # spin up unbounded threads.
+        max_size = playlist_mgmt_batch_max_size()
+        if parallelism > max_size:
+            parallelism = max_size
+
+        label = params.get("label") or f"batch of {len(items)} playlist(s)"
+
+        # ── Per-run log directory ──
+        #
+        # Wire batch jobs into the same per-run-log-directory ecosystem
+        # snapshot / restore / direct use. The directory name encodes
+        # the SOURCE server slug so Servers > Logs picks up the batch
+        # log under that server's group automatically (no UI changes
+        # needed). When a batch spans multiple sources, the FIRST
+        # source's slug is used (alphabetical stability); a synthetic
+        # "multisource" slug surfaces under its own group.
+        #
+        # The standard logger (plexmigrate) lands every log.info()
+        # line into runtime.log within the run dir. The auth-chain
+        # trace + per-item progress events both call logger.info() so
+        # operators can read the full forensic trail off disk.
+        settings = _merge_settings(params, mode="playlist_copy_batch")
+        unique_source_slugs: List[str] = []
+        seen_src_ids: set = set()
+        for it in items:
+            sid = str(it.get("source_server_id") or "")
+            if sid and sid not in seen_src_ids:
+                seen_src_ids.add(sid)
+                try:
+                    from server import server_registry
+                    row = server_registry.get_server_by_id(sid, include_token=False)
+                    if row:
+                        svc = (row.get("service_type") or "plex").lower()
+                        slug = backend_aware_slug(row.get("name") or "", svc)
+                        if slug:
+                            unique_source_slugs.append(slug)
+                except Exception:
+                    pass
+        if len(unique_source_slugs) == 1:
+            primary_slug = unique_source_slugs[0]
+        elif len(unique_source_slugs) > 1:
+            primary_slug = "multisource"
+        else:
+            primary_slug = "playlist-batch"
+        _set_run_timestamp(primary_slug)
+        logger, run_log_dir = _build_logger(
+            settings["log_dir"], settings.get("verbose", False),
+        )
+        rec.run_log_dir = run_log_dir
+        logger.info(
+            "playlist_copy_batch: job_id=%s label=%r items=%d parallelism=%d "
+            "primary_source=%s",
+            rec.job_id, label, len(items), parallelism, primary_slug,
+        )
+        for i, it in enumerate(items):
+            logger.info(
+                "  item[%d]: source=%s/%s playlist=%s -> dest=%s/%s",
+                i,
+                it.get("source_server_id") or "?",
+                it.get("source_user_id") or "?",
+                it.get("source_playlist_id") or "?",
+                it.get("dest_server_id") or "?",
+                it.get("dest_user_id") or "?",
+            )
+
+        # Per-item cancel events: read whatever cancel_batch_item may
+        # have already set BEFORE the worker reached us (pre-start
+        # cancel is supported via the same dict). The public method
+        # creates the dict on first call; we attach an empty one here
+        # if it doesn't exist yet so subsequent cancel calls find it.
+        with self._lock:
+            evt_dict = getattr(rec, "_per_item_cancel_events", None)
+            if evt_dict is None:
+                evt_dict = {}
+                rec._per_item_cancel_events = evt_dict  # type: ignore[attr-defined]
+            # Pre-create an Event for every item index up front, under
+            # the lock. After this the dict is never structurally
+            # mutated again: cancel_batch_item only .get()s + .set()s an
+            # existing Event (both thread-safe) and the batch worker
+            # threads only .get() it, so they need no lock. setdefault
+            # preserves any Event a pre-start cancel already inserted.
+            for _idx in range(len(items)):
+                evt_dict.setdefault(_idx, threading.Event())
+
+        stop_event = getattr(rec, "_stop_event", None)
+        if stop_event is None:
+            # Fall through to the shared engine stop_event so the
+            # operator's existing Stop button works as it does for
+            # every other mode.
+            stop_event = state._active_stop_event
+
+        # ── Pre-resolve context labels for the activity feed ──
+        #
+        # "Item N: failed" alone gives
+        # no clue what failed. Pre-resolve server names + per-user
+        # usernames + per-playlist names ONCE here, then per-item
+        # activity emits render rich context like:
+        #   "Item 3 'Movies' (alice on Server A -> bob on Server B):
+        #    ITEM_FAILED -- DEST_USER_TOKEN_MISSING ..."
+        #
+        # Lookups are best-effort: any failure (server not registered,
+        # cache miss, db error) falls back to the raw id. We never
+        # block batch execution on label resolution.
+        from server import media_db, playlist_cache_db, server_registry
+
+        # Server name lookup: id -> human label
+        server_name_by_id: Dict[str, str] = {}
+        unique_server_ids: set = set()
+        for it in items:
+            for k in ("source_server_id", "dest_server_id"):
+                sid = str(it.get(k) or "")
+                if sid:
+                    unique_server_ids.add(sid)
+        for sid in unique_server_ids:
+            try:
+                row = server_registry.get_server_by_id(sid, include_token=False)
+                if row and row.get("name"):
+                    server_name_by_id[sid] = str(row["name"])
+            except Exception:
+                pass
+
+        # Per-(server, user_id) -> username
+        # We resolve managed_users.username for each (server, backend_user_id)
+        # pair seen across items. Also handle the case where the item
+        # passed a username instead of a backend_user_id (the lookup
+        # falls through to the raw id in that case).
+        username_by_server_and_id: Dict[Tuple[str, str], str] = {}
+        per_server_user_ids: Dict[str, set] = {}
+        for it in items:
+            for sid_key, uid_key in (
+                ("source_server_id", "source_user_id"),
+                ("dest_server_id", "dest_user_id"),
+            ):
+                sid = str(it.get(sid_key) or "")
+                uid = str(it.get(uid_key) or "")
+                if sid and uid:
+                    per_server_user_ids.setdefault(sid, set()).add(uid)
+        for sid, uids in per_server_user_ids.items():
+            try:
+                rows = media_db.list_managed_users(server_id=sid) or []
+            except Exception:
+                rows = []
+            # Build (backend_user_id, username) and (username, username) maps
+            for r in rows:
+                buid = str(r.get("backend_user_id") or "")
+                uname = str(r.get("username") or "")
+                if not uname:
+                    continue
+                if buid and buid in uids:
+                    username_by_server_and_id[(sid, buid)] = uname
+                if uname in uids:
+                    username_by_server_and_id[(sid, uname)] = uname
+
+        # Per-(server, user_id, playlist_id) -> playlist name from
+        # the playlist_cache. Cache is best-effort; if it's cold the
+        # playlist id surfaces alone in the activity feed.
+        playlist_name_by_triple: Dict[Tuple[str, str, str], str] = {}
+        per_user_playlist_ids: Dict[Tuple[str, str], set] = {}
+        for it in items:
+            sid = str(it.get("source_server_id") or "")
+            uid = str(it.get("source_user_id") or "")
+            pid = str(it.get("source_playlist_id") or "")
+            if sid and uid and pid:
+                per_user_playlist_ids.setdefault((sid, uid), set()).add(pid)
+        for (sid, uid), pids in per_user_playlist_ids.items():
+            try:
+                cached = playlist_cache_db.list_cached_playlists(
+                    server_id=sid, user_id=uid,
+                ) or []
+            except Exception:
+                cached = []
+            for row in cached:
+                pid = str(row.get("playlist_id") or "")
+                name = str(row.get("name") or "")
+                if pid in pids and name:
+                    playlist_name_by_triple[(sid, uid, pid)] = name
+
+        def _label_for_item(idx: int) -> str:
+            """Build a human-readable label for one batch item index.
+            Falls back to raw ids when a lookup misses."""
+            if idx is None or not (0 <= int(idx) < len(items)):
+                return f"item #{idx}"
+            it = items[int(idx)]
+            ssid = str(it.get("source_server_id") or "")
+            dsid = str(it.get("dest_server_id") or "")
+            suid = str(it.get("source_user_id") or "")
+            duid = str(it.get("dest_user_id") or "")
+            pid = str(it.get("source_playlist_id") or "")
+            s_server = server_name_by_id.get(ssid) or ssid or "?"
+            d_server = server_name_by_id.get(dsid) or dsid or "?"
+            s_user = username_by_server_and_id.get((ssid, suid)) or suid or "?"
+            d_user = username_by_server_and_id.get((dsid, duid)) or duid or "?"
+            pl_name = playlist_name_by_triple.get((ssid, suid, pid)) or pid or "?"
+            return (
+                f"'{pl_name}' ({s_user}@{s_server} -> {d_user}@{d_server})"
+            )
+
+        def _on_progress(ev: Dict[str, Any]) -> None:
+            """Translate batch + per-item events into DashboardState
+            push_activity + counter updates."""
+            try:
+                dash = state.get_dashboard()
+                if dash is None:
+                    return
+                kind = ev.get("event")
+                if kind == "batch-started":
+                    dash.push_activity(
+                        "started", "-",
+                        f"Batch start: {label} ({ev.get('total')} item(s), "
+                        f"parallelism={ev.get('parallelism')})",
+                    )
+                elif kind == "batch-item-running":
+                    # Fired AFTER the per-source semaphore acquire so
+                    # the feed shows which items are actually in
+                    # flight. Makes the parallel-vs-throttled
+                    # distinction obvious.
+                    idx = ev.get("index")
+                    line = (
+                        f"Item {idx} running -> "
+                        f"{_label_for_item(int(idx or 0))}"
+                    )
+                    dash.push_activity("phase", "-", line)
+                    logger.info("BATCH %s", line)
+                elif kind == "auth-chain":
+                    # Surface every auth-chain decision (saved_token /
+                    # pin / admin_fallback / admin_owner) for every
+                    # in-flight item so the operator can see exactly
+                    # which step decided which token to use. Missing
+                    # token + admin fallback shows up as
+                    # 'admin_fallback used' so it's clear writes are
+                    # landing under the admin's account, not the
+                    # target user.
+                    step = ev.get("step") or "?"
+                    outcome = ev.get("outcome") or "?"
+                    user = ev.get("user") or "?"
+                    role_str = ev.get("role") or "?"
+                    server_id_ev = ev.get("server_id") or "?"
+                    server_label = (
+                        server_name_by_id.get(server_id_ev) or server_id_ev
+                    )
+                    detail = ev.get("detail") or ""
+                    line = (
+                        f"Auth [{role_str} {user}@{server_label}]: "
+                        f"{step} -> {outcome}"
+                    )
+                    if detail:
+                        line += f"  ({detail})"
+                    dash.push_activity("phase", "-", line)
+                    # Also persist to the run-log so the
+                    # operator can read the full chain off disk later
+                    # via Servers > Logs > <source server>.
+                    logger.info("AUTH-CHAIN %s", line)
+                elif kind == "batch-item-done":
+                    idx = ev.get("index")
+                    code = ev.get("error_code")
+                    msg = ev.get("error_message")
+                    written = ev.get("items_written")
+                    skipped_items = ev.get("items_skipped_no_match")
+                    if ev.get("cancelled"):
+                        status = "cancelled"
+                    elif ev.get("success"):
+                        # Successful copies can still surface useful
+                        # detail: "ok (12 written, 3 missed)".
+                        bits: List[str] = []
+                        if written is not None:
+                            bits.append(f"{int(written)} written")
+                        if skipped_items:
+                            bits.append(f"{int(skipped_items)} missed")
+                        status = "ok" + (f" ({', '.join(bits)})" if bits else "")
+                    else:
+                        status = code or "failed"
+                    line = f"Item {idx} {status} -> {_label_for_item(int(idx or 0))}"
+                    if (not ev.get("success")) and msg:
+                        # Trim very long error messages so the
+                        # activity feed stays readable; full text is
+                        # available on the per-item drill-down.
+                        m = str(msg)
+                        if len(m) > _ACTIVITY_MSG_MAX_CHARS:
+                            m = m[:_ACTIVITY_MSG_MAX_CHARS] + " ..."
+                        line += f"  ::  {m}"
+                    dash.push_activity("phase", "-", line)
+                    # Full event also gets pinned to disk.
+                    # ERROR level for failed items so the standard
+                    # ERROR filter picks them up into errors.log.
+                    if ev.get("success") or ev.get("cancelled"):
+                        logger.info("BATCH %s", line)
+                    else:
+                        logger.error("BATCH %s", line)
+                    # Tick the dashboard's completed counter so the UI
+                    # shows ongoing progress in the same shape every
+                    # other job uses.
+                    if ev.get("success") and not ev.get("cancelled"):
+                        with dash._lock:  # type: ignore[attr-defined]
+                            dash.completed += 1
+                elif kind == "batch-done":
+                    summary_line = (
+                        f"Batch complete: {ev.get('succeeded')} ok / "
+                        f"{ev.get('failed')} failed / "
+                        f"{ev.get('skipped')} skipped / "
+                        f"{ev.get('cancelled')} cancelled "
+                        f"(elapsed {ev.get('elapsed_seconds', 0.0):.2f}s)"
+                    )
+                    dash.push_activity("done", "-", summary_line)
+                    logger.info("BATCH %s", summary_line)
+                # ── Phase-level file-log entries so the time-cost
+                # breakdown is visible without the dashboard. Filters
+                # the noisy per-item 'resolving' ticks down to
+                # start + end markers.
+                elif kind == "source-loaded":
+                    idx = ev.get("index")
+                    name = ev.get("playlist_name") or "(playlist)"
+                    n = ev.get("item_count")
+                    logger.info(
+                        "PHASE Item %s source-loaded -> %r (%s item(s))",
+                        idx, name, n,
+                    )
+                elif kind == "resolving":
+                    completed = int(ev.get("completed") or 0)
+                    total = int(ev.get("total") or 0)
+                    # Only emit at start (completed=1), midpoint, and
+                    # end to keep the file log readable. The dashboard
+                    # gets every tick via push_activity above.
+                    if total and (
+                        completed == 1
+                        or completed == total
+                        or (total >= 4 and completed == total // 2)
+                    ):
+                        resolved = int(ev.get("resolved") or 0)
+                        skipped_n = int(ev.get("skipped") or 0)
+                        idx = ev.get("index")
+                        logger.info(
+                            "PHASE Item %s resolving %d/%d "
+                            "(written=%d skipped=%d)",
+                            idx, completed, total, resolved, skipped_n,
+                        )
+                elif kind == "writing":
+                    idx = ev.get("index")
+                    name = ev.get("name") or "(playlist)"
+                    n = ev.get("resolved_count")
+                    logger.info(
+                        "PHASE Item %s writing destination playlist "
+                        "%r with %s resolved item(s)...",
+                        idx, name, n,
+                    )
+                elif kind == "done":
+                    # Per-item 'done' from copy_playlist (distinct
+                    # from batch-done above). Marks the end of the
+                    # write phase for this item.
+                    idx = ev.get("index")
+                    written = ev.get("items_written")
+                    skipped_n = ev.get("items_skipped_no_match")
+                    logger.info(
+                        "PHASE Item %s done (written=%s missed=%s)",
+                        idx, written, skipped_n,
+                    )
+                elif kind == "tier-hit":
+                    # Per-item resolution tier hit. Useful to see
+                    # which tier is doing the work without scrolling
+                    # the debug stream.
+                    idx = ev.get("index")
+                    tier = ev.get("tier") or "?"
+                    title = ev.get("title") or ""
+                    logger.info(
+                        "PHASE Item %s tier-hit %s -> %r",
+                        idx, tier, title,
+                    )
+            except Exception:
+                log.exception(
+                    "playlist_copy_batch progress dashboard push failed",
+                )
+
+        # Tag every HTTP response fired inside this batch
+        # with the job_id so the Network panel can filter the per-
+        # request timeline by job. The contextvar propagates through
+        # ThreadPoolExecutor.submit via copy_context() (the engine's
+        # submit_with_context helper does this automatically; pl-batch
+        # threads inherit from the calling context).
+        from services.dashboard import job_http_context
+        try:
+            with job_http_context(rec.job_id):
+                result = playlist_copy.copy_playlist_batch(
+                    items,
+                    parallelism=parallelism,
+                    stop_event=stop_event,
+                    per_item_cancel_events=evt_dict,
+                    progress_cb=_on_progress,
+                )
+        finally:
+            # Always close + finalise the run-log dir so the
+            # Servers > Logs tab picks up the run with its PASS/FAIL
+            # suffix. Mirrors snapshot/restore/direct finally blocks.
+            _finalize_run(logger, run_log_dir)
+
+        rec.summary = {
+            "playlist_copy_batch": {
+                "total": int(result.get("total") or 0),
+                "succeeded": int(result.get("succeeded") or 0),
+                "failed": int(result.get("failed") or 0),
+                "skipped": int(result.get("skipped") or 0),
+                "cancelled": int(result.get("cancelled") or 0),
+                "elapsed_seconds": float(result.get("elapsed_seconds") or 0.0),
+                "results": list(result.get("results") or []),
+                "label": label,
+                "parallelism": parallelism,
+            },
+            "params": {
+                k: v for k, v in params.items()
+                if k != "items"
+            },
+        }
+        # Surface partial-failure semantics:
+        #   * any failed item -> rec.error set so worker_loop transitions
+        #     to COMPLETED_WITH_ERRORS rather than green COMPLETED
+        #   * all-cancelled (failed == 0, succeeded == 0, cancelled == total)
+        #     transitions to CANCELLED via the existing STOPPING/state-
+        #     check pipeline if a Stop was issued; if cancels were per-item
+        #     only (no global Stop), we report it as completed-with-errors
+        #     with an informative error message
+        if int(result.get("failed") or 0) > 0:
+            rec.error = (
+                f"batch had {result['failed']} failed item(s) "
+                f"out of {result['total']}; see summary.results for codes."
+            )
+        elif (
+            int(result.get("cancelled") or 0) > 0
+            and int(result.get("succeeded") or 0) == 0
+            and rec.state != STATE_STOPPING
+        ):
+            # Per-item cancels with no successful items: surface as
+            # completed_with_errors so the operator sees the cancel
+            # bookkeeping in the result panel.
+            rec.error = (
+                f"batch cancelled per-item before any item completed "
+                f"({result['cancelled']}/{result['total']})."
+            )
 
     # ── Engine invocation: direct server-to-server transfer ─────────
 
@@ -1857,7 +2832,7 @@ class JobQueue:
         handles connection resolution, logger setup, and stop-flag
         threading.
 
-        Fan-out (v0.10.0): when ``dest_server_names`` carries more than
+        Fan-out: when ``dest_server_names`` carries more than
         one name the call is forwarded to :func:`run_fan_out_direct`
         and the single-destination resolution / engine call below is
         skipped. ``len == 1`` keeps the existing single-destination
@@ -1867,7 +2842,7 @@ class JobQueue:
         """
         settings = _merge_settings(rec.params, mode="direct")
 
-        # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: same state stash as
+        # Same state stash as
         # _run_restore so direct-transfer restores see the end user's
         # mixed-media config.
         try:
@@ -1918,13 +2893,13 @@ class JobQueue:
         dst_conn = connect_registered_server(dst_name, boot_logger)
         dst_server, dst_row = dst_conn.server, dst_conn.row
 
-        # PR-Backends: artifact slugs are backend-aware so a direct
+        # Artifact slugs are backend-aware so a direct
         # transfer between same-named-different-backend servers never
         # collides with another server's artifacts.
         src_slug = backend_aware_slug(src_row["name"], src_conn.service_type)
         dst_slug = backend_aware_slug(dst_row["name"], dst_conn.service_type)
         combined_slug = f"{src_slug}-to-{dst_slug}"
-        # v0.13.x: libraries are known up-front for direct transfer
+        # Libraries are known up-front for direct transfer
         # (end user picks them from the source). Include in the slug.
         _direct_libs = sorted({str(n) for n in (settings.get("libraries") or [])})
         _set_run_timestamp(combined_slug, libraries=_direct_libs)
@@ -1960,7 +2935,24 @@ class JobQueue:
         # raw identifier, not friendly name.
         _populate_run_user_context(src_server, source_name=src_name)
 
-        # v0.13.x: pre-Replace safety belt. Direct transfer writes into
+        # Cross-backend Replace-mode refusal. Run BEFORE the
+        # pre-replace safety snapshot fires so an unrunnable job
+        # doesn't burn the auto-capture budget. Same-backend Replace
+        # continues unchanged.
+        _refusal = _cross_backend_replace_requires_mappings(
+            source_server_id=src_row.get("id") or "",
+            source_service_type=src_conn.service_type or "plex",
+            dest_server_id=dst_row.get("id") or "",
+            dest_service_type=dst_conn.service_type or "plex",
+            mode=str(settings.get("mode") or "merge"),
+            ignore_library_mapping=bool(
+                settings.get("ignore_library_mapping") or False
+            ),
+        )
+        if _refusal:
+            raise ValueError(_refusal)
+
+        # Pre-Replace safety belt. Direct transfer writes into
         # the destination using the same primitive as restore, so the
         # same overwrite semantics apply when mode == "replace". Capture
         # the destination's pre-state before the engine fires so the
@@ -2011,7 +3003,7 @@ class JobQueue:
 
         # Hand the keyboard-stub stop event over so /api/job/stop
         # propagates into the orchestrator.
-        stop_event = runtime_patches._active_stop_event
+        stop_event = state._active_stop_event
 
         # v0.9.6 Feature 4: resolve per-user tokens on both sides so
         # direct transfer can carry managed-user data. Each home_users
@@ -2054,7 +3046,7 @@ class JobQueue:
         # user for minutes at a time.
         state._current_user_visible = bool(user_filter)
 
-        # PR-Backends dispatch: if EITHER side is non-Plex, route
+        # If EITHER side is non-Plex, route
         # through the adapter engines (snapshot via source adapter,
         # restore via destination adapter, in-memory chain). Plex<->Plex
         # stays on the perf-tuned run_direct_transfer.
@@ -2096,19 +3088,32 @@ class JobQueue:
             skip_collections=bool(settings.get("skip_collections") or False),
             fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
             skip_playlists=bool(settings.get("skip_playlists") or False),
-            # PR-3 / Phase D - four-flag data-type filter.
+            # Four-flag data-type filter.
             include_watch_history=bool(settings.get("include_watch_history", True)),
             include_ratings=bool(settings.get("include_ratings", True)),
             include_playlists=bool(settings.get("include_playlists", True)),
             include_collections=bool(settings.get("include_collections", True)),
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
-            # Phase C (admin-management follow-up, 2026-05-15):
-            # per-library metric filter forwarded to direct transfer.
+            # Per-library metric filter forwarded to direct transfer.
             # The direct-transfer entry point hands this to both the
             # source snapshot phase and the destination restore phase
             # so per-library choices apply end-to-end.
             library_metrics=settings.get("library_metrics") or None,
+            # Per-run override that bypasses the library mapping table.
+            # Matches the restore-from-snapshot path above. Source +
+            # dest server IDs are required so the mapping consult in
+            # services.restorer can identify the pair correctly.
+            ignore_library_mapping=bool(
+                settings.get("ignore_library_mapping") or False
+            ),
+            # Per-run library name overrides.
+            # Same shape as the restore path's matching field.
+            library_mapping_overrides=(
+                settings.get("library_mapping_overrides") or None
+            ),
+            source_server_id=src_row.get("id") or "",
+            dest_server_id=dst_row.get("id") or "",
         )
 
         # Part B: run-level finalize phase so the dashboard doesn't
@@ -2116,10 +3121,9 @@ class JobQueue:
         _dash = state.get_dashboard()
         if _dash is not None:
             _dash.set_finalizing("finalizing run")
-        _close_logger(logger, run_log_dir)
-        _finalise_run_dir(run_log_dir)
+        _finalize_run(logger, run_log_dir)
 
-    # ── Fan-out dispatch (v0.10.0) ───────────────────────────────────
+    # ── Fan-out dispatch ─────────────────────────────────────────────
 
     def _run_direct_fan_out(
         self,
@@ -2177,15 +3181,18 @@ class JobQueue:
         if settings.get("remap_old") and settings.get("remap_new"):
             remap = (settings["remap_old"], settings["remap_new"])
 
-        stop_event = runtime_patches._active_stop_event
+        stop_event = state._active_stop_event
 
-        # Plan[EMBY-JELLYFIN-FULL-USE-AUDIT] item 1: dispatch on source
-        # service_type. The existing run_fan_out_direct path is Plex-
-        # source-only (it connects the source as a PlexServer and
-        # passes it through to run_direct_transfer in each worker). For
-        # non-Plex sources we route to the adapter-aware fan-out which
-        # captures the source via the adapter engine and dispatches
-        # restores to each destination.
+        # Dispatch on the source + destination service_types. The
+        # existing run_fan_out_direct path is Plex<->Plex only - it
+        # connects both ends as PlexServer and passes them through to
+        # run_direct_transfer in each worker, which calls
+        # ``dest_server.library.sections()`` directly on the plexapi
+        # handle. If the source OR any destination is non-Plex, we
+        # route to the adapter-aware fan-out which captures the source
+        # via the adapter engine and dispatches restores per-destination
+        # through ``_run_direct_via_adapter`` - the same dispatch the
+        # single-destination path uses for mixed-backend transfers.
         from server import server_registry as _registry
         _src_row = _registry.get_server_by_name(src_name) if src_name else None
         if _src_row is None:
@@ -2193,7 +3200,17 @@ class JobQueue:
         _src_service = (
             (_src_row.get("service_type") if _src_row else None) or "plex"
         ).lower()
-        if _src_service != "plex":
+
+        def _dest_service(name: str) -> str:
+            row = _registry.get_server_by_name(name) if name else None
+            if row is None:
+                row = _registry.get_server_by_id(name, include_token=False)
+            return (
+                (row.get("service_type") if row else None) or "plex"
+            ).lower()
+
+        _dst_services = [_dest_service(n) for n in dest_names]
+        if _src_service != "plex" or any(s != "plex" for s in _dst_services):
             # Sequential per-destination via _run_direct_via_adapter.
             # Each dest re-reads the source (matches existing fan-out
             # behaviour; capture-once optimisation is a follow-up).
@@ -2226,7 +3243,7 @@ class JobQueue:
             skip_collections=bool(settings.get("skip_collections") or False),
             fast_collection_detection=bool(settings.get("fast_collection_detection") or False),
             skip_playlists=bool(settings.get("skip_playlists") or False),
-            # PR-3 / Phase D - four-flag data-type filter (fan-out direct).
+            # Four-flag data-type filter (fan-out direct).
             include_watch_history=bool(settings.get("include_watch_history", True)),
             include_ratings=bool(settings.get("include_ratings", True)),
             include_playlists=bool(settings.get("include_playlists", True)),
@@ -2234,10 +3251,10 @@ class JobQueue:
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
             pre_replace_settings=_build_pre_replace_settings(settings),
-            # v0.13.x: destination concurrency cap. 0 = unlimited
-            # (today's behavior). Direct transfer doesn't expose a
-            # library_workers axis yet (the per-destination engine is
-            # still serial across libraries), so only the destination
+            # Destination concurrency cap. 0 = unlimited.
+            # Direct transfer doesn't expose a
+            # library_workers axis (the per-destination engine is
+            # serial across libraries), so only the destination
             # axis is wired here.
             destination_workers=int(settings.get("fan_out_destination_workers") or 0),
         )
@@ -2252,16 +3269,20 @@ class JobQueue:
         settings: Dict[str, Any],
         stop_event: Optional[threading.Event],
     ) -> None:
-        """Multi-destination direct transfer for non-Plex sources.
+        """Multi-destination direct transfer when the source OR any
+        destination is non-Plex.
 
-        Plan[EMBY-JELLYFIN-FULL-USE-AUDIT] item 1 fix. The existing
-        run_fan_out_direct path requires a PlexServer source; this
-        method handles the cases where the source is Jellyfin or
-        Emby. Implementation is intentionally simple: per-destination
-        sequential dispatch to the existing _run_direct_via_adapter
-        single-dest path. Each destination re-reads from source
-        (matches the wastefulness of the existing Plex fan-out path);
-        capture-once + N-restore optimisation is a follow-up.
+        The existing run_fan_out_direct path is Plex<->Plex only - it
+        calls ``server.direct_transfer.run_direct_transfer`` which
+        pokes plexapi internals (``server.library.sections()``) on
+        both ends. This method handles every other backend combination
+        (P->J, P->E, J->*, E->*) by dispatching each destination
+        sequentially through ``_run_direct_via_adapter``, which uses
+        the snapshotter+restorer adapter engines.
+
+        Each destination re-reads from source (matches the wastefulness
+        of the existing Plex fan-out path); capture-once + N-restore
+        optimisation is a follow-up.
 
         Per-destination errors are caught and recorded on a
         FanOutResult; one failed destination does not abort the rest.
@@ -2331,7 +3352,7 @@ class JobQueue:
                     dest_name,
                 )
                 dest_result.state = "failed"
-                dest_result.error = str(exc)
+                dest_result.error = safe_error(exc)
             finally:
                 dest_result.finished_at = time.time()
         _apply_fan_out_result(rec, result)
@@ -2366,7 +3387,7 @@ class JobQueue:
         if settings.get("remap_old") and settings.get("remap_new"):
             remap = (settings["remap_old"], settings["remap_new"])
 
-        stop_event = runtime_patches._active_stop_event
+        stop_event = state._active_stop_event
 
         result: FanOutResult = run_fan_out_restore(
             dest_names=list(dest_names),
@@ -2381,7 +3402,7 @@ class JobQueue:
             log_dir_root=settings.get("log_dir") or "./plex_logs",
             output_dir=settings.get("output_dir"),
             stop_event=stop_event,
-            # PR-3 / Phase D - four-flag data-type filter (fan-out import).
+            # Four-flag data-type filter (fan-out import).
             # The Pydantic validator translates any legacy skip_* into
             # include_* upstream.
             include_playlists=bool(settings.get("include_playlists", True)),
@@ -2391,13 +3412,13 @@ class JobQueue:
             mode=str(settings.get("mode") or "merge"),
             merge_watch_strategy=str(settings.get("merge_watch_strategy") or "higher"),
             pre_replace_settings=_build_pre_replace_settings(settings),
-            # v0.14 - per-job user filter forwarded to each
+            # Per-job user filter forwarded to each
             # destination in the fan-out. The fan-out helper passes
             # it straight to run_restore.
             user_filter=settings.get("user_filter"),
-            # v0.13.x: two-axis concurrency for fan-out restore.
+            # Two-axis concurrency for fan-out restore.
             # destination_workers caps how many destinations run at
-            # once (0 = no cap, today's behavior). library_workers is
+            # once (0 = no cap). library_workers is
             # forwarded into each destination's own run_restore call
             # so the within-destination library concurrency stays
             # consistent with the single-destination restore path.
@@ -2415,7 +3436,7 @@ class _JobCancelled(Exception):
 
 def _log_pin_preflight_ack(rec: JobRecord, logger: logging.Logger) -> None:
     """
-    PR-12 - write the end user-acknowledged at-risk user list to the
+    Write the end user-acknowledged at-risk user list to the
     per-run logger so the audit trail lives in the run's ``runtime.log``
     alongside the engine's own output. No-op when the end user did
     not see the preflight modal (the flag is False/absent).
@@ -2439,7 +3460,7 @@ def _log_pin_preflight_ack(rec: JobRecord, logger: logging.Logger) -> None:
 
 
 def _apply_mixed_media_state(settings: Dict[str, Any]) -> None:
-    """Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: resolve the end user's
+    """Resolve the end user's
     per-run + global mixed-media config and stash on services.state
     so the engine sees it without per-call kwarg plumbing.
 
@@ -2513,7 +3534,7 @@ def _resolve_dest_names(settings: Dict[str, Any]) -> List[str]:
     The Pydantic model validator already collapses ``dest_server_name``
     and ``dest_server_names`` into the plural form, but this helper
     keeps working for callers that supply the singular form only (CLI
-    invocations, scheduler payloads written before v0.10.0). Empty
+    invocations, older scheduler payloads). Empty
     strings are dropped; duplicates are preserved as the validator's
     job. Returns an empty list if neither field has any value - the
     caller decides whether that's an error.
@@ -2538,7 +3559,7 @@ def _apply_fan_out_result(rec: JobRecord, result: "FanOutResult") -> None:
     destination failed (which the worker turns into ``STATE_FAILED``
     with ``rec.error``).
     """
-    # v0.13.x: copy per-destination safety-belt snapshot ids onto the
+    # Copy per-destination safety-belt snapshot ids onto the
     # parent JobRecord's summary so the end user can find every
     # destination's rollback point on the Snapshots tab. The single-
     # destination paths set ``summary["pre_replace_snapshot_id"]``
@@ -2595,10 +3616,10 @@ def _merge_settings(params: Dict[str, Any], *, mode: str) -> Dict[str, Any]:
         "remap_new": None,
         "source_server_name": None,
         "dest_server_name": None,
-        # v0.10.0: fan-out destinations. The Pydantic model collapses
+        # Fan-out destinations. The Pydantic model collapses
         # singular ``dest_server_name`` into this list at the API
-        # boundary, but we keep the legacy key populated for any
-        # downstream code that hasn't been migrated yet.
+        # boundary, but the legacy key stays populated for any
+        # downstream code that has not been migrated yet.
         "dest_server_names": None,
     }
     for key, value in params.items():
@@ -2622,18 +3643,16 @@ def _resolve_source_connection(
     the symptom of "every operation hits the first/default server" -
     a request that *should* fail loudly (no server selected) was
     silently succeeding against whichever server happened to be in
-    legacy settings. The fallback is gone from this API path; the CLI
-    still supports ad-hoc URL+token via its own ``--server`` /
-    ``--token`` flags (see ``plexmigrate.py``), which does not go
-    through this function.
+    legacy settings. The fallback is gone: every operation resolves a
+    server explicitly through the registry.
 
     Returns ``(PlexServer, url, token, owner_name, slug)``. ``slug``
     is the filename-safe form of the friendly server name, used by
     :func:`_set_run_timestamp` to prefix log dirs and snapshot filenames.
     """
-    # PR-Backends (TODO-AGENT-2-5): prefer the stable server id when
+    # Prefer the stable server id when
     # the job params carry one; fall back to (name + service_type).
-    # Plan[SERVER-UID-IDENTITY] 2026-05-16: log id-name disagreement
+    # Log id-name disagreement
     # and warn when callers send only a name (name-only resolution
     # can land on the wrong server when names collide across backends).
     source_id = (settings.get("source_server_id") or "").strip()
@@ -2697,8 +3716,21 @@ def _resolve_source_connection(
         )
     conn = connect_registered_server(resolved_id, logger)
     if state.get_dashboard():
+        # The message labels the admin token holder explicitly. A
+        # bare "Connected to '<server>' as <owner>" on multi-admin
+        # Emby installs misleadingly suggests capture runs
+        # FOR that admin user, even when a user_filter narrows the
+        # actual capture scope to a different user (e.g. Kai with
+        # Ares listed as the admin). The connection always
+        # authenticates AS the admin token holder; the data
+        # subject is decided later by the user_filter. The explicit
+        # admin label lets the operator distinguish "admin
+        # credential = Ares" from "data subject = Kai" in the
+        # activity feed.
+        _admin_name = conn.row.get('owner_name') or '?'
         state.get_dashboard().push_activity(
-            "started", "-", f"Connected to '{resolved_name}' as {conn.row.get('owner_name') or '?'}",
+            "started", "-",
+            f"Connected to '{resolved_name}' (admin: {_admin_name})",
         )
     # ``conn.token`` is the already-decrypted plaintext; the engine's
     # direct-HTTP helpers (/:/scrobble, /:/rate, etc.) consume it via
@@ -2744,9 +3776,10 @@ def _populate_run_user_context(
         state._plex_owner_email = ""
 
     # Carry the cached display-name map into the dashboard so the WS
-    # snapshot can ship it to the frontend. PR-Backends (TODO-AGENT-2-5):
-    # prefer stable id when supplied so a post-submit rename / duplicate
-    # name doesn't surface the wrong server's display-name map.
+    # snapshot can ship it to the frontend.
+    # Prefer the stable id when supplied so a post-submit rename /
+    # duplicate name doesn't surface the wrong server's
+    # display-name map.
     if state.get_dashboard() is not None and (source_name or source_server_id):
         try:
             row = None
@@ -2766,47 +3799,7 @@ def _populate_run_user_context(
             pass
 
 
-_LIB_SLUG_STRIP = re.compile(r'[\\/:*?"<>|]+')
 _LIBRARY_FIELD_RE = re.compile(rb'"library"\s*:\s*"([^"]+)"')
-_LIBRARIES_IN_SLUG = 3  # cap before "+N" overflow kicks in
-
-
-def _safe_lib_slug(name: str) -> str:
-    """Sanitize one library name for use inside a filesystem path.
-
-    Replaces whitespace with hyphens and strips characters that would
-    cause trouble on Windows / macOS / Linux. Empty input -> "".
-    """
-    if not name:
-        return ""
-    cleaned = _LIB_SLUG_STRIP.sub("", name).strip()
-    return re.sub(r"\s+", "-", cleaned) or ""
-
-
-def _libraries_slug(libraries: Optional[List[str]]) -> str:
-    """Compose a short, readable libraries fragment for the run-dir name.
-
-    Caps the visible list at ``_LIBRARIES_IN_SLUG`` and appends ``+N``
-    for the rest so long lists don't blow the dir name into something
-    unreadable. Returns ``""`` when no libraries are supplied (the
-    caller's slug then falls back to server-only).
-
-    Example: ``["Movies", "TV Shows", "Audio-Books", "Music"]`` ->
-    ``"Movies_TV-Shows_Audio-Books+1"``.
-    """
-    if not libraries:
-        return ""
-    parts: List[str] = []
-    for name in libraries:
-        slug = _safe_lib_slug(str(name))
-        if slug:
-            parts.append(slug)
-    if not parts:
-        return ""
-    if len(parts) <= _LIBRARIES_IN_SLUG:
-        return "_".join(parts)
-    overflow = len(parts) - _LIBRARIES_IN_SLUG
-    return "_".join(parts[:_LIBRARIES_IN_SLUG]) + f"+{overflow}"
 
 
 def _peek_library_field(path: Path) -> Optional[str]:
@@ -2886,42 +3879,6 @@ def _peek_libraries_from_inputs(
                     libs.append(name)
                 break
     return libs
-
-
-def _set_run_timestamp(
-    slug: str,
-    libraries: Optional[List[str]] = None,
-) -> None:
-    """
-    Re-derive ``state._run_timestamp`` so the current run's log dir
-    and snapshot filenames are prefixed with the server's slug and,
-    when known, the libraries the run is about.
-
-    The engine reads ``state._run_timestamp`` lazily inside
-    :func:`services.logging_ops.setup_logging` and
-    :func:`services.snapshotter.snapshot_library`, so we can reassign it
-    here without touching either of those modules.
-
-    Examples:
-      ``slug="Plex1", libraries=None`` ->
-          log dir   : plex_logs/run_Plex1_20260510_135425/
-          filename  : Movies_Plex1_20260510_135425.plexexport.json
-
-      ``slug="Plex1", libraries=["Movies","TV Shows"]`` ->
-          log dir   : plex_logs/run_Plex1_Movies_TV-Shows_20260510_135425/
-
-      ``slug="Plex1", libraries=["Movies","TV","Audio","Music","Photos"]`` ->
-          log dir   : plex_logs/run_Plex1_Movies_TV_Audio+2_20260510_135425/
-    """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    libs_part = _libraries_slug(libraries)
-    if slug and slug != "adhoc":
-        if libs_part:
-            state._run_timestamp = f"{slug}_{libs_part}_{ts}"
-        else:
-            state._run_timestamp = f"{slug}_{ts}"
-    else:
-        state._run_timestamp = f"{libs_part}_{ts}" if libs_part else ts
 
 
 def _persist_run_history_row(rec: JobRecord, job_run_id: str) -> None:
@@ -3069,43 +4026,95 @@ def _dump_run_settings(
             pass
 
 
-def _build_logger(log_dir: str, verbose: bool) -> Tuple[logging.Logger, str]:
+def _cross_backend_replace_requires_mappings(
+    *,
+    source_server_id: str,
+    source_service_type: str,
+    dest_server_id: str,
+    dest_service_type: str,
+    mode: str,
+    ignore_library_mapping: bool,
+) -> Optional[str]:
+    """Safety belt: refuse a
+    cross-backend Replace-mode run when zero library mappings have
+    been declared between the two servers.
+
+    Replace mode is destructive - it makes the destination match the
+    source exactly, removing destination-side state that's not in
+    the source. When source and destination are different backends
+    (Plex ↔ Jellyfin / Emby), library equivalence is NOT
+    self-evident from library names; the operator must declare which
+    library on side A corresponds to which on side B. Without a
+    declaration, Replace can't know which destination library to
+    overwrite, and the existing per-library skip-on-no-name-match
+    would silently produce a no-op that the operator misreads as
+    success.
+
+    Returns:
+      - None when the run is safe to proceed.
+      - A human-readable error message when the run MUST be refused.
+
+    The check only fires when:
+      1. mode == "replace"
+      2. ignore_library_mapping is False (operator hasn't opted out)
+      3. source and dest backends differ (cross-backend)
+      4. ZERO mapping rows exist between the two servers
+
+    Same-backend Replace stays unaffected because exact-name matching
+    typically works on a same-backend transfer. Operators with a
+    same-backend rename can either use the mapping table OR enable
+    the per-run ignore_library_mapping override.
     """
-    Set up the per-run logger the same way :func:`plexmigrate.main` does.
-    Returns ``(logger, run_log_dir)``. When the end user has disabled
-    run logging via the global ``run_logging_enabled`` setting,
-    ``setup_logging`` skips the per-run directory entirely and returns
-    a console-only logger; ``run_log_dir`` is then the empty string so
-    downstream finalize / library-log writers know to no-op.
-    """
-    # Resolve the global toggle (default true). Per-server is
-    # intentionally out of scope for run logging - one global switch.
-    run_logging_enabled = bool(
-        (load_settings() or {}).get("run_logging_enabled", True)
-        if (load_settings() or {}).get("run_logging_enabled") is not None
-        else True
+    if str(mode or "").lower() != "replace":
+        return None
+    if ignore_library_mapping:
+        return None
+    src_svc = (source_service_type or "").strip().lower()
+    dst_svc = (dest_service_type or "").strip().lower()
+    if not src_svc or not dst_svc:
+        return None
+    if src_svc == dst_svc:
+        return None
+    if not source_server_id or not dest_server_id:
+        return None
+    try:
+        from server import library_mapping_db
+        rows = library_mapping_db.list_mappings_for_pair(
+            source_server_id, dest_server_id,
+        ) or []
+    except Exception:
+        # If the mapping DB can't be read, fail safe by refusing the
+        # Replace. Better to error visibly than risk a destructive
+        # write with unknown library equivalence.
+        return (
+            "Cross-backend Replace-mode refused: could not read the "
+            "library mapping table to verify equivalence. Re-try after "
+            "Server Syncing > Library Mapping loads, or enable the "
+            "per-run 'Ignore library mapping' override if you really "
+            "want exact-name matching only."
+        )
+    # Operator-confirmed rows (source='operator', either side mapped
+    # to a real dest library OR to the explicit-skip sentinel) count
+    # toward the gate; auto rows that have not been confirmed do not,
+    # because Replace is destructive and we want the operator to have
+    # explicitly looked at the pair.
+    confirmed = [
+        r for r in rows
+        if (r.get("source") or "").lower() == "operator"
+    ]
+    if confirmed:
+        return None
+    return (
+        f"Cross-backend Replace-mode refused: no operator-confirmed "
+        f"library mappings exist between the source ({src_svc}) and "
+        f"destination ({dst_svc}) servers. Replace mode is destructive "
+        f"and the engine cannot know which destination library matches "
+        f"each source library without a declaration. Open Server "
+        f"Syncing > Library Mapping, declare the equivalences (or "
+        f"explicit skips), then re-run. To bypass this check use the "
+        f"per-run 'Ignore library mapping' checkbox + exact-name "
+        f"matching."
     )
-    logger = setup_logging(log_dir, verbose, run_logging_enabled=run_logging_enabled)
-    if state._run_log_dir is None:
-        return logger, ""
-    return logger, str(state._run_log_dir)
-
-
-def _close_logger(logger: logging.Logger, run_log_dir: str) -> None:
-    """
-    Close and detach all file handlers from the logger.
-
-    The engine's setup_logging adds rotating file handlers to two
-    named loggers; if we don't close them here, the per-run log
-    directory rename below fails on Windows because the files are
-    still open.
-    """
-    for lg in (logging.getLogger("plexmigrate"), logging.getLogger("plexmigrate.media")):
-        for h in lg.handlers[:]:
-            try:
-                h.close()
-            finally:
-                lg.removeHandler(h)
 
 
 def _resolve_server_id(
@@ -3120,9 +4129,9 @@ def _resolve_server_id(
     foreign key in media.db. Returns an empty string when no match -
     callers treat that as "no snapshot capture possible."
 
-    PR-Backends (TODO-AGENT-2-5 from Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md):
-    callers that already have the stable id pass it via ``prefer_id``;
-    we verify it still resolves and short-circuit. ``service_type``
+    Callers that already have the stable id pass it via ``prefer_id``;
+    the function verifies it still resolves and short-circuits.
+    ``service_type``
     disambiguates same-named-different-backend rows when no id is
     supplied. Both default to None so legacy single-arg callers keep
     working.
@@ -3143,6 +4152,7 @@ def _resolve_server_id(
     try:
         from server.server_registry import list_servers
         target_service = (service_type or "").lower() if service_type else None
+        matches: List[str] = []
         for row in list_servers(include_tokens=False):
             if (row.get("name") or "") != source_server_name:
                 continue
@@ -3150,7 +4160,23 @@ def _resolve_server_id(
                 row_service = (row.get("service_type") or "plex").lower()
                 if row_service != target_service:
                     continue
-            return str(row.get("id") or "")
+            sid = str(row.get("id") or "")
+            if sid:
+                matches.append(sid)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            # Name collision with no service_type to disambiguate
+            # (e.g. a Plex and an Emby server sharing a friendly
+            # name). Refuse to guess: "" is the documented "no match"
+            # return and is safer than resolving to the wrong
+            # server's id.
+            logging.getLogger("plexmigrate.server.jobs").warning(
+                "_resolve_server_id: %r matches %d registered servers "
+                "and no service_type was given to disambiguate; "
+                "treating as unresolved.",
+                source_server_name, len(matches),
+            )
     except Exception:
         return ""
     return ""
@@ -3197,7 +4223,7 @@ def _capture_pre_replace_snapshot(
     dest_service_type: str = "plex",
 ) -> str:
     """
-    v0.13.x: pre-Replace auto-capture safety belt.
+    Pre-Replace auto-capture safety belt.
 
     Fires when ``mode == "replace"`` and the end user has the safety
     belt on (the default). Captures a fresh snapshot of the destination
@@ -3324,8 +4350,7 @@ def _capture_pre_replace_snapshot(
             include_playlists=include_pl,
             include_collections=include_co,
         )
-        _close_logger(pre_logger, pre_run_log_dir)
-        _finalise_run_dir(pre_run_log_dir)
+        _finalize_run(pre_logger, pre_run_log_dir)
 
         snapshot_id = _capture_snapshot_after_run(
             rec=pre_rec,  # type: ignore[arg-type]
@@ -3373,7 +4398,7 @@ def _capture_snapshot_after_run(
     snapshot_name_prefix: str = "",
 ) -> Optional[str]:
     """
-    PR-13 snapshot capture (Rule 1 - payload-direct edition).
+    Snapshot capture (Rule 1 - payload-direct edition).
 
     The engine fetches every metric live during ``snapshot_library``
     and appends its per-library ``export_data`` to
@@ -3415,15 +4440,15 @@ def _capture_snapshot_after_run(
     # end user already cares about: server, libraries, captured_at.
     # The result is both the on-disk .db basename AND the registry's
     # ``snapshot_name`` field, so the file on disk reads e.g.
-    # ``My Server - Audio-Books, Music - 2026-05-13 02-26.db`` instead
-    # of the previous ``My-Server_20260513_022609.db``.
+    # ``My Server - Audio-Books, Music - 2026-05-13 02-26.db`` - a
+    # human-readable name rather than a bare timestamp slug.
     captured_at_ts = time.time()
     snapshot_name = snapshot_registry.format_snapshot_filename(
         server_name=server_name,
         libraries=libraries,
         captured_at=captured_at_ts,
     )
-    # v0.13.x: optional prefix lets callers tag auto-captured snapshots
+    # Optional prefix lets callers tag auto-captured snapshots
     # so the Snapshots tab shows them distinctly from manual runs. The
     # pre-Replace safety belt uses "[pre-replace safety]" to mark its
     # rollback points - end users can find them by name when they need
@@ -3541,23 +4566,21 @@ def _capture_snapshot_after_run(
     row_counts = {k: v for k, v in capture_counts.items() if k != "file_size"}
     file_size = int(capture_counts.get("file_size") or 0)
 
-    # v0.13.x: granular finalize labels so the dashboard reports each
-    # post-engine step. Pre-fix, the only post-100% signal was a single
-    # "writing snapshot to database" label set before the heavy build
-    # ran - everything else was silent. Now: build_db -> registry insert
+    # Granular finalize labels so the dashboard reports each
+    # post-engine step. build_db -> registry insert
     # -> optional sidecar render each get their own labelled phase, and
-    # the end user sees progress all the way to STATE_COMPLETED.
+    # the end user sees progress all the way to STATE_COMPLETED. A
+    # single pre-build label would leave every later step silent.
     _dash_finalize = state.get_dashboard()
     if _dash_finalize is not None:
         _dash_finalize.set_finalizing("registering snapshot")
 
     try:
-        # Phase D (admin-management follow-up, 2026-05-15): synthesize
-        # the snapshot description string before register() so the
-        # registry row carries the same one-line summary that's
+        # Synthesize the snapshot description string before register()
+        # so the registry row carries the same one-line summary that's
         # already stamped into the .db file's snapshot_meta. Format
         # mirrors snapshot_capture._synthesize_snapshot_description.
-        # Phase E (2026-05-16): pulls counts from the freshly-written
+        # Counts are pulled from the freshly-written
         # snapshot.db rather than the cumulative media.db. ``total``
         # is the full roster (owner + every managed user the engine
         # attempted); ``with_data`` is the subset that contributed
@@ -3605,8 +4628,8 @@ def _capture_snapshot_after_run(
             row_counts.get("watch_events", "?"),
         )
         # End user opt-in: render the .plexexport.json sidecar now so
-        # the first Download click is instant. Off by default - this
-        # is the legacy v0.11-era behaviour brought back as a checkbox.
+        # the first Download click is instant. Off by default; exposed
+        # as a checkbox.
         if rec.params.get("prebuild_json_sidecar"):
             if _dash_finalize is not None:
                 _dash_finalize.set_finalizing("building JSON sidecar")
@@ -3630,38 +4653,11 @@ def _capture_snapshot_after_run(
         log.exception("snapshot_registry.register failed for %s", snapshot_db_path)
         raise
 
-    # v0.13.x: surface the snapshot id back to the caller. The
+    # Surface the snapshot id back to the caller. The
     # pre-Replace safety belt path stashes it on rec.summary so the
     # end user can recover the pre-restore state if the Replace
     # turned out to be wrong. Regular snapshot jobs ignore the return.
     return str(registered["id"]) if isinstance(registered, dict) and registered.get("id") else None
-
-
-def _finalise_run_dir(run_log_dir: str) -> None:
-    """
-    Mirror :func:`plexmigrate.main`'s end-of-run PASS/FAIL rename so a
-    job invoked over the API leaves the same on-disk artefact a CLI
-    run does. Best-effort: a rename failure on a locked file is logged
-    and ignored - the logs themselves are still readable.
-    """
-    # Run-logging-disabled path: no run dir to rename.
-    if not run_log_dir:
-        return
-    p = Path(run_log_dir)
-    if not p.exists():
-        return
-    errors_file = p / "errors.log"
-    passed = not (errors_file.exists() and errors_file.stat().st_size > 0)
-    suffix = "PASS" if passed else "FAIL"
-    final = p.parent / f"{p.name}_{suffix}"
-    try:
-        p.rename(final)
-    except OSError:
-        # On Windows, a still-open handle blocks the rename. We've
-        # already closed our handlers, but any background scan-cache
-        # thread the engine may have spawned could still hold one.
-        # Leaving the directory under its temporary name is acceptable.
-        pass
 
 
 # ── Module-level singleton ────────────────────────────────────────────────────

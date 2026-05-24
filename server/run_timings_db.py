@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from server.persistence import get_data_dir
+from server._db_connect import apply_additive_columns, open_db
 
 
 log = logging.getLogger("plexmigrate.server.run_timings_db")
@@ -73,7 +74,7 @@ _initialised = False
 
 
 # Default retention when no settings.json value is present or readable.
-# Matches the value documented in CLAUDE.md / Plan[DEVOPS] for
+# Matches the value documented in CLAUDE.md for
 # ``run_timings_retention_count``.
 DEFAULT_RETENTION_COUNT = 200
 
@@ -86,49 +87,22 @@ def _connect() -> sqlite3.Connection:
     """Fresh connection per call. The persistence path is short-lived
     (write a batch, close); long-lived connections would add no benefit
     and complicate tests that swap the data dir between cases."""
-    conn = sqlite3.connect(str(_db_path()), timeout=30.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    return open_db(
+        _db_path(),
+        label="run_timings.db",
+        check_same_thread=True,
+        foreign_keys=False,
+        synchronous_normal=True,
+        chmod_sidecars=False,
+    )
 
 
 _SCHEMA = """
--- Adaptive ETA per-bucket regression statistics. One row per
--- (server_id, label, library_type, bulk_strategy) bucket. Each
--- row carries the EMA-decayed sufficient statistics for an online
--- weighted linear regression duration ~ intercept + slope * items.
--- Updated by services.eta_training.ETATrainer at run completion;
--- read by GET /api/eta/predict.
---
--- The old 'eta_weights' table (EMA-on-duration shape, size_bucket
--- in the key) is dropped on startup if present. Pre-release Legacy
--- Support Policy governs: schema bumps free, end user recovery is
--- run_timings backfill into the new shape.
+-- Retired: the adaptive-ETA predictor was removed. Its legacy
+-- eta_weights store and the eta_buckets store are dropped on
+-- startup if a pre-retirement install still has them.
 DROP TABLE IF EXISTS eta_weights;
-CREATE TABLE IF NOT EXISTS eta_buckets (
-    server_id        TEXT NOT NULL,
-    label            TEXT NOT NULL,
-    library_type     TEXT NOT NULL,
-    bulk_strategy    TEXT NOT NULL,
-    sum_w            REAL NOT NULL,
-    sum_wx           REAL NOT NULL,
-    sum_wy           REAL NOT NULL,
-    sum_wxx          REAL NOT NULL,
-    sum_wxy          REAL NOT NULL,
-    sum_wyy          REAL NOT NULL,
-    sample_count     INTEGER NOT NULL,
-    last_observed_at REAL NOT NULL,
-    sum_w_ping       REAL NOT NULL DEFAULT 0,
-    sum_wp           REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (server_id, label, library_type, bulk_strategy)
-);
-CREATE INDEX IF NOT EXISTS idx_eta_buckets_label
-    ON eta_buckets(label);
-CREATE INDEX IF NOT EXISTS idx_eta_buckets_server
-    ON eta_buckets(server_id);
-CREATE INDEX IF NOT EXISTS idx_eta_buckets_observed
-    ON eta_buckets(last_observed_at);
+DROP TABLE IF EXISTS eta_buckets;
 
 CREATE TABLE IF NOT EXISTS run_timings (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,10 +127,10 @@ CREATE INDEX IF NOT EXISTS idx_run_timings_label
 CREATE INDEX IF NOT EXISTS idx_run_timings_recorded
     ON run_timings(recorded_at);
 
--- Phase 4 of the dashboard / log reorg: one row per RUN (not per
--- timing entry). Drives the Servers > Recent Runtimes panel. Joined
--- with run_timings at query time when the end user drills into a
--- specific row from the Recent Runtimes table.
+-- One row per RUN (not per timing entry). Drives the Servers >
+-- Recent Runtimes panel. Joined with run_timings at query time
+-- when the end user drills into a specific row from the Recent
+-- Runtimes table.
 CREATE TABLE IF NOT EXISTS run_history (
     run_id              TEXT PRIMARY KEY,
     started_at          REAL NOT NULL,
@@ -184,8 +158,22 @@ CREATE INDEX IF NOT EXISTS idx_run_history_started
 """
 
 
+# Additive column migrations for tables created on a pre-release
+# install before a column was added to CREATE TABLE. Each entry
+# is (table_name, column_definition). Empty since the ETA buckets
+# table was retired.
+_ADDITIVE_COLUMN_MIGRATIONS: List[tuple] = []
+
+
 def init_db() -> None:
-    """Create ``run_timings.db`` and apply schema. Idempotent."""
+    """Create ``run_timings.db`` and apply schema. Idempotent.
+
+    Also runs additive column migrations for tables that may have
+    been created on a pre-release install before columns were
+    added to the CREATE TABLE statement. Each ADD COLUMN is
+    wrapped in its own try/except so a partial migration history
+    doesn't block startup.
+    """
     global _initialised
     with _init_lock:
         if _initialised:
@@ -194,6 +182,8 @@ def init_db() -> None:
         conn = _connect()
         try:
             conn.executescript(_SCHEMA)
+            # Additive column migrations onto pre-existing installs.
+            apply_additive_columns(conn, _ADDITIVE_COLUMN_MIGRATIONS)
         finally:
             conn.close()
         _initialised = True
@@ -361,17 +351,17 @@ def list_recent_runs(*, limit: int = 25) -> List[Dict[str, Any]]:
     the dashboard's runtime-breakdown panel to render the recent-runs
     sidebar.
 
-    2026-05-17 bug fix: this previously drove off the ``run_timings``
-    table (per-operation timing rows). Restore jobs that do not emit
-    per-operation timings via ``services.run_timer`` produced zero
-    rows in run_timings and were silently invisible to the dashboard.
-    The fix drives off ``run_history`` (the canonical one-row-per-job
-    table populated by every job's central finally block via
+    Drives off ``run_history`` (the canonical one-row-per-job table
+    populated by every job's central finally block via
     :func:`record_run_history`) and LEFT-JOINs the per-operation
-    aggregates from run_timings for entry_count + total_items. Runs
-    without per-operation timings still surface with their wall-clock
-    duration + job_type + state; the dashboard's drilldown returns
-    "No entries recorded for this run" honestly when expanded.
+    aggregates from run_timings for entry_count + total_items.
+    Driving off run_timings instead would miss restore jobs that do
+    not emit per-operation timings via ``services.run_timer``: they
+    produce zero rows in run_timings and would be silently invisible
+    to the dashboard. Runs without per-operation timings still
+    surface with their wall-clock duration + job_type + state; the
+    dashboard's drilldown returns "No entries recorded for this run"
+    honestly when expanded.
     """
     init_db()
     conn = _connect()
@@ -499,7 +489,7 @@ def get_label_history(
     ]
 
 
-# ── run_history (per-run summary, Phase 4 of the log reorg) ────────────────
+# ── run_history (per-run summary) ─────────────────────────────────────────────
 
 
 _RUN_HISTORY_DEFAULT_RETENTION = 200
@@ -716,259 +706,13 @@ def enforce_run_history_retention(
         conn.close()
 
 
-# ── ETA bucket regression statistics ────────────────────────────────────────
-
-
-def load_all_eta_buckets() -> List[Dict[str, Any]]:
-    """
-    Return every persisted ETA bucket row. The trainer loads this
-    once on first use into an in-memory dict keyed by BucketKey, then
-    writes back on every run completion.
-
-    Each row carries: {server_id, label, library_type, bulk_strategy,
-                       sum_w, sum_wx, sum_wy, sum_wxx, sum_wxy, sum_wyy,
-                       sample_count, last_observed_at}.
-    """
-    init_db()
-    conn = _connect()
-    try:
-        rows = conn.execute(
-            """
-            SELECT server_id, label, library_type, bulk_strategy,
-                   sum_w, sum_wx, sum_wy, sum_wxx, sum_wxy, sum_wyy,
-                   sample_count, last_observed_at,
-                   sum_w_ping, sum_wp
-            FROM eta_buckets
-            """,
-        ).fetchall()
-    finally:
-        conn.close()
-    return [
-        {
-            "server_id": r["server_id"],
-            "label": r["label"],
-            "library_type": r["library_type"],
-            "bulk_strategy": r["bulk_strategy"],
-            "sum_w": float(r["sum_w"]),
-            "sum_wx": float(r["sum_wx"]),
-            "sum_wy": float(r["sum_wy"]),
-            "sum_wxx": float(r["sum_wxx"]),
-            "sum_wxy": float(r["sum_wxy"]),
-            "sum_wyy": float(r["sum_wyy"]),
-            "sample_count": int(r["sample_count"]),
-            "last_observed_at": float(r["last_observed_at"]),
-            "sum_w_ping": float(r["sum_w_ping"] or 0.0),
-            "sum_wp": float(r["sum_wp"] or 0.0),
-        }
-        for r in rows
-    ]
-
-
-def persist_eta_buckets(rows: Iterable[Dict[str, Any]]) -> int:
-    """
-    Upsert one or more eta_buckets rows in a single transaction.
-    Each row must carry the full primary key (server_id, label,
-    library_type, bulk_strategy) plus the eight learned columns.
-    Returns the number of rows upserted.
-
-    Used by the trainer's batch_update at run completion. Safe to
-    call with an empty iterable (no-op, returns 0).
-    """
-    init_db()
-    payload = list(rows)
-    if not payload:
-        return 0
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        try:
-            conn.executemany(
-                """
-                INSERT INTO eta_buckets (
-                    server_id, label, library_type, bulk_strategy,
-                    sum_w, sum_wx, sum_wy, sum_wxx, sum_wxy, sum_wyy,
-                    sample_count, last_observed_at,
-                    sum_w_ping, sum_wp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (server_id, label, library_type, bulk_strategy)
-                DO UPDATE SET
-                    sum_w = excluded.sum_w,
-                    sum_wx = excluded.sum_wx,
-                    sum_wy = excluded.sum_wy,
-                    sum_wxx = excluded.sum_wxx,
-                    sum_wxy = excluded.sum_wxy,
-                    sum_wyy = excluded.sum_wyy,
-                    sample_count = excluded.sample_count,
-                    last_observed_at = excluded.last_observed_at,
-                    sum_w_ping = excluded.sum_w_ping,
-                    sum_wp = excluded.sum_wp
-                """,
-                [
-                    (
-                        str(r["server_id"] or ""),
-                        str(r["label"] or ""),
-                        str(r["library_type"] or ""),
-                        str(r["bulk_strategy"] or ""),
-                        float(r["sum_w"]),
-                        float(r["sum_wx"]),
-                        float(r["sum_wy"]),
-                        float(r["sum_wxx"]),
-                        float(r["sum_wxy"]),
-                        float(r["sum_wyy"]),
-                        int(r["sample_count"]),
-                        float(r["last_observed_at"]),
-                        float(r.get("sum_w_ping", 0.0) or 0.0),
-                        float(r.get("sum_wp", 0.0) or 0.0),
-                    )
-                    for r in payload
-                ],
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-    finally:
-        conn.close()
-    return len(payload)
-
-
-def count_eta_buckets() -> int:
-    """Return the number of rows in eta_buckets. Used by the startup
-    auto-backfill hook to decide whether the trainer needs warming
-    from run_timings history."""
-    init_db()
-    conn = _connect()
-    try:
-        row = conn.execute("SELECT COUNT(*) AS c FROM eta_buckets").fetchone()
-    finally:
-        conn.close()
-    return int(row["c"] or 0)
-
-
-def iter_all_run_timings_for_backfill() -> List[Dict[str, Any]]:
-    """
-    Return every row in ``run_timings`` ordered by ``started_at``
-    ascending. Used by the ETA trainer's backfill path: feeds
-    historical entries through the trainer in chronological order so
-    older observations decay correctly under the EMA's recency bias.
-
-    Each row carries the minimum the trainer needs to build a
-    BucketKey and call update() on the right bucket: server_id,
-    label, items_processed, duration_seconds, started_at, plus the
-    JSON-decoded ``extra`` dict (for library_type + bulk_strategy).
-
-    The full table is bounded by ``run_timings_retention_count``
-    (default 200 runs); the rows-per-run multiplier is typically
-    10-30 entries, so the full set is bounded at ~6k rows and a
-    single ``SELECT *`` does not need pagination.
-    """
-    init_db()
-    conn = _connect()
-    try:
-        rows = conn.execute(
-            """
-            SELECT run_id, label, server_id, library, user_handle,
-                   started_at, ended_at, duration_seconds,
-                   items_processed, extra_json
-            FROM run_timings
-            ORDER BY started_at ASC
-            """,
-        ).fetchall()
-    finally:
-        conn.close()
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        extra: Dict[str, Any] = {}
-        raw = r["extra_json"]
-        if raw:
-            try:
-                extra = json.loads(raw) or {}
-            except Exception:
-                extra = {}
-        out.append({
-            "run_id": r["run_id"],
-            "label": r["label"],
-            "server_id": r["server_id"],
-            "library": r["library"],
-            "user_handle": r["user_handle"],
-            "started_at": float(r["started_at"] or 0.0),
-            "ended_at": float(r["ended_at"] or 0.0),
-            "duration_seconds": float(r["duration_seconds"] or 0.0),
-            "items_processed": r["items_processed"],
-            "extra": extra,
-        })
-    return out
-
-
-def repair_missing_server_ids() -> Dict[str, int]:
-    """
-    Backfill missing ``server_id`` values on existing ``run_timings``
-    rows by joining against ``run_history`` on ``run_id``. The earlier
-    bug in ``services.snapshotter.snapshot_library`` produced ~2,000
-    timing entries with ``server_id=NULL`` because the per-library
-    dispatch never threaded the kwarg through; once that's fixed,
-    future runs are correct but the legacy entries still poison the
-    trainer's backfill.
-
-    Returns ``{"updated": N, "still_orphan": M}``. Orphans are entries
-    whose run_id has no ``run_history`` row (older runs from before
-    that table existed).
-    """
-    init_db()
-    conn = _connect()
-    try:
-        conn.execute("BEGIN")
-        try:
-            cur = conn.execute(
-                """
-                UPDATE run_timings
-                SET server_id = (
-                    SELECT server_id FROM run_history
-                    WHERE run_history.run_id = run_timings.run_id
-                )
-                WHERE (server_id IS NULL OR server_id = '')
-                  AND EXISTS (
-                    SELECT 1 FROM run_history
-                    WHERE run_history.run_id = run_timings.run_id
-                      AND run_history.server_id IS NOT NULL
-                      AND run_history.server_id != ''
-                  )
-                """,
-            )
-            updated = int(cur.rowcount or 0)
-            still_orphan_row = conn.execute(
-                "SELECT COUNT(*) FROM run_timings "
-                "WHERE server_id IS NULL OR server_id = ''"
-            ).fetchone()
-            still_orphan = int(still_orphan_row[0] or 0)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-    finally:
-        conn.close()
-    return {"updated": updated, "still_orphan": still_orphan}
-
-
-def flush_all_eta_buckets() -> int:
-    """Wipe every row in eta_buckets. Wired to the end user's
-    Settings ETA Training "Flush all training data" button. Returns
-    the count of rows deleted so the UI can confirm the operation
-    landed."""
-    init_db()
-    conn = _connect()
-    try:
-        cur = conn.execute("DELETE FROM eta_buckets")
-        return int(cur.rowcount or 0)
-    finally:
-        conn.close()
+# ── Bulk reset ───────────────────────────────────────────────────────────────
 
 
 def flush_all_run_timings() -> int:
-    """Wipe every row in run_timings. Pairs with flush_all_eta_buckets
-    when the end user wants a true zero-state reset; without this, the
-    auto-backfill on next boot would repopulate eta_buckets from the
-    run_timings history. Returns the count of rows deleted."""
+    """Wipe every row in run_timings. Used when the end user wants a
+    true zero-state reset of the run-timing history. Returns the count
+    of rows deleted."""
     init_db()
     conn = _connect()
     try:
@@ -977,32 +721,6 @@ def flush_all_run_timings() -> int:
     finally:
         conn.close()
 
-
-def reset_eta_buckets_for_server(server_id: str) -> int:
-    """
-    Delete every eta_buckets row for one server. Wired to the
-    end user-facing reset button (D-RESET in the plan): "I just
-    upgraded the server's storage; the old timings are wrong."
-    Returns the number of rows deleted.
-
-    Empty / falsy ``server_id`` is a no-op (no surprise wipe of every
-    server's buckets).
-    """
-    if not server_id:
-        return 0
-    init_db()
-    conn = _connect()
-    try:
-        cur = conn.execute(
-            "DELETE FROM eta_buckets WHERE server_id = ?",
-            (str(server_id),),
-        )
-        return int(cur.rowcount or 0)
-    finally:
-        conn.close()
-
-
-# ── Test seam ───────────────────────────────────────────────────────────────
 
 def _close_for_tests() -> None:
     """Reset the init flag so a fresh data dir gets a fresh DB on the

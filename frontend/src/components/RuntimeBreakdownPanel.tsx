@@ -1,5 +1,4 @@
-// Runtime breakdown panel (Feature 1 phase 1.5; Phase 4 leak fix
-// 2026-05-15).
+// Runtime breakdown panel.
 //
 // Reads the per-run timing rows recorded by services.run_timer +
 // server.run_timings_db. The dashboard surface ONLY shows the most
@@ -21,6 +20,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { api, RuntimeRunSummary, RuntimeEntry } from '../api';
+import { errorText, formatTimestamp } from '../utils/format';
 
 // Job-state shape the dashboard hands down so the panel can detect
 // the running -> terminal transition and refetch automatically.
@@ -37,7 +37,9 @@ interface RuntimeBreakdownPanelProps {
 
 // Terminal job states the worker sets when a job ends. Mirrors the
 // list jobs.py uses to decide when to write a run_history row.
-const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_STATES = new Set([
+  'completed', 'completed_with_errors', 'failed', 'cancelled',
+]);
 
 const LS_KEY = 'plexmigrate.runtime_panel_visible';
 
@@ -70,11 +72,6 @@ function formatDuration(seconds: number): string {
   return `${m}m ${s.toString().padStart(2, '0')}s`;
 }
 
-function formatTimestamp(epochSeconds: number): string {
-  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return '-';
-  const d = new Date(epochSeconds * 1000);
-  return d.toLocaleString();
-}
 
 function formatExtra(extra: Record<string, unknown>): string {
   const keys = Object.keys(extra || {});
@@ -93,11 +90,11 @@ export function RuntimeBreakdownPanel({ job }: RuntimeBreakdownPanelProps = {}) 
   const [loadingEntries, setLoadingEntries] = useState<boolean>(false);
   const [entriesError, setEntriesError] = useState<string | null>(null);
 
-  // 2026-05-17 bug fix: auto-refresh the panel when a job transitions
-  // from 'running' to a terminal state. Pre-fix, the panel only
-  // fetched on mount + on manual Refresh click, so after a restore
-  // job finished the end user saw the previous job's row until they
-  // clicked Refresh. We track the previous job state in a ref and
+  // Auto-refresh the panel when a job transitions from 'running' to
+  // a terminal state. Without this the panel only fetches on mount +
+  // on manual Refresh click, so after a restore job finishes the
+  // user keeps seeing the previous job's row until they click
+  // Refresh. We track the previous job state in a ref and
   // fire refreshRuns() on the running -> terminal edge.
   const prevJobStateRef = useRef<string | null>(null);
 
@@ -110,14 +107,14 @@ export function RuntimeBreakdownPanel({ job }: RuntimeBreakdownPanelProps = {}) 
     setLoadingRuns(true);
     setRunsError(null);
     try {
-      // Phase 4 leak fix: the dashboard ONLY shows the most recent
+      // The dashboard ONLY shows the most recent
       // run. Asking for limit=1 prevents the panel from ever
       // accumulating a list of older runs on the live dashboard.
       // Historical browsing lives at Servers > Recent Runtimes.
       const resp = await api.listRuntimeRuns(1);
       setRuns(resp.runs);
     } catch (e) {
-      setRunsError(e instanceof Error ? e.message : String(e));
+      setRunsError(errorText(e));
     } finally {
       setLoadingRuns(false);
     }
@@ -171,7 +168,7 @@ export function RuntimeBreakdownPanel({ job }: RuntimeBreakdownPanelProps = {}) 
       const resp = await api.getRuntimeRunDetail(runId);
       setEntries(resp.entries);
     } catch (e) {
-      setEntriesError(e instanceof Error ? e.message : String(e));
+      setEntriesError(errorText(e));
     } finally {
       setLoadingEntries(false);
     }

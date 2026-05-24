@@ -48,11 +48,10 @@ log = logging.getLogger("plexmigrate.server.scheduler")
 # fire at minute resolution, so half-minute polling guarantees no fire
 # is missed by more than 30 s.
 #
-# Hot-reload (Phase 3): the loop reads ``tunables.scheduler_tick_seconds()``
-# at the top of each iteration so a settings save takes effect within
-# at most the previous tick's window. The constant below is the
-# fallback used when the tunables module isn't importable (CLI-only
-# checkouts) and matches the historical hardcoded value.
+# Hot-reload: the loop reads ``tunables.scheduler_tick_seconds()`` at
+# the top of each iteration so a settings save takes effect within at
+# most the previous tick's window. The constant below is the fallback
+# used when the tunables module isn't importable (CLI-only checkouts).
 _TICK_SECONDS_FALLBACK = 30
 
 
@@ -133,6 +132,7 @@ class Scheduler:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._started = False
+        self._start_lock = threading.Lock()
 
     def start(self) -> None:
         """
@@ -147,9 +147,10 @@ class Scheduler:
         on the ones I missed", and silently spawning queued jobs
         after a downtime would be surprising.
         """
-        if self._started:
-            return
-        self._started = True
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
         # Refresh next_run_at for everything on disk so the first
         # tick has a consistent view.
         rows = persistence.load_schedules()
@@ -182,9 +183,9 @@ class Scheduler:
                 log.exception("Scheduler tick failed: %s", exc)
             # ``Event.wait`` returns early if .stop() is called while
             # we're sleeping - that gives us a clean shutdown.
-            # Hot-reload: read the cadence each iteration so a save
-            # to ``tunables.scheduler_tick_seconds`` takes effect on
-            # the next wake without a process restart.
+            # Read the cadence each iteration so a save to
+            # ``tunables.scheduler_tick_seconds`` takes effect on the
+            # next wake without a process restart.
             try:
                 from services.tunables import scheduler_tick_seconds
                 tick = scheduler_tick_seconds()
@@ -199,14 +200,13 @@ class Scheduler:
         - we let the job queue serialise them naturally), and writes
         the updated next_run_at values back.
 
-        Multi-server (v0.9.0): each schedule carries a
-        ``source_server_name`` that resolves against the registry at
-        fire time. A schedule missing this field (carried over from a
-        pre-v0.9.0 install) is skipped with a warning and its
-        ``next_run_at`` is still rolled forward - we don't keep
-        firing the same broken schedule once per minute, but we also
-        don't auto-pick a server because that risks running against
-        the wrong server.
+        Each schedule carries a ``source_server_name`` that resolves
+        against the registry at fire time. A schedule missing this
+        field (carried over from a legacy install) is skipped with a
+        warning and its ``next_run_at`` is still rolled forward - we
+        don't keep firing the same broken schedule once per minute, but
+        we also don't auto-pick a server because that risks running
+        against the wrong server.
         """
         rows = persistence.load_schedules()
         if not rows:
@@ -217,24 +217,23 @@ class Scheduler:
         for row in rows:
             if not row.get("enabled", True):
                 continue
-            # Fix for a v0.8.0 bug: we used to call ensure_next_run_at()
-            # here, but that helper rolls a stale next_run_at forward,
-            # which meant any schedule that became due since the last
-            # tick got rolled past the fire-check below and never
-            # actually fired. The startup pass in :func:`Scheduler.start`
-            # already rolls forward any schedules that were due during a
-            # downtime, so the tick only needs to handle the corner case
-            # of a malformed row missing next_run_at altogether.
+            # Do NOT call ensure_next_run_at() here: that helper rolls
+            # a stale next_run_at forward, which would roll any
+            # schedule that became due since the last tick past the
+            # fire-check below so it never actually fires. The startup
+            # pass in :func:`Scheduler.start` already rolls forward any
+            # schedules that were due during a downtime, so the tick
+            # only needs to handle the corner case of a malformed row
+            # missing next_run_at altogether.
             nxt = row.get("next_run_at")
             if not isinstance(nxt, (int, float)):
                 row["next_run_at"] = _compute_next(row, now=now_ts)
                 mutated = True
                 continue
             if row["next_run_at"] <= now_ts:
-                # Task 2 (admin-management plan follow-up, 2026-05-15):
-                # schedules can fire snapshot OR restore OR direct.
-                # Pre-Task-2 schedules have no ``mode`` field; treat
-                # them as snapshot so behaviour on upgrade is identical.
+                # Schedules can fire snapshot OR restore OR direct.
+                # Legacy schedules have no ``mode`` field; treat them
+                # as snapshot so behaviour on upgrade is identical.
                 mode = str(row.get("mode") or "snapshot").strip()
                 if mode not in ("snapshot", "restore", "direct"):
                     log.warning(
@@ -354,12 +353,11 @@ class Scheduler:
                 if mode == "snapshot" and "prebuild_json_sidecar" in row:
                     params["prebuild_json_sidecar"] = bool(row["prebuild_json_sidecar"])
 
-                # ── Phase C (admin-management follow-up, 2026-05-15):
-                # per-library metric map. The schedule's ScheduleIn
+                # ── Per-library metric map. The schedule's ScheduleIn
                 # validator already expanded any global include_*
                 # flags into library_metrics at save time, so the row
                 # on disk should have a populated library_metrics
-                # entry. Pass it straight through to the fired job.
+                # entry. Pass it straight through to the fired job. ──
                 if row.get("library_metrics"):
                     params["library_metrics"] = row["library_metrics"]
 
@@ -383,49 +381,47 @@ class Scheduler:
                 if isinstance(_uf, list):
                     params["user_filter"] = [str(s) for s in _uf if isinstance(s, str)]
 
-                # ── Schedules-alignment additions (2026-05-16) ──────
-                # Forward the new per-job knobs that bring the schedule
-                # row to Run Job submit parity. Each field is only
+                # ── Run Job parity knobs. ──
+                # Forward the per-job knobs that bring the schedule row
+                # to Run Job submit parity. Each field is only
                 # forwarded when present and meaningful on the disk row;
-                # pre-alignment schedules omit them and the engine falls
-                # back to the same defaults Run Job uses on a fresh form.
-                # D-OWNER (a): per-user fan-out toggle. Default True
-                # matches the adapter engines' include_managed_users
-                # kwarg. We forward unconditionally so a hand-edited row
-                # that flipped it to False is honored.
+                # legacy schedules omit them and the engine falls back
+                # to the same defaults Run Job uses on a fresh form.
+                # Per-user fan-out toggle. Default True matches the
+                # adapter engines' include_managed_users kwarg. We
+                # forward unconditionally so a hand-edited row that
+                # flipped it to False is honored.
                 if "include_managed_users" in row:
                     params["include_managed_users"] = bool(row["include_managed_users"])
-                # D-RATE: per-job rating-mapping policy. Cross-backend
-                # routes (source.service_type != dest.service_type)
-                # consult these; same-backend routes ignore them. The
-                # engine reads rate_threshold only when rate_mode ==
-                # 'tunable' (validator gates this combination too).
+                # Per-job rating-mapping policy. Cross-backend routes
+                # (source.service_type != dest.service_type) consult
+                # these; same-backend routes ignore them. The engine
+                # reads rate_threshold only when rate_mode == 'tunable'
+                # (validator gates this combination too).
                 _rm = row.get("rate_mode")
                 if _rm in ("default", "tunable", "numeric_only"):
                     params["rate_mode"] = _rm
                 _rt = row.get("rate_threshold")
                 if isinstance(_rt, (int, float)):
                     params["rate_threshold"] = float(_rt)
-                # D-OWNER (b): pre-confirmed user-create specs. The
-                # adapter engine reads this list and idempotently
-                # creates missing destination users before the data
-                # write. List of dicts shaped like ProposedUser /
-                # UserCreateSpec.
+                # Pre-confirmed user-create specs. The adapter engine
+                # reads this list and idempotently creates missing
+                # destination users before the data write. List of
+                # dicts shaped like ProposedUser / UserCreateSpec.
                 _ucs = row.get("user_create_specs")
                 if isinstance(_ucs, list) and _ucs:
                     params["user_create_specs"] = _ucs
-                # Per-Run Settings parity: overwrite_playlists. Run Job
-                # exposes this in Per-Run Settings > General; the engine
-                # treats it as a back-compat no-op today but Run Job
-                # forwards it on every submit so we mirror that on
-                # scheduled fires too.
+                # overwrite_playlists. Run Job exposes this in Per-Run
+                # Settings > General; the engine treats it as a
+                # back-compat no-op today but Run Job forwards it on
+                # every submit so we mirror that on scheduled fires too.
                 if row.get("overwrite_playlists") is not None:
                     params["overwrite_playlists"] = bool(row["overwrite_playlists"])
-                # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: per-run mixed-
-                # media playlist overrides. None on the row means
-                # "inherit global tunable", so we forward only when the
-                # end user set an explicit value. Same field set lives
-                # on SnapshotJobIn / RestoreJobIn / DirectTransferIn.
+                # Per-run mixed-media playlist overrides. None on the
+                # row means "inherit global tunable", so we forward
+                # only when the end user set an explicit value. Same
+                # field set lives on SnapshotJobIn / RestoreJobIn /
+                # DirectTransferIn.
                 for _mm_field in (
                     "mixed_media_behavior",
                     "mixed_media_dominance_threshold",
@@ -463,7 +459,22 @@ class Scheduler:
                     rec.job_id,
                     dt.datetime.fromtimestamp(row["next_run_at"]).isoformat(timespec="seconds"),
                 )
+                # Persist the rolled-forward next_run_at immediately,
+                # before processing any further schedule in this tick.
+                # The per-row body is not wrapped in try/except: a
+                # later submit_*() that raises propagates out of _tick
+                # and the trailing save below never runs. Without this
+                # in-loop write, every schedule already fired this
+                # tick would lose its next_run_at roll-forward and
+                # re-fire next tick - duplicate snapshots, or worse,
+                # duplicate Replace-mode restores.
+                persistence.save_schedules(rows)
         if mutated:
+            # Final consolidated write. Redundant after the in-loop
+            # save above when a fire occurred, but still required to
+            # persist roll-forward-only mutations (malformed rows,
+            # unfireable schedules) whose `continue` paths never reach
+            # the in-loop save.
             persistence.save_schedules(rows)
 
 
@@ -486,9 +497,8 @@ def list_schedules() -> List[Dict[str, Any]]:
     Used by ``GET /api/schedules`` so the frontend always sees an
     up-to-date "next run" column even right after a fire.
 
-    Also augments each row with ``resolutions_status`` per
-    Plan[CROSS-PLATFORM-PREFLIGHT] step 5: a status badge for the
-    schedule list UI based on whether the row's stored
+    Also augments each row with ``resolutions_status``: a status badge
+    for the schedule list UI based on whether the row's stored
     cross_platform_resolutions still point at users that exist on
     the current destination roster.
     """

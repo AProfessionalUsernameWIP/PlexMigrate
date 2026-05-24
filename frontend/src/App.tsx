@@ -3,7 +3,7 @@
 // child components can read the latest snapshot from props without
 // each owning its own socket.
 //
-// v0.11.0 - opt-in JWT auth wraps the whole app. On mount we hit
+// Opt-in JWT auth wraps the whole app. On mount we hit
 // /api/auth/status once to decide what to render:
 //   * auth_enabled = false               → render <Main /> straight away
 //   * auth_enabled, setup_needed         → render <SetupPage />
@@ -14,12 +14,11 @@
 //
 // The access token lives in component state only - never in
 // localStorage, sessionStorage, or cookies. Closing the tab logs the
-// end user out. This is the deliberate trade-off documented in
-// roadmapplan4.md: a locally-hosted tool exposed beyond localhost
-// should optimise for "no persisted creds in the browser" over
-// "stay-signed-in" UX.
+// user out. This is a deliberate trade-off: a locally-hosted tool
+// exposed beyond localhost should optimise for "no persisted creds
+// in the browser" over "stay-signed-in" UX.
 
-import { useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import {
   AuthStatus,
   MeResponse,
@@ -31,49 +30,60 @@ import {
   setAccessToken,
   ServerTime,
   DashboardFrame,
+  JobPayload,
 } from './api';
 import { AuthProvider, ROLE_RANK, useAuthContext } from './contexts/AuthContext';
 import { ClockProvider, useClockDisplay } from './contexts/ClockContext';
 import { usePermission } from './hooks/usePermission';
+import { useNowTick } from './hooks/useNowTick';
+import { pausableInterval } from './utils/pausableInterval';
+import { ConfirmProvider } from './components/ConfirmModal';
 import { DashboardPanel } from './components/DashboardPanel';
 import { ElevateModal } from './components/ElevateModal';
 import { RuntimeBreakdownPanel } from './components/RuntimeBreakdownPanel';
-import { DeveloperPanel } from './components/DeveloperPanel';
+import { DashboardDownloadLogsPanel } from './components/DashboardDownloadLogsPanel';import { ThemeSwitcher } from './components/ThemeSwitcher';
+import { Modal } from './components/Modal';
 import { ServerLogsPanel } from './components/ServerLogsPanel';
-import { JobFormPanel } from './components/JobFormPanel';
-import { SchedulesPanel } from './components/SchedulesPanel';
-import { PlaylistManagementPanel } from './components/PlaylistManagementPanel';
+import { SchedulesPanel } from './components/SchedulesPanel';import { ServerSyncingPage } from './components/ServerSyncingPage';
 import { LogsPanel } from './components/LogsPanel';
 import { ApplicationLogsPanel } from './components/ApplicationLogsPanel';
 import { ExportsPanel } from './components/ExportsPanel';
-import { SettingsPanel } from './components/SettingsPanel';
 import { AccountsPanel } from './components/AccountsPanel';
 import { AccountSettingsPanel } from './components/AccountSettingsPanel';
 import { UserAccountsExplorer } from './components/UserAccountsExplorer';
-import { ServersPanel } from './components/ServersPanel';
-import { NetworkingPanel } from './components/NetworkingPanel';
 import { ServerAdvancedSettingsPanel } from './components/ServerAdvancedSettingsPanel';
-import { RunDefaultsPanel } from './components/RunDefaultsPanel';
-import { TunablesPanel } from './components/TunablesPanel';
-import { DatabasesPanel } from './components/DatabasesPanel';
-import { AccessControlPanel } from './components/AccessControlPanel';
-import { UserManagementPanel } from './components/UserManagementPanel';
-import { LoginPage } from './components/LoginPage';
+import { RunDefaultsPanel } from './components/RunDefaultsPanel';import { AccessControlPanel } from './components/AccessControlPanel';import { LoginPage } from './components/LoginPage';
 import { SetupPage } from './components/SetupPage';
-import { UpgradeSplitModal } from './components/UpgradeSplitModal';
-import { InfoTip } from './components/InfoTip';
-import { HelpPanel } from './components/HelpPanel';
-import { TooltipProvider } from './contexts/TooltipContext';
+import { InfoTip } from './components/InfoTip';import { TooltipProvider } from './contexts/TooltipContext';
 import { ElevationProvider, useElevation } from './contexts/ElevationContext';
+import { BackendTintProvider, useBackendTint } from './contexts/BackendTintContext';
+
+// Heavy / rarely-visited routes are code-split via React.lazy so they
+// stay out of the initial bundle. Each panel is a named export, hence
+// the `.then` remap to the `default` shape React.lazy expects. The
+// Suspense boundary around <main> shows a brief loader on first open.
+const DeveloperPanel = lazy(() => import('./components/DeveloperPanel').then((m) => ({ default: m.DeveloperPanel })));
+const DevBlogPanel = lazy(() => import('./components/DevBlogPanel').then((m) => ({ default: m.DevBlogPanel })));
+const PlaylistManagementPanel = lazy(() => import('./components/PlaylistManagementPanel').then((m) => ({ default: m.PlaylistManagementPanel })));
+const NetworkingPanel = lazy(() => import('./components/NetworkingPanel').then((m) => ({ default: m.NetworkingPanel })));
+const TunablesPanel = lazy(() => import('./components/TunablesPanel').then((m) => ({ default: m.TunablesPanel })));
+const DatabasesPanel = lazy(() => import('./components/DatabasesPanel').then((m) => ({ default: m.DatabasesPanel })));
+const UserManagementPanel = lazy(() => import('./components/UserManagementPanel').then((m) => ({ default: m.UserManagementPanel })));
+const ServerCommandsPanel = lazy(() => import('./components/ServerCommandsPanel').then((m) => ({ default: m.ServerCommandsPanel })));
+const HelpPanel = lazy(() => import('./components/HelpPanel').then((m) => ({ default: m.HelpPanel })));
+const JobFormPanel = lazy(() => import('./components/JobFormPanel').then((m) => ({ default: m.JobFormPanel })));
+const SettingsPanel = lazy(() => import('./components/SettingsPanel').then((m) => ({ default: m.SettingsPanel })));
+const ServersPanel = lazy(() => import('./components/ServersPanel').then((m) => ({ default: m.ServersPanel })));
 
 // 'developer' is appended dynamically only when the backend reports
 // debug_mode=true on /api/health. Production builds never see it.
-type Tab = 'dashboard' | 'run' | 'servers' | 'account' | 'settings' | 'developer';
-// Sub-tabs nested under Run Job. Persists across navigation.
-type RunSubTab = 'run' | 'schedules' | 'playlists';
-// Sub-tabs nested under Servers. PR-7 removed 'logs' and 'snapshots'
-// from here and moved them under Settings; PR-10 added 'users' for
-// the User Management panel (end user+ only).
+type Tab = 'dashboard' | 'run' | 'servers' | 'account' | 'settings' | 'server_commands' | 'devblog' | 'developer';
+// Sub-tabs nested under Jobs. Persists across navigation. ``syncing``
+// (Server Syncing) is the fourth sub-tab since it's job-class work
+// like the other three.
+type RunSubTab = 'run' | 'schedules' | 'playlists' | 'syncing';
+// Sub-tabs nested under Servers. 'users' is the User Management
+// panel (end user+ only).
 type ServersSubTab = 'servers' | 'networking' | 'users' | 'run_defaults' | 'advanced' | 'exports' | 'logs';
 // Sub-tabs nested under Account. ``account`` is every end user's own
 // self-service surface (display name, password, clock). ``account_management``
@@ -83,9 +93,9 @@ type ServersSubTab = 'servers' | 'networking' | 'users' | 'run_defaults' | 'adva
 // roles that can only see one of the two (i.e. anyone without
 // ``users.manage``).
 type AccountSubTab = 'account' | 'account_management';
-// Sub-tabs nested under Settings. After the Account-promotion, the
-// Settings tab houses system-level end user views only: system
-// preferences, logs, exports, plus a flat Help reference page.
+// Sub-tabs nested under Settings. The Settings tab houses
+// system-level end user views only: system preferences, logs,
+// exports, plus a flat Help reference page.
 type SettingsSubTab = 'settings' | 'tunables' | 'databases' | 'logs' | 'help';
 
 // Inner nav inside the Account Management sub-tab. Three pages:
@@ -98,7 +108,7 @@ type AccountMgmtPage = 'db_admin' | 'user_accounts' | 'access_control';
 // Connection states surfaced in the topbar dot. "connecting" is the
 // initial state before the first WS frame; the dashboard panel uses
 // it to render a "Connecting…" placeholder instead of the "no job
-// running" empty state, which used to read as "didn't load".
+// running" empty state, which would otherwise read as "didn't load".
 type ConnState = 'connecting' | 'connected' | 'disconnected';
 
 // How long to keep showing the last snapshot's totals after a job
@@ -106,39 +116,82 @@ type ConnState = 'connecting' | 'connected' | 'disconnected';
 // engine returns, hiding the final counters the user just earned.
 const POST_FINISH_RETAIN_MS = 30_000;
 
+// localStorage key for the dashboard "keep results until next job"
+// toggle. Browser-local; a per-operator view preference.
+const DASHBOARD_PERSIST_KEY = 'hm.dashboard.persistUntilNextJob';
+
+// localStorage key for the retained dashboard snapshot itself. The
+// last finished job's frame is mirrored here so a "kept" dashboard
+// survives a full page reload, not just a same-session navigation.
+const DASHBOARD_SNAPSHOT_KEY = 'hm.dashboard.lastSnapshot';
+
+type RetainedSnapshot = { snap: DashboardFrame; at: number };
+
+// Read the persisted finished-job snapshot, if any. Tolerates a
+// missing, malformed, or unavailable store by returning null.
+function readPersistedSnapshot(): RetainedSnapshot | null {
+  try {
+    const raw = localStorage.getItem(DASHBOARD_SNAPSHOT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RetainedSnapshot;
+    if (parsed && typeof parsed.at === 'number' && parsed.snap) return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistedSnapshot(entry: RetainedSnapshot): void {
+  try {
+    localStorage.setItem(DASHBOARD_SNAPSHOT_KEY, JSON.stringify(entry));
+  } catch {
+    /* quota exceeded / unavailable - the in-memory retain still works */
+  }
+}
+
+// Drop the persisted snapshot on logout so a finished job's dashboard
+// from one operator's session isn't visible to the next.
+function clearPersistedSnapshot(): void {
+  try {
+    localStorage.removeItem(DASHBOARD_SNAPSHOT_KEY);
+  } catch {
+    /* unavailable - nothing to clear */
+  }
+}
+
 // ── Outer App: auth gating ───────────────────────────────────────────────────
 
 export function App() {
-  // PR-A2: auth is always on. The status probe is now used only to
-  // detect first-boot setup (``setup_needed: true``); the
-  // ``auth_enabled`` field is preserved on the wire for backward-
-  // compat but ignored by the frontend.
+  // Auth is always on. The status probe is used only to detect
+  // first-boot setup (``setup_needed: true``); the ``auth_enabled``
+  // field is preserved on the wire for backward-compat but ignored by
+  // the frontend.
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   // Access token lives only in React state for the lifetime of this
-  // <App /> (LoginBugFix1: no localStorage / sessionStorage). What
-  // survives across page refreshes is the HttpOnly refresh-token
-  // cookie set by the backend at Path=/api/auth - the boot effect
-  // below silently POSTs to /api/auth/refresh and adopts the new
-  // access token if the cookie is still valid.
+  // <App /> - no localStorage / sessionStorage. What survives across
+  // page refreshes is the HttpOnly refresh-token cookie set by the
+  // backend at Path=/api/auth - the boot effect below silently POSTs
+  // to /api/auth/refresh and adopts the new access token if the
+  // cookie is still valid.
   const [token, setToken] = useState<string | null>(null);
   // ``refreshAttempted`` flips to true once the boot-time silent
   // refresh either succeeds or fails. Before that we render a neutral
   // loading splash - NOT the login form - so a returning user with a
   // valid refresh cookie doesn't see a login flash on every page load.
   const [refreshAttempted, setRefreshAttempted] = useState(false);
-  // PR-A3: the authoritative identity comes from ``/api/auth/me``
-  // (fetched whenever ``token`` changes). ``null`` while the fetch is
-  // in flight - the App renders a splash until it lands so role-
-  // gated children never see a half-formed AuthContext.
+  // The authoritative identity comes from ``/api/auth/me`` (fetched
+  // whenever ``token`` changes). ``null`` while the fetch is in
+  // flight - the App renders a splash until it lands so role-gated
+  // children never see a half-formed AuthContext.
   const [me, setMe] = useState<MeResponse | null>(null);
   const [meError, setMeError] = useState<string | null>(null);
 
-  // Phase 6 of the dashboard / log reorg: inline re-auth modal state.
-  // Open when an API call returns 403 with the elevation marker;
-  // ``elevatePromiseRef`` carries the pending resolve callback so the
-  // http<T> helper can await the end user's confirm / cancel choice
-  // before deciding whether to retry the original request.
+  // Inline re-auth modal state. Open when an API call returns 403
+  // with the elevation marker; ``elevatePromiseRef`` carries the
+  // pending resolve callback so the http<T> helper can await the
+  // user's confirm / cancel choice before deciding whether to retry
+  // the original request.
   const [elevateOpen, setElevateOpen] = useState<boolean>(false);
   const elevatePromiseRef = useRef<((ok: boolean) => void) | null>(null);
 
@@ -146,7 +199,7 @@ export function App() {
   // fires only AFTER api.ts's internal silent-refresh-and-retry has
   // already failed - i.e. the refresh cookie is gone or revoked. We
   // drop the in-memory state and the render gate below sends the
-  // end user to the login screen.
+  // user to the login screen.
   useEffect(() => {
     onUnauthorized(() => {
       setAccessToken(null);
@@ -155,13 +208,13 @@ export function App() {
     });
   }, []);
 
-  // Phase 6: register the elevation handler once. http<T> calls this
-  // on any 403 carrying the elevation marker; we stash the resolver
-  // on the ref so the modal's close handler can finish the promise.
-  // If the modal is already open when another elevation-required
-  // call lands, we resolve the previous promise false so the prior
-  // call surfaces a normal error rather than waiting forever - the
-  // end user can only consciously confirm one elevate at a time.
+  // Register the elevation handler once. http<T> calls this on any
+  // 403 carrying the elevation marker; we stash the resolver on the
+  // ref so the modal's close handler can finish the promise. If the
+  // modal is already open when another elevation-required call
+  // lands, we resolve the previous promise false so the prior call
+  // surfaces a normal error rather than waiting forever - the user
+  // can only consciously confirm one elevate at a time.
   useEffect(() => {
     onElevationRequired(() => {
       return new Promise<boolean>((resolve) => {
@@ -234,22 +287,22 @@ export function App() {
   //
   // LoginBugFix1 - no ``remember`` flag, no storage write. Token is
   // in-memory only for the lifetime of this <App />.
-  const acceptSession = (session: { access_token: string }) => {
+  const acceptSession = useCallback((session: { access_token: string }) => {
     setAccessToken(session.access_token);
     setToken(session.access_token);
-  };
+  }, []);
 
-  // Refresh /me into context - used by AccountSettingsPanel (PR-A5)
-  // after a self-display-name edit so the topbar chip updates without
-  // a page reload.
-  const refreshMe = async () => {
+  // Refresh /me into context - used by AccountSettingsPanel after a
+  // self-display-name edit so the topbar chip updates without a page
+  // reload.
+  const refreshMe = useCallback(async () => {
     try {
       const r = await api.authMe();
       setMe(r);
     } catch {
       /* 401 handler covers stale-token case */
     }
-  };
+  }, []);
 
   // Loading splash - shown until BOTH boot probes finish: the
   // /auth/status check (setup vs login) AND the silent /refresh
@@ -260,7 +313,7 @@ export function App() {
     return (
       <div className="app">
         <header className="topbar">
-          <div className="brand">PlexMigrate</div>
+          <div className="brand" title="Hestia-MediaManager"><span className="wordmark-badge">HM²</span><span className="brand-fullname">Hestia-MediaManager</span></div>
         </header>
         <main className="main">
           <div className="panel">
@@ -303,7 +356,7 @@ export function App() {
     return (
       <div className="app">
         <header className="topbar">
-          <div className="brand">PlexMigrate</div>
+          <div className="brand" title="Hestia-MediaManager"><span className="wordmark-badge">HM²</span><span className="brand-fullname">Hestia-MediaManager</span></div>
         </header>
         <main className="main">
           <div className="panel">
@@ -316,24 +369,13 @@ export function App() {
     );
   }
 
-  // Item 1: forced upgrade-split for legacy installs. If the install
-  // was set up with the legacy single-account flow (setup_version=1
-  // or undefined) AND the end user is a root_admin (the only role
-  // such installs can produce), block the main UI until they create
-  // a separate root account. The modal is non-dismissable.
-  const needsUpgradeSplit =
-    (authStatus.setup_version ?? 1) < 2
-    && me.real_role === 'root_admin';
-
   // Authenticated and profile loaded - wrap Main in AuthProvider so
   // every gated component can read role + permissions via context.
-  // TooltipProvider lives outside the auth tree so even the
-  // upgrade-split modal could in principle consume it (no current
-  // call site, but the layering is consistent).
   return (
     <ClockProvider>
      <TooltipProvider>
       <ElevationProvider>
+       <BackendTintProvider>
        <AuthProvider
         username={me.username}
         displayName={me.display_name}
@@ -345,26 +387,12 @@ export function App() {
         createdAt={me.created_at}
         refreshMe={refreshMe}
       >
-        {needsUpgradeSplit && (
-          <UpgradeSplitModal
-            callerUsername={me.username}
-            onComplete={() => {
-              // Force a fresh login: the end user's role just changed
-              // from root_admin to admin in the DB, but their current
-              // JWT still claims root_admin. Sign out cleanly.
-              api.authLogout().catch(() => { /* no-op */ });
-              dashboardWsClient.close();
-              setAccessToken(null);
-              setToken(null);
-              setMe(null);
-              setAuthStatus({ ...authStatus, setup_version: 2 });
-            }}
-          />
-        )}
+       <ConfirmProvider>
         <Main
           onLogout={() => {
             api.authLogout().catch(() => { /* no-op */ });
             dashboardWsClient.close();
+            clearPersistedSnapshot();
             setAccessToken(null);
             setToken(null);
             setMe(null);
@@ -381,13 +409,13 @@ export function App() {
             setMe(null);
           }}
         />
-        {/* Phase 6 of the dashboard / log reorg: inline re-auth modal.
-            Mounted as a sibling to Main so it overlays whichever tab
-            the end user was on when the elevation-required 403
-            landed. The api.ts http<T> helper awaits the end user's
-            confirm / cancel choice via the elevatePromiseRef-backed
-            resolver and either retries the original request silently
-            (on confirm) or throws the 403 to the caller (on cancel). */}
+        {/* Inline re-auth modal. Mounted as a sibling to Main so it
+            overlays whichever tab the user was on when the
+            elevation-required 403 landed. The api.ts http<T> helper
+            awaits the user's confirm / cancel choice via the
+            elevatePromiseRef-backed resolver and either retries the
+            original request silently (on confirm) or throws the 403
+            to the caller (on cancel). */}
         <ElevateModal
           open={elevateOpen}
           onClose={(ok) => {
@@ -397,7 +425,9 @@ export function App() {
             if (resolve) resolve(ok);
           }}
         />
+       </ConfirmProvider>
        </AuthProvider>
+       </BackendTintProvider>
       </ElevationProvider>
      </TooltipProvider>
     </ClockProvider>
@@ -406,6 +436,41 @@ export function App() {
 
 
 // ── Inner Main: the existing tab UI ──────────────────────────────────────────
+
+// Browser-local toggle on the dashboard page: when on, a finished
+// job's full dashboard (process list, libraries, thread pool,
+// activity feed) stays visible until a new job starts, instead of
+// clearing ~30s after the job ends.
+function DashboardPersistToggle({
+  value,
+  onChange,
+}: {
+  value: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <div
+      className="panel"
+      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 14px' }}
+    >
+      <label className="switch" style={{ margin: 0 }}>
+        <input
+          type="checkbox"
+          checked={value}
+          onChange={(e) => onChange(e.target.checked)}
+        />
+        <span>Keep results on screen until the next job starts</span>
+      </label>
+      <InfoTip>
+        On: after a job finishes, the full dashboard - process list,
+        libraries, thread pool, and activity feed - stays on screen so
+        you can review it, until a new job starts. Off (default): the
+        dashboard clears about 30 seconds after the job ends. The
+        choice is saved in this browser.
+      </InfoTip>
+    </div>
+  );
+}
 
 function Main({
   onLogout,
@@ -419,46 +484,60 @@ function Main({
   // new token instead of clearing.
   onSessionSwap: ((newToken: string) => void) | null;
 }) {
-  // PR-A3 - identity now reads from AuthContext. The previous
-  // ``currentUser`` prop is gone; Main is always rendered inside an
-  // ``<AuthProvider>``.
+  // Identity reads from AuthContext. Main is always rendered inside
+  // an ``<AuthProvider>``.
   const auth = useAuthContext();
   const currentUser = { username: auth.username, role: auth.role };
   // The single source of truth for live state, pushed in by the WebSocket.
   const [snapshot, setSnapshot] = useState<DashboardFrame | null>(null);
   const [conn, setConn] = useState<ConnState>('connecting');
   const [tab, setTab] = useState<Tab>('dashboard');
-  // Feature 3: debug-mode probe. Polled once on mount. The Developer
-  // tab is only added to the nav when this is true. Production
-  // deployments leave PLEXMIGRATE_DEBUG_MODE unset and the tab never
-  // renders. False-positive risk: an end user who unsets the env var
-  // mid-session keeps the tab visible until they reload; the backend
-  // endpoint still 403s so no harm done.
+  // Debug-mode probe. Polled once on mount. The Developer tab is only
+  // added to the nav when this is true. Production deployments leave
+  // PLEXMIGRATE_DEBUG_MODE unset and the tab never renders.
+  // False-positive risk: a user who unsets the env var mid-session
+  // keeps the tab visible until they reload; the backend endpoint
+  // still 403s so no harm done.
   const [debugMode, setDebugMode] = useState<boolean>(false);
   useEffect(() => {
     api.getHealth()
       .then((h) => setDebugMode(Boolean(h.debug_mode)))
       .catch(() => setDebugMode(false));
   }, []);
+  // Server Commands developer console gate. The top-level tab renders
+  // only for root_admin AND when the ``dev_console_enabled`` tunable
+  // is on. The tunable defaults to true on the backend, so an absent
+  // key still counts as enabled; only an explicit false hides it.
+  const [devConsoleEnabled, setDevConsoleEnabled] = useState<boolean>(false);
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        const v = s.tunables?.dev_console_enabled as unknown;
+        setDevConsoleEnabled(
+          v !== false && v !== 0 && v !== 'false' && v !== 'False',
+        );
+      })
+      .catch(() => setDevConsoleEnabled(false));
+  }, []);
   // Both sub-tab states persist independently - navigating away and back
   // always restores the last active sub-tab rather than resetting.
   const [runSubTab, setRunSubTab] = useState<RunSubTab>('run');
   const [serversSubTab, setServersSubTab] = useState<ServersSubTab>('servers');
-  // Account tab inner state. Defaults to the end user's own account
+  // Account tab inner state. Defaults to the user's own account
   // surface; the Account Management sub-tab is only visible for roles
   // with ``users.manage`` (admin / root_admin).
   const [accountSubTab, setAccountSubTab] = useState<AccountSubTab>('account');
   // Settings tab inner state. Defaults to system settings; the snap-back
-  // effect below picks the first sub-tab the end user actually has
+  // effect below picks the first sub-tab the user actually has
   // permission for when they land on the Settings tab.
   const [settingsSubTab, setSettingsSubTab] = useState<SettingsSubTab>('settings');
   // Inner page within the Account Management sub-tab. Persists
-  // separately so the end user's last-viewed inner page survives
+  // separately so the user's last-viewed inner page survives
   // navigation around the rest of the app.
   const [accountMgmtPage, setAccountMgmtPage] = useState<AccountMgmtPage>('db_admin');
 
-  // PR-A4 - permission flags for the tab strip + sub-tab strips. Use
-  // the same hook every gated component uses so Switch View Mode (when
+  // Permission flags for the tab strip + sub-tab strips. Use the same
+  // hook every gated component uses so Switch View Mode (when
   // root_admin temporarily drops to a lesser role) flips the visible
   // tabs along with everything else.
   const canStartJobs = usePermission('jobs.start');
@@ -488,8 +567,8 @@ function Main({
   // any other privileged surface.
   const canManageAccessControl = auth.effectiveRole === 'root_admin';
 
-  // PR-A5 - Switch View Mode modal visibility. Only root_admin ever
-  // sees the trigger button (rendered conditionally below).
+  // Switch View Mode modal visibility. Only root_admin ever sees the
+  // trigger button (rendered conditionally below).
   const [showSwitchViewModal, setShowSwitchViewModal] = useState(false);
   // Login-as-root re-auth modal visibility. Trigger lives next to
   // Logout in the topbar. The flow runs a fresh /api/auth/login call
@@ -499,11 +578,11 @@ function Main({
   const [showLoginAsRootModal, setShowLoginAsRootModal] = useState(false);
 
   // The Settings tab carries end user surfaces plus the always-on
-  // Help reference page; if the effective role has none of the
-  // end user surfaces we still keep the tab visible because Help is
-  // available to everyone, but that means the tab is effectively
-  // unconditional. Kept as a constant for symmetry with the snap-back
-  // and tab-strip logic below.
+  // Help reference page; even if the effective role has none of the
+  // end user surfaces the tab stays visible because Help is available
+  // to everyone, which makes the tab effectively unconditional. Kept
+  // as a constant for symmetry with the snap-back and tab-strip logic
+  // below.
   const canSeeSettingsTab = true;
 
   // Snap the active tab back to a permitted one when the effective
@@ -513,11 +592,17 @@ function Main({
     if (tab === 'run' && !canStartJobs) setTab('dashboard');
     if (tab === 'settings' && !canSeeSettingsTab) setTab('dashboard');
     if (tab === 'developer' && !debugMode) setTab('dashboard');
-  }, [tab, canStartJobs, canSeeSettingsTab, debugMode]);
-  // Servers sub-tab snap-back. ``users`` (User Management, PR-10) is
-  // end user+ only; ``exports`` is gated by canViewExports. If a
-  // Switch View Mode drop strands the caller on either, bounce back
-  // to the plain Servers list.
+    if (
+      tab === 'server_commands'
+      && !(auth.role === 'root_admin' && devConsoleEnabled)
+    ) {
+      setTab('dashboard');
+    }
+  }, [tab, canStartJobs, canSeeSettingsTab, debugMode, auth.role, devConsoleEnabled]);
+  // Servers sub-tab snap-back. ``users`` (User Management) is end
+  // user+ only; ``exports`` is gated by canViewExports. If a Switch
+  // View Mode drop strands the caller on either, bounce back to the
+  // plain Servers list.
   useEffect(() => {
     if (tab === 'servers' && serversSubTab === 'users' && !canStartJobs) {
       setServersSubTab('servers');
@@ -541,8 +626,7 @@ function Main({
   // current one is no longer visible (e.g. ``settings`` after a drop
   // out of canEditSettings). ``help`` is unconditional, so it's the
   // ultimate fallback when no end user surface is available.
-  // ``exports`` moved to the Servers tab in v0.13.0 and is no longer
-  // a Settings sub-tab.
+  // ``exports`` is a Servers-tab sub-tab, not a Settings sub-tab.
   useEffect(() => {
     if (tab !== 'settings') return;
     const valid =
@@ -557,7 +641,7 @@ function Main({
     else if (canViewLogs) setSettingsSubTab('logs');
     else setSettingsSubTab('help');
   }, [tab, settingsSubTab, canEditSettings, canManageTunables, canViewLogs]);
-  // If the end user was viewing the Database Admin inner page and a
+  // If the user was viewing the Database Admin inner page and a
   // Switch View Mode drop removes ``db_admin.access``, fall back to
   // the User Accounts inner page so the surrounding nav doesn't show
   // an active-but-hidden button with a blank pane below it.
@@ -571,9 +655,9 @@ function Main({
       setAccountMgmtPage('user_accounts');
     }
   }, [tab, accountSubTab, accountMgmtPage, canAccessDbAdmin]);
-  // Same snap-back for Access Control: if the end user was on this
-  // page and lost root_admin (e.g. View Mode drop), bounce them to
-  // User Accounts so the page doesn't render under the wrong identity.
+  // Same snap-back for Access Control: if the user was on this page
+  // and lost root_admin (e.g. View Mode drop), bounce them to User
+  // Accounts so the page doesn't render under the wrong identity.
   useEffect(() => {
     if (
       tab === 'account' &&
@@ -584,12 +668,12 @@ function Main({
       setAccountMgmtPage('user_accounts');
     }
   }, [tab, accountSubTab, accountMgmtPage, canManageAccessControl]);
-  // PR-8 - Dashboard multi-job sub-tab selection. ``null`` means
-  // "auto-pick the running job," which is also the only sane choice
-  // when there's just one job. The strip renders dynamically from
-  // the WS payload's ``jobs`` array, mirroring Run Job / Servers /
-  // Settings sub-tab visuals. State lives here (not in DashboardPanel)
-  // so the strip can sit at the same layer as the other sub-tab strips.
+  // Dashboard multi-job sub-tab selection. ``null`` means "auto-pick
+  // the running job," which is also the only sane choice when there's
+  // just one job. The strip renders dynamically from the WS payload's
+  // ``jobs`` array, mirroring Run Job / Servers / Settings sub-tab
+  // visuals. State lives here (not in DashboardPanel) so the strip
+  // can sit at the same layer as the other sub-tab strips.
   const [dashJobId, setDashJobId] = useState<string | null>(null);
   // Server-side clock surfaced in the topbar. We fetch the timezone +
   // an initial wallclock from /api/server-time, then tick locally using
@@ -597,12 +681,36 @@ function Main({
   // every 5 min keeps DST transitions and host clock drift in line
   // without polling once per second.
   const [serverTime, setServerTime] = useState<ServerTime | null>(null);
-  const [, setClockTick] = useState(0);
+  // Drives the 1 Hz topbar server-clock re-render (pauses on tab-hide).
+  useNowTick(1000);
   const clockSkewRef = useRef<number>(0);
-  // Keep the last seen "running"/"stopping" snapshot around for a
-  // brief grace period after the job finishes so the user can read
-  // the final totals before the panel goes blank.
-  const lastRunningRef = useRef<{ snap: DashboardFrame; at: number } | null>(null);
+  // Last running/finished snapshot, kept so a completed job's
+  // dashboard can be retained after it ends. Lazy-initialised from
+  // localStorage on first render so a "kept" dashboard (see
+  // persistDashboard) survives a full page reload.
+  const lastRunningRef = useRef<RetainedSnapshot | null>();
+  if (lastRunningRef.current === undefined) {
+    lastRunningRef.current = readPersistedSnapshot();
+  }
+
+  // Dashboard "keep results until next job" toggle (browser-local).
+  // When on, a finished job's full dashboard stays on screen until a
+  // NEW job starts instead of clearing after POST_FINISH_RETAIN_MS.
+  const [persistDashboard, setPersistDashboard] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(DASHBOARD_PERSIST_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const setPersistDashboardPref = useCallback((next: boolean) => {
+    setPersistDashboard(next);
+    try {
+      localStorage.setItem(DASHBOARD_PERSIST_KEY, next ? '1' : '0');
+    } catch {
+      /* localStorage unavailable (private mode) - in-memory only */
+    }
+  }, []);
 
   // ── WebSocket lifecycle ────────────────────────────────────────────────
   useEffect(() => {
@@ -617,22 +725,33 @@ function Main({
       // wind-down finishes).
       const state = msg.job?.state;
       if (state === 'running' || state === 'stopping' || msg.dashboard) {
-        lastRunningRef.current = { snap: msg, at: lastMsg };
+        const entry: RetainedSnapshot = { snap: msg, at: lastMsg };
+        lastRunningRef.current = entry;
+        // On the terminal frame, mirror the retained snapshot to
+        // localStorage so a "kept" dashboard survives a page reload.
+        // Only the finished frame is written - a mid-run reload
+        // reconnects the socket and gets live data anyway.
+        if (
+          state === 'completed' || state === 'completed_with_errors'
+          || state === 'failed' || state === 'cancelled'
+        ) {
+          writePersistedSnapshot(entry);
+        }
       }
       setSnapshot(msg);
       setConn('connected');
     });
-    const tick = window.setInterval(() => {
+    const stopStaleCheck = pausableInterval(() => {
       if (Date.now() - lastMsg > 5000) setConn('disconnected');
     }, 1000);
     return () => {
       unsubscribe();
-      window.clearInterval(tick);
+      stopStaleCheck();
     };
   }, []);
 
-  // Server-clock lifecycle: one initial fetch + a 5-minute refresh,
-  // plus a 1 Hz local tick so the rendered HH:MM:SS advances smoothly.
+  // Server-clock lifecycle: one initial fetch + a 5-minute refresh.
+  // The 1 Hz tick that advances the rendered HH:MM:SS is useNowTick.
   useEffect(() => {
     const load = () => {
       api.getServerTime()
@@ -643,12 +762,7 @@ function Main({
         .catch(() => { /* keep prior value; render falls back to '-' */ });
     };
     load();
-    const refresh = window.setInterval(load, 5 * 60 * 1000);
-    const tick = window.setInterval(() => setClockTick((x) => x + 1), 1000);
-    return () => {
-      window.clearInterval(refresh);
-      window.clearInterval(tick);
-    };
+    return pausableInterval(load, 5 * 60 * 1000);
   }, []);
 
   // First-load fallback: if the WS hasn't arrived yet, fetch a one-shot
@@ -664,23 +778,23 @@ function Main({
           type: 'dashboard_frame',
           server_ts: Date.now() / 1000,
           dashboard: j.dashboard || null,
-          // v0.10.0: REST one-shot fallback doesn't know about fan-out
+          // The REST one-shot fallback doesn't know about fan-out
           // - the field is populated on the next WS tick if a fan-out
           // job is in flight. ``null`` here keeps the type intact and
           // gives the DashboardPanel its single-destination render
           // path until the socket catches up.
           fan_out: null,
-          // v0.12.0: servers_network ships only via WS; the REST
-          // fallback returns an empty array and the Networking tab
-          // shows "Waiting for first tick…" until the socket connects.
+          // servers_network ships only via WS; the REST fallback
+          // returns an empty array and the Networking tab shows
+          // "Waiting for first tick…" until the socket connects.
           servers_network: [],
           job:
             j.state === 'idle'
               ? null
               : {
                   job_id: '',
-                  mode: (j.mode as 'snapshot' | 'restore') || 'snapshot',
-                  state: j.state as JobPayloadState,
+                  mode: (j.mode as JobPayload['mode']) || 'snapshot',
+                  state: j.state as JobPayload['state'],
                   queued_at: 0,
                   started_at: null,
                   finished_at: null,
@@ -706,7 +820,7 @@ function Main({
   const displaySnapshot = (() => {
     if (snapshot && snapshot.dashboard) return snapshot;
     const retained = lastRunningRef.current;
-    if (retained && Date.now() - retained.at < POST_FINISH_RETAIN_MS) {
+    if (retained && (persistDashboard || Date.now() - retained.at < POST_FINISH_RETAIN_MS)) {
       return retained.snap;
     }
     return snapshot;
@@ -730,8 +844,8 @@ function Main({
     };
     // ``server`` mode keeps the server timezone. ``local`` mode and
     // ``custom`` mode render in the browser's local timezone - the
-    // end user chose to look away from the server clock, so the
-    // browser zone is the right context for those modes.
+    // user chose to look away from the server clock, so the browser
+    // zone is the right context for those modes.
     if (clock.mode === 'server') {
       try {
         return new Intl.DateTimeFormat(undefined, { ...fmtOpts, timeZone: serverTime.tz }).format(d);
@@ -751,7 +865,7 @@ function Main({
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">PlexMigrate</div>
+        <div className="brand" title="Hestia-MediaManager"><span className="wordmark-badge">HM²</span><span className="brand-fullname">Hestia-MediaManager</span></div>
         {/* Right side stacks vertically: clock + Live on top, user
             info + Log out beneath. The bottom row only renders when
             auth is enabled AND a user is signed in (both ``currentUser``
@@ -783,13 +897,14 @@ function Main({
               <span className={`dot ${dotClass}`} />
               {connLabel}
             </span>
+            <ThemeSwitcher />
           </div>
           {/* ``onLogout`` is the truthy gate - App.tsx only passes a
               function when auth is enabled AND a token is in state.
               ``currentUser`` is optional decoration; if the JWT
               payload didn't decode cleanly the button still appears
-              so the end user never gets locked into a half-state
-              with no way out. */}
+              so the user never gets locked into a half-state with no
+              way out. */}
           {onLogout && (
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               {currentUser && (
@@ -801,38 +916,42 @@ function Main({
                     </span>
                   )}
                   {auth.inViewMode && (
-                    <span style={{
-                      marginLeft: 8,
-                      padding: '2px 8px',
-                      borderRadius: 999,
-                      background: '#5a3a85',
-                      color: '#fff',
-                      fontSize: 10,
-                      fontWeight: 700,
-                      letterSpacing: 0.3,
-                      textTransform: 'uppercase',
-                      verticalAlign: 'middle',
-                    }}>
+                    <span
+                      data-testid="topbar-view-mode-chip"
+                      style={{
+                        marginLeft: 8,
+                        padding: '2px 8px',
+                        borderRadius: 999,
+                        background: '#5a3a85',
+                        color: '#fff',
+                        fontSize: 10,
+                        fontWeight: 700,
+                        letterSpacing: 0.3,
+                        textTransform: 'uppercase',
+                        verticalAlign: 'middle',
+                      }}
+                    >
                       Viewing as {auth.effectiveRole.replace('_', ' ')}
                     </span>
                   )}
                 </span>
               )}
-              {/* Item 1: elevation chip. Only visible when the
-                  caller is currently elevated (sudo-style cache is
-                  live). Shows a countdown to expiry and lets the
-                  end user drop elevation manually. */}
+              {/* Elevation chip. Only visible when the caller is
+                  currently elevated (sudo-style cache is live). Shows
+                  a countdown to expiry and lets the user drop
+                  elevation manually. */}
               {auth.realRole === 'root_admin' && <TopbarElevationChip />}
               {/* Switch View Mode button visibility is keyed off the
                   REAL role, not the effective one - the button must
-                  stay reachable while dropped so the end user can
-                  always restore. Hidden only for viewer (no drop
-                  targets exist for that role). */}
+                  stay reachable while dropped so the user can always
+                  restore. Hidden only for viewer (no drop targets
+                  exist for that role). */}
               {auth.realRole !== 'viewer' && (
                 <button
                   onClick={() => setShowSwitchViewModal(true)}
                   title="Change the active permission level for this session. Resets on page refresh."
                   style={{ fontSize: 12 }}
+                  data-testid="topbar-switch-permissions"
                 >
                   Switch permissions
                 </button>
@@ -841,18 +960,18 @@ function Main({
                 onClick={onLogout}
                 title="Log out and clear the refresh-token cookie."
                 style={{ fontSize: 12 }}
+                data-testid="logout-btn"
               >
                 Log out
               </button>
-              {/* Login-as-root shortcut. Visible only when the end user's
+              {/* Login-as-root shortcut. Visible only when the user's
                   REAL role is below root_admin and they are not already in
                   a switched-down view (use Exit view mode from the
                   permissions modal in that case). Single-click path to
                   the same viewModeEnter('root_admin') flow surfaced
-                  via the renamed Switch permissions modal; saved as a
-                  dedicated button at the end user's request because
-                  many sessions need root for a single action and
-                  burying it in the modal is friction. */}
+                  via the Switch permissions modal; kept as a dedicated
+                  button because many sessions need root for a single
+                  action and burying it in the modal is friction. */}
               {auth.realRole !== 'root_admin'
                 && auth.realRole === auth.role
                 && auth.realRole !== 'viewer' && (
@@ -874,16 +993,38 @@ function Main({
           every role (everyone can manage their own profile);
           ``Settings`` is visible only when the role has at least one
           end user surface (system settings, logs, or exports). */}
-      <nav className="tabs">
-        <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>Dashboard</button>
+      <nav className="tabs" data-testid="tab-strip">
+        <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')} data-testid="tab-dashboard">Dashboard</button>
         {canStartJobs && (
-          <button className={tab === 'run' ? 'active' : ''} onClick={() => setTab('run')}>Jobs</button>
+          <button className={tab === 'run' ? 'active' : ''} onClick={() => setTab('run')} data-testid="tab-jobs">Jobs</button>
         )}
-        <button className={tab === 'servers' ? 'active' : ''} onClick={() => setTab('servers')}>Servers</button>
-        <button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')}>Account</button>
+        <button className={tab === 'servers' ? 'active' : ''} onClick={() => setTab('servers')} data-testid="tab-servers">Servers</button>
+        <button className={tab === 'account' ? 'active' : ''} onClick={() => setTab('account')} data-testid="tab-account">Account</button>
         {canSeeSettingsTab && (
-          <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')}>Settings</button>
+          <button className={tab === 'settings' ? 'active' : ''} onClick={() => setTab('settings')} data-testid="tab-settings">Settings</button>
         )}
+        {auth.role === 'root_admin' && devConsoleEnabled && (
+          <button
+            className={tab === 'server_commands' ? 'active' : ''}
+            onClick={() => setTab('server_commands')}
+            title="Root-admin developer console: live per-item state, raw API calls, membership editing."
+            data-testid="tab-dev-console"
+          >
+            Server Commands
+          </button>
+        )}
+        {/* Dev Blog tab temporarily hidden pre-v0.18.0. The panel,
+            iframe wrapper, and the static HTML under
+            frontend/public/dev-blog/ are all still present in the
+            tree but not shipped. Un-comment this button when the
+            blog content is ready for public viewing. */}
+        {/* <button
+          className={tab === 'devblog' ? 'active' : ''}
+          onClick={() => setTab('devblog')}
+          title="About the developer and walkthroughs of how this app was built."
+        >
+          Dev Blog
+        </button> */}
         {debugMode && (
           <button
             className={tab === 'developer' ? 'active' : ''}
@@ -904,16 +1045,23 @@ function Main({
           {canViewSchedules && (
             <button className={runSubTab === 'schedules' ? 'active' : ''} onClick={() => setRunSubTab('schedules')}>Schedules</button>
           )}
-          {/* Playlist Transfer — new sub-tab per Plan[PLAYLIST-MANAGEMENT].
-              Same permission gate as Run Job; viewers don't see this
-              branch. (Tab renamed from "Playlist Management" to
-              "Playlist Transfer" 2026-05-17 per end user request — the
-              feature is specifically about transferring a playlist
-              from one user to another, which the new name makes
-              explicit. Internal identifiers + API URLs keep the
-              -mgmt-prefixed names; only the operator-facing label
-              changed.) */}
+          {/* Playlist Transfer sub-tab. Same permission gate as Run
+              Job; viewers don't see this branch. The feature is
+              specifically about transferring a playlist from one user
+              to another, which the label makes explicit. Internal
+              identifiers + API URLs keep the -mgmt-prefixed names;
+              only the operator-facing label differs. */}
           <button className={runSubTab === 'playlists' ? 'active' : ''} onClick={() => setRunSubTab('playlists')}>Playlist Transfer</button>
+          {/* Server Syncing. Cross-server library mapping + sync
+              subscriptions. Same ``canStartJobs`` gate as the rest of
+              this strip, so no inner permission check is needed. */}
+          <button
+            className={runSubTab === 'syncing' ? 'active' : ''}
+            onClick={() => setRunSubTab('syncing')}
+            title="Cross-server library mapping + sync subscriptions (watch counts, ratings, playlists)."
+          >
+            Server Syncing
+          </button>
         </nav>
       )}
 
@@ -921,17 +1069,17 @@ function Main({
         <nav className="tabs sub-tabs">
           <button className={serversSubTab === 'servers' ? 'active' : ''} onClick={() => setServersSubTab('servers')}>Overview</button>
           <button className={serversSubTab === 'networking' ? 'active' : ''} onClick={() => setServersSubTab('networking')}>Networking</button>
-          {/* PR-10 - User Management. End user+ only; hidden from
-              viewer since they have no jobs to set up credentials for. */}
+          {/* User Management. End user+ only; hidden from viewer
+              since they have no jobs to set up credentials for. */}
           {canStartJobs && (
             <button className={serversSubTab === 'users' ? 'active' : ''} onClick={() => setServersSubTab('users')}>User Management</button>
           )}
-          {/* Run Defaults - moved here from Settings ▸ General Settings.
-              These are the run-level knobs (paths, performance, snapshot
-              defaults, transfer resolution, retention ceiling) that
-              describe HOW snapshots and direct transfers operate
-              against Plex. settings.edit gates write access; the panel
-              itself stays read-only without it. */}
+          {/* Run Defaults. These are the run-level knobs (paths,
+              performance, snapshot defaults, transfer resolution,
+              retention ceiling) that describe HOW snapshots and
+              direct transfers operate against Plex. settings.edit
+              gates write access; the panel itself stays read-only
+              without it. */}
           {canEditSettings && (
             <button className={serversSubTab === 'run_defaults' ? 'active' : ''} onClick={() => setServersSubTab('run_defaults')}>Run Defaults</button>
           )}
@@ -940,19 +1088,18 @@ function Main({
           {canEditSettings && (
             <button className={serversSubTab === 'advanced' ? 'active' : ''} onClick={() => setServersSubTab('advanced')}>Advanced Settings</button>
           )}
-          {/* v0.13.0: Export moved from Settings to Servers since the
-              exports list is server-scoped anyway. Same exports.view
-              permission gate; rendered last so the existing Servers
-              flow (Overview -> Networking -> Users -> Advanced) is
-              preserved at the front of the strip. */}
+          {/* Export. The exports list is server-scoped, so it belongs
+              on the Servers tab. Gated by exports.view; rendered last
+              so the Servers flow (Overview -> Networking -> Users ->
+              Advanced) stays at the front of the strip. */}
           {canViewExports && (
             <button className={serversSubTab === 'exports' ? 'active' : ''} onClick={() => setServersSubTab('exports')}>Export</button>
           )}
           {/* Logs sub-tab. Mirrors the per-server-grouped layout of
-              Exports so the end user can scope log browsing to one
-              server without leaving the Servers tab. The global view
-              of every run (including ones whose server has since been
-              removed) still lives under Settings > Logs. */}
+              Exports so the user can scope log browsing to one server
+              without leaving the Servers tab. The global view of
+              every run (including ones whose server has since been
+              removed) lives under Settings > Logs. */}
           {canViewLogs && (
             <button className={serversSubTab === 'logs' ? 'active' : ''} onClick={() => setServersSubTab('logs')}>Logs</button>
           )}
@@ -982,39 +1129,45 @@ function Main({
 
       {/* Settings sub-tabs filtered by role: general settings (admin+),
           logs (end user+). Help is always visible since it's a reference
-          page with no destructive controls. v0.13.0 moved Exports to
-          the Servers tab; the "Settings" sub-tab is now labeled
-          "General Settings" to distinguish it from Servers > Advanced
-          Settings (per-server config). */}
+          page with no destructive controls. The "Settings" sub-tab is
+          labeled "General Settings" to distinguish it from Servers >
+          Advanced Settings (per-server config). */}
       {tab === 'settings' && (
         <nav className="tabs sub-tabs">
           {canEditSettings && (
             <button className={settingsSubTab === 'settings' ? 'active' : ''} onClick={() => setSettingsSubTab('settings')}>General Settings</button>
           )}
           {/* System Tunables - root_admin only. Infrastructure-level
-              knobs (HTTP timeouts, JWT TTL, SQLite busy timeout, etc.)
-              that used to be hardcoded literals. */}
+              knobs (HTTP timeouts, JWT TTL, SQLite busy timeout,
+              etc.). */}
           {canManageTunables && (
             <button className={settingsSubTab === 'tunables' ? 'active' : ''} onClick={() => setSettingsSubTab('tunables')}>Tunables</button>
           )}
           {/* Databases viewer - root_admin only. Read-only schema +
               row browser for every SQLite database the app creates.
-              Plan[DATABASES-VIEWER]-2026-05-16. Same gate as Tunables
-              + Access Control (most sensitive end user surface in
-              the app; auth.db is in here). */}
+              Same gate as Tunables + Access Control (most sensitive
+              end user surface in the app; auth.db is in here). */}
           {canManageTunables && (
-            <button className={settingsSubTab === 'databases' ? 'active' : ''} onClick={() => setSettingsSubTab('databases')}>Databases</button>
+            <button
+              className={settingsSubTab === 'databases' ? 'active' : ''}
+              onClick={() => setSettingsSubTab('databases')}
+              data-testid="tab-databases"
+            >Databases</button>
           )}
           {canViewLogs && (
-            <button className={settingsSubTab === 'logs' ? 'active' : ''} onClick={() => setSettingsSubTab('logs')}>Logs</button>
+            <button
+              className={settingsSubTab === 'logs' ? 'active' : ''}
+              onClick={() => setSettingsSubTab('logs')}
+              data-testid="tab-app-logs"
+            >Logs</button>
           )}
           <button className={settingsSubTab === 'help' ? 'active' : ''} onClick={() => setSettingsSubTab('help')}>Help</button>
         </nav>
       )}
 
-      {/* PR-8 - Dashboard multi-job sub-tab strip. Renders only when
-          more than one job is active or queued; single-job case is
-          unchanged. Lives at the same visual layer as Run Job / Servers
+      {/* Dashboard multi-job sub-tab strip. Renders only when more
+          than one job is active or queued; the single-job case has no
+          strip. Lives at the same visual layer as Run Job / Servers
           / Settings sub-tabs so the nesting feels consistent. The
           buttons are built dynamically from the WS payload's ``jobs``
           array - no hardcoded tab count. */}
@@ -1036,10 +1189,15 @@ function Main({
               const isRunning =
                 !!snapshot?.job && j.job_id === snapshot.job.job_id;
               const mode = j.mode.charAt(0).toUpperCase() + j.mode.slice(1);
+              // FECORE-14: queue position is 1-based among ONLY the
+              // queued jobs, not the raw array index (index 0 would
+              // otherwise render "#0" when no job is running).
+              const queuePos =
+                jobs.slice(0, idx).filter((q) => q.state === 'queued').length + 1;
               const label = isRunning
                 ? `${mode} (running)`
                 : j.state === 'queued'
-                  ? `${mode} (queue #${idx})`
+                  ? `${mode} (queue #${queuePos})`
                   : `${mode} (${j.state})`;
               return (
                 <button
@@ -1057,31 +1215,38 @@ function Main({
       })()}
 
       <main className="main">
+        <Suspense fallback={<div className="panel"><div className="empty">Loading…</div></div>}>
         {tab === 'dashboard' && (
           <>
+            <DashboardPersistToggle value={persistDashboard} onChange={setPersistDashboardPref} />
             <DashboardPanel
               snapshot={displaySnapshot}
               connState={conn}
               selectedJobId={dashJobId}
             />
-            {/* Feature 1 phase 1.5: per-operation runtime data lives in
-                its own panel below the live dashboard. The panel reads
-                from /api/run-timings/runs and is collapsible via the
-                Verbose toggle (default ON per D3). Keeping it as a
-                sibling of DashboardPanel rather than embedding inside
+            {/* Per-operation runtime data lives in its own panel
+                below the live dashboard. The panel reads from
+                /api/run-timings/runs and is collapsible via the
+                Verbose toggle (default ON). Keeping it as a sibling
+                of DashboardPanel rather than embedding inside
                 DashboardPanel avoids editing the 2200-line dashboard
-                component.
-                2026-05-17 bug fix: pass the current job so the panel
-                can auto-refresh on the running -> terminal transition
-                (pre-fix it only refreshed on mount + manual click, so
-                a just-completed restore wasn't visible until the
-                end user clicked Refresh). */}
+                component. The current job is passed in so the panel
+                can auto-refresh on the running -> terminal transition;
+                without it a just-completed restore wouldn't be
+                visible until the user clicked Refresh. */}
             <RuntimeBreakdownPanel job={displaySnapshot?.job ?? null} />
+            {/* Download-logs panel for the current / last-completed
+                run. Persists between runs (reads from the same
+                displaySnapshot.job that DashboardPanel uses, which
+                itself freezes on the last job until a new one
+                starts). */}
+            <DashboardDownloadLogsPanel job={displaySnapshot?.job ?? null} />
           </>
         )}
         {tab === 'run' && runSubTab === 'run' && canStartJobs && <JobFormPanel snapshot={snapshot} />}
         {tab === 'run' && runSubTab === 'schedules' && canViewSchedules && <SchedulesPanel />}
         {tab === 'run' && runSubTab === 'playlists' && canStartJobs && <PlaylistManagementPanel />}
+        {tab === 'run' && runSubTab === 'syncing' && canStartJobs && <ServerSyncingPage />}
         {tab === 'servers' && serversSubTab === 'servers' && <ServersPanel />}
         {tab === 'servers' && serversSubTab === 'networking' && <NetworkingPanel snapshot={snapshot} />}
         {tab === 'servers' && serversSubTab === 'users' && canStartJobs && <UserManagementPanel />}
@@ -1131,15 +1296,19 @@ function Main({
         {tab === 'settings' && settingsSubTab === 'settings' && canEditSettings && <SettingsPanel />}
         {tab === 'settings' && settingsSubTab === 'tunables' && canManageTunables && <TunablesPanel />}
         {tab === 'settings' && settingsSubTab === 'databases' && canManageTunables && <DatabasesPanel />}
-        {/* Settings > Logs hosts APP-LEVEL logs only after the
-            ServersPanel > Logs sub-tab landed; per-run job logs now
-            live there grouped by server. ``LogsPanel`` still exists
-            in the codebase but is no longer mounted; deletion is a
-            follow-up cleanup if the end user confirms nothing else
-            references it. */}
+        {/* Settings > Logs hosts APP-LEVEL logs only; per-run job
+            logs live under the ServersPanel > Logs sub-tab grouped by
+            server. ``LogsPanel`` still exists in the codebase but is
+            no longer mounted; deletion is a follow-up cleanup once
+            nothing else references it. */}
         {tab === 'settings' && settingsSubTab === 'logs' && canViewLogs && <ApplicationLogsPanel />}
         {tab === 'settings' && settingsSubTab === 'help' && <HelpPanel />}
+        {tab === 'devblog' && <DevBlogPanel />}
         {tab === 'developer' && debugMode && <DeveloperPanel />}
+        {tab === 'server_commands' && auth.role === 'root_admin' && devConsoleEnabled && (
+          <ServerCommandsPanel />
+        )}
+        </Suspense>
       </main>
 
       {showLoginAsRootModal && (
@@ -1159,16 +1328,16 @@ function Main({
 }
 
 
-// Server-side View Mode (Fix 2). The override lives in
-// _VIEW_MODE_SESSIONS on the backend, keyed by the caller's JWT jti.
-// Every enter/exit hits the server, then we refetch /me to pull the
-// new effective_role into context. Password is required for every
-// transition (enter, switch between drops, exit).
+// Server-side View Mode. The override lives in _VIEW_MODE_SESSIONS on
+// the backend, keyed by the caller's JWT jti. Every enter/exit hits
+// the server, then we refetch /me to pull the new effective_role into
+// context. Password is required for every transition (enter, switch
+// between drops, exit).
 //
 // The dropdown shows the caller's drop targets only - all roles
-// strictly below their REAL role. The end user can switch between
-// any two of those targets without exiting first; the server
-// overwrites the existing entry.
+// strictly below their REAL role. The user can switch between any two
+// of those targets without exiting first; the server overwrites the
+// existing entry.
 
 const VIEW_MODE_DROP_TARGETS: Record<Role, Role[]> = {
   viewer: [],
@@ -1260,50 +1429,20 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
   // disabled state rather than crashing.
   if (dropTargets.length === 0) {
     return (
-      <div
-        onClick={onClose}
-        style={{
-          position: 'fixed', inset: 0,
-          background: 'rgba(0,0,0,0.55)',
-          zIndex: 1000,
-          display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-          paddingTop: '8vh',
-        }}
-      >
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="panel"
-          style={{ width: 360, maxWidth: '92vw' }}
-        >
-          <h2 style={{ marginTop: 0 }}>Switch view mode</h2>
-          <span className="help">
-            Your role has no roles below it to preview as.
-          </span>
-          <div className="row-buttons" style={{ marginTop: 12 }}>
-            <button onClick={onClose}>Close</button>
-          </div>
+      <Modal onClose={onClose} title="Switch view mode" width={360}>
+        <span className="help">
+          Your role has no roles below it to preview as.
+        </span>
+        <div className="row-buttons" style={{ marginTop: 12 }}>
+          <button onClick={onClose}>Close</button>
         </div>
-      </div>
+      </Modal>
     );
   }
 
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 480, maxWidth: '92vw' }}
-      >
-        <h2 style={{ marginTop: 0 }}>
+    <Modal onClose={onClose} width={480}>
+        <h2 style={{ marginTop: 0 }} data-testid="view-mode-modal">
           Switch permissions
           <InfoTip>
             Backend-enforced privilege drop. The server actually denies
@@ -1330,7 +1469,11 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
 
         <label className="field">
           <span className="label">View as</span>
-          <select value={target} onChange={(e) => setTarget(e.target.value as Role)}>
+          <select
+            value={target}
+            onChange={(e) => setTarget(e.target.value as Role)}
+            data-testid="view-mode-select"
+          >
             {dropTargets.map((r) => (
               <option key={r} value={r}>{ROLE_DROP_LABEL[r]}</option>
             ))}
@@ -1362,6 +1505,7 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
             className="primary"
             disabled={!applyEnabled}
             onClick={applyEnter}
+            data-testid="view-mode-confirm"
           >
             {submitting
               ? 'Switching…'
@@ -1370,14 +1514,17 @@ function SwitchViewModeModal({ onClose }: { onClose: () => void }) {
                 : `Enter view mode as ${target.replace('_', ' ')}`}
           </button>
           {exitVisible && (
-            <button onClick={applyExit} disabled={!exitEnabled}>
+            <button
+              onClick={applyExit}
+              disabled={!exitEnabled}
+              data-testid="view-mode-exit"
+            >
               Exit view mode
             </button>
           )}
           <button onClick={onClose} disabled={submitting}>Cancel</button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -1417,7 +1564,7 @@ function LoginAsRootModal({
     try {
       const session = await api.authLogin(username, password);
       // Confirm the resulting role is actually root_admin so the
-      // end user doesn't think they elevated when they actually just
+      // user doesn't think they elevated when they actually just
       // signed in as a non-root account. The backend already rejects
       // bad credentials; this guard catches a "wrong username typed"
       // case (root_admin role landed on the wrong user record).
@@ -1426,7 +1573,7 @@ function LoginAsRootModal({
           `Sign-in succeeded but the resulting role is "${session.user.role}", `
             + 'not root_admin. Use the actual root account name to elevate.',
         );
-        // Discard the token rather than silently swap; the end user
+        // Discard the token rather than silently swap; the user
         // probably did not mean to drop to a non-root account.
         return;
       }
@@ -1439,22 +1586,7 @@ function LoginAsRootModal({
   };
 
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 380, maxWidth: '92vw' }}
-      >
-        <h2 style={{ marginTop: 0 }}>Login as root</h2>
+    <Modal onClose={onClose} title="Login as root" width={380}>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
           Sign in as the root account. This replaces your current
           session entirely; logging out afterward does not return you
@@ -1491,8 +1623,7 @@ function LoginAsRootModal({
             {submitting ? 'Signing in…' : 'Sign in'}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 

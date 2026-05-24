@@ -1,6 +1,6 @@
 // Server management tab.
 //
-// v0.9.1 update - server list and Add Server form only:
+// Server list and Add Server form:
 //   * Server list row: friendly name, URL, live status dot, ping ms,
 //     library count, last-contacted timestamp, manual refresh button,
 //     remove button with a confirmation prompt that reminds the user
@@ -19,8 +19,15 @@ import { useEffect, useRef, useState } from 'react';
 import { api, LibraryDescriptor, PingResult, ProbeUnsavedResult, ServerUser, ServerUsersResponse, ServerDeleteSummary, ServerView } from '../api';
 import type { PinMigrationSuggestion, ServerManagedUser } from '../api';
 import { usePermission } from '../hooks/usePermission';
+import { pausableInterval } from '../utils/pausableInterval';
 import { PinMigrationModal } from './PinMigrationModal';
 import { RecentRuntimesPanel } from './RecentRuntimesPanel';
+import { DriftHistoryTab } from './DriftHistoryTab';
+import { FirstRunMirrorDialog } from './FirstRunMirrorDialog';
+import { ServerMirrorBadge, type ServerMirrorStateRow } from './ServerMirrorBadge';
+import { LogsPanel } from './LogsPanel';
+import { useConfirm } from './ConfirmModal';
+import { errorText } from '../utils/format';
 import {
   BackendTabStrip,
   BackendType,
@@ -35,36 +42,386 @@ import {
 const PING_INTERVAL_MS_DEFAULT = 30_000;
 
 export function ServersPanel() {
-  // PR-A4 - viewers / end users / managers see this panel read-only.
-  // Add / Edit / Remove buttons are hidden when ``servers.edit`` is
-  // absent. The backend (require_role('root_admin') on the CRUD
-  // routes) is the authoritative gate.
+  // Viewers / end users / managers see this panel read-only. Add /
+  // Edit / Remove buttons are hidden when ``servers.edit`` is absent.
+  // The backend (require_role('root_admin') on the CRUD routes) is
+  // the authoritative gate.
   const canEditServers = usePermission('servers.edit');
 
   const [servers, setServers] = useState<ServerView[]>([]);
   const [error, setError] = useState<string | null>(null);
   // Top-level sub-tab routing inside the Servers page. Each tab
   // scopes which panel renders below; the tabbar itself stays
-  // visible across all tabs so the end user can pivot without
-  // scrolling. The four tabs mirror what existed previously as
-  // stacked panels - Overview (registered Plex servers + add/edit
+  // visible across all tabs so the user can pivot without scrolling.
+  // The tabs - Overview (registered Plex servers + add/edit
   // controls), Library Catalogues, Server Users, and Recent
-  // Runtimes - so no information is hidden, only organised.
+  // Runtimes - organise the surface without hiding any information.
   const [activeTab, setActiveTab] = useState<
-    'overview' | 'libraries' | 'users' | 'runtimes'
+    'overview' | 'libraries' | 'users' | 'runtimes' | 'drift' | 'logs'
   >('overview');
-  // Phase A of the backend-filter UI restructure (see
-  // Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). One backend tier
-  // shared across all four sub-tabs so the end user stays in the
-  // chosen backend's context as they pivot. Defaults to 'plex' since
-  // every install today has at least one Plex server.
+
+  // First-run mirror prompt. Lives inline at the top of the Overview
+  // tab (not a modal; belongs with the server registration surface
+  // since the mirror is server-scoped, not a job). Gated on the
+  // ``engine_mirror_first_run_dialog_seen`` tunable; either button
+  // flips that flag to true so the panel never re-renders.
+  const [firstRunMirrorOpen, setFirstRunMirrorOpen] = useState<boolean>(false);
+  // Global mirror mode default; ServerMirrorBadge uses this to label
+  // "Use global (auto)" / "Use global (always-live)" correctly.
+  const [globalMirrorMode, setGlobalMirrorMode] = useState<'auto' | 'always-live'>('auto');
+  useEffect(() => {
+    let cancelled = false;
+    api.getSettings()
+      .then((s) => {
+        if (cancelled) return;
+        const seen = !!(s.tunables
+          && s.tunables.engine_mirror_first_run_dialog_seen);
+        if (!seen) setFirstRunMirrorOpen(true);
+        const mode = (s.tunables
+          && s.tunables.engine_mirror_mode) as
+          | 'auto' | 'always-live' | undefined;
+        if (mode === 'always-live') setGlobalMirrorMode('always-live');
+      })
+      .catch(() => {
+        // Best-effort: a failure to probe means the panel stays
+        // closed this session. It will re-evaluate on next mount.
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Per-server mirror state for the badge column. Indexed by
+  // server_id; missing entries render a "no mirror state yet" badge.
+  const [mirrorState, setMirrorState] = useState<
+    Record<string, ServerMirrorStateRow>
+  >({});
+  const refreshMirrorState = async () => {
+    try {
+      const r = await api.getServerMirrorState();
+      const next: Record<string, ServerMirrorStateRow> = {};
+      for (const row of r.servers) next[row.server_id] = row;
+      setMirrorState(next);
+    } catch {
+      // Best-effort: failure means badge column renders empty.
+    }
+  };
+  useEffect(() => {
+    void refreshMirrorState();
+  }, []);
+
+  // Collection-children cache stats. Per-server map of cached
+  // collection counts + freshness so the operator can verify cache
+  // is populating and force-invalidate when retesting.
+  const [collectionCacheState, setCollectionCacheState] = useState<
+    Record<string, {
+      collections: number;
+      items: number;
+      last_fetched_at: number;
+    }>
+  >({});
+  const refreshCollectionCacheState = async () => {
+    try {
+      const r = await api.getCollectionCacheStatus();
+      const next: Record<string, {
+        collections: number; items: number; last_fetched_at: number;
+      }> = {};
+      for (const row of r.servers) {
+        next[row.server_id] = {
+          collections: row.collections,
+          items: row.items,
+          last_fetched_at: row.last_fetched_at,
+        };
+      }
+      setCollectionCacheState(next);
+    } catch {
+      // Best-effort.
+    }
+  };
+  useEffect(() => {
+    void refreshCollectionCacheState();
+  }, []);
+  const [busyCollectionCacheId, setBusyCollectionCacheId] = useState<
+    string | null
+  >(null);
+  const confirm = useConfirm();
+  const clearCollectionCacheForServer = async (serverId: string) => {
+    if (!(await confirm({
+      body:
+        `Clear the collection-children cache for ${serverId}? The next ` +
+        `snapshot of this server will re-fetch every collection's ` +
+        `children from Plex (slow first run; fast subsequent runs).`,
+      danger: true,
+    }))) return;
+    setBusyCollectionCacheId(serverId);
+    try {
+      await api.invalidateCollectionCache(serverId);
+      await refreshCollectionCacheState();
+    } finally {
+      setBusyCollectionCacheId(null);
+    }
+  };
+  const buildCollectionCacheForServer = async (serverId: string) => {
+    setBusyCollectionCacheId(serverId);
+    setCacheNotice(null);
+    try {
+      const result = await api.warmCollectionCache(serverId);
+      await refreshCollectionCacheState();
+      const libs = (result.libraries || [])
+        .map((l) => `${l.name}: ${l.collections} cached (${l.errors} error)`)
+        .join('; ');
+      // FECORE-15: surface success inline instead of window.alert.
+      setCacheNotice({
+        kind: 'good',
+        message:
+          `Collection cache built for ${serverId}: ` +
+          `${result.total_collections} collection(s), ` +
+          `${result.total_items} item(s) in ${result.elapsed_seconds.toFixed(1)}s. ` +
+          `Per library — ${libs || '(no libraries)'}.`,
+      });
+    } catch (e) {
+      // FECORE-15: surface failure inline instead of window.alert.
+      setCacheNotice({
+        kind: 'error',
+        message: `Build cache failed for ${serverId}: ${(e as Error).message}`,
+      });
+    } finally {
+      setBusyCollectionCacheId(null);
+    }
+  };
+
+  // Bulk action: warm one or both caches for every registered server
+  // in one click. Operator picks which cache types to build via the
+  // checkboxes next to the button; the label updates to reflect the
+  // selection. Per-server failures (with reasons) are surfaced in the
+  // result panel below the button so the operator can see WHICH server
+  // failed and WHY, instead of a single opaque alert.
+  const [busyAllCaches, setBusyAllCaches] = useState<boolean>(false);
+  const [buildCollections, setBuildCollections] = useState<boolean>(true);
+  const [buildPlaylists, setBuildPlaylists] = useState<boolean>(true);
+  // Per-server failure rows from the last bulk build. Cleared on the
+  // next click. Each row carries the cache type so the panel can
+  // explain "Plex-A failed for playlists because <reason>".
+  type BulkFailure = {
+    server_id: string;
+    cache_type: 'collections' | 'playlists';
+    reason: string;
+  };
+  const [bulkFailures, setBulkFailures] = useState<BulkFailure[]>([]);
+  // Per-server success rows: shown as a compact list under the button
+  // so the operator can see which servers warmed and how much.
+  type BulkSuccess = {
+    server_id: string;
+    cache_type: 'collections' | 'playlists';
+    note: string;
+  };
+  const [bulkSuccesses, setBulkSuccesses] = useState<BulkSuccess[]>([]);
+  // Wall-clock + headline counts from the last bulk run. Rendered
+  // above the per-server rows.
+  const [bulkSummary, setBulkSummary] = useState<string | null>(null);
+
+  const bulkButtonLabel = (busy: boolean): string => {
+    if (busy) return 'Building caches…';
+    const parts: string[] = [];
+    if (buildCollections) parts.push('Collections');
+    if (buildPlaylists) parts.push('Playlists');
+    if (parts.length === 0) return 'Build caches (pick at least one)';
+    return `Build ${parts.join(' + ')}`;
+  };
+
+  // Global Sync mirrors button. Companion to the per-row Sync Now
+  // buttons in ServerMirrorBadge. The endpoint launches one
+  // background walker per registered server (each runs independently
+  // - a slow server doesn't gate the rest). Per-server status rows
+  // let us surface a failure list inline so a server that can't
+  // connect doesn't quietly disappear.
+  const [busyAllSync, setBusyAllSync] = useState<boolean>(false);
+  type SyncFailure = { server_id: string; reason: string };
+  const [syncFailures, setSyncFailures] = useState<SyncFailure[]>([]);
+  const [syncSummary, setSyncSummary] = useState<string | null>(null);
+  const syncAllMirrors = async () => {
+    if (!(await confirm({
+      body:
+        'Launch a background mirror sync for every registered server? ' +
+        'Each server walks its libraries via the adapter and writes the ' +
+        'result to server_mirror.db. Per-server walkers run independently; ' +
+        'one slow server does not gate the rest.',
+    }))) return;
+    setBusyAllSync(true);
+    setSyncFailures([]);
+    setSyncSummary(null);
+    try {
+      const r = await api.syncAllServerMirrors();
+      const failures: SyncFailure[] = [];
+      let started = 0;
+      let already = 0;
+      for (const row of r.results) {
+        if (row.status === 'error') {
+          failures.push({
+            server_id: row.server_id,
+            reason: row.error || 'unknown',
+          });
+        } else if (row.status === 'in_progress') {
+          already += 1;
+        } else {
+          started += 1;
+        }
+      }
+      setSyncFailures(failures);
+      setSyncSummary(
+        `${started} walker(s) launched, ${already} already in progress, ${failures.length} failed to launch. ` +
+        'Badges will update as each walker finishes.',
+      );
+      // Refresh the per-row mirror state several times so the operator
+      // sees ``last_full_sync_at`` flip as walkers finish. Cadence
+      // matches the per-row poll in ServerMirrorBadge.doSync.
+      let i = 0;
+      let stopPoll: (() => void) | null = null;
+      stopPoll = pausableInterval(() => {
+        void refreshMirrorState();
+        i += 1;
+        if (i >= 10) stopPoll?.();
+      }, 3000);
+    } catch (e) {
+      setSyncFailures([{
+        server_id: '(all servers)',
+        reason: `endpoint failed: ${(e as Error).message}`,
+      }]);
+    } finally {
+      setBusyAllSync(false);
+    }
+  };
+
+  const buildAllCaches = async () => {
+    if (!buildCollections && !buildPlaylists) {
+      // FECORE-15: inline guard notice instead of window.alert.
+      setCacheNotice({
+        kind: 'error',
+        message: 'Pick at least one cache type to build.',
+      });
+      return;
+    }
+    setCacheNotice(null);
+    const parts: string[] = [];
+    if (buildCollections) parts.push('collection-children');
+    if (buildPlaylists) parts.push('playlist');
+    if (!(await confirm({
+      body:
+        `Warm the ${parts.join(' + ')} cache for ALL registered servers? ` +
+        `Each server walks its libraries (collections) or fetches every ` +
+        `user's playlists. First-run cost can be minutes per server on ` +
+        `large libraries; subsequent runs are fast because the cache is ` +
+        `populated.`,
+    }))) return;
+    setBusyAllCaches(true);
+    setBulkFailures([]);
+    setBulkSuccesses([]);
+    setBulkSummary(null);
+    const failures: BulkFailure[] = [];
+    const successes: BulkSuccess[] = [];
+    let collectionsTotal = 0;
+    let playlistsTotal = 0;
+    let serversWarmed = 0;
+    let serversFailed = 0;
+    let elapsed = 0;
+    try {
+      // Run both bulk endpoints in parallel so total wall-clock is
+      // max(collections, playlists), not the sum.
+      const collectionsPromise = buildCollections
+        ? api.warmAllCollectionCaches()
+        : Promise.resolve(null);
+      const playlistsPromise = buildPlaylists
+        ? api.warmAllPlaylistCaches('servers-bulk')
+        : Promise.resolve(null);
+      const [collResult, plResult] = await Promise.all([
+        collectionsPromise.catch((e) => {
+          // Top-level endpoint failure (e.g. auth) — surface as a
+          // single failure row rather than a generic toast.
+          failures.push({
+            server_id: '(all servers)',
+            cache_type: 'collections',
+            reason: `endpoint failed: ${(e as Error).message}`,
+          });
+          return null;
+        }),
+        playlistsPromise.catch((e) => {
+          failures.push({
+            server_id: '(all servers)',
+            cache_type: 'playlists',
+            reason: `endpoint failed: ${(e as Error).message}`,
+          });
+          return null;
+        }),
+      ]);
+      if (collResult) {
+        collectionsTotal = collResult.total_collections;
+        serversWarmed += collResult.servers_warmed;
+        serversFailed += collResult.servers_failed;
+        elapsed = Math.max(elapsed, collResult.elapsed_seconds);
+        for (const r of collResult.results) {
+          if (r.error) {
+            failures.push({
+              server_id: r.server_id,
+              cache_type: 'collections',
+              reason: r.error,
+            });
+          } else {
+            successes.push({
+              server_id: r.server_id,
+              cache_type: 'collections',
+              note: `${r.total_collections ?? 0} collection(s), ${r.total_items ?? 0} item(s)`,
+            });
+          }
+        }
+      }
+      if (plResult) {
+        playlistsTotal = plResult.total_playlists;
+        serversWarmed += plResult.servers_warmed;
+        serversFailed += plResult.servers_failed;
+        elapsed = Math.max(elapsed, plResult.elapsed_seconds);
+        for (const r of plResult.results) {
+          if (r.error) {
+            failures.push({
+              server_id: r.server_id,
+              cache_type: 'playlists',
+              reason: r.error,
+            });
+          } else {
+            const perUserErrors = r.per_user_errors ?? 0;
+            const note = perUserErrors > 0
+              ? `${r.playlists_count ?? 0} playlist(s), ${r.items_count ?? 0} item(s); ${perUserErrors} per-user error(s)`
+              : `${r.playlists_count ?? 0} playlist(s), ${r.items_count ?? 0} item(s)`;
+            successes.push({
+              server_id: r.server_id,
+              cache_type: 'playlists',
+              note,
+            });
+          }
+        }
+      }
+      await refreshCollectionCacheState();
+      const summary = [
+        `${serversWarmed} server-pass(es) warmed`,
+        `${serversFailed} failed`,
+        ...(buildCollections ? [`${collectionsTotal} collection(s)`] : []),
+        ...(buildPlaylists ? [`${playlistsTotal} playlist(s)`] : []),
+        `in ${elapsed.toFixed(1)}s`,
+      ].join(', ');
+      setBulkSummary(summary);
+      setBulkFailures(failures);
+      setBulkSuccesses(successes);
+    } finally {
+      setBusyAllCaches(false);
+    }
+  };
+  // One backend tier shared across all four sub-tabs so the user
+  // stays in the chosen backend's context as they pivot. Defaults to
+  // 'plex' since every install today has at least one Plex server.
   const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
 
   // Auto-correct activeBackend when it points at an empty backend
   // and another backend has servers. Fires after the server list
-  // refreshes (e.g. end user deleted the last Plex server while on
-  // the Plex tab). Without this, the panel would render its empty
-  // state forever even though Jellyfin servers are registered.
+  // refreshes (e.g. user deleted the last Plex server while on the
+  // Plex tab). Without this, the panel would render its empty state
+  // forever even though Jellyfin servers are registered.
   useEffect(() => {
     if (servers.length === 0) return;
     const counts = backendCounts(servers);
@@ -78,7 +435,7 @@ export function ServersPanel() {
   // Derived: the registered-server list filtered to the active backend.
   // Used by the Overview table + passed down to per-backend sub-panels.
   const backendServers = serversForBackend(servers, activeBackend);
-  // End user-facing label for the active backend's panel heading.
+  // User-facing label for the active backend's panel heading.
   const backendLabel = activeBackend === 'plex' ? 'Plex'
     : activeBackend === 'jellyfin' ? 'Jellyfin'
     : 'Emby';
@@ -92,14 +449,21 @@ export function ServersPanel() {
   const [cacheWarmingIds, setCacheWarmingIds] = useState<Set<string>>(new Set());
   // Last cascade summary from a successful delete. Rendered as a
   // green toast banner at the top of the panel and dismissed by the
-  // end user (or by the next action).
+  // user (or by the next action).
   const [cascadeToast, setCascadeToast] = useState<ServerDeleteSummary | null>(null);
-  // Item 2: refresh-button token-capture toast. Cleared by Dismiss or
-  // by a subsequent refresh that does no work (the toast only renders
-  // when there's something worth saying).
+  // Refresh-button token-capture toast. Cleared by Dismiss or by a
+  // subsequent refresh that does no work (the toast only renders when
+  // there's something worth saying).
   const [refreshToast, setRefreshToast] = useState<{ name: string; message: string } | null>(null);
+  // FECORE-15: inline banner for the per-server cache-build outcome
+  // and the "pick a cache type" guard. Replaces the three window.alert
+  // calls so these paths surface results the same way the bulk paths
+  // do (bulkSummary / bulkFailures), not via a native modal.
+  const [cacheNotice, setCacheNotice] = useState<
+    { kind: 'good' | 'error'; message: string } | null
+  >(null);
 
-  // Item 3: cross-server PIN migration modal state. Triggered after
+  // Cross-server PIN migration modal state. Triggered after
   // Add-Server and Refresh-Server flows discover an overlap between
   // this server's managed users and another server's stored PINs.
   const [pinMigration, setPinMigration] = useState<
@@ -109,7 +473,7 @@ export function ServersPanel() {
 
   // Probe the suggestions endpoint and open the modal if non-empty.
   // Failure is silent: the prompt is a nicety, not a blocking
-  // requirement, and the end user can still capture PINs manually.
+  // requirement, and the user can still capture PINs manually.
   const probeAndMaybeOpenPinMigration = async (serverId: string, serverName: string) => {
     try {
       const res = await api.pinMigrationSuggestions(serverId);
@@ -128,42 +492,42 @@ export function ServersPanel() {
   // ``undefined`` if no ping has come back yet for that id.
   const [pings, setPings] = useState<Record<string, PingResult>>({});
 
-  // v0.9.6 Feature 3: per-server user lists fetched on tab visit.
-  // Keyed by server id. ``undefined`` = not yet fetched / refetching;
+  // Per-server user lists fetched on tab visit. Keyed by server id.
+  // ``undefined`` = not yet fetched / refetching;
   // resolved values may carry a non-null ``error`` when systemAccounts
   // failed but the owner row is still there. The ``error`` shape with
   // a single ``message`` field flags total fetch failures (connect
   // refused / 502) so the panel can render a recoverable inline error.
   const [users, setUsers] = useState<Record<string, ServerUsersResponse | { error: string }>>({});
 
-  // PR-11 - self-firing sync. When the Servers page mounts (or the
-  // server list changes), we diff the live user list against what's
-  // in the local managed_users DB. New users surface as dismissible
-  // toasts at the top of the panel and a background sync runs to
-  // bring the DB up to date so the JobFormPanel picker reflects the
-  // current state on the next visit.
+  // Self-firing sync. When the Servers page mounts (or the server
+  // list changes), we diff the live user list against what's in the
+  // local managed_users DB. New users surface as dismissible toasts
+  // at the top of the panel and a background sync runs to bring the
+  // DB up to date so the JobFormPanel picker reflects the current
+  // state on the next visit.
   const [syncToasts, setSyncToasts] = useState<
     { id: string; server_name: string; added: string[] }[]
   >([]);
-  // PR-11.1 - in-flight sync guard. A ref-based Set lets the effect
-  // re-run on every ``servers`` change without stacking duplicate
-  // sync calls for the same server (which would hammer Plex with
-  // parallel ``systemAccounts()`` calls). Cleared when the sync
-  // promise settles (success or failure).
+  // In-flight sync guard. A ref-based Set lets the effect re-run on
+  // every ``servers`` change without stacking duplicate sync calls
+  // for the same server (which would hammer Plex with parallel
+  // ``systemAccounts()`` calls). Cleared when the sync promise
+  // settles (success or failure).
   const inFlightSyncsRef = useRef<Set<string>>(new Set());
 
   // Track the polling timer so we can clear it on unmount.
-  const pollTimerRef = useRef<number | null>(null);
+  const pollTimerRef = useRef<(() => void) | null>(null);
 
-  // Live ping cadence. Loaded once from settings on mount so an end user
+  // Live ping cadence. Loaded once from settings on mount so a user
   // who bumps it via Settings ▸ Tunables doesn't need a code change.
   // A panel re-mount picks up subsequent changes; the effect that arms
   // the timer below depends on this value, so a new cadence rearms
   // automatically once the load completes.
   const [pingIntervalMs, setPingIntervalMs] = useState<number>(PING_INTERVAL_MS_DEFAULT);
   // Optional UID column toggle. Reads `servers_panel_show_server_uid`
-  // (developer tunable, 2026-05-16). Off by default — flip via
-  // Settings ▸ Tunables ▸ UI & Display ▸ Admin & UX toggles.
+  // (developer tunable). Off by default - flip via Settings ▸
+  // Tunables ▸ UI & Display ▸ Admin & UX toggles.
   const [showServerUid, setShowServerUid] = useState(false);
   useEffect(() => {
     api.getSettings()
@@ -185,15 +549,15 @@ export function ServersPanel() {
   const refresh = async () => {
     try {
       const next = await api.listServers();
-      // 2026-05-17 defensive (operator report — servers vanished after
-      // Refresh): only commit the new list when it's non-empty OR when
-      // we KNOW the registry is genuinely empty (no servers existed
-      // before either). A transient empty response — e.g. because the
-      // parallel playlist refresh briefly tied up the registry read —
-      // used to wipe every row from the UI until a hard reload.
+      // Defensive: only commit the new list when it's non-empty OR
+      // when we KNOW the registry is genuinely empty (no servers
+      // existed before either). A transient empty response - e.g.
+      // because the parallel playlist refresh briefly tied up the
+      // registry read - would otherwise wipe every row from the UI
+      // until a hard reload.
       setServers((prev) => {
         if (next.length === 0 && prev.length > 0) {
-          // Suspicious — keep the prior list rather than blank the UI.
+          // Suspicious - keep the prior list rather than blank the UI.
           // The next refresh tick repopulates correctly.
           // eslint-disable-next-line no-console
           console.warn(
@@ -215,7 +579,7 @@ export function ServersPanel() {
     refresh();
     return () => {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
     };
@@ -227,7 +591,7 @@ export function ServersPanel() {
   useEffect(() => {
     if (servers.length === 0) {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
       return;
@@ -252,12 +616,12 @@ export function ServersPanel() {
     // Fire one ping right now so the dots aren't grey on first paint
     // for the 30 seconds until the first interval fires.
     pingAll();
-    if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
-    pollTimerRef.current = window.setInterval(pingAll, pingIntervalMs);
+    if (pollTimerRef.current !== null) pollTimerRef.current();
+    pollTimerRef.current = pausableInterval(pingAll, pingIntervalMs);
 
     return () => {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
     };
@@ -266,12 +630,12 @@ export function ServersPanel() {
     // via Settings ▸ Tunables.
   }, [servers, pingIntervalMs]);
 
-  // v0.9.6 Feature 3: fetch per-server user lists in parallel whenever
-  // the server list changes. No caching - the user list on a Plex
-  // server can change at any time (add/remove managed users), so a
-  // stale cache would mislead. One round-trip per registered server
-  // per Servers tab visit is acceptable; if performance becomes a
-  // concern with many servers, add a short TTL later.
+  // Fetch per-server user lists in parallel whenever the server list
+  // changes. No caching - the user list on a Plex server can change
+  // at any time (add/remove managed users), so a stale cache would
+  // mislead. One round-trip per registered server per Servers tab
+  // visit is acceptable; if performance becomes a concern with many
+  // servers, add a short TTL later.
   useEffect(() => {
     if (servers.length === 0) {
       setUsers({});
@@ -290,18 +654,18 @@ export function ServersPanel() {
       ]);
       if (cancelled) return;
       // Live user list - same surface the panel renders and the
-      // JobFormPanel used to read on its own before PR-11.
+      // JobFormPanel reads.
       if (liveRes.status === 'fulfilled') {
         setUsers((prev) => ({ ...prev, [s.id]: liveRes.value }));
       } else {
         setUsers((prev) => ({ ...prev, [s.id]: { error: String(liveRes.reason) } }));
       }
-      // PR-11 diff. If the live API surfaced users that aren't in
-      // the local managed_users DB (visible OR hidden), fire a
-      // background sync and queue a toast for the end user. Only
-      // "additions" trigger this - removals never auto-fire deletes
-      // (additive-only rule from clp.md). The DB call failing is
-      // non-fatal; we just skip the diff and let the next visit retry.
+      // Diff. If the live API surfaced users that aren't in the local
+      // managed_users DB (visible OR hidden), fire a background sync
+      // and queue a toast for the user. Only "additions" trigger this
+      // - removals never auto-fire deletes (additive-only rule from
+      // clp.md). The DB call failing is non-fatal; we just skip the
+      // diff and let the next visit retry.
       if (
         liveRes.status === 'fulfilled' &&
         dbRes.status === 'fulfilled'
@@ -313,16 +677,16 @@ export function ServersPanel() {
           .map((u) => u.raw_name)
           .filter((n) => !!n && !dbNames.has(n));
         if (newlyDetected.length > 0) {
-          // PR-11.1 concurrency guard - skip if a sync for this
-          // server is already in flight. The diff effect re-runs
-          // whenever ``servers`` changes (test, refresh, edit) and
-          // without this guard each re-run would stack another
-          // background ``systemAccounts()`` call against Plex.
+          // Concurrency guard - skip if a sync for this server is
+          // already in flight. The diff effect re-runs whenever
+          // ``servers`` changes (test, refresh, edit) and without
+          // this guard each re-run would stack another background
+          // ``systemAccounts()`` call against Plex.
           if (!inFlightSyncsRef.current.has(s.id)) {
             inFlightSyncsRef.current.add(s.id);
             api.syncServerManagedUsers(s.id)
               .catch(() => {
-                /* end user can hit the manual sync button if this fails */
+                /* user can hit the manual sync button if this fails */
               })
               .finally(() => {
                 inFlightSyncsRef.current.delete(s.id);
@@ -361,11 +725,11 @@ export function ServersPanel() {
     try {
       const result = await api.testServer(id);
       await refresh();
-      // Item 2: surface the token-capture sweep result. captured > 0
-      // means new tokens landed; throttled true means the end user
-      // clicked Refresh faster than the throttle allows (rare, since
-      // Refresh bypasses the throttle by design); errors get a quiet
-      // mention but don't fail the refresh.
+      // Surface the token-capture sweep result. captured > 0 means
+      // new tokens landed; throttled true means the user clicked
+      // Refresh faster than the throttle allows (rare, since Refresh
+      // bypasses the throttle by design); errors get a quiet mention
+      // but don't fail the refresh.
       const cap = result?.token_capture;
       if (cap && (cap.captured > 0 || cap.errors.length > 0)) {
         const name = result?.name ?? 'server';
@@ -375,22 +739,21 @@ export function ServersPanel() {
         if (cap.errors.length > 0) parts.push(`${cap.errors.length} error(s) - see runtime.log`);
         setRefreshToast({ name, message: parts.join('; ') });
       }
-      // Item 3: after a refresh, also probe for cross-server PIN
-      // overlaps. The refresh might have discovered a new managed
-      // user that matches a stored PIN on another server.
+      // After a refresh, also probe for cross-server PIN overlaps.
+      // The refresh might have discovered a new managed user that
+      // matches a stored PIN on another server.
       const serverName = (result && result.name) || id;
       void probeAndMaybeOpenPinMigration(id, serverName);
-      // 2026-05-17 (operator bug report — servers disappearing after
-      // Refresh): the playlist-cache warm now fires AFTER the synchronous
+      // The playlist-cache warm fires AFTER the synchronous
       // testServer + listServers refresh completes, NOT in parallel
-      // with it. The parallel version contended with the registry sync
-      // and surfaced as an empty server list until the page was reloaded.
-      // The bulk refresh now runs strictly in the background once the
-      // server-list state is stable.
+      // with it. Running it in parallel contends with the registry
+      // sync and can surface as an empty server list until the page
+      // is reloaded. The bulk refresh runs strictly in the background
+      // once the server-list state is stable.
       setCacheWarmingIds((prev) => new Set(prev).add(id));
       void api.playlistMgmtRefreshServer(id, 'servers-refresh')
         .catch(() => {
-          /* best-effort — failures are visible in Settings ▸ Application Logs ▸ Playlist Cache */
+          /* best-effort - failures are visible in Settings ▸ Application Logs ▸ Playlist Cache */
         })
         .finally(() => {
           setCacheWarmingIds((prev) => {
@@ -407,11 +770,11 @@ export function ServersPanel() {
   };
 
   const remove = async (s: ServerView) => {
-    // v0.9.5: fetch the cascade preview first so the confirmation
-    // dialog can show concrete counts. If the preview call itself
-    // fails (e.g. server is mid-cascade by another request), fall
-    // back to the previous text-only prompt so the end user can
-    // still cancel the action safely.
+    // Fetch the cascade preview first so the confirmation dialog can
+    // show concrete counts. If the preview call itself fails (e.g.
+    // server is mid-cascade by another request), fall back to a
+    // text-only prompt so the user can still cancel the action
+    // safely.
     let previewLine = '';
     try {
       const preview = await api.previewServerCascade(s.id);
@@ -424,11 +787,13 @@ export function ServersPanel() {
     } catch {
       previewLine = 'Cascade will also delete every schedule, snapshot, and log directory attributable to this server.\n\n';
     }
-    if (!confirm(
-      `Delete server "${s.name}" and everything attributable to it?\n\n` +
-      previewLine +
-      'This cannot be undone.'
-    )) return;
+    if (!(await confirm({
+      body:
+        `Delete server "${s.name}" and everything attributable to it?\n\n` +
+        previewLine +
+        'This cannot be undone.',
+      danger: true,
+    }))) return;
     setCascadeToast(null);
     try {
       const summary = await api.deleteServer(s.id);
@@ -442,6 +807,18 @@ export function ServersPanel() {
   return (
     <>
       {error && <div className="banner error">{error}</div>}
+
+      {/* FECORE-15: inline banner for per-server cache-build outcomes
+          and the cache-type guard (formerly window.alert calls). */}
+      {cacheNotice && (
+        <div
+          className={`banner ${cacheNotice.kind}`}
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}
+        >
+          <div>{cacheNotice.message}</div>
+          <button onClick={() => setCacheNotice(null)} style={{ flexShrink: 0 }}>Dismiss</button>
+        </div>
+      )}
 
       {refreshToast && (
         <div
@@ -478,9 +855,9 @@ export function ServersPanel() {
         </div>
       )}
 
-      {/* PR-11 - new-user detection toasts. One per server, queued
-          by the diff effect above. Background sync has already fired
-          by the time this renders; the toast is purely informational. */}
+      {/* New-user detection toasts. One per server, queued by the
+          diff effect above. Background sync has already fired by the
+          time this renders; the toast is purely informational. */}
       {syncToasts.map((t) => (
         <div
           key={t.id}
@@ -504,8 +881,8 @@ export function ServersPanel() {
       {/* Top-level sub-tab nav. Stays visible regardless of which tab
           is active so a single click switches surface without
           scrolling. The Overview tab carries the registered-server
-          table + add/edit controls; the others carry the panels that
-          used to stack below it. */}
+          table + add/edit controls; the other tabs carry their own
+          panels. */}
       <nav className="tabs sub-tabs" style={{ marginBottom: 8 }}>
         <button
           className={activeTab === 'overview' ? 'active' : ''}
@@ -537,7 +914,57 @@ export function ServersPanel() {
         >
           Recent Runtimes
         </button>
+        {/* Drift History sub-tab. Lists drift_events rows newest
+            first; operators use this to audit cache freshness. */}
+        <button
+          className={activeTab === 'drift' ? 'active' : ''}
+          onClick={() => setActiveTab('drift')}
+          disabled={servers.length === 0}
+          title={servers.length === 0 ? 'Register a server first.' : undefined}
+        >
+          Drift History
+        </button>
+        {/* Per-run job logs. The inner view restructures the run
+            list into per-server sub-tabs + a Direct Transfers tab
+            instead of a per-backend filter. The same panel also
+            mounts under Settings > Logs for muscle-memory
+            continuity. */}
+        <button
+          className={activeTab === 'logs' ? 'active' : ''}
+          onClick={() => setActiveTab('logs')}
+          title="Per-server job logs. Sub-tabs let you pick a server; the 'Direct Transfers' view surfaces server-to-server runs under either participating server."
+        >
+          Logs
+        </button>
+        {/* Library Mapping lives on the top-level Server Syncing tab,
+            alongside the Sync Subscriptions UI. */}
       </nav>
+
+      {activeTab === 'drift' && (
+        <DriftHistoryTab />
+      )}
+
+      {activeTab === 'logs' && (
+        <LogsPanel />
+      )}
+
+      {activeTab === 'overview' && (
+        <FirstRunMirrorDialog
+          open={firstRunMirrorOpen}
+          onClose={(decision) => {
+            setFirstRunMirrorOpen(false);
+            void api.saveSettings({
+              tunables: {
+                engine_mirror_first_run_dialog_seen: 1,
+              } as Record<string, number | string>,
+            }).catch(() => {
+              // A save failure means the panel re-shows next mount,
+              // which is acceptable.
+            });
+            void decision;
+          }}
+        />
+      )}
 
       {activeTab === 'overview' && (
       <div className="banner info">
@@ -546,6 +973,176 @@ export function ServersPanel() {
         across all involved servers. Schedule recurring exports at staggered times rather
         than the same minute, and see the README's <em>Understanding Performance and Threading</em>
         section for guidance on worker counts.
+      </div>
+      )}
+
+      {/* Global mirror sync button. Companion to the per-row Sync Now
+          in ServerMirrorBadge. Each per-server walker launches
+          independently in a daemon thread; per-server status
+          (started / in_progress / error) lands in the failure list
+          so a server that can't connect doesn't quietly disappear. */}
+      {activeTab === 'overview' && servers.length > 0 && canEditServers && (
+      <div
+        className="panel"
+        style={{ marginBottom: 12 }}
+      >
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <strong style={{ marginRight: 4 }}>Mirror:</strong>
+          <button
+            type="button"
+            onClick={() => { void syncAllMirrors(); }}
+            disabled={busyAllSync}
+            title={
+              "Launch a background mirror walker for every " +
+              "registered server. Each walker is independent — a slow " +
+              "server does not gate the rest. Per-row badges update " +
+              "as each walker finishes (badge auto-refreshes for ~30s)."
+            }
+          >
+            {busyAllSync ? 'Launching walkers…' : 'Sync all mirrors'}
+          </button>
+          <span className="help" style={{ flex: 1, minWidth: 240 }}>
+            Each per-row badge in the table below also has its own
+            Sync Now control with the same single-flight semantics.
+          </span>
+        </div>
+        {(syncSummary || syncFailures.length > 0) && (
+          <div style={{ marginTop: 10 }}>
+            {syncSummary && (
+              <div style={{ marginBottom: 6 }}>
+                <strong>Last sync launch:</strong> {syncSummary}
+              </div>
+            )}
+            {syncFailures.length > 0 && (
+              <div className="banner error" style={{ padding: 8 }}>
+                <strong>Failed to launch:</strong>
+                <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                  {syncFailures.map((f, i) => (
+                    <li key={`${f.server_id}-${i}`}>
+                      <code>{f.server_id}</code>: {f.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      )}
+
+      {/* Bulk cache control bar - parity with the per-row controls in
+          the table below. The operator picks which cache types to
+          (re)build via the two checkboxes; the button label updates
+          to reflect the selection. Per-server failures land in the
+          result panel below the button with a reason string so the
+          operator can see WHICH server failed and WHY, rather than a
+          single opaque alert. */}
+      {activeTab === 'overview' && servers.length > 0 && canEditServers && (
+      <div
+        className="panel"
+        style={{ marginBottom: 12 }}
+      >
+        <div
+          style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}
+        >
+          <strong style={{ marginRight: 4 }}>Build caches:</strong>
+          <label
+            style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+            title={
+              "Include the collection-children cache. Used by " +
+              "snapshots' Collections phase to skip the expensive " +
+              "per-collection /children fetch on unchanged collections."
+            }
+          >
+            <input
+              type="checkbox"
+              checked={buildCollections}
+              onChange={(e) => setBuildCollections(e.target.checked)}
+              disabled={busyAllCaches}
+            />
+            Collections
+          </label>
+          <label
+            style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+            title={
+              "Include the per-user playlist cache. Used by " +
+              "Playlist Transfer + snapshot's Playlists phase to " +
+              "skip a per-user list-playlists round-trip."
+            }
+          >
+            <input
+              type="checkbox"
+              checked={buildPlaylists}
+              onChange={(e) => setBuildPlaylists(e.target.checked)}
+              disabled={busyAllCaches}
+            />
+            Playlists
+          </label>
+          <button
+            type="button"
+            onClick={() => { void buildAllCaches(); }}
+            disabled={busyAllCaches || (!buildCollections && !buildPlaylists)}
+            title={
+              "Warm the selected caches for ALL registered servers. " +
+              "First run per server is slow on libraries with many " +
+              "collections (Plex serializes /library/metadata/X/" +
+              "children server-side) or many home-user playlists; " +
+              "subsequent calls are fast because each collection's " +
+              "updatedAt is checked and unchanged ones skip the fetch."
+            }
+          >
+            {bulkButtonLabel(busyAllCaches)}
+          </button>
+          <span className="help" style={{ flex: 1, minWidth: 240 }}>
+            Both caches also populate as a side effect of snapshots
+            (collections) or Refresh (playlists); these buttons let
+            you pre-warm without paying the full snapshot cost.
+          </span>
+        </div>
+        {(bulkSummary || bulkFailures.length > 0 || bulkSuccesses.length > 0) && (
+          <div style={{ marginTop: 10 }}>
+            {bulkSummary && (
+              <div style={{ marginBottom: 6 }}>
+                <strong>Last bulk run:</strong> {bulkSummary}
+              </div>
+            )}
+            {bulkSuccesses.length > 0 && (
+              <details style={{ marginBottom: 6 }}>
+                <summary>
+                  Successful: {bulkSuccesses.length} server-pass(es)
+                </summary>
+                <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                  {bulkSuccesses.map((s, i) => (
+                    <li key={`${s.server_id}-${s.cache_type}-${i}`}>
+                      <code>{s.server_id}</code>
+                      {' '}({s.cache_type}): {s.note}
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+            {bulkFailures.length > 0 && (
+              <div
+                className="banner error"
+                style={{ padding: 8 }}
+              >
+                <strong>
+                  Failed: {bulkFailures.length} server-pass(es). Each
+                  row shows the cache type and the reason returned by
+                  the backend.
+                </strong>
+                <ul style={{ margin: '4px 0 0 16px', padding: 0 }}>
+                  {bulkFailures.map((f, i) => (
+                    <li key={`${f.server_id}-${f.cache_type}-${i}`}>
+                      <code>{f.server_id}</code>
+                      {' '}({f.cache_type}): {f.reason}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
       </div>
       )}
 
@@ -591,6 +1188,8 @@ export function ServersPanel() {
                 <th style={{ textAlign: 'right' }}>Ping</th>
                 <th style={{ textAlign: 'right' }}>Libraries</th>
                 <th>Last contact</th>
+                <th>Mirror</th>
+                <th>Collection cache</th>
                 <th></th>
               </tr>
             </thead>
@@ -643,11 +1242,127 @@ export function ServersPanel() {
                     <td className="num">{s.last_libraries.length || '-'}</td>
                     <td>{s.last_checked_at ? new Date(s.last_checked_at * 1000).toLocaleString() : '-'}</td>
                     <td>
+                      {mirrorState[s.id] ? (
+                        <ServerMirrorBadge
+                          state={mirrorState[s.id]}
+                          globalMode={globalMirrorMode}
+                          onChange={() => { void refreshMirrorState(); }}
+                        />
+                      ) : (
+                        <span
+                          className="muted"
+                          title="No mirror state yet. Trigger a sync from any job or via Sync Now button on the mirror badge once mirror data lands."
+                          style={{ fontSize: 11 }}
+                        >
+                          —
+                        </span>
+                      )}
+                    </td>
+                    <td>
+                      {(() => {
+                        const cc = collectionCacheState[s.id];
+                        const isEmpty = !cc || cc.collections === 0;
+                        // FECORE-16: a malformed row with last_fetched_at
+                        // == 0 (or null/undefined) would otherwise render
+                        // an age of ~56 years. Treat a non-positive /
+                        // missing timestamp as unknown ("—").
+                        const hasTs = !!cc && cc.last_fetched_at > 0;
+                        const ageSec = !isEmpty && hasTs ? Math.max(
+                          0,
+                          Math.floor(Date.now() / 1000 - cc.last_fetched_at),
+                        ) : 0;
+                        const ageStr =
+                          !hasTs ? '—' :
+                          ageSec < 60 ? `${ageSec}s` :
+                          ageSec < 3600 ? `${Math.floor(ageSec / 60)}m` :
+                          ageSec < 86400 ? `${Math.floor(ageSec / 3600)}h` :
+                          `${Math.floor(ageSec / 86400)}d`;
+                        return (
+                          <div style={{ display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
+                            {isEmpty ? (
+                              <span
+                                className="muted"
+                                title={
+                                  "No collections cached for this server yet. " +
+                                  "The cache populates either (a) during the next snapshot of " +
+                                  "a library with collections (typically Movies), or (b) when " +
+                                  "you click the Build button below. Note: the 'Refresh' " +
+                                  "button warms the playlist cache + pings the server; it " +
+                                  "does NOT touch the collection cache."
+                                }
+                                style={{ fontSize: 11 }}
+                              >
+                                empty
+                              </span>
+                            ) : (
+                              <span
+                                className="tag"
+                                title={
+                                  `${cc.collections} collection(s), ${cc.items} item(s) cached. ` +
+                                  // FECORE-16: phrase the age line for the unknown case.
+                                  (hasTs
+                                    ? `Last refresh ${ageStr} ago. `
+                                    : 'Last refresh time unknown. ') +
+                                  `The next snapshot will skip ` +
+                                  `the collection.items() call for these collections — ` +
+                                  `unless their Plex updatedAt has advanced, in which case ` +
+                                  `the cache entry is invalidated automatically and refetched.`
+                                }
+                                style={{ fontSize: 10 }}
+                              >
+                                {cc.collections} · {ageStr}
+                              </span>
+                            )}
+                            {canEditServers && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => { void buildCollectionCacheForServer(s.id); }}
+                                  disabled={busyCollectionCacheId === s.id || busyAllCaches}
+                                  title={
+                                    "Populate the collection-children cache for this server " +
+                                    "WITHOUT running a full snapshot. Walks every library, " +
+                                    "fetches every collection's children, writes results to " +
+                                    "the cache. Wall-clock equals one snapshot's collection " +
+                                    "phase (slow first run; fast if you re-click without " +
+                                    "Plex-side changes). Use this to test cache speed and " +
+                                    "fidelity without paying the full snapshot cost."
+                                  }
+                                  style={{ fontSize: 10, padding: '2px 6px' }}
+                                >
+                                  {busyCollectionCacheId === s.id ? 'Building…' : 'Build'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => clearCollectionCacheForServer(s.id)}
+                                  disabled={busyCollectionCacheId === s.id || busyAllCaches || isEmpty}
+                                  title={
+                                    "Drop the cached collections for this server. The next " +
+                                    "snapshot or Build click will re-fetch every collection's " +
+                                    "children from Plex. Useful for testing the cache miss-then-hit " +
+                                    "speedup or after data on the server has changed materially."
+                                  }
+                                  style={{ fontSize: 10, padding: '2px 6px' }}
+                                >
+                                  {busyCollectionCacheId === s.id ? '…' : 'Clear'}
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
+                    </td>
+                    <td>
                       <div className="row-buttons">
                         <button
                           onClick={() => test(s.id)}
                           disabled={busyId === s.id}
-                          title="Refresh status, re-enumerate libraries, and warm the playlist cache."
+                          title={
+                            "Refresh status, re-enumerate libraries, and warm the " +
+                            "playlist cache for this server. Note: this does NOT " +
+                            "populate the Collection cache (use the Build button in " +
+                            "the Collection cache column for that)."
+                          }
                         >
                           {busyId === s.id ? 'Refreshing…' : 'Refresh'}
                         </button>
@@ -675,16 +1390,16 @@ export function ServersPanel() {
                             <button className="danger" onClick={() => remove(s)}>Remove</button>
                           </>
                         )}
-                        {/* Bugfix: pre-PR-13 there was a ``View`` button
-                            rendered for viewer / end user that opened
-                            the same ``ServerEditor`` used for Edit. The
-                            editor's input fields aren't read-only, so a
-                            lower-privilege role could see (and try to
-                            type into) the server URL + token. The
-                            backend CRUD routes reject the write, but the
-                            UI shouldn't expose those fields at all.
-                            Connection settings are now strictly
-                            admin / root_admin. */}
+                        {/* No ``View`` button is rendered for viewer
+                            / end user. The ``ServerEditor`` used for
+                            Edit has input fields that aren't
+                            read-only, so exposing it to a
+                            lower-privilege role would let them see
+                            (and try to type into) the server URL +
+                            token. The backend CRUD routes reject the
+                            write, but the UI shouldn't expose those
+                            fields at all - connection settings are
+                            strictly admin / root_admin. */}
                       </div>
                     </td>
                   </tr>
@@ -716,7 +1431,7 @@ export function ServersPanel() {
         />
       )}
 
-      {/* Item 3: cross-server PIN migration modal. Triggered by both
+      {/* Cross-server PIN migration modal. Triggered by both
           Add-Server and Refresh-Server paths via probeAndMaybeOpenPinMigration. */}
       {pinMigration && (
         <PinMigrationModal
@@ -766,9 +1481,9 @@ export function ServersPanel() {
         </>
       )}
 
-      {/* Phase 4: per-run history surface. Reads from /api/runs/recent
-          which carries one row per completed job (snapshot / restore
-          / direct / fan-out). Lives in its own sub-tab so the
+      {/* Per-run history surface. Reads from /api/runs/recent which
+          carries one row per completed job (snapshot / restore /
+          direct / fan-out). Lives in its own sub-tab so the
           historical view doesn't compete with the Overview surface
           for screen space. */}
       {activeTab === 'runtimes' && servers.length > 0 && (
@@ -790,13 +1505,11 @@ export function ServersPanel() {
 function UsersForServer({
   server,
   payload,
-  // 2026-05-17 (operator request): display-name editing moved to the
-  // User Management tab so we have one source of truth across the app.
-  // The previous inline owner-edit affordance + ``onPatched`` callback
-  // were removed from this sub-tab; it's now a view-only roster.
-  // ``onPatched`` is kept as an unused prop so the call-site at
-  // ``ServerUsersPanel`` doesn't need to change; safe to delete in a
-  // later cleanup pass.
+  // Display-name editing lives on the User Management tab so there is
+  // one source of truth across the app. This sub-tab is a view-only
+  // roster. ``onPatched`` is kept as an unused prop so the call-site
+  // at ``ServerUsersPanel`` doesn't need to change; safe to delete in
+  // a later cleanup pass.
   onPatched: _onPatched,
 }: {
   server: ServerView;
@@ -815,13 +1528,13 @@ function UsersForServer({
   }
   if ('error' in payload && !('users' in payload)) {
     // Total fetch failure (e.g. 502 - server unreachable). The backend
-    // error message points at URL / token, but a previously-working
-    // server failing usually means the Plex Server itself is down,
+    // error message points at URL / token, but a working server that
+    // starts failing usually means the Plex Server itself is down,
     // restarting, or otherwise unreachable from this host - the
     // ConnectionError catch-all in server_registry.sync_managed_users_from_live
     // can't distinguish bad credentials from network failure. Show a
     // short hint inline and a richer diagnostic list on hover so the
-    // end user knows where else to look.
+    // user knows where else to look.
     const diagnosticHint =
       'Things to check:\n' +
       '  1. Plex Media Server is running on the host (open its web UI directly).\n' +
@@ -857,9 +1570,8 @@ function UsersForServer({
   return (
     <div className="col" style={{ minWidth: 280 }}>
       <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{server.name}</h3>
-      {/* 2026-05-17 (operator request): this surface is view-only now.
-          Display-name editing was duplicated between here and the
-          User Management tab; User Management is the source of truth
+      {/* This surface is view-only. Display-name editing lives only
+          on the User Management tab, which is the source of truth
           across the app. Operators looking to set / change a display
           name navigate to Settings ▸ User Management. */}
       {owner ? (
@@ -936,50 +1648,75 @@ function ServerEditor(props: {
   const [name, setName] = useState(server?.name ?? '');
   const [url, setUrl] = useState(server?.url ?? 'http://host.docker.internal:32400');
   const [token, setToken] = useState('');
-  // PR-Backends backend picker. Reads from the existing row when
-  // editing (so the end user can't accidentally rebrand a Plex row as
-  // Jellyfin); fresh adds default to Plex for behavior parity with
-  // pre-picker installs. The radio is hidden in the edit path - we
-  // don't support changing a registered server's backend type today.
+  // Backend picker. Reads from the existing row when editing (so the
+  // user can't accidentally rebrand a Plex row as Jellyfin); fresh
+  // adds default to Plex. The radio is hidden in the edit path -
+  // changing a registered server's backend type isn't supported.
   const [serviceType, setServiceType] = useState<'plex' | 'jellyfin' | 'emby'>(
     (server?.service_type as 'plex' | 'jellyfin' | 'emby' | undefined) ?? 'plex',
   );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // PR-2 / Phase C (auth refactor - duplicate-token soft warning).
-  // After a successful Test Connection the probe response includes the
-  // ``owner_name`` of the Plex account the supplied token belongs to.
-  // If that owner already appears under one or more other registered
-  // servers, the end user is reusing the same Plex.tv account's token
-  // across servers - valid, but worth surfacing because the servers
-  // will share authentication context (revoking one revokes all).
+  // Per-server auto-tombstone opt-in. Only visible on the edit path
+  // (a brand-new server has nothing to tombstone yet). Persisted via
+  // its own PATCH endpoint so the main Save / Test flow is
+  // untouched.
+  const [autoTombstoneEnabled, setAutoTombstoneEnabled] = useState<boolean>(
+    Boolean(server?.auto_tombstone_inactive_users_enabled),
+  );
+  const [autoTombstoneSaving, setAutoTombstoneSaving] = useState(false);
+  const [autoTombstoneError, setAutoTombstoneError] = useState<string | null>(null);
+
+  const toggleAutoTombstone = async (next: boolean) => {
+    if (!server) return;
+    setAutoTombstoneSaving(true);
+    setAutoTombstoneError(null);
+    try {
+      const r = await api.setServerAutoTombstone(server.id, next);
+      setAutoTombstoneEnabled(
+        Boolean(r.auto_tombstone_inactive_users_enabled),
+      );
+    } catch (e) {
+      setAutoTombstoneError(
+        errorText(e),
+      );
+    } finally {
+      setAutoTombstoneSaving(false);
+    }
+  };
+
+  // Duplicate-token soft warning. After a successful Test Connection
+  // the probe response includes the ``owner_name`` of the Plex
+  // account the supplied token belongs to. If that owner already
+  // appears under one or more other registered servers, the user is
+  // reusing the same Plex.tv account's token across servers - valid,
+  // but worth surfacing because the servers will share authentication
+  // context (revoking one revokes all).
   //
   // We can't compare raw tokens client-side because the API never
   // returns them, but ``owner_name`` is exposed on every ServerView
   // and is a reliable proxy for "this token belongs to that account."
-  // The warning is soft / informational; the end user can save anyway.
+  // The warning is soft / informational; the user can save anyway.
 
   // ── Test Connection state ────────────────────────────────────────
-  // v0.10.0: the test now uses /api/servers/test-unsaved which probes
-  // URL+token without touching the registry. The previous "create a
-  // row, ping it, delete on failure (keep on success)" dance left a
-  // half-registered server behind whenever the test passed - that's
-  // the "Test Connection adds it to the list" bug.
+  // The test uses /api/servers/test-unsaved which probes URL+token
+  // without touching the registry. Probing this way avoids leaving a
+  // half-registered server behind whenever the test passes.
   //
   // The probe response carries the connected server's friendly name
-  // and machine identifier; the UI surfaces them so the end user can
+  // and machine identifier; the UI surfaces them so the user can
   // confirm they hit the right Plex install before saving (a Plex
   // account's token works on every server it owns, so a successful
   // connect does not by itself prove which server you reached).
   const [testing, setTesting] = useState(false);
   const [probe, setProbe] = useState<ProbeUnsavedResult | null>(null);
-  // When the end user clicks "Try fallback token" on the auth_error
+  // When the user clicks "Try fallback token" on the auth_error
   // banner, this captures the borrowed-from server's id. The Save
   // path then submits ``use_fallback_from_server_id`` so the backend
   // borrows that server's token and stashes the typed one as pending.
-  // Cleared whenever the end user changes URL or token (the borrow
-  // offer was scoped to the original probe).
+  // Cleared whenever the user changes URL or token (the borrow offer
+  // was scoped to the original probe).
   const [acceptedFallbackFromId, setAcceptedFallbackFromId] = useState<string | null>(null);
 
   // Reset the probe result whenever the user changes a connection
@@ -1038,18 +1775,18 @@ function ServerEditor(props: {
       if (server) {
         await api.updateServer(server.id, { name, url, token });
       } else {
-        // v0.10.0: create_server on the backend re-probes and rejects
+        // create_server on the backend re-probes and rejects
         // duplicate machine_identifiers, so passing a probed-OK row
         // through here is safe. The frontend pre-test in testConnection
         // is for fast UX feedback; the backend still enforces.
         //
-        // Auto-fallback (2026-05-15): when the end user accepted the
-        // "Try fallback token" offer on the Test result, we submit
+        // Auto-fallback: when the user accepted the "Try fallback
+        // token" offer on the Test result, we submit
         // ``use_fallback_from_server_id`` so the backend uses the
         // borrowed token as the active credential and stashes the
-        // typed one as pending. The end user's typed token still
-        // rides along in ``token`` so the backend can encrypt it
-        // into the pending_token slot.
+        // typed one as pending. The user's typed token still rides
+        // along in ``token`` so the backend can encrypt it into the
+        // pending_token slot.
         const created = await api.createServer({
           name,
           url,
@@ -1062,8 +1799,8 @@ function ServerEditor(props: {
             ? { use_fallback_from_server_id: acceptedFallbackFromId }
             : {}),
         });
-        // Item 3: stash the new id on the close payload so the parent
-        // panel can probe pin-migration suggestions right after.
+        // Stash the new id on the close payload so the parent panel
+        // can probe pin-migration suggestions right after.
         if (created && typeof created === 'object' && 'id' in created) {
           onAddedServerId?.(String((created as { id: string }).id), String((created as { name: string }).name));
         }
@@ -1080,7 +1817,7 @@ function ServerEditor(props: {
   // the duplicate-machine-identifier check passes. For *editing*,
   // Save is enabled whenever the form has required fields filled.
   //
-  // Fallback-accepted path: after the end user clicks "Try fallback
+  // Fallback-accepted path: after the user clicks "Try fallback
   // token" we record ``acceptedFallbackFromId`` and the save flow
   // submits ``use_fallback_from_server_id`` so the backend stores
   // the borrowed token and stashes the typed one as pending. In
@@ -1111,7 +1848,7 @@ function ServerEditor(props: {
       <h2>{server ? `Edit Server: ${server.name}` : 'Add Server'}</h2>
       {error && <div className="banner error">{error}</div>}
       {probe && !probe.ok && probe.status === 'auth_error' && !acceptedFallbackFromId && (
-        // 401/403 gets its own banner so the end user's first reaction
+        // 401/403 gets its own banner so the user's first reaction
         // is "wrong token" rather than "network down." The token-finder
         // link points at Plex's own canonical docs because the
         // procedure (browser dev tools / View XML) is Plex-specific
@@ -1185,7 +1922,7 @@ function ServerEditor(props: {
         </div>
       )}
       {probe && probe.fallback && acceptedFallbackFromId && (
-        // After the operator clicks "Try fallback token", the original
+        // After the user clicks "Try fallback token", the original
         // error banner stays hidden and this acceptance banner takes
         // over. Save will submit with use_fallback_from_server_id so
         // the backend stores the borrowed token and stashes the typed
@@ -1286,7 +2023,7 @@ function ServerEditor(props: {
           (s) =>
             s.name === name.trim()
             && s.url === url.trim()
-            && (s.service || 'plex') === 'plex',
+            && (s.service_type || 'plex') === serviceType,
         );
         if (matches.length === 0) return null;
         return (
@@ -1310,10 +2047,10 @@ function ServerEditor(props: {
         </div>
       )}
       {probe?.ok && !probe.duplicate_of && probe.owner_name && (() => {
-        // PR-2 / Phase C: soft duplicate-token warning. Surface every
-        // *other* registered server whose owner matches the one this
-        // probe authenticated as - strong signal the same Plex.tv
-        // account (and likely the same token) is being reused.
+        // Soft duplicate-token warning. Surface every *other*
+        // registered server whose owner matches the one this probe
+        // authenticated as - strong signal the same Plex.tv account
+        // (and likely the same token) is being reused.
         const otherSiblings = existingServers.filter((s) =>
           s.id !== (server?.id ?? '') &&
           (s.owner_name ?? '').toLowerCase().trim() === probe.owner_name!.toLowerCase().trim()
@@ -1339,8 +2076,8 @@ function ServerEditor(props: {
           'My Plex'
         } />
       </label>
-      {/* PR-Backends backend picker. Hidden in the edit path - changing
-          a registered server's backend type isn't supported (the
+      {/* Backend picker. Hidden in the edit path - changing a
+          registered server's backend type isn't supported (the
           adapter, stored credentials, and on-disk identifiers all
           assume one backend). For new servers the operator picks once
           at registration time and the form below adapts its labels +
@@ -1405,6 +2142,43 @@ function ServerEditor(props: {
         </span>
         <input type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder={server ? '••••••••' : ''} />
       </label>
+      {server && (
+        <div
+          className="panel"
+          style={{ marginTop: 12, padding: 10, fontSize: 12 }}
+          title="Per-server opt-in for the auto-tombstone sweeper."
+        >
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={autoTombstoneEnabled}
+              disabled={autoTombstoneSaving}
+              onChange={(e) => void toggleAutoTombstone(e.target.checked)}
+            />
+            <span>
+              <strong>Auto-tombstone inactive users</strong>
+              <span style={{ color: 'var(--text-dim)', marginLeft: 6 }}>
+                (off by default)
+              </span>
+            </span>
+          </label>
+          <p style={{ color: 'var(--text-dim)', marginTop: 6, marginBottom: 0 }}>
+            If a user on this server fails auth (per the trigger types
+            enabled under <em>Settings &rsaquo; Tunables &rsaquo;
+            Polling &rsaquo; User Activity</em>) for N consecutive
+            sweep cycles, the engine will tombstone them automatically
+            so future snapshots / sync / etc. skip them. Reversible
+            via the User Management panel. The global sweeper master
+            switch must also be on for this toggle to fire any
+            tombstones.
+          </p>
+          {autoTombstoneError && (
+            <div className="banner error" style={{ marginTop: 6 }}>
+              {autoTombstoneError}
+            </div>
+          )}
+        </div>
+      )}
       <div className="row-buttons">
         <button
           onClick={testConnection}
@@ -1486,7 +2260,7 @@ function PendingTokenChip({
         ok: false,
         swapped: false,
         status: 'error',
-        detail: e instanceof Error ? e.message : String(e),
+        detail: errorText(e),
       });
     } finally {
       setBusy(false);
@@ -1561,10 +2335,9 @@ function WalkButton({ serverId }: { serverId: string }) {
     refresh();
     // Light polling while running: every 5s. Stop polling once the
     // walk finishes so we don't generate background traffic forever.
-    const t = window.setInterval(() => {
+    return pausableInterval(() => {
       if (status.running) refresh();
     }, 5000);
-    return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverId, status.running]);
 
@@ -1761,7 +2534,7 @@ function ServerUsersPanel({
       <h2>Server Users</h2>
       <p style={{ color: 'var(--text-dim)', fontSize: 12, marginTop: 0 }}>
         Read-only roster of the owner + Plex Home managed users on each
-        registered server. 2026-05-17: display-name editing lives on{' '}
+        registered server. Display-name editing lives on{' '}
         <strong>Settings ▸ User Management</strong> — the canonical
         identity-management surface across the app. Display names set
         there propagate to the dashboard run header, activity feed,

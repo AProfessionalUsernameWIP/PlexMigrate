@@ -1,23 +1,20 @@
-# PlexBackUp -WIP
-**Version 0.13.1**
+# Hestia-MediaManager
+**Version 0.18.0** (snapshot schema v18)
 A tool that backs up and moves your Plex watch history, listening history, playlists, collections, and star ratings between Plex servers, without losing any data.
 
 > **Three docs, three audiences. Pick the one that fits you:**
 >
-> * **[QUICKSTART.md](QUICKSTART.md)** - the 5-minute setup. Read this if you just want to get PlexBackUp running and take a snapshot.
-> * **README.md** (this file) - the **operator manual**. How to install, configure, run, schedule, troubleshoot, and tune PlexBackUp. Written for anyone who runs the tool, no engineering background assumed.
+> * **[QUICKSTART.md](QUICKSTART.md)** - the 5-minute setup. Read this if you just want to get Hestia-MediaManager running and take a snapshot.
+> * **README.md** (this file) - the **operator manual**. How to install, configure, run, schedule, troubleshoot, and tune Hestia-MediaManager. Written for anyone who runs the tool, no engineering background assumed.
 > * **[OVERVIEW.md](OVERVIEW.md)** - the **technical architecture**. How the engine, databases, API surface, and concurrency model are wired together, and why each decision was made the way it was. Also covers advanced setup topics like LAN exposure and the security architecture. Written for contributors and the technically curious.
 
-> **A note on quality and bug reports.** PlexBackUp uses a **CI/CD pipeline** that runs **unit tests before any commit lands in the repo**. The pipeline will be made available to end users so you can see what gets checked on each change. This doesn't catch every bug, but it does mean issues are much more likely to be caught before they ship.
+> **A note on quality and bug reports.** Hestia-MediaManager uses a **CI/CD pipeline** that runs **unit tests before any commit lands in the repo**. The pipeline will be made available to end users so you can see what gets checked on each change. This doesn't catch every bug, but it does mean issues are much more likely to be caught before they ship.
 >
 > If you do find a bug, **please report it**. I will make every effort to fold any reported failure case into the test suite as a new unit test, so the same issue can't sneak back in. Please be patient with us and send the bug reports through - they make the tool better for everyone.
 
-PlexBackUp ships two run modes. **The Docker + Web UI is the recommended way to use it**, and the path that gets ongoing testing and feature work. The terminal CLI is still here for users who prefer a shell, but it is slowly drifting out of step with the web mode: it does not get the same test coverage, so it is more likely to carry bugs or feel rougher to use over time. **If you hit something broken in terminal mode, please open an issue and I will do my best to address it.**
+Hestia-MediaManager runs as a Docker + Web UI app. `docker compose up --build` (or `make docker`) brings up a FastAPI backend and a React frontend in two containers. The web dashboard shows live job state, every per-run option has a labelled form control, and you can save scheduled recurring exports. Jump to [Docker and Web UI](#docker-and-web-ui).
 
-* **Docker + Web UI (recommended).** `docker compose up --build` (or `make docker`). Brings up a FastAPI backend and a React frontend in two containers. The web dashboard shows live job state; every CLI flag has a form control; you can save scheduled recurring exports. This is the path that gets ongoing test coverage and feature work. Jump to [Docker and Web UI](#docker-and-web-ui).
-* **Terminal mode (legacy).** `python plexmigrate.py`. The original CLI, with the live `htop`-style dashboard and keyboard shortcuts, no server, no Docker. Still functional, but no longer the focus of testing or new features. Jump to [How to Run](#how-to-run).
-
-**Latest changes (v0.12.3): snapshot rename and capture pipeline.**
+**Recent: snapshot rename and capture pipeline.**
 The "export to `.plexexport.json` file" model is now three layers:
 `media.db` (the live working store), per-server snapshot `.db` files
 (immutable point-in-time copies), and `snapshots.db` (the registry
@@ -31,23 +28,21 @@ with an auto-migration that runs once on startup. Pre-rename
 `.plexexport.json` files relocate to `snapshots/legacy/` and stay
 readable via a compat shim.
 
-For older releases, see [versionhistory.md](versionhistory.md).
-
 ---
 
-## Why PlexBackUp Exists
+## Why Hestia-MediaManager Exists
 
 Plex is where a lot of people put a real chunk of their lives. Years of watch history. Ratings you actually thought about. Playlists you built one track at a time. The "watched" badges that mean you can see at a glance what you've already finished. None of that is media. All of it is yours.
 
 The problem: Plex (and Emby, and Jellyfin) don't ship a real backup story for that data. You can re-buy disks, re-rip media, re-index a library, but you can't trivially recover the human metadata that turns a folder of files into "your" library. If the Plex database goes sideways, that data is gone. If you migrate to a new box, you start over. The standard line is "Plex stores it for you", and that's fine right up until it isn't.
 
-PlexBackUp fills that gap. It captures every operator-relevant piece of metadata, including watch history, ratings, playlists, collections, and per-user state, into a portable snapshot file. It restores that snapshot back into the same server or a different one, and it can transfer server to server directly with no intermediate file on the happy path. You can run it on a schedule, fan a single capture out to multiple destination servers, or use it as a one-time migration tool when you replace hardware.
+Hestia-MediaManager fills that gap. It captures every operator-relevant piece of metadata, including watch history, ratings, playlists, collections, and per-user state, into a portable snapshot file. It restores that snapshot back into the same server or a different one, and it can transfer server to server directly with no intermediate file on the happy path. You can run it on a schedule, fan a single capture out to multiple destination servers, or use it as a one-time migration tool when you replace hardware.
 
-The short version: **Plex doesn't have a backup button. PlexBackUp is that button.**
+The short version: **Plex doesn't have a backup button. Hestia-MediaManager is that button.**
 
 A few things worth knowing up front:
 
-* **It runs alongside Plex, not against it.** PlexBackUp talks to Plex through the same API your phone app uses. Active streams keep playing. Nothing on the media disk is touched. You can run a snapshot while the family is watching TV and nobody will notice.
+* **It runs alongside Plex, not against it.** Hestia-MediaManager talks to Plex through the same API your phone app uses. Active streams keep playing. Nothing on the media disk is touched. You can run a snapshot while the family is watching TV and nobody will notice.
 * **It never deletes anything by default.** Restore Merge mode (the default) is strictly additive: it only adds what is missing. There is also a destructive Replace mode for "I want this destination to be an exact mirror of a known capture", and it requires you to type a confirmation word before it will run.
 * **It is built for more than just Plex.** The data model is deliberately backend-agnostic at rest. Adding Emby or Jellyfin support is on the roadmap and does not require a rewrite, just new "gather" and "restore" code for those platforms. The full reasoning is in [OVERVIEW.md](OVERVIEW.md).
 
@@ -55,27 +50,27 @@ A few things worth knowing up front:
 
 ## What This Does
 
-PlexBackUp works through Plex's built-in API, the same interface your Plex app uses when you hit play, mark something watched, or build a playlist. It doesn't touch your media files, move any data on disk, or require you to stop using Plex while it runs. You can keep watching TV or listening to music on any device while a snapshot or restore runs in the background.
+Hestia-MediaManager works through Plex's built-in API, the same interface your Plex app uses when you hit play, mark something watched, or build a playlist. It doesn't touch your media files, move any data on disk, or require you to stop using Plex while it runs. You can keep watching TV or listening to music on any device while a snapshot or restore runs in the background.
 
 There are two steps.
 
-**Snapshot.** Run this on your old server, or before you rebuild. PlexBackUp connects to Plex, reads your watch history, resume positions, star ratings, playlists, and collections, and saves them into a per-server snapshot `.db` file (one row in `snapshots.db` per capture). Plex must be running on that machine for this step.
+**Snapshot.** Run this on your old server, or before you rebuild. Hestia-MediaManager connects to Plex, reads your watch history, resume positions, star ratings, playlists, and collections, and saves them into a per-server snapshot `.db` file (one row in `snapshots.db` per capture). Plex must be running on that machine for this step.
 
-**Restore.** Run this on your new or freshly rebuilt server. PlexBackUp reads the snapshot and restores everything it can find, matching each item using four methods in order: by its global ID (IMDb, TMDB, TVDB, or MusicBrainz), by its exact file path, by a path-suffix match (for cross-platform migrations, see below), and finally by title. Plex must be running on the target machine for this step, but nothing else needs to stop. Active streams and in-progress playback are not affected.
+**Restore.** Run this on your new or freshly rebuilt server. Hestia-MediaManager reads the snapshot and restores everything it can find, matching each item using four methods in order: by its global ID (IMDb, TMDB, TVDB, or MusicBrainz), by its exact file path, by a path-suffix match (for cross-platform migrations, see below), and finally by title. Plex must be running on the target machine for this step, but nothing else needs to stop. Active streams and in-progress playback are not affected.
 
 Between those two steps, the snapshot is just a file on disk. Copy it however you like (USB drive, network share, cloud storage) and run the restore whenever you're ready.
 
-PlexBackUp logs everything it does and produces a plain-English troubleshooting report for anything it couldn't restore automatically.
+Hestia-MediaManager logs everything it does and produces a plain-English troubleshooting report for anything it couldn't restore automatically.
 
 ---
 
 ## Data Safety
 
-PlexBackUp has two restore modes. The defaults are conservative; the destructive one requires you to type a confirmation word before it will run.
+Hestia-MediaManager has two restore modes. The defaults are conservative; the destructive one requires you to type a confirmation word before it will run.
 
 ### Merge mode (the default, additive only)
 
-**PlexBackUp never deletes, overwrites, or reduces any data on your target server in Merge mode.** Every restore is strictly additive. It only adds what is missing.
+**Hestia-MediaManager never deletes, overwrites, or reduces any data on your target server in Merge mode.** Every restore is strictly additive. It only adds what is missing.
 
 Here is what "additive" means for each data type:
 
@@ -94,14 +89,14 @@ Use Merge for "I'm migrating to a new server" or "I want to keep both sides goin
 
 ---
 
-## Where PlexBackUp keeps its state
+## Where Hestia-MediaManager keeps its state
 
-PlexBackUp uses three small SQLite files under `server_data/`. You usually don't need to touch them directly, but knowing what each one stores makes backups and troubleshooting much easier:
+Hestia-MediaManager uses three small SQLite files under `server_data/`. You usually don't need to touch them directly, but knowing what each one stores makes backups and troubleshooting much easier:
 
 | File | What it stores |
 |---|---|
 | `auth.db` | App user accounts, password hashes, and JWT refresh tokens. Nothing about Plex itself. |
-| `media.db` | The live working pool of every metadata item, watch event, rating, playlist, and collection PlexBackUp has ever ingested. |
+| `media.db` | The live working pool of every metadata item, watch event, rating, playlist, and collection Hestia-MediaManager has ever ingested. |
 | `snapshots.db` | An index of every captured snapshot `.db` file on disk, with per-server retention metadata. |
 
 Each one can fail or be rebuilt independently of the others, which is why the tool is safe to leave running for months. The architectural reasoning (WAL mode, single-writer pattern, GUID keying) lives in [OVERVIEW.md: Databases](OVERVIEW.md#databases).
@@ -110,7 +105,7 @@ Each one can fail or be rebuilt independently of the others, which is why the to
 
 ## Docker and Web UI
 
-Starting in v0.8.0 PlexBackUp ships an optional web layer. Nothing about the terminal mode changes. Running `python plexmigrate.py` still does exactly what it did in v0.7.1. The web layer is a separate codepath under `server/` (FastAPI backend) and `frontend/` (React UI) that wraps the same engine.
+Hestia-MediaManager runs as a web layer over the engine: a FastAPI backend under `server/` and a React UI under `frontend/`, both wrapping the shared engine code under `services/`.
 
 ### Requirements
 
@@ -133,12 +128,12 @@ make docker
 
 This builds two images (backend Python and frontend nginx) and brings them up on the same compose network. The first build takes a couple of minutes. Later builds use the layer cache and are fast.
 
-Once both containers are healthy, open <http://localhost:8080> in your browser. Open the **Settings** tab and paste your Plex server URL and authentication token (the same token the CLI auto-discovers from `Preferences.xml`). Settings persist on a host bind mount (`./server_data/settings.json`).
+Once both containers are healthy, open <http://localhost:8080> in your browser. Open the **Settings** tab and paste your Plex server URL and authentication token. Settings persist on a host bind mount (`./server_data/settings.json`).
 
 ### What the web UI gives you
 
-* **Dashboard tab**: the live, browser-side version of the terminal dashboard. The header shows the libraries queued for this run, which library is being processed right now, and (when a direct transfer is scoped to specific users) which user the engine is on. Below that you get the thread pool counts, run stats, match resolution stats, per-library progress bars with ETA, the colour-coded activity feed, and a Network Activity panel that charts HTTP status codes, requests-per-second, and average latency over the last 60 seconds. Elapsed and ETA freeze at the final values when a job ends so you can see what the actual run duration was. Updates over a WebSocket at 4 Hz, same cadence as the terminal panel.
-* **Run Job tab**: each CLI flag has a clearly labelled form control. Pick snapshot, restore, or direct server-to-server transfer; select libraries (or snapshot rows), set worker count, toggle verbose and strict match, fill in path remap if needed, then submit. Direct mode adds a Users section with checkboxes for the owner and every managed user that exists on both servers - uncheck anyone you don't want to migrate. Jobs run one at a time; subsequent submissions queue.
+* **Dashboard tab**: the live view of the current run. The header shows the libraries queued for this run, which library is being processed right now, and (when a direct transfer is scoped to specific users) which user the engine is on. Below that you get the thread pool counts, run stats, match resolution stats, per-library progress bars with ETA, the colour-coded activity feed, and a Network Activity panel that charts HTTP status codes, requests-per-second, and average latency over the last 60 seconds. Elapsed and ETA freeze at the final values when a job ends so you can see what the actual run duration was. Updates over a WebSocket at 4 Hz.
+* **Run Job tab**: every per-run option has a clearly labelled form control. Pick snapshot, restore, or direct server-to-server transfer; select libraries (or snapshot rows), set worker count, toggle verbose and strict match, fill in path remap if needed, then submit. Direct mode adds a Users section with checkboxes for the owner and every managed user that exists on both servers - uncheck anyone you don't want to migrate. Jobs run one at a time; subsequent submissions queue.
 * **Servers tab**: register, edit, test, and remove Plex servers by friendly name. The Server Users block under each row lists the owner and every Plex Home managed user; click the owner's display name to edit it inline (the chosen name propagates to the dashboard header, the activity feed, and the direct-transfer user selector). Removing a server is a cascade - schedules referencing it, snapshot files produced by it, and per-run log directories under its slug all get deleted with a confirmation dialog showing the counts.
 * **Schedules tab**: create, edit, enable / disable, and delete recurring snapshot schedules. Schedules fire in the container's configured timezone (set the `TZ` env var in `docker-compose.yml`), and the topbar shows a live server-time clock so you always know what time the schedule engine sees. Frequency: hourly, daily, or weekly, at a wall-clock time you choose.
 * **Logs tab**: a three-pane browser over `plex_logs/`. Click a run directory, click a file, read the contents in the browser. The viewer has a case-insensitive keyword filter - type any substring and matching lines stay visible with the match highlighted, everything else hides. Files larger than 4 MB show the tail.
@@ -161,7 +156,6 @@ Once both containers are healthy, open <http://localhost:8080> in your browser. 
 | Stop containers and wipe volumes (does NOT touch host bind mounts) | `docker compose down -v` |
 | Rebuild after a code change | `docker compose up --build` |
 | Tail backend logs | `docker compose logs -f backend` |
-| Run the CLI inside the backend container | `docker compose exec backend python plexmigrate.py --help` |
 
 ### Where data lives
 
@@ -170,7 +164,7 @@ Three host directories are bind-mounted into the backend container so all data o
 | Host path | Container path | Contents |
 |---|---|---|
 | `./snapshots/` | `/app/snapshots/` | Per-server snapshot `.db` files. `snapshots/legacy/` holds any pre-PR-13 `.plexexport.json` archives moved there by the first-boot migration. |
-| `./plex_logs/` | `/app/plex_logs/` | Per-run log directories (same format as CLI mode) |
+| `./plex_logs/` | `/app/plex_logs/` | Per-run log directories |
 | `./server_data/` | `/app/server_data/` | `settings.json`, `schedules.json`, `servers.json`, `media.db`, `snapshots.db` (snapshot registry, PR-13), `auth.db` (PR-A1), and the binary `.keyfile` used for at-rest encryption (v0.9.5+) |
 
 You can inspect and edit everything in the table from the host. The JSON files use 2-space indent and are easy to diff. The `.keyfile` is 32 raw bytes - don't open it in a text editor, don't commit it to source control (`.gitignore` already excludes it), and don't delete it unless you're prepared to re-enter every registered server's token.
@@ -179,76 +173,43 @@ You can inspect and edit everything in the table from the host. The JSON files u
 
 The basics: **auth is always on**. On first boot the UI walks you through creating a root admin account; every subsequent boot shows the login screen. Every API call and the WebSocket require a login. Plex tokens are encrypted at rest. You don't need to configure any of this; it just works.
 
-If you want to dig deeper, the following topics live in [OVERVIEW.md](OVERVIEW.md) rather than here, because none of them are required to get PlexBackUp running:
+If you want to dig deeper, the following topics live in [OVERVIEW.md](OVERVIEW.md) rather than here, because none of them are required to get Hestia-MediaManager running:
 
 * **Security architecture** - at-rest encryption (Fernet keyfile), JWT auth, log scrubber, file permissions, and Windows-vs-Unix ACL caveats.
-* **Exposing PlexBackUp to other devices on your network** - the optional walkthrough for accessing the web UI from a phone, tablet, or other desktop on your home LAN, including firewall and subnet gotchas.
+* **Exposing Hestia-MediaManager to other devices on your network** - the optional walkthrough for accessing the web UI from a phone, tablet, or other desktop on your home LAN, including firewall and subnet gotchas.
 
 ---
 
 ## Makefile
 
-Two convenience targets at the project root:
+Convenience targets at the project root:
 
 | Target | What it does |
 |---|---|
 | `make docker` | Runs `docker compose up --build`. Builds and starts the full web stack (backend + frontend) on `http://localhost:8080`. |
-| `make cli` | Creates `./venv/`, installs every pip dependency (engine + server) into it, prints the activation command. For users who want only the terminal CLI and no Docker. |
-| `make clean` | Removes `./venv/`. Does not touch `snapshots/`, `plex_logs/`, or `server_data/`. |
+| `make docker-rebuild` | Forces a no-cache backend rebuild then starts everything. Use after a Python source change when you want to be certain the container picked up the new code. |
+| `make clean` | Removes `./venv/` if one exists. Does not touch `snapshots/`, `plex_logs/`, or `server_data/`. |
 | `make help` (or just `make`) | Prints the target list. |
-
-`make cli` auto-detects `python3` vs `python` on PATH and prints the right activation command for your shell (PowerShell, cmd, or POSIX). You can still install the deps the old way (`pip install plexapi rich requests`) if you don't want the server dependencies. The server deps are only required when you run the FastAPI server.
 
 ---
 
 ## Multi-Server Support
 
-Starting in v0.9.0, PlexBackUp manages a registry of Plex servers rather than a single connection. Every snapshot, restore, and schedule targets a specific registered server by friendly name. A new direct transfer mode moves data from one registered server straight into another in memory.
+Starting in v0.9.0, Hestia-MediaManager manages a registry of Plex servers rather than a single connection. Every snapshot, restore, and schedule targets a specific registered server by friendly name. A new direct transfer mode moves data from one registered server straight into another in memory.
 
 ### Registering servers
 
-#### Web UI
-
 Open the **Servers** tab in the web frontend. Click **+ Add Server**, fill in:
 
-* **Friendly name:** any string. You'll pick this in CLI flags, the Run Job form, and schedules. Names must be unique.
+* **Friendly name:** any string. You'll pick this in the Run Job form and schedules. Names must be unique.
 * **Server URL:** full URL including protocol and port (for example `http://host.docker.internal:32400`).
 * **Plex authentication token:** same token you'd find via the Plex web UI's `X-Plex-Token` URL param.
 
-When you save, PlexBackUp adds the server to the registry and immediately probes the connection. The probe populates the status indicator and discovers the library catalogue. You can later **Test** the connection, **Edit** the fields, or **Remove** the server from the registry.
+When you save, Hestia-MediaManager adds the server to the registry and immediately probes the connection. The probe populates the status indicator and discovers the library catalogue. You can later **Test** the connection, **Edit** the fields, or **Remove** the server from the registry.
 
-> **Removing a server from the registry never deletes any `.plexexport.json` files or log directories produced from that server.** The registry is just a pointer table. The files on disk live independently.
-
-#### CLI
-
-```
-python plexmigrate.py --add-server "Plex1" --server http://192.168.1.10:32400 --token YOUR_TOKEN
-python plexmigrate.py --list-servers
-python plexmigrate.py --test-server "Plex1"
-python plexmigrate.py --rename-server "Plex1" "Living Room Plex"
-python plexmigrate.py --remove-server "Living Room Plex"
-```
-
-The CLI and web UI read and write the same `server_data/servers.json` file, so a server registered from one shows up immediately in the other.
+> **Removing a server from the registry never deletes any snapshot files or log directories produced from that server.** The registry is just a pointer table. The files on disk live independently.
 
 ### Targeting registered servers
-
-#### CLI
-
-```
-# Snapshot from a registered server
-python plexmigrate.py --snapshot --source-server "Plex1" --libraries "Movies,Music"
-
-# Restore into a registered server
-python plexmigrate.py --import --dest-server "Plex2" --input-file Movies_Plex1_20260511_015458.plexexport.json
-
-# Direct server-to-server transfer (no intermediate file)
-python plexmigrate.py --direct --source-server "Plex1" --dest-server "Plex2" --libraries "Movies"
-```
-
-The legacy ad-hoc form `--server URL --token TOK` still works for one-off use without registering a server.
-
-#### Web UI
 
 The **Run Job** tab has an operation selector (Snapshot, Restore, or Direct transfer) and a server selector below it. In direct transfer mode the form shows a side-by-side "Source server -> Destination server" picker so the direction of data flow is unambiguous. Library and snapshot pickers populate from the selected server.
 
@@ -260,7 +221,7 @@ The Servers tab also has a per-row **Refresh** button that runs the heavier `tes
 
 ### Direct transfer fallback (v0.9.1)
 
-If the in-memory direct path fails for a library mid-transfer (network blip, unexpected response, very large library), PlexBackUp automatically falls back to a temporary snapshot-and-restore for that library only. The other libraries keep going on the direct path. The dashboard announces the fallback in the activity feed, and the end result for your data is the same either way. The mechanics of how the fallback file is written, restored, and cleaned up live in [OVERVIEW.md: Direct transfer](OVERVIEW.md#direct-transfer).
+If the in-memory direct path fails for a library mid-transfer (network blip, unexpected response, very large library), Hestia-MediaManager automatically falls back to a temporary snapshot-and-restore for that library only. The other libraries keep going on the direct path. The dashboard announces the fallback in the activity feed, and the end result for your data is the same either way. The mechanics of how the fallback file is written, restored, and cleaned up live in [OVERVIEW.md: Direct transfer](OVERVIEW.md#direct-transfer).
 
 ### Per-user transfer scope (v0.9.6+)
 
@@ -292,9 +253,9 @@ Log directories and snapshot filenames from v0.9.0 onwards carry the friendly se
 
 ## Smart Playlists
 
-Smart playlists are playlists whose contents are generated by a saved filter (for example, "all unwatched Action movies added this year"). PlexBackUp **cannot transfer smart playlists automatically** because the filter query contains server-specific IDs that are different on every Plex installation.
+Smart playlists are playlists whose contents are generated by a saved filter (for example, "all unwatched Action movies added this year"). Hestia-MediaManager **cannot transfer smart playlists automatically** because the filter query contains server-specific IDs that are different on every Plex installation.
 
-When PlexBackUp encounters a smart playlist, it:
+When Hestia-MediaManager encounters a smart playlist, it:
 1. Records it in the failure log with the category "Smart Playlist - Requires Manual Recreation."
 2. Saves the original filter URL in the run log so you have it for reference.
 3. Does not create any placeholder playlist on the target server.
@@ -305,25 +266,25 @@ To restore a smart playlist: open Plex on the target server, create a new Smart 
 
 ## Plex Home Users
 
-If your Plex server is linked to a Plex.tv account and you use Plex Home (multiple user profiles sharing one server), PlexBackUp automatically snapshots and restores each managed user's watch history, playlists, and ratings independently. Each user's data lives in the snapshot under a `"users"` section and is restored into the correct profile on the target server.
+If your Plex server is linked to a Plex.tv account and you use Plex Home (multiple user profiles sharing one server), Hestia-MediaManager automatically snapshots and restores each managed user's watch history, playlists, and ratings independently. Each user's data lives in the snapshot under a `"users"` section and is restored into the correct profile on the target server.
 
 **Requirements for multi-user support:**
 - The server must be linked to a Plex.tv account (not using a LocalAdminToken).
 - The managed users must exist on the target server with the same usernames before you run the restore.
 
-**What happens if a user is on the old server but not the new one yet?** PlexBackUp logs which users it found on the target server and which ones exist in the snapshot before it starts restoring, so you can see the gap immediately. Users not found on the target are skipped with an INFO log, not an error. The end-of-restore summary lists which users were restored and which were skipped, by name. Re-invite the skipped users to the new server and re-run the restore to restore their data.
+**What happens if a user is on the old server but not the new one yet?** Hestia-MediaManager logs which users it found on the target server and which ones exist in the snapshot before it starts restoring, so you can see the gap immediately. Users not found on the target are skipped with an INFO log, not an error. The end-of-restore summary lists which users were restored and which were skipped, by name. Re-invite the skipped users to the new server and re-run the restore to restore their data.
 
-If the server is not linked to Plex.tv, PlexBackUp logs a note and continues. Only admin account data is processed, with no error.
+If the server is not linked to Plex.tv, Hestia-MediaManager logs a note and continues. Only admin account data is processed, with no error.
 
 ### Managed user PINs and the preflight warning
 
-If a managed user has a Plex Home PIN set and PlexBackUp doesn't have a captured token for them, the Run Job form shows a **preflight warning** listing the at-risk users before the job submits. You can either fix it (capture the PIN in the Servers tab, then re-run) or continue, in which case those users are dropped from the run with a clear log line.
+If a managed user has a Plex Home PIN set and Hestia-MediaManager doesn't have a captured token for them, the Run Job form shows a **preflight warning** listing the at-risk users before the job submits. You can either fix it (capture the PIN in the Servers tab, then re-run) or continue, in which case those users are dropped from the run with a clear log line.
 
 The technical detail of how managed user auth actually works (parallel token-based auth with PIN fallback, background token capture, why we don't silently fall back to admin impersonation) lives in [OVERVIEW.md: Managed user authentication](OVERVIEW.md#managed-user-authentication).
 
 ### How users are identified across servers (the app_user_uuid)
 
-PlexBackUp tracks three identifiers per user, each with a different lifetime and scope:
+Hestia-MediaManager tracks three identifiers per user, each with a different lifetime and scope:
 
 | Identifier | What it is | Mutable? |
 |---|---|---|
@@ -351,97 +312,9 @@ The `strict_identity_resolution` tunable cuts the chain short after step 2 so op
 
 ---
 
-## Terminal Mode (CLI)
-
-> **Heads-up: terminal mode is the legacy path.** The Docker + Web UI is the recommended way to run PlexBackUp and is the mode that gets the most testing. The terminal CLI still ships in every release and still works, but it does not get the same test coverage, so it can drift behind on bugs and usability over time. If you find something broken here, please open an issue and I will do my best to address it.
-
-If you don't want Docker (and the web UI), the original terminal CLI is still here. Everything below this point is for running PlexBackUp from a shell. Docker users can skip to [Step-by-Step: Migrating to a New Server](#step-by-step-migrating-to-a-new-server) or [Common Problems](#common-problems).
-
-### Before You Start
-
-You will need the following before running PlexBackUp from the CLI:
-
-1. **Python 3.9 or newer.** Download from https://python.org/downloads/. During installation on Windows, check "Add Python to PATH."
-
-2. **A Plex Media Token.** A secret key that lets the script talk to your Plex server. To find yours:
-   - Open Plex Web in a browser and play any item.
-   - Open your browser's developer tools (F12), go to the Network tab.
-   - Look for any request to your Plex server and find `X-Plex-Token` in the URL or headers.
-   - Alternatively, follow Plex's official guide at: https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/
-
-3. **Plex Media Server running** and reachable at the URL you will pass to `--server` (default: `http://localhost:32400`). For snapshot, this is your old server. For restore, this is your new server. The server doesn't need to be idle. Active streams and playback are not affected.
-
-4. **For restore:** at least one snapshot file from the snapshot step, and the media files already present in the target Plex library. Plex must have scanned them before you restore. Items that don't exist in the library yet can't be matched.
-
-### Installation
-
-If you just want to get going, see [QUICKSTART.md](QUICKSTART.md). The notes below cover the per-OS specifics.
-
-**Windows.** Open Command Prompt or PowerShell, `cd` into the project folder, then:
-```
-pip install plexapi rich requests
-```
-
-**macOS.** Open Terminal, `cd` into the project folder, then:
-```
-pip3 install plexapi rich requests
-```
-
-**Linux (Debian, Ubuntu, Raspberry Pi OS).** A bare `pip install` will fail with `externally-managed-environment`. Use a virtual environment:
-```
-sudo apt install python3-full python3-venv
-python3 -m venv venv
-source venv/bin/activate
-pip install plexapi rich requests
-```
-
-Don't use `sudo` with `python3 -m venv` or `pip install` here. The venv must be owned by your user account. Every new terminal session needs `source venv/bin/activate` before you run the script (or call `venv/bin/python3 plexmigrate.py ...` directly). See "error: externally-managed-environment" under [Common Problems](#common-problems) for the full explanation.
-
-### How to Run
-
-Same commands on every OS. Use `python` on Windows, `python3` on macOS and Linux. On Linux, activate the venv first (`source venv/bin/activate`) or call `venv/bin/python3` directly.
-
-**Snapshot (save your data):**
-```
-python plexmigrate.py --snapshot --server http://localhost:32400
-```
-
-**Restore (restore your data):**
-```
-python plexmigrate.py --import --server http://localhost:32400 --input-file "Movies_20260509_173300.plexexport.json"
-```
-
-**Interactive mode (no flags, the script asks you what to do):**
-```
-python plexmigrate.py
-```
-
-### Flags Reference
-
-| Flag | What it does | Example |
-|---|---|---|
-| `--snapshot` | Run in snapshot mode (save data from this server) | `--snapshot` |
-| `--import` | Run in restore mode (restore data to this server) | `--import` |
-| `--token TOKEN` | Your Plex authentication token | `--token abc123xyz` |
-| `--server URL` | URL of the Plex server to connect to | `--server http://192.168.1.10:32400` |
-| `--output-dir PATH` | Where to save snapshot files (default: `./snapshots`) | `--output-dir /mnt/export/plex` |
-| `--input-file FILE` | One or more snapshot files to restore | `--input-file Movies.plexexport.json Music.plexexport.json` |
-| `--workers N` | How many parallel worker threads to use | `--workers 8` |
-| `--libraries NAMES` | Which libraries to process (skip interactive prompt) | `--libraries "Movies,TV Shows,Music"` |
-| `--verbose` | Print and log extra debug information | `--verbose` |
-| `--log-dir PATH` | Where to save log files (default: `./plex_logs`) | `--log-dir /var/log/plexmigrate` |
-| `--remap-path OLD NEW` | Change the root path for media files during restore | `--remap-path /media/plex /mnt/storage` |
-| `--no-strict-match` | Allow best-guess when multiple title matches exist (use carefully, may select the wrong item) | `--no-strict-match` |
-
-> **Note:** `--overwrite-playlists` is still accepted for backward compatibility but has no effect. Since v0.2.0 all playlist restores use additive union merge.
-
-The registry and direct-transfer flags (`--add-server`, `--list-servers`, `--source-server`, `--dest-server`, `--direct`, and friends) are documented under [Multi-Server Support](#multi-server-support).
-
----
-
 ## Step-by-Step: Migrating to a New Server
 
-1. **On your old server:** Run the snapshot (Run Job tab in the web UI, or `--snapshot` on the CLI). Select the libraries you want to back up.
+1. **On your old server:** Run the snapshot from the Run Job tab in the web UI. Select the libraries you want to back up.
 2. The script creates a per-server snapshot `.db` and (optionally) `.plexexport.json` sidecars in the `./snapshots/` folder, one per library.
 3. **Copy those files** to the machine where your new server runs. USB drive, network share, cloud storage; any method works.
 4. **On your new server:** Make sure your media files are accessible and Plex has scanned them. The items must appear in Plex before you can restore.
@@ -452,7 +325,7 @@ The registry and direct-transfer flags (`--add-server`, `--list-servers`, `--sou
 
 ## Log Files
 
-All logs land in `./plex_logs/` (or the path you set with `--log-dir`). Filenames carry a timestamp so runs never overwrite each other.
+All logs land in `./plex_logs/` (or the path you set in Settings). Filenames carry a timestamp so runs never overwrite each other.
 
 | Log file | When created | What's in it |
 |---|---|---|
@@ -466,7 +339,7 @@ All logs land in `./plex_logs/` (or the path you set with `--log-dir`). Filename
 
 ## Common Problems
 
-The troubleshooting catalogue lives in its own file now: **[commonproblems.md](commonproblems.md)**. That's where you'll find the resolutions for everything the README used to cover here. `externally-managed-environment` pip errors, missing modules, dashboard refresh quirks on Linux, the "local:// GUID" music-track edge case, the empty-`guids` IndexError in Play Count restore, the playlist 400 bad_request on large static playlists, and so on, plus new entries that don't belong in the README's main flow. The split keeps this file focused on "how to use the tool" while leaving room for the troubleshooting list to grow without making the README itself a 1000-line scroll.
+If you hit an issue not covered by this README, please file it on the issue tracker and include the relevant log snippet from `plex_logs/`. The most common failure modes are: `externally-managed-environment` pip errors, missing modules, dashboard refresh quirks on Linux, the "local:// GUID" music-track edge case, the empty-`guids` IndexError in Play Count restore, and the playlist 400 bad_request on large static playlists. Each one usually has an obvious cause in the logs.
 
 If you hit something that isn't documented in either file, the run log directory under `plex_logs/run_<slug>_<timestamp>_FAIL/` carries the per-library success/fail logs, the runtime/errors/media streams, and a generated `troubleshoot.log` keyed by failure category. That's the first place to look before reporting anything.
 
@@ -474,12 +347,11 @@ If you hit something that isn't documented in either file, the run log directory
 
 ## Tips for Large Libraries
 
-- Use `--workers 16` or higher on machines with many CPU cores to speed up processing.
-- Run the snapshot overnight if your library is very large. The script is safe to leave running.
+- Set the worker count to 16 or higher on machines with many CPU cores to speed up processing.
+- Run the snapshot overnight if your library is very large. Hestia-MediaManager is safe to leave running.
 - After restore, check the Plex dashboard to verify watch history appears correctly on a few items before assuming everything is done.
 - You can safely run the restore more than once. The additive merge logic means repeated runs only add what's still missing. They won't create duplicates.
-- While the script runs, a full terminal dashboard shows a thread pool summary, per-library progress bars with ETA, run stats (completed / skipped / failed / unresolved), and a match resolution breakdown (GUID / filepath / suffix / fuzzy). It also shows a live activity feed of the last 8 significant events. On terminals smaller than 80x22, the dashboard falls back to compact Rich progress bars instead.
-- **Keyboard shortcuts** while the dashboard is visible: **Q** to quit cleanly, **V** to toggle verbose (DEBUG) console output, **P** to pause or resume all worker threads at safe checkpoints, **L** to open the log folder in your file manager, **S** to open the connected Plex server in your browser (auto-logged in), and **R** to force an immediate dashboard refresh.
+- The web Dashboard tab shows a live view of every run: thread pool counts, per-library progress bars with ETA, run stats (completed / skipped / failed / unresolved), a match resolution breakdown (GUID / filepath / suffix / fuzzy), and a colour-coded activity feed.
 
 ### Collection performance settings (v0.12.3)
 
@@ -491,7 +363,7 @@ Plex doesn't offer a "give me only this user's personal collections" endpoint. T
 
 Three-layer optimisation now applies automatically on the per-user pass:
 
-1. **Early exit.** If every collection the user can see is already in the library-wide set, the user has no personal collections at all. PlexBackUp returns immediately with no further API calls.
+1. **Early exit.** If every collection the user can see is already in the library-wide set, the user has no personal collections at all. Hestia-MediaManager returns immediately with no further API calls.
 2. **Skip-before-work.** For the remaining users who do have personal collections, library-wide entries are skipped before `coll.items()`, serialization, log writes, or dashboard counter increments fire. Only genuinely personal collections pay the full cost.
 3. **Fast owner detection** (opt-in). See the table below.
 
@@ -512,13 +384,13 @@ Three-layer optimisation now applies automatically on the per-user pass:
 
 ## Understanding Performance and Threading
 
-All worker threads run on the host (the machine running the container or CLI), **not** on your Plex server. Speed depends on your network to Plex, how fast Plex answers, and how many parallel requests Plex tolerates. The default thread count comes from the host's CPU core count, but PlexBackUp spends almost all its time waiting on Plex, so the host's core count barely matters.
+All worker threads run on the host (the machine running the container), **not** on your Plex server. Speed depends on your network to Plex, how fast Plex answers, and how many parallel requests Plex tolerates. The default thread count comes from the host's CPU core count, but Hestia-MediaManager spends almost all its time waiting on Plex, so the host's core count barely matters.
 
-> **A note for the technically curious.** If you've heard that Python's "Global Interpreter Lock" (GIL) prevents Python from using more than one CPU core, that's true, and almost completely irrelevant for this tool. PlexBackUp spends roughly 99% of its wall-clock time waiting for Plex HTTP responses or for SQLite to fsync, and both of those waits release the GIL. A 16-worker pool against Plex really is 16x parallel for the part that matters. The reasoning is fleshed out in [OVERVIEW.md: Concurrency, Python, and the GIL](OVERVIEW.md#concurrency-python-and-the-gil).
+> **A note for the technically curious.** If you've heard that Python's "Global Interpreter Lock" (GIL) prevents Python from using more than one CPU core, that's true, and almost completely irrelevant for this tool. Hestia-MediaManager spends roughly 99% of its wall-clock time waiting for Plex HTTP responses or for SQLite to fsync, and both of those waits release the GIL. A 16-worker pool against Plex really is 16x parallel for the part that matters. The reasoning is fleshed out in [OVERVIEW.md: Concurrency, Python, and the GIL](OVERVIEW.md#concurrency-python-and-the-gil).
 
 ### If it's running slowly
 
-1. **Lower the worker count** with `--workers` (CLI) or the Worker threads field (Run Job tab).
+1. **Lower the worker count** in the Worker threads field (Run Job tab).
 2. **Get on the same LAN as Plex.** Single-digit milliseconds on a LAN, hundreds over the internet.
 3. **Check whether Plex is busy** streaming or transcoding. That contention shows up as slow API responses.
 
@@ -532,7 +404,7 @@ Both servers receive API calls at once, so cut workers further to keep both resp
 
 ### Recommended starting points
 
-| Scenario | Recommended `--workers` | Notes |
+| Scenario | Recommended worker count | Notes |
 |---|---|---|
 | Host and Plex server on the same LAN | The default (`min(32, cpu_count x 4)`) | Network is fast and reliable. Plex itself is the bottleneck, and most home servers handle this comfortably. |
 | Host remote from Plex / over the internet | **Start with 8** and increase from there | High network round-trip time means more parallel requests in flight, not all of which can be served before timing out. Lower workers = fewer timeouts. |
@@ -565,18 +437,15 @@ If you are contributing code, reviewing a change, or trying to understand why th
 
 ## Learning More
 
-The `SOURCES.md` file in this folder contains links and plain-English explanations for every technology, library, and API used in this project. That includes FastAPI, uvicorn, Pydantic, React, Vite, TypeScript, Nginx, and Docker (added in v0.8.0). If you want to understand how PlexBackUp works under the hood, what python-plexapi is, how MusicBrainz GUIDs work, what ThreadPoolExecutor does, or how Plex's scrobble API works, start there. Each entry explains not just what the technology is, but why it matters for this specific project.
+The `SOURCES.md` file in this folder contains links and plain-English explanations for every technology, library, and API used in this project. That includes FastAPI, uvicorn, Pydantic, React, Vite, TypeScript, Nginx, and Docker (added in v0.8.0). If you want to understand how Hestia-MediaManager works under the hood, what python-plexapi is, how MusicBrainz GUIDs work, what ThreadPoolExecutor does, or how Plex's scrobble API works, start there. Each entry explains not just what the technology is, but why it matters for this specific project.
 
-**Project structure.** PlexBackUp is split along two seams: the engine (terminal mode and server mode share it) and the two consumers (the CLI driver and the FastAPI server). `plexmigrate.py` is the CLI entry-point driver, around 290 lines. Engine logic lives under `services/`. The optional web layer lives under `server/` and `frontend/`.
-
-Both `plexmigrate.py` and the `services/` folder need to live in the same directory for the CLI to run. You only need the `server/` and `frontend/` directories (plus `Dockerfile.backend`, `docker-compose.yml`, and `Makefile`) if you want the web UI.
+**Project structure.** Hestia-MediaManager is split into the engine and the web layer that drives it. Engine logic lives under `services/`. The web layer lives under `server/` (FastAPI backend) and `frontend/` (React UI); together with `Dockerfile.backend`, `docker-compose.yml`, and `Makefile` they are the full running app.
 
 <details>
 <summary><strong>Full file layout</strong> (click to expand)</summary>
 
 | File / Directory | What it contains |
 |---|---|
-| `plexmigrate.py` | CLI entry point. Prompts, argument parsing, `main()`. |
 | `services/state.py` | All shared module-level globals and singletons (VERSION, console, thread locks, counters). Per-run state lives in `ContextVar`s so fan-out destinations stay isolated. |
 | `services/dashboard.py` | Dashboard UI, keyboard handling, Rich Progress factory. Holds `submit_with_context` which is how worker pools inherit the current run's context. |
 | `services/logging_ops.py` | Logging setup, result recorders, log file writers. |
@@ -615,6 +484,6 @@ Both `plexmigrate.py` and the `services/` folder need to live in the same direct
 | `frontend/Dockerfile` | Two-stage React build + nginx serve. |
 | `frontend/nginx.conf` | SPA fallback + `/api` and `/ws` reverse proxy to the backend container. |
 | `docker-compose.yml` | Two-service orchestration with host bind mounts. |
-| `Makefile` | `make docker` and `make cli` targets. |
+| `Makefile` | `make docker` and related convenience targets. |
 
 </details>

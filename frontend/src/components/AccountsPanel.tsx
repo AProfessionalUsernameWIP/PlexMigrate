@@ -11,9 +11,11 @@
 // update payload, so a 401/403 surfaces here cleanly through the
 // existing error banners if the gate ever leaks.
 
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { api } from '../api';
 import { InfoTip } from './InfoTip';
+import { useResourceQuery } from '../hooks/useResourceQuery';
+import { Modal } from './Modal';
 
 
 export function AccountsPanel() {
@@ -28,32 +30,20 @@ export function AccountsPanel() {
 // ── Top-level switcher: loading / setup / detail view ───────────────────────
 
 function DbAdminSection() {
-  const [hasAdmin, setHasAdmin] = useState<boolean | null>(null);
-  const [username, setUsername] = useState<string | null>(null);
-  const [topError, setTopError] = useState<string | null>(null);
-
-  const refresh = async () => {
-    try {
-      const s = await api.getDbAdminStatus();
-      setHasAdmin(s.has_admin);
-      setUsername(s.username);
-      setTopError(null);
-    } catch (e) {
-      setTopError(String(e));
-    }
-  };
-  useEffect(() => { void refresh(); }, []);
+  const { data, error: topError, reload: refresh } = useResourceQuery<
+    { has_admin: boolean; username: string | null } | null
+  >(() => api.getDbAdminStatus(), [], null);
 
   if (topError) {
     return <div className="banner error">{topError}</div>;
   }
-  if (hasAdmin === null) {
+  if (data === null) {
     return <div className="panel"><div className="empty">Loading database admin…</div></div>;
   }
-  if (!hasAdmin) {
+  if (!data.has_admin) {
     return <SetupPanel onSetupComplete={refresh} />;
   }
-  return <DetailView username={username ?? ''} onChanged={refresh} />;
+  return <DetailView username={data.username ?? ''} onChanged={refresh} />;
 }
 
 
@@ -201,7 +191,7 @@ function ChangeUsernameModal({
   };
 
   return (
-    <ModalShell title={`Rename ${currentUsername || 'database admin'}`} onClose={onClose}>
+    <Modal title={`Rename ${currentUsername || 'database admin'}`} onClose={onClose}>
       <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
         Picks a new username for the database admin row. Doesn't have to match
         any application login account.
@@ -233,7 +223,7 @@ function ChangeUsernameModal({
         </button>
         <button onClick={onClose} disabled={submitting}>Cancel</button>
       </div>
-    </ModalShell>
+    </Modal>
   );
 }
 
@@ -274,7 +264,7 @@ function ChangePasswordModal({
   };
 
   return (
-    <ModalShell title={`Change password for ${currentUsername || 'database admin'}`} onClose={onClose}>
+    <Modal title={`Change password for ${currentUsername || 'database admin'}`} onClose={onClose}>
       <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
         Sets a new password for the database admin. Must be ≥ 8 characters.
         Verified per-request against <code>auth.db</code>.
@@ -317,7 +307,7 @@ function ChangePasswordModal({
         </button>
         <button onClick={onClose} disabled={submitting}>Cancel</button>
       </div>
-    </ModalShell>
+    </Modal>
   );
 }
 
@@ -402,40 +392,7 @@ function SetupPanel({ onSetupComplete }: { onSetupComplete: () => void | Promise
 }
 
 
-// ── Shared modal shell + role badge (mirrors UserAccountsExplorer) ──────────
-
-function ModalShell({
-  title,
-  onClose,
-  children,
-}: {
-  title: string;
-  onClose: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 520, maxWidth: '92vw', maxHeight: '80vh', overflowY: 'auto' }}
-      >
-        <h2 style={{ marginTop: 0 }}>{title}</h2>
-        {children}
-      </div>
-    </div>
-  );
-}
-
+// ── Role badge (mirrors UserAccountsExplorer) ───────────────────────────────
 
 function DbAdminBadge() {
   return (

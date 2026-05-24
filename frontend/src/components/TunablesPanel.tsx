@@ -1,7 +1,7 @@
 // Settings ▸ Tunables sub-tab.
 //
-// Root-admin-only infrastructure knobs that used to be hardcoded
-// literals. Every value is hot-reloadable - services/tunables.py
+// Root-admin-only infrastructure knobs. Every value is
+// hot-reloadable - services/tunables.py
 // mtime-caches the settings.json read, so a save is picked up on the
 // next call. The HTTP-related tunables additionally trigger
 // services.auth.invalidate_sessions() so the live requests Sessions
@@ -22,6 +22,7 @@
 import { useContext, useEffect, useMemo, useState } from 'react';
 import { api, SettingsView, ServerView } from '../api';
 import { TooltipContext } from '../contexts/TooltipContext';
+import { useResourceQuery } from '../hooks/useResourceQuery';
 import { InfoTip } from './InfoTip';
 
 // Local mirror of the tunables block. Numbers + strings; all optional.
@@ -57,7 +58,7 @@ interface TunablesShape {
   frontend_server_ping_interval_ms?: number;
   scheduler_tick_seconds?: number;
   refresh_token_cleanup_interval_seconds?: number;
-  // v0.13.x: TTL for the generated ``.plexexport.json`` sidecar.
+  // TTL for the generated ``.plexexport.json`` sidecar.
   // 0 disables the sweep; positive values are seconds-since-mtime
   // after which the background reap deletes the file.
   snapshot_sidecar_ttl_seconds?: number;
@@ -91,7 +92,7 @@ interface TunablesShape {
   // surface when the env var is unset. Gated by the Danger Zone's
   // "I understand" checkbox + root_admin permission.
   developer_mode_enabled?: boolean;
-  // UI & Display caps (Phase 3 of the dashboard/log reorg). Numeric
+  // UI & Display caps. Numeric
   // tunables consumed by frontend panels:
   // - etr_color_multiplier scales the ETR amber/red thresholds.
   // - restoration_summary_panel_max_items: visible-row cap for the
@@ -106,24 +107,9 @@ interface TunablesShape {
   user_count_tooltip_max_items?: number;
   // Servers ▸ Overview table: when true, render a "UID" column showing
   // each server's prefixed id (e.g. plex_a1b2c3 / jellyfin_d4e5f6).
-  // End user-facing tunable shipped by developer 2026-05-16; default
-  // false (no UI change on upgrade).
+  // Defaults false (no UI change on upgrade).
   servers_panel_show_server_uid?: boolean;
-  // Adaptive ETA / training engine knobs (Danger Zone). Shape the
-  // engine-anchored ETA the dashboard's "Estimated remaining" reads.
-  // Surfaced under Danger because tuning these can make the
-  // displayed remaining misleading; change only with intent.
-  eta_wallclock_floor_fraction?: number;
-  eta_calibration_ratio_min?: number;
-  eta_calibration_ratio_max?: number;
-  eta_calibration_blend_threshold?: number;
-  eta_almost_done_progress_threshold?: number;
-  // Per-label cold-start defaults dict. Not edited inline today;
-  // end users who need to tune individual labels must use the
-  // settings.json file directly. Surface placeholder so the type
-  // round-trips through the panel without dropping the field.
-  eta_tier5_defaults_seconds?: Record<string, number>;
-  // ── Plan[PLAYLIST-MANAGEMENT] (developer commit 2026-05-16) ──
+  // ── Playlist Management ──
   playlist_cache_enabled?: boolean;
   playlist_cache_refresh_interval_seconds?: number;
   playlist_cache_snapshot_threshold_seconds?: number;
@@ -131,13 +117,13 @@ interface TunablesShape {
   playlist_cache_background_refresh_enabled?: boolean;
   playlist_mgmt_plex_home_auth_mode?: 'owner_token' | 'per_user_token';
   playlist_mgmt_same_user_behavior?: 'skip' | 'duplicate';
-  // ── Plan[MIXED-MEDIA-PLAYLISTS] (developer commit 2026-05-16) ──
+  // ── Mixed-Media Playlists ──
   mixed_media_behavior?: 'skip' | 'dominant' | 'split';
   mixed_media_dominance_threshold?: number;
   mixed_media_video_routing?: 'library_agnostic' | 'library_dominant';
   mixed_media_collision_handling?: 'duplicate' | 'suffix' | 'skip';
   mixed_media_logging?: 'full' | 'decisions_only' | 'off';
-  // ── USER-MGMT-IDENTITY-AUDIT (developer commit 2026-05-16) ──
+  // ── User-Management Identity Audit ──
   // strict_identity_resolution: when true, the cross-server user
   // resolver refuses to fall back to case-insensitive username
   // matching; only explicit identity_map rows + backend_user_id
@@ -146,6 +132,18 @@ interface TunablesShape {
   // in log lines. Both default false to preserve legacy behaviour.
   strict_identity_resolution?: boolean;
   log_use_display_name?: boolean;
+  // When true, a managed_users row
+  // joining an identity_map equivalence class auto-inherits any PIN
+  // already stored on another row in the class. Additive only.
+  // Default true so freshly registered servers + newly mapped users
+  // pick up the operator's PIN automatically; set false to require
+  // explicit PIN entry on every row regardless of identity_map state.
+  auto_backfill_pin_from_identity_links?: boolean;
+  // ── Worker Timers (Server Commands developer console) ──
+  dev_console_heartbeat_active_seconds?: number;
+  dev_console_heartbeat_idle_seconds?: number;
+  dev_console_connect_timeout_seconds?: number;
+  dev_console_mirror_sync_seconds?: number;
 }
 
 // Defaults baked into the engine. Mirrors services/tunables.py _DEFAULTS.
@@ -188,24 +186,7 @@ const DEFAULTS: Required<TunablesShape> = {
   user_count_tooltip_delay_ms: 600,
   user_count_tooltip_max_items: 20,
   servers_panel_show_server_uid: false,
-  eta_wallclock_floor_fraction: 0.15,
-  eta_calibration_ratio_min: 0.25,
-  eta_calibration_ratio_max: 4.0,
-  eta_calibration_blend_threshold: 0.25,
-  eta_almost_done_progress_threshold: 0.85,
-  eta_tier5_defaults_seconds: {
-    snapshot_watch_history: 120.0,
-    snapshot_ratings: 90.0,
-    snapshot_playlists: 45.0,
-    snapshot_collections: 45.0,
-    bulk_fetch_for_filters: 30.0,
-    restore_watch_history: 180.0,
-    restore_ratings: 120.0,
-    restore_playlists: 90.0,
-    restore_collections: 90.0,
-    direct_library_transfer: 240.0,
-  },
-  // Plan[PLAYLIST-MANAGEMENT] 2026-05-16 (developer lock):
+  // Playlist Management:
   playlist_cache_enabled: true,
   playlist_cache_refresh_interval_seconds: 1800,
   playlist_cache_snapshot_threshold_seconds: 900,
@@ -213,15 +194,21 @@ const DEFAULTS: Required<TunablesShape> = {
   playlist_cache_background_refresh_enabled: false,
   playlist_mgmt_plex_home_auth_mode: 'owner_token',
   playlist_mgmt_same_user_behavior: 'skip',
-  // Plan[MIXED-MEDIA-PLAYLISTS] 2026-05-16 (developer lock):
+  // Mixed-Media Playlists:
   mixed_media_behavior: 'skip',
   mixed_media_dominance_threshold: 0.60,
   mixed_media_video_routing: 'library_agnostic',
   mixed_media_collision_handling: 'duplicate',
   mixed_media_logging: 'full',
-  // USER-MGMT-IDENTITY-AUDIT 2026-05-16 (developer):
+  // User-Management Identity Audit:
   strict_identity_resolution: false,
   log_use_display_name: false,
+  auto_backfill_pin_from_identity_links: true,
+  // Worker Timers - Server Commands developer console:
+  dev_console_heartbeat_active_seconds: 10,
+  dev_console_heartbeat_idle_seconds: 60,
+  dev_console_connect_timeout_seconds: 25,
+  dev_console_mirror_sync_seconds: 300,
 };
 
 // Field descriptor drives form rendering. ``min`` is enforced as a
@@ -277,15 +264,27 @@ const UI_DISPLAY_FIELDS: FieldDef[] = [
   { key: 'user_count_tooltip_max_items', label: 'User-count tooltip cap', unit: 'names', help: 'How many user names the tooltip lists before the "… +N more" overflow line. Clamped to [1, 200].', min: 1, step: 1 },
 ];
 
-// Six sub-tab structure for the Tunables page. Replaces the old single-
-// scroll layout. Each tab renders its own field group + any associated
-// boolean / string-enum panels. The Save button operates on the whole
-// document regardless of which tab is visible, so values entered on
-// one tab persist after switching to another.
+// Worker / heartbeat / job timers, grouped into one subtab so every
+// background cadence is editable in one place. The dev-console mirror
+// sync cadence is also per-server overridable (see PER_SERVER_FIELDS).
+const WORKER_TIMERS_FIELDS: FieldDef[] = [
+  { key: 'dev_console_heartbeat_active_seconds', label: 'Dev console heartbeat (active)', unit: 's', help: 'Heartbeat cadence for the Server Commands panel you are actively viewing. Drives the "background job" banner; never calls a media-server API. Clamped to [2, 600].', min: 2, step: 1 },
+  { key: 'dev_console_heartbeat_idle_seconds', label: 'Dev console heartbeat (idle)', unit: 's', help: 'Heartbeat cadence for a Server Commands client with no server selected. Clamped to [5, 3600].', min: 5, step: 5 },
+  { key: 'dev_console_connect_timeout_seconds', label: 'Dev console connect timeout', unit: 's', help: 'Hard cap on a single Server Commands connect attempt before it fails fast instead of hanging the panel. Clamped to [3, 120].', min: 3, step: 1 },
+  { key: 'dev_console_mirror_sync_seconds', label: 'Dev console mirror sync cadence', unit: 's', help: 'How often the background worker refreshes a server’s Server Commands mirror database. Per-server overridable below. Clamped to [30, 86400].', min: 30, step: 30 },
+  { key: 'scheduler_tick_seconds', label: 'Scheduler tick', unit: 's', help: 'How often the scheduler loop checks for due jobs. Also editable on the Polling tab.', min: 1, step: 1 },
+  { key: 'refresh_token_cleanup_interval_seconds', label: 'Refresh-token cleanup cadence', unit: 's', help: 'How often the background sweep purges expired refresh tokens. Also editable on the Polling tab.', min: 60, step: 60 },
+];
+
+// Sub-tab structure for the Tunables page. Each tab renders its own
+// field group + any associated boolean / string-enum panels. The Save
+// button operates on the whole document regardless of which tab is
+// visible, so values entered on one tab persist after switching.
 type TunablesTab =
   | 'networking'
   | 'performance'
   | 'polling'
+  | 'worker_timers'
   | 'limits'
   | 'ui'
   | 'playlist'
@@ -295,13 +294,14 @@ const TAB_DEFS: Array<{ id: TunablesTab; label: string; danger?: boolean }> = [
   { id: 'networking',  label: 'Networking' },
   { id: 'performance', label: 'Performance' },
   { id: 'polling',     label: 'Polling' },
+  { id: 'worker_timers', label: 'Worker Timers' },
   { id: 'limits',      label: 'Limits' },
   { id: 'ui',          label: 'UI & Display' },
   { id: 'playlist',    label: 'Playlist & Mixed-Media' },
   { id: 'danger',      label: 'Danger',      danger: true },
 ];
 
-// Plan[PLAYLIST-MANAGEMENT] + Plan[MIXED-MEDIA-PLAYLISTS] numeric
+// Playlist Management + Mixed-Media Playlists numeric
 // tunables. String-enum fields render as dedicated <select> blocks
 // in the tab body (same pattern as owner_display_style).
 const PLAYLIST_NUMERIC_FIELDS: FieldDef[] = [
@@ -316,13 +316,6 @@ const DANGER_FIELDS: FieldDef[] = [
   { key: 'sqlite_busy_timeout_short_seconds', label: 'SQLite busy timeout (short-lived conns)', unit: 's', help: 'Lower-latency timeout for the short-lived read connections snapshot_registry uses for get-style queries.', min: 1, step: 1, danger: true },
   { key: 'http_pool_connections', label: 'HTTP pool connections', unit: 'pools', help: 'requests.adapters.HTTPAdapter pool_connections - how many distinct host pools the Session keeps. Wrong values waste FDs or starve concurrent Plex calls.', min: 1, step: 1, danger: true },
   { key: 'http_pool_maxsize_cap', label: 'HTTP pool max-size cap', unit: 'connections', help: 'requests.adapters.HTTPAdapter pool_maxsize - how many simultaneous connections fit in one host pool.', min: 1, step: 1, danger: true },
-  // Adaptive ETA / training engine. These shape the dashboard's
-  // "Estimated remaining" headline.
-  { key: 'eta_wallclock_floor_fraction', label: 'ETA wall-clock floor', unit: 'fraction', help: 'Floor for the predicted ETR during the pre-discovery window (before the engine has discovered work to anchor against). Expressed as a fraction of the original prediction. Default 0.15 prevents an undershot cold-start prediction from decaying to 0 and surfacing "Almost done" prematurely.', min: 0, step: 0.05, danger: true },
-  { key: 'eta_calibration_ratio_min', label: 'ETA calibration ratio (min)', unit: 'x', help: 'Lower clamp on the actual/expected ratio used to calibrate the anchored ETR mid-run. 0.25 means the displayed remaining never drops below 25% of the engine\'s predicted remaining, regardless of how fast the run appears to be going.', min: 0.05, step: 0.05, danger: true },
-  { key: 'eta_calibration_ratio_max', label: 'ETA calibration ratio (max)', unit: 'x', help: 'Upper clamp on the actual/expected ratio. 4.0 means the displayed remaining never exceeds 4x the engine\'s predicted remaining; protects against one anomalous slow phase teleporting the ETA.', min: 1, step: 0.5, danger: true },
-  { key: 'eta_calibration_blend_threshold', label: 'ETA calibration blend point', unit: 'fraction', help: 'Completion fraction at which the run-pace calibration reaches full weight. Smaller = reacts to actual pace faster but jumpier on noisy early ticks; larger = trusts the cold-start prediction longer.', min: 0.05, step: 0.05, danger: true },
-  { key: 'eta_almost_done_progress_threshold', label: 'Almost-done progress gate', unit: 'fraction', help: 'Library-completion fraction below which the dashboard refuses to display "Almost done", even if the projected ETR drops below 5 seconds. Raising this requires more progress evidence before the copy fires.', min: 0, step: 0.05, danger: true },
 ];
 
 
@@ -426,6 +419,7 @@ function FieldGroup({
 interface PerServerTunable {
   plex_connect_timeout_seconds?: number;
   viewcount_increment_cap?: number;
+  dev_console_mirror_sync_seconds?: number;
 }
 
 const PER_SERVER_FIELDS: Array<{
@@ -448,6 +442,13 @@ const PER_SERVER_FIELDS: Array<{
     unit: 'plays',
     help: 'Per-server batch cap. Weaker servers benefit from a lower number; powerful servers tolerate the global default.',
     min: 1,
+  },
+  {
+    key: 'dev_console_mirror_sync_seconds',
+    label: 'Dev console mirror sync cadence',
+    unit: 's',
+    help: 'Per-server override for how often this server’s Server Commands mirror refreshes. Set a slower cadence on a server while you work on it to cut API load.',
+    min: 30,
   },
 ];
 
@@ -658,6 +659,15 @@ export function TunablesPanel() {
         <FieldGroup
           title="Performance Caps"
           fields={PERFORMANCE_FIELDS}
+          values={values}
+          onChange={setOneNumeric}
+        />
+      )}
+
+      {activeTab === 'worker_timers' && (
+        <FieldGroup
+          title="Worker &amp; Heartbeat Timers"
+          fields={WORKER_TIMERS_FIELDS}
           values={values}
           onChange={setOneNumeric}
         />
@@ -981,10 +991,9 @@ export function TunablesPanel() {
       </div>
       )}
 
-      {/* USER-MGMT-IDENTITY-AUDIT (developer, 2026-05-16): identity +
-          log presentation toggles. Both are root-admin only and
-          default false. Grouped together because they are the two
-          knobs end users reach for when tuning how the engine names
+      {/* Identity + log presentation toggles. Both are root-admin
+          only and default false. Grouped together because they are
+          the two knobs reached for when tuning how the engine names
           and routes users across servers. */}
       {activeTab === 'ui' && (
       <div className="panel">
@@ -1062,6 +1071,45 @@ export function TunablesPanel() {
                 continue to use the raw handle regardless of this setting. The only thing that
                 changes is the human-readable string that lands in log files and run-history
                 fields.
+              </span>
+            </label>
+          );
+        })()}
+        {(() => {
+          const fallback = DEFAULTS.auto_backfill_pin_from_identity_links as boolean;
+          const current = values.auto_backfill_pin_from_identity_links;
+          const effective = current === undefined ? fallback : current;
+          const isCustom = current !== undefined && current !== fallback;
+          return (
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={effective}
+                onChange={(e) => setOne('auto_backfill_pin_from_identity_links', e.target.checked)}
+              />
+              <span>
+                Auto-backfill PIN across identity-linked accounts
+                {isCustom && (
+                  <span className="tag" style={{ marginLeft: 6, fontSize: 10 }}>custom</span>
+                )}
+                <span style={{ color: 'var(--text-dim)', marginLeft: 6, fontSize: 11 }}>
+                  (default {fallback ? 'on' : 'off'})
+                </span>
+              </span>
+              <span className="help">
+                When a managed-user row joins an identity_map equivalence class (either
+                auto-linked at sync via the backend&apos;s native user ID or manually wired
+                in the User Mapping panel), the row&apos;s PIN column auto-inherits any PIN
+                already stored on another row in the class. Same-backend rows inherit
+                straight across (one Plex server&apos;s Home PIN -&gt; another Plex
+                server&apos;s Home PIN); cross-backend rows route the value into the
+                destination row&apos;s natural PIN column (Plex Home PIN value -&gt; Emby
+                row&apos;s EasyPassword, etc).
+                <br /><br />
+                <strong>Additive only.</strong> An existing PIN on the destination row is
+                NEVER overwritten by the backfill. Disable this only if you intentionally
+                want different PINs across your linked accounts and need to enter each one
+                manually.
               </span>
             </label>
           );
@@ -1155,9 +1203,8 @@ export function TunablesPanel() {
       </div>
       )}
 
-      {/* Playlist & Mixed-Media tab — developer's Plan[PLAYLIST-MANAGEMENT]
-          + Plan[MIXED-MEDIA-PLAYLISTS] 2026-05-16 commits. Surfaces
-          the 11 new tunables end users want to dial. */}
+      {/* Playlist & Mixed-Media tab. Surfaces the playlist-cache and
+          mixed-media tunables. */}
       {activeTab === 'playlist' && (
         <FieldGroup
           title="Playlist cache + mixed-media handling (numeric)"
@@ -1172,7 +1219,6 @@ export function TunablesPanel() {
         <h2 style={{ marginTop: 0 }}>Playlist cache toggles</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
           Boolean preferences for the playlist cache layer.
-          See Plan[PLAYLIST-MANAGEMENT]-2026-05-16.md for the full design.
         </span>
         <label className="switch">
           <input
@@ -1319,8 +1365,7 @@ export function TunablesPanel() {
         <h2 style={{ marginTop: 0 }}>Mixed-Media behavior</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
           How mixed-media (audio + video) playlists are handled when
-          the destination is Plex (which forbids mixed playlists). See
-          Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16.md.
+          the destination is Plex (which forbids mixed playlists).
         </span>
         {(['mixed_media_behavior', 'mixed_media_video_routing', 'mixed_media_collision_handling', 'mixed_media_logging'] as const).map((key) => {
           const labels: Record<typeof key, string> = {
@@ -1521,20 +1566,17 @@ export function TunablesPanel() {
 // Non-destructive: rewrites server_id only, never deletes files.
 
 function OrphanSnapshotMerge() {
-  const [servers, setServers] = useState<ServerView[] | null>(null);
   const [selectedId, setSelectedId] = useState<string>('');
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<
     | { checked: number; reassigned: number; no_op: number }
     | null
   >(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    api.listServers()
-      .then((list) => setServers(list))
-      .catch((e) => setError(String(e)));
-  }, []);
+  const { data: servers, error, setError } = useResourceQuery<ServerView[] | null>(
+    () => api.listServers(),
+    [],
+    null,
+  );
 
   const submit = async () => {
     if (!selectedId) return;

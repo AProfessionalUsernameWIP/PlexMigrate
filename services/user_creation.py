@@ -124,7 +124,7 @@ def create_users_for_job(
         treat as failure (defensive; the spec contract is "non-empty
         id on success").
       * managed_users persist fails -> rollback + raise (the
-        destination has the users but PlexBackUp has no record of
+        destination has the users but Hestia-MediaManager has no record of
         them; cleaner to undo than to leave half-recorded state).
     """
     lg = logger or log
@@ -267,35 +267,27 @@ def _persist_mappings(
         logger.warning(
             "user_creation: server.media_db.upsert_managed_user not "
             "importable; skipping mapping persist (created users "
-            "remain on destination but PlexBackUp has no record)."
+            "remain on destination but Hestia-MediaManager has no record)."
         )
         return
     for r in results:
         if r.status != "created":
             continue
-        try:
-            upsert_managed_user(
-                server_id=dest_server_id,
-                username=r.target_username,
-                backend_user_id=r.backend_user_id,
-                source_user_handle=r.source_user_handle,
-                created_via_user_creation=True,
-            )
-        except TypeError:
-            # ``upsert_managed_user`` may not yet accept the two new
-            # kwargs; fall back to the legacy positional shape so the
-            # test harness + older callers keep working. The link
-            # column will be backfilled in a follow-up migration.
-            try:
-                upsert_managed_user(
-                    server_id=dest_server_id,
-                    username=r.target_username,
-                )
-            except Exception:
-                logger.exception(
-                    "user_creation: upsert_managed_user fallback failed "
-                    "for target=%r", r.target_username,
-                )
+        # CONSOLE-17: upsert_managed_user accepts backend_user_id,
+        # source_user_handle and created_via_user_creation (the columns
+        # exist via media.db migrations v10 / v21). The old
+        # `except TypeError` fallback - which re-called it without the
+        # two newer kwargs - is now unreachable, so it was removed. A
+        # genuine persist failure here propagates to create_users_for_job,
+        # which rolls back every user created in this run (the documented
+        # "managed_users persist failure -> rollback all" contract).
+        upsert_managed_user(
+            server_id=dest_server_id,
+            username=r.target_username,
+            backend_user_id=r.backend_user_id,
+            source_user_handle=r.source_user_handle,
+            created_via_user_creation=True,
+        )
 
 
 def _rollback_created_users(

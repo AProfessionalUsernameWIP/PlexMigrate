@@ -1,4 +1,4 @@
-# PlexMigrate runtime dependencies.
+# Hestia-MediaManager runtime dependencies.
 #
 # Engine deps (also required for CLI-only use):
 plexapi>=4.15

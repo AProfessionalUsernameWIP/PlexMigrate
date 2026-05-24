@@ -1,6 +1,5 @@
 """
-Developer / debug mode flag (Feature 3 phase 3.1; Tunables Danger-Zone
-extension 2026-05-15).
+Developer / debug mode flag.
 
 A boolean read from two sources, in order of precedence:
 

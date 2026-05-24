@@ -1,5 +1,5 @@
 """
-Application-user database for the opt-in web-UI authentication layer (v0.11.0).
+Application-user database for the opt-in web-UI authentication layer.
 
 Roadmap reference: Part 5 / Feature 2 of ``roadmapplan4.md``.
 
@@ -20,7 +20,7 @@ Activation
 ----------
 This module is **only loaded** when the auth layer is enabled (the
 ``PLEXMIGRATE_AUTH_ENABLED`` env var is truthy). The default is
-disabled - pre-v0.11.0 installs and CLI runs never touch this code.
+disabled - CLI runs never touch this code.
 """
 
 from __future__ import annotations
@@ -31,9 +31,10 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from server.persistence import get_data_dir
+from server._db_connect import apply_additive_columns, open_db
 
 
 log = logging.getLogger("plexmigrate.server.auth_db")
@@ -67,15 +68,14 @@ def _connect() -> sqlite3.Connection:
     Open a connection with WAL mode and a 30-second busy timeout.
     Caller is responsible for closing (use a context manager).
     """
-    conn = sqlite3.connect(str(_db_path()), timeout=30.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    # WAL + foreign_keys are session-level pragmas; setting them on
-    # every connection is the documented safe pattern. WAL once set on
-    # the file persists across reopens, so the journal_mode call is a
-    # no-op after the first run.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return open_db(
+        _db_path(),
+        label="auth.db",
+        check_same_thread=True,
+        foreign_keys=True,
+        synchronous_normal=False,
+        chmod_sidecars=False,
+    )
 
 
 def init_auth_db() -> None:
@@ -85,35 +85,29 @@ def init_auth_db() -> None:
     this unconditionally without checking for prior runs.
 
     The bcrypt hashes are stored as TEXT (passlib's
-    ``$2b$<rounds>$<salt><hash>`` format is ASCII-safe). PR-A1 widens
-    the ``role`` CHECK constraint to admit the full five-value space
-    used by the multi-user auth system:
+    ``$2b$<rounds>$<salt><hash>`` format is ASCII-safe). The ``role``
+    CHECK constraint admits the full role space used by the
+    multi-user auth system:
 
     * ``viewer``     - read-only role. Dashboard + Servers (RO) +
                        own Account Settings.
-    * ``end user``   - read + start jobs. Cannot stop jobs or edit
+    * ``operator``   - read + start jobs. Cannot stop jobs or edit
                        schedules. Can see Logs + Backups.
-    * ``manager``    - end user + stop jobs + edit schedules + view
-                       Sync (when Feature 5 ships).
+    * ``manager``    - operator + stop jobs + edit schedules + view
+                       Sync.
+    * ``admin``      - every permission except settings.tunables;
+                       cannot modify a root_admin row.
     * ``root_admin`` - full access. Only role that can manage other
                        user accounts.
     * ``db_admin``   - NON-LOGIN special-purpose credential row that
-                       gates destructive User Management writes
-                       (PR-10). Managed by root_admin via Settings
-                       → Accounts → Database Admin Account.
+                       gates destructive User Management writes.
+                       Managed by root_admin via Settings -> Accounts
+                       -> Database Admin Account.
 
-    Migration path for legacy installs:
-      * pre-PR-9   schema admitted ``admin`` + ``end user`` only.
-      * PR-9.1     widened to ``admin`` + ``db_admin`` + ``end user``.
-      * PR-A1      widens further to include ``viewer`` + ``manager``
-                   + ``root_admin``, ADDS ``display_name`` and
-                   ``last_login`` columns, AND remaps every existing
-                   ``role='admin'`` row to ``role='root_admin'`` in
-                   the same transaction.
-
-    ``_migrate_schema`` is idempotent - it detects the active
-    schema shape via ``sqlite_master`` and only rebuilds when an
-    upgrade is required.
+    An older ``auth.db`` whose role CHECK predates the current shape
+    is rebuilt on first boot by ``_migrate_schema``, which is
+    idempotent - it detects the active schema via ``sqlite_master``
+    and only rebuilds when an upgrade is required.
     """
     global _initialised
     with _init_lock:
@@ -127,9 +121,9 @@ def init_auth_db() -> None:
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     username            TEXT UNIQUE NOT NULL,
                     password_hash       TEXT NOT NULL,
-                    role                TEXT NOT NULL DEFAULT 'end user'
+                    role                TEXT NOT NULL DEFAULT 'operator'
                                         CHECK (role IN (
-                                            'viewer', 'end user', 'manager',
+                                            'viewer', 'operator', 'manager',
                                             'admin', 'root_admin', 'db_admin'
                                         )),
                     display_name        TEXT,
@@ -150,7 +144,12 @@ def init_auth_db() -> None:
                     username    TEXT NOT NULL,
                     issued_at   REAL NOT NULL,
                     expires_at  REAL NOT NULL,
-                    revoked     INTEGER NOT NULL DEFAULT 0
+                    revoked     INTEGER NOT NULL DEFAULT 0,
+                    -- AUTH-08: NULL while the token is live; set to the
+                    -- rotation timestamp when /refresh consumes it. A
+                    -- token with rotated_at set, presented again, is a
+                    -- replay (rotation reuse detection).
+                    rotated_at  REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_refresh_tokens_username
                     ON refresh_tokens(username);
@@ -159,6 +158,7 @@ def init_auth_db() -> None:
             """)
             _migrate_schema(conn)
             _migrate_permission_columns(conn)
+            _migrate_refresh_token_columns(conn)
         finally:
             conn.close()
         _initialised = True
@@ -168,42 +168,50 @@ def init_auth_db() -> None:
 def _migrate_permission_columns(conn: sqlite3.Connection) -> None:
     """
     Add ``extra_permissions`` and ``revoked_permissions`` TEXT columns
-    to ``app_users`` if they're not already present. Idempotent -
-    ``ALTER TABLE ADD COLUMN`` raises ``OperationalError: duplicate
-    column name`` when the column already exists, which we catch.
+    to ``app_users`` if not already present. Idempotent.
 
     These columns store JSON arrays of permission strings used by
     ``server.auth_router.effective_permissions_for`` to layer per-user
     grants and revokes on top of the role baseline.
     """
-    have = {r["name"] for r in conn.execute("PRAGMA table_info(app_users)").fetchall()}
-    if "extra_permissions" not in have:
-        try:
-            conn.execute("ALTER TABLE app_users ADD COLUMN extra_permissions TEXT")
-            log.info("auth.db: added extra_permissions column")
-        except sqlite3.OperationalError:
-            pass
-    if "revoked_permissions" not in have:
-        try:
-            conn.execute("ALTER TABLE app_users ADD COLUMN revoked_permissions TEXT")
-            log.info("auth.db: added revoked_permissions column")
-        except sqlite3.OperationalError:
-            pass
+    apply_additive_columns(conn, [
+        ("app_users", "extra_permissions TEXT"),
+        ("app_users", "revoked_permissions TEXT"),
+    ])
+
+
+def _migrate_refresh_token_columns(conn: sqlite3.Connection) -> None:
+    """
+    Add the ``rotated_at`` column to ``refresh_tokens`` if absent
+    (AUTH-08). NULL means the token is still live; a non-NULL value is
+    the timestamp at which a /refresh rotation consumed it. Idempotent
+    - an ``auth.db`` created before rotation existed gets the column
+    on the next boot, defaulting every existing row to NULL (live).
+    """
+    apply_additive_columns(conn, [
+        ("refresh_tokens", "rotated_at REAL"),
+    ])
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
     """
-    Bring an existing ``app_users`` table forward to the PR-A1 shape:
+    Bring an existing ``app_users`` table forward to the current shape:
 
-      * CHECK constraint covers all five role values
+      * role CHECK constraint covers
+        (viewer, operator, manager, admin, root_admin, db_admin)
       * ``display_name`` and ``last_login`` columns present
-      * Every legacy ``role='admin'`` row remapped to ``role='root_admin'``
+      * Every legacy ``role='end user'`` row remapped to
+        ``role='operator'`` - the code vocabulary and every
+        require_role call site say ``operator``
+      * Every legacy ``role='admin'`` row remapped to
+        ``role='root_admin'``
 
     Detection: inspect the stored CREATE TABLE statement in
-    ``sqlite_master``. If it doesn't mention ``root_admin``, we know
-    the schema is on an older shape and we rebuild. The rebuild runs
-    in a single transaction so a crash mid-migration leaves the
-    original table intact.
+    ``sqlite_master``. The current shape is the only one whose CHECK
+    constraint carries ``'operator'``; any table without it is on an
+    older shape and is rebuilt. The rebuild runs in a single
+    transaction so a crash mid-migration leaves the original table
+    intact.
 
     The CREATE TABLE IF NOT EXISTS above sets the new schema on
     fresh installs; this function handles every other case.
@@ -214,22 +222,24 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if row is None:
         return  # fresh install just got the new schema above
     create_sql = (row["sql"] or "").lower()
-    # The CHECK constraint must list every accepted role. The post-
-    # PR-A1.1 shape has six values; we detect by looking for the last
-    # one added (``'admin'`` as a discrete word - root_admin contains
-    # the same substring so ``"'admin'"`` is the unambiguous probe).
-    if "'admin'" in create_sql and "root_admin" in create_sql:
+    # The CHECK constraint must list every accepted role. The current
+    # shape carries ``'operator'``; an older shape carries
+    # ``'end user'`` in its place. ``'operator'`` is a substring of no
+    # other role name, so its presence is the unambiguous probe that
+    # the table is already current.
+    if "'operator'" in create_sql and "root_admin" in create_sql:
         return  # already on the current schema
 
     log.info(
-        "Migrating auth.db schema: widening role CHECK "
+        "Migrating auth.db schema: role CHECK to "
         "(viewer/operator/manager/admin/root_admin/db_admin), adding "
-        "display_name + last_login columns, remapping legacy admin → root_admin."
+        "display_name + last_login columns, remapping legacy "
+        "'end user' to 'operator' and legacy 'admin' to 'root_admin'."
     )
     # Detect which columns the existing table has so the INSERT
-    # SELECT only references columns that exist. Pre-PR-A1 tables
-    # don't have ``display_name`` or ``last_login``; we leave those
-    # NULL in the new table.
+    # SELECT only references columns that exist. Older tables don't
+    # have ``display_name`` or ``last_login``; we leave those NULL in
+    # the new table.
     legacy_cols = {r["name"] for r in conn.execute(
         "PRAGMA table_info(app_users)"
     ).fetchall()}
@@ -245,22 +255,27 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     revoked_perms_expr = "revoked_permissions" if has_revoked_perms else "NULL"
 
     # We need a CASE expression that:
-    #   * remaps the LEGACY ``admin`` (pre-PR-A1) → ``root_admin``,
-    #     BUT only when the new ``admin`` role doesn't already exist
-    #     in the schema (i.e. the legacy CHECK constraint had at most
-    #     ``admin`` / ``end user`` / ``db_admin``).
-    #   * leaves the new ``admin`` role alone on already-PR-A1
-    #     installs being upgraded to add the sudo-root admin value.
+    #   * always remaps a legacy ``end user`` role to ``operator``
+    #     (_ROLE_RANK and every require_role call site say
+    #     ``operator``).
+    #   * remaps the LEGACY ``admin`` to ``root_admin``, BUT only when
+    #     the new ``admin`` role doesn't already exist in the schema
+    #     (i.e. the legacy CHECK constraint had at most ``admin`` /
+    #     ``end user`` / ``db_admin``).
+    #   * leaves the new ``admin`` role alone on installs that already
+    #     have the current role set being upgraded.
     #
     # The probe: if the old schema already has ``root_admin`` in its
-    # CHECK constraint then the existing ``admin`` rows ARE the new
-    # sudo-root admin and must be preserved. Otherwise (pre-PR-A1)
-    # there's no ``root_admin`` so any ``admin`` row is the legacy
-    # login admin and must be promoted.
+    # CHECK constraint then the existing ``admin`` rows ARE the
+    # sudo-root admin and must be preserved. Otherwise there's no
+    # ``root_admin`` so any ``admin`` row is the legacy login admin
+    # and must be promoted.
     legacy_install = "root_admin" not in create_sql
     role_expr = (
-        "CASE WHEN role = 'admin' THEN 'root_admin' ELSE role END"
-        if legacy_install else "role"
+        "CASE WHEN role = 'admin' THEN 'root_admin' "
+        "WHEN role = 'end user' THEN 'operator' ELSE role END"
+        if legacy_install else
+        "CASE WHEN role = 'end user' THEN 'operator' ELSE role END"
     )
     conn.executescript(f"""
         BEGIN TRANSACTION;
@@ -268,9 +283,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             username            TEXT UNIQUE NOT NULL,
             password_hash       TEXT NOT NULL,
-            role                TEXT NOT NULL DEFAULT 'end user'
+            role                TEXT NOT NULL DEFAULT 'operator'
                                 CHECK (role IN (
-                                    'viewer', 'end user', 'manager',
+                                    'viewer', 'operator', 'manager',
                                     'admin', 'root_admin', 'db_admin'
                                 )),
             display_name        TEXT,
@@ -345,8 +360,8 @@ def _dummy_hash() -> bytes:
 # Valid role values for ``create_user`` and ``update_role``. The first
 # four are the login-capable roles in the multi-user auth hierarchy;
 # ``db_admin`` is a non-login special-purpose credential used to gate
-# destructive User Management writes (PR-10) and is created from a
-# different surface (Settings → Accounts → Database Admin Account).
+# destructive User Management writes and is created from a different
+# surface (Settings → Accounts → Database Admin Account).
 _LOGIN_ROLES = ("viewer", "operator", "manager", "admin", "root_admin")
 _VALID_ROLES = _LOGIN_ROLES + ("db_admin",)
 
@@ -367,8 +382,8 @@ def create_user(
       * ``password`` is shorter than 8 characters or longer than
         :data:`_MAX_PASSWORD_LEN` (bcrypt truncates at 72 bytes -
         rejecting up front prevents silent prefix collisions)
-      * ``role`` is not one of ``viewer | end user | manager |
-        root_admin | db_admin``
+      * ``role`` is not one of ``viewer | operator | manager |
+        admin | root_admin | db_admin``
       * a user with that username already exists
 
     ``display_name`` is optional. ``None`` or an empty string leaves
@@ -481,8 +496,8 @@ def _row_to_user(row: sqlite3.Row) -> Dict[str, Any]:
         "id": row["id"],
         "username": row["username"],
         "role": row["role"],
-        "display_name": row["display_name"] if "display_name" in row.keys() else None,
-        "last_login": row["last_login"] if "last_login" in row.keys() else None,
+        "display_name": row["display_name"],
+        "last_login": row["last_login"],
         "created_at": row["created_at"],
     }
 
@@ -493,13 +508,13 @@ def get_user(username: str) -> Optional[Dict[str, Any]]:
     hash) or ``None`` if not found.
 
     Used by:
-    * The PR-A2 ``require_role()`` dependency - re-reads the user's
+    * The ``require_role()`` dependency - re-reads the user's
       current role on every request so role changes via
       ``PATCH /api/auth/users/{u}`` take effect immediately without
       requiring the affected user to re-login.
     * ``GET /api/auth/me`` - returns the caller's full identity to the
       frontend.
-    * The User Accounts explorer (PR-A5) - drilled-in detail view.
+    * The User Accounts explorer - drilled-in detail view.
     """
     init_auth_db()
     uname = (username or "").strip()
@@ -520,12 +535,12 @@ def get_user(username: str) -> Optional[Dict[str, Any]]:
 def list_users() -> List[Dict[str, Any]]:
     """
     Return every user row (without password hashes), ordered by
-    creation time. Includes ``display_name`` and ``last_login``
-    columns added in PR-A1 so the User Accounts explorer can render
-    them directly. db_admin rows are EXCLUDED - they're a non-login
-    credential managed via a different surface (Settings → Accounts
-    → Database Admin Account) and should never appear in the login-
-    user management table per the PR-9 Sub-PR-A spec.
+    creation time. Includes the ``display_name`` and ``last_login``
+    columns so the User Accounts explorer can render them directly.
+    db_admin rows are EXCLUDED - they're a non-login credential
+    managed via a different surface (Settings → Accounts → Database
+    Admin Account) and should never appear in the login-user
+    management table.
     """
     init_auth_db()
     conn = _connect()
@@ -642,7 +657,7 @@ def set_user_permission_grants(
         conn.close()
 
 
-# ── PR-A1: mutation helpers for the multi-user system ──────────────────────
+# ── Mutation helpers for the multi-user system ─────────────────────────────────
 
 def _count_role(conn: sqlite3.Connection, role: str) -> int:
     """Count ``app_users`` rows currently holding ``role``."""
@@ -654,9 +669,7 @@ def _count_role(conn: sqlite3.Connection, role: str) -> int:
 
 def count_role(role: str) -> int:
     """Public wrapper around ``_count_role``. Opens its own connection
-    so callers don't need to plumb one through. Used by the Item 1
-    upgrade-split endpoint to detect "exactly one root_admin = legacy
-    install" before performing the split."""
+    so callers don't need to plumb one through."""
     init_auth_db()
     conn = _connect()
     try:
@@ -667,8 +680,8 @@ def count_role(role: str) -> int:
 
 def update_role(username: str, new_role: str) -> None:
     """
-    Change a user's role. Used by ``PATCH /api/auth/users/{u}`` in
-    PR-A2 and the User Accounts explorer in PR-A5.
+    Change a user's role. Used by ``PATCH /api/auth/users/{u}`` and
+    the User Accounts explorer.
 
     Raises ``ValueError`` on:
       * empty username
@@ -727,7 +740,7 @@ def update_display_name(username: str, display_name: Optional[str]) -> None:
     """
     Set or clear a user's display name. ``None`` or empty string
     clears the field (the UI will fall back to showing the raw
-    username). Used by the Account Settings panel (PR-A5) and the
+    username). Used by the Account Settings panel and the
     User Accounts explorer.
     """
     init_auth_db()
@@ -809,17 +822,17 @@ def delete_user(username: str) -> None:
         conn.close()
 
 
-# ── PR-A1 - Role-specific lookups ───────────────────────────────────────────
+# ── Role-specific lookups ──────────────────────────────────────────────────────
 #
 # Two distinct admin rows live in ``app_users``, differentiated by
 # their ``role`` column:
 #
 #   * ``role='root_admin'`` - the application-login admin. Created via
 #     ``/api/auth/setup`` on first boot. Authoritative login credential
-#     for the web UI. Renamed from ``admin`` in PR-A1.
-#   * ``role='db_admin'``   - the Database Admin Account (PR-9). A
+#     for the web UI.
+#   * ``role='db_admin'``   - the Database Admin Account. A
 #     completely separate credential set whose only purpose is to
-#     gate destructive User Management writes (PR-10).
+#     gate destructive User Management writes.
 #
 # Multiple rows are technically allowed for each role (the schema
 # permits it) but the Settings UI surfaces only the earliest-created
@@ -843,8 +856,8 @@ def _get_first_by_role(role: str) -> Optional[Dict[str, Any]]:
 def get_db_admin() -> Optional[Dict[str, Any]]:
     """
     Return the canonical Database Admin row (``role='db_admin'``) or
-    ``None``. Used by the Accounts sub-tab in Settings (PR-9.1) and
-    by every User Management write gate in PR-10.
+    ``None``. Used by the Accounts sub-tab in Settings and by every
+    User Management write gate.
     """
     return _get_first_by_role("db_admin")
 
@@ -852,14 +865,13 @@ def get_db_admin() -> Optional[Dict[str, Any]]:
 def get_root_admin() -> Optional[Dict[str, Any]]:
     """
     Return the canonical root-admin row (``role='root_admin'``) or
-    ``None``. Replaces ``get_login_admin`` from PR-9.1 - the role
-    formerly known as ``admin`` is now ``root_admin``.
+    ``None``.
     """
     return _get_first_by_role("root_admin")
 
 
 # Back-compat alias for any in-tree caller that still references the
-# pre-PR-A1 name. New code should call ``get_root_admin()`` directly.
+# old name. New code should call ``get_root_admin()`` directly.
 def get_login_admin() -> Optional[Dict[str, Any]]:
     return get_root_admin()
 
@@ -912,17 +924,37 @@ def update_username(old_username: str, new_username: str) -> None:
         return  # no-op
     conn = _connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            cur = conn.execute(
-                "UPDATE app_users SET username = ? WHERE username = ?",
+            try:
+                cur = conn.execute(
+                    "UPDATE app_users SET username = ? WHERE username = ?",
+                    (new, old),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"A user named {new!r} already exists."
+                ) from exc
+            if cur.rowcount == 0:
+                raise ValueError(f"No user named {old!r}.")
+            # AUTH-10: refresh_tokens.username is a plain TEXT column
+            # with no FK to app_users, so a rename leaves its rows
+            # pointing at the OLD name. The /refresh path then resolves
+            # the stale name to a missing account and silently kills
+            # every other session the renamed user had. Carry the
+            # rename across in the SAME transaction so those sessions
+            # survive intact.
+            conn.execute(
+                "UPDATE refresh_tokens SET username = ? WHERE username = ?",
                 (new, old),
             )
-        except sqlite3.IntegrityError as exc:
-            raise ValueError(
-                f"A user named {new!r} already exists."
-            ) from exc
-        if cur.rowcount == 0:
-            raise ValueError(f"No user named {old!r}.")
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
     finally:
         conn.close()
 
@@ -1014,6 +1046,92 @@ def validate_refresh_token(token_id: str) -> Optional[str]:
     if float(row["expires_at"]) <= time.time():
         return None
     return row["username"]
+
+
+def rotate_refresh_token(old_token_id: str) -> Optional[Tuple[str, str]]:
+    """
+    Atomically consume ``old_token_id`` and issue its replacement.
+
+    This is the /refresh primitive (AUTH-08). On success it returns
+    ``(username, new_token_id)``: the old row is marked rotated +
+    revoked and a fresh row is inserted, all in one transaction, so
+    the caller ships ``new_token_id`` as the new cookie. Returns
+    ``None`` on every rejection path - unknown / expired / revoked /
+    replayed - so the caller surfaces a single generic 401 with no
+    oracle for which one it was.
+
+    Reuse detection: a token is stamped ``rotated_at`` the moment it
+    is consumed. If a token that is ALREADY rotated is presented
+    again, that is a replay of a stale or stolen cookie - every
+    refresh token for that user is revoked (forcing a fresh login on
+    every device) and a security warning is logged. This is the
+    OAuth 2.0 BCP rotation-with-reuse-detection behaviour.
+    """
+    init_auth_db()
+    if not isinstance(old_token_id, str) or not old_token_id:
+        return None
+    now = time.time()
+    new_token_id = secrets.token_urlsafe(32)  # 256 bits of entropy
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT username, expires_at, revoked, rotated_at "
+                "FROM refresh_tokens WHERE id = ?",
+                (old_token_id,),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            username = row["username"]
+            if row["rotated_at"] is not None:
+                # Reuse: this token was already consumed by an earlier
+                # rotation. Burn every refresh token the user holds.
+                conn.execute(
+                    "UPDATE refresh_tokens SET revoked = 1 "
+                    "WHERE username = ? AND revoked = 0",
+                    (username,),
+                )
+                conn.execute("COMMIT")
+                log.warning(
+                    "refresh-token REUSE detected for user %r: an "
+                    "already-rotated token was presented again - the "
+                    "cookie may have been stolen. Revoked every refresh "
+                    "token for that user; all devices must log in again.",
+                    username,
+                )
+                return None
+            if row["revoked"]:
+                conn.execute("ROLLBACK")
+                return None
+            if float(row["expires_at"]) <= now:
+                conn.execute("ROLLBACK")
+                return None
+            # Live token: consume it (rotated + revoked) and issue the
+            # replacement in the SAME transaction so a crash can never
+            # leave the user with neither a valid old nor new token.
+            conn.execute(
+                "UPDATE refresh_tokens "
+                "SET revoked = 1, rotated_at = ? WHERE id = ?",
+                (now, old_token_id),
+            )
+            conn.execute(
+                "INSERT INTO refresh_tokens "
+                "(id, username, issued_at, expires_at, revoked, rotated_at) "
+                "VALUES (?, ?, ?, ?, 0, NULL)",
+                (new_token_id, username, now, now + _refresh_token_ttl()),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+    finally:
+        conn.close()
+    return (username, new_token_id)
 
 
 def revoke_refresh_token(token_id: str) -> None:

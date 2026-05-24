@@ -15,6 +15,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, LogFileContent } from '../api';
 import { isRunGoneError } from './DashboardPanel';
+import { pausableInterval } from '../utils/pausableInterval';
+import { renderHighlighted } from '../utils/highlight';
 
 const TAIL_POLL_MS = 2000;
 
@@ -87,7 +89,11 @@ export function LogTailer({
   // Poll loop - appends only the new bytes via ?since=offset.
   useEffect(() => {
     if (!liveTail || externalFreeze || !runName || !fileName) return;
-    const tick = window.setInterval(async () => {
+    // pausableInterval's cancel fn isn't available until it returns,
+    // so hold it in a mutable binding the poll body can reach to
+    // self-cancel when the run directory disappears.
+    let stop: (() => void) | null = null;
+    stop = pausableInterval(async () => {
       try {
         const r = await api.readLogFile(runName, fileName, offsetRef.current);
         if (r.content.length > 0) setBody((prev) => prev + r.content);
@@ -95,11 +101,11 @@ export function LogTailer({
         setMeta(r);
         setLastPolledAt(Date.now());
       } catch (e) {
-        if (isRunGoneError(e)) { window.clearInterval(tick); return; }
+        if (isRunGoneError(e)) { stop?.(); return; }
         setError(String(e));
       }
     }, TAIL_POLL_MS);
-    return () => window.clearInterval(tick);
+    return () => stop?.();
   }, [liveTail, externalFreeze, runName, fileName]);
 
   // Keep the viewport pinned to the bottom whenever new bytes arrive
@@ -127,6 +133,10 @@ export function LogTailer({
       setLastPolledAt(Date.now());
       stickyRef.current = true;
     } catch (e) {
+      // Suppress the run-gone 404 the same way the initial load does:
+      // a manual Reload on a run whose directory was renamed at job
+      // end would otherwise flash a banner the user can't act on.
+      if (isRunGoneError(e)) return;
       setError(String(e));
     }
   };
@@ -217,6 +227,7 @@ export function LogTailer({
         ref={bodyRef}
         onScroll={onBodyScroll}
         style={{ height, maxHeight: height }}
+        data-testid="log-content"
       >
         {filteredLines === null ? (
           // Fast path: raw text blob, browser-native rendering.
@@ -236,44 +247,3 @@ export function LogTailer({
   );
 }
 
-// ── Helpers (v0.9.7 Item 8) ─────────────────────────────────────────────────
-
-// Escape a string so it can be embedded in a RegExp literal without
-// interpreting special characters. The filter input is a plain
-// substring - end users don't expect regex semantics from typing
-// e.g. "(error)" into the box.
-function escapeForRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Split ``line`` around every case-insensitive occurrence of
-// ``needle`` and wrap the matched chunks in ``<mark>`` so the
-// matched substring is visually highlighted. Returns a React node
-// (array of strings + spans) suitable for direct rendering. Empty
-// ``needle`` short-circuits to the plain string.
-function renderHighlighted(line: string, needle: string): React.ReactNode {
-  if (!needle) return line;
-  const re = new RegExp(escapeForRegex(needle), 'gi');
-  const parts: React.ReactNode[] = [];
-  let lastIndex = 0;
-  let m: RegExpExecArray | null;
-  let keyCount = 0;
-  while ((m = re.exec(line)) !== null) {
-    if (m.index > lastIndex) {
-      parts.push(line.slice(lastIndex, m.index));
-    }
-    parts.push(
-      <mark key={keyCount++} className="log-match">
-        {m[0]}
-      </mark>
-    );
-    lastIndex = m.index + m[0].length;
-    // Avoid an infinite loop on zero-length matches (shouldn't happen
-    // with our escaping, but defensive).
-    if (m.index === re.lastIndex) re.lastIndex++;
-  }
-  if (lastIndex < line.length) {
-    parts.push(line.slice(lastIndex));
-  }
-  return parts;
-}

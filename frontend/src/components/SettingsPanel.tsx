@@ -1,7 +1,7 @@
-// Settings panel - PlexMigrate app behaviour (Bucket B).
+// Settings panel - Hestia-MediaManager app behaviour (Bucket B).
 //
 // As of the Phase-2 Settings/Servers reorg, this panel holds only the
-// settings that describe how the PlexMigrate app itself behaves -
+// settings that describe how the Hestia-MediaManager app itself behaves -
 // distinct from the run-level defaults that describe how snapshots
 // and direct transfers operate against Plex (those moved to
 // Servers ▸ Run Defaults).
@@ -21,10 +21,10 @@
 //
 // What moved to Settings ▸ Tunables:
 //   * Root-admin-only infrastructure knobs (HTTP timeouts, JWT TTL,
-//     SQLite busy timeouts, etc.) - populated in Phase 3.
+//     SQLite busy timeouts, etc.).
 
 import { useEffect, useState } from 'react';
-import { api, EtaTrainingStatus, PrunePreview, PruneResult, RecentRunRow, SettingsView } from '../api';
+import { api, PrunePreview, PruneResult, RecentRunRow, SettingsView } from '../api';
 import { InfoTip } from './InfoTip';
 
 export function SettingsPanel() {
@@ -48,32 +48,26 @@ export function SettingsPanel() {
   const [pruneServerOpen, setPruneServerOpen] = useState<string | null>(null);
   const [servers, setServers] = useState<{ id: string; name: string }[]>([]);
 
-  // Phase 4: ETR colour multiplier. Scales the dashboard's per-phase
+  // ETR colour multiplier. Scales the dashboard's per-phase
   // amber/red stall thresholds. 1.0 = ship defaults; <1.0 warns
   // sooner; >1.0 is more lenient. Clamped to [0.5, 2.0] at the
   // backend read boundary too.
   const [etrMultiplier, setEtrMultiplier] = useState<number>(1.0);
 
-  // ETA training: bucket inventory + flush controls. Mounts lazily;
-  // null until the first fetch completes. Refresh button refetches
-  // on demand; the flush button is gated by a typed confirmation
-  // shown in a modal.
-  const [trainingStatus, setTrainingStatus] = useState<EtaTrainingStatus | null>(null);
-  const [trainingLoading, setTrainingLoading] = useState<boolean>(false);
-  const [flushOpen, setFlushOpen] = useState<boolean>(false);
+  // Resolved on-disk paths of every app-level log
+  // file the build writes. Surfaced as a "Log file locations"
+  // subsection of the Logging panel so the operator can tail / grep
+  // them from a shell without first navigating to the Application
+  // Logs viewer for each category.
+  const [logPaths, setLogPaths] = useState<{ data_dir: string; paths: Record<string, string> } | null>(null);
 
   // Run History subtab state. activeTab toggles which top-level
   // panel set renders. recentRuns is the run_history listing; the
   // end user-facing inspection surface for past job runs (snapshot
-  // / restore / direct). repairBusy + backfillBusy are inline
-  // spinners on the recovery actions.
+  // / restore / direct).
   const [activeTab, setActiveTab] = useState<'settings' | 'history' | 'databases'>('settings');
   const [recentRuns, setRecentRuns] = useState<RecentRunRow[]>([]);
   const [runsLoading, setRunsLoading] = useState<boolean>(false);
-  const [repairBusy, setRepairBusy] = useState<boolean>(false);
-  const [repairResult, setRepairResult] = useState<{ updated: number; still_orphan: number } | null>(null);
-  const [backfillBusy, setBackfillBusy] = useState<boolean>(false);
-  const [backfillResult, setBackfillResult] = useState<{ entries_read: number; buckets_touched: number } | null>(null);
 
   const load = async () => {
     try {
@@ -97,7 +91,7 @@ export function SettingsPanel() {
           ? lw.stale_threshold_days
           : 7,
       );
-      // Phase 4: ETR colour multiplier.
+      // ETR colour multiplier.
       const m = (s as { etr_color_multiplier?: number }).etr_color_multiplier;
       if (typeof m === 'number' && Number.isFinite(m)) {
         setEtrMultiplier(Math.max(0.5, Math.min(2.0, m)));
@@ -117,18 +111,13 @@ export function SettingsPanel() {
       .catch(() => { /* non-fatal; prune action falls back to manual id */ });
   }, []);
 
-  const refreshTrainingStatus = async () => {
-    setTrainingLoading(true);
-    try {
-      const s = await api.etaTrainingStatus();
-      setTrainingStatus(s);
-    } catch {
-      setTrainingStatus(null);
-    } finally {
-      setTrainingLoading(false);
-    }
-  };
-  useEffect(() => { void refreshTrainingStatus(); }, []);
+  // Log-file paths. Best-effort; non-fatal if the fetch fails (the
+  // panel renders a fallback hint instead).
+  useEffect(() => {
+    api.listLogPaths()
+      .then((r) => setLogPaths(r))
+      .catch(() => setLogPaths(null));
+  }, []);
 
   const refreshRecentRuns = async () => {
     setRunsLoading(true);
@@ -142,34 +131,6 @@ export function SettingsPanel() {
     }
   };
   useEffect(() => { void refreshRecentRuns(); }, []);
-
-  const doRepair = async () => {
-    setRepairBusy(true);
-    try {
-      const r = await api.etaRepairServerIds();
-      setRepairResult(r);
-      // Refresh training status so the end user can see the new
-      // bucket inventory once they also run the backfill.
-      await refreshTrainingStatus();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setRepairBusy(false);
-    }
-  };
-
-  const doBackfill = async (resetFirst: boolean) => {
-    setBackfillBusy(true);
-    try {
-      const r = await api.backfillEtaWeights(resetFirst);
-      setBackfillResult(r);
-      await refreshTrainingStatus();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBackfillBusy(false);
-    }
-  };
 
   const save = async () => {
     setError(null);
@@ -188,7 +149,7 @@ export function SettingsPanel() {
         interval_seconds: Math.max(1, Math.floor(Number(walkIntervalHours) || 24)) * 3600,
         stale_threshold_days: Math.max(1, Math.floor(Number(staleThresholdDays) || 7)),
       },
-      // Phase 4: ETR colour multiplier. Backend clamps too.
+      // ETR colour multiplier. Backend clamps too.
       etr_color_multiplier: Math.max(0.5, Math.min(2.0, Number(etrMultiplier) || 1.0)),
     };
     try {
@@ -285,6 +246,70 @@ export function SettingsPanel() {
             </button>
           </div>
         </div>
+
+        {/* Log file locations - resolved on-disk paths for every
+            application-level log this build writes. Lives here (not
+            in Settings > Application Logs) so an operator wanting to
+            tail / grep a log from a shell finds the path at a glance
+            without first opening a category viewer. */}
+        <div style={{ marginTop: 18 }}>
+          <h3 style={{ fontSize: 14, margin: '0 0 4px' }}>Log file locations</h3>
+          <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
+            On-disk paths of every application-level log file the server writes. Useful for
+            shell-side tail / grep (e.g. <code>tail -f &lt;path&gt;</code>). Per-run job logs
+            (snapshot / restore / direct) live under <strong>Servers ▸ Logs</strong>.
+          </span>
+          {!logPaths && (
+            <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+              Loading paths…
+            </div>
+          )}
+          {logPaths && (
+            <>
+              <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 8 }}>
+                Data directory: <code style={{ userSelect: 'all' }}>{logPaths.data_dir}</code>
+              </div>
+              <table style={{ width: '100%', fontSize: 12 }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid var(--border)' }}>Log</th>
+                    <th style={{ textAlign: 'left', padding: '4px 8px', borderBottom: '1px solid var(--border)' }}>Path</th>
+                    <th style={{ padding: '4px 8px', borderBottom: '1px solid var(--border)' }} />
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    { key: 'app',            label: 'App (server-wide INFO+)' },
+                    { key: 'db-access',      label: 'Database Access' },
+                    { key: 'playlist-cache', label: 'Playlist Cache' },
+                    { key: 'sync',           label: 'Sync Activity' },
+                  ].map((row) => {
+                    const p = logPaths.paths[row.key];
+                    if (!p) return null;
+                    return (
+                      <tr key={row.key}>
+                        <td style={{ padding: '4px 8px', verticalAlign: 'top' }}>{row.label}</td>
+                        <td style={{ padding: '4px 8px', fontFamily: 'monospace' }}>
+                          <code style={{ userSelect: 'all' }}>{p}</code>
+                        </td>
+                        <td style={{ padding: '4px 8px', textAlign: 'right' }}>
+                          <button
+                            type="button"
+                            onClick={() => { if (p) void navigator.clipboard?.writeText(p); }}
+                            style={{ fontSize: 11, padding: '0 6px' }}
+                            title="Copy path to clipboard"
+                          >
+                            Copy
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Rule 2: library walk cadence + Prune Missing Items. */}
@@ -377,7 +402,7 @@ export function SettingsPanel() {
         />
       )}
 
-      {/* Phase 4: Dashboard ETR colour-switch timing. */}
+      {/* Dashboard ETR colour-switch timing. */}
       <div className="panel">
         <h2>Dashboard Stall Colours</h2>
         <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
@@ -518,135 +543,6 @@ export function SettingsPanel() {
         )}
       </div>
 
-      {/* Recovery actions panel. The legacy snapshot_library bug left
-          ~99% of historical run_timings entries with server_id=NULL,
-          so the trainer couldn't bucketize them. Repair + reset-
-          backfill recovers that data; the flush button at the bottom
-          is the nuclear reset. */}
-      <div className="panel">
-        <h2>Training data recovery</h2>
-        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
-          Two recovery actions for the ETA training data. Earlier runs
-          may have telemetry entries that are missing their server
-          identifier, which prevents the trainer from using them. Step
-          1 fills those in by matching against the job history; step 2
-          reads everything through the trainer to rebuild the bucket
-          store from scratch.
-        </p>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
-          <button onClick={() => void doRepair()} disabled={repairBusy}>
-            {repairBusy ? 'Repairing…' : '1. Repair missing server identifiers'}
-          </button>
-          <button onClick={() => void doBackfill(true)} disabled={backfillBusy}>
-            {backfillBusy ? 'Rebuilding…' : '2. Rebuild training store'}
-          </button>
-        </div>
-        {repairResult && (
-          <div className="banner good" style={{ marginTop: 8, fontSize: 12 }}>
-            Repaired {repairResult.updated} run_timings row(s); {repairResult.still_orphan} still orphaned
-            (no matching run_history row - typically pre-2026-05 runs that predate the run_history table).
-          </div>
-        )}
-        {backfillResult && (
-          <div className="banner good" style={{ marginTop: 8, fontSize: 12 }}>
-            Backfilled {backfillResult.entries_read} entries into {backfillResult.buckets_touched} bucket(s).
-            Estimates on the Run Job form will now reflect this data.
-          </div>
-        )}
-      </div>
-
-      {/* ETA Training inspector + flush. Bucket inventory survives
-          docker rebuilds via the server_data/ bind mount (see
-          docker-compose.yml). The flush button is the end user's
-          escape hatch to restart training from zero - confirms the
-          run_timings table optionally goes with it. */}
-      <div className="panel">
-        <h2>ETA Training</h2>
-        <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 4 }}>
-          Per-server, per-operation training buckets. Each row tracks
-          one combination of (server, operation, library type, bulk strategy).
-          Tier 1 fires at {trainingStatus?.by_server[0]?.summary.min_samples_for_tier_one ?? 5}+
-          samples (tight confidence bands); anchor mode uses fewer
-          samples with wider bands. Training data persists in{' '}
-          <code>server_data/run_timings.db</code> and survives docker
-          rebuilds.
-        </p>
-
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8 }}>
-          <button onClick={() => void refreshTrainingStatus()} disabled={trainingLoading}>
-            {trainingLoading ? 'Refreshing…' : 'Refresh'}
-          </button>
-          <button
-            className="danger"
-            onClick={() => setFlushOpen(true)}
-            disabled={trainingLoading}
-          >
-            Flush all training data…
-          </button>
-        </div>
-
-        {!trainingStatus || trainingStatus.by_server.length === 0 ? (
-          <div className="empty" style={{ marginTop: 12 }}>
-            {trainingLoading ? 'Loading…' : 'No training data on any server yet.'}
-          </div>
-        ) : (
-          trainingStatus.by_server.map((srv) => {
-            const serverName = servers.find((s) => s.id === srv.server_id)?.name || srv.server_id;
-            return (
-              <div key={srv.server_id} style={{ marginTop: 12 }}>
-                <h3 style={{ fontSize: 14, margin: '8px 0' }}>{serverName}</h3>
-                <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 6 }}>
-                  {srv.summary.tier_one_count} of {srv.summary.total_buckets} buckets
-                  at tier 1 (confident);{' '}
-                  {srv.summary.anchor_count} in anchor mode (training).
-                </div>
-                <table className="list" style={{ width: '100%', fontSize: 12 }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: 'left' }}>Label</th>
-                      <th style={{ textAlign: 'left' }}>Type</th>
-                      <th style={{ textAlign: 'left' }}>Strategy</th>
-                      <th style={{ textAlign: 'right' }}>Samples</th>
-                      <th style={{ textAlign: 'left' }}>Status</th>
-                      <th style={{ textAlign: 'right' }}>Mean obs (s)</th>
-                      <th style={{ textAlign: 'right' }}>Ping</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {srv.buckets.map((b, i) => {
-                      let status = 'untrained';
-                      let color = 'var(--text-dim)';
-                      if (b.tier_one_ready) {
-                        status = 'tier 1';
-                        color = 'var(--success, #16a34a)';
-                      } else if (b.anchor_ready) {
-                        status = 'anchor';
-                        color = 'var(--warning, #d97706)';
-                      }
-                      return (
-                        <tr key={`${b.label}-${b.library_type}-${b.bulk_strategy}-${i}`}>
-                          <td>{b.label}</td>
-                          <td>{b.library_type || '-'}</td>
-                          <td>{b.bulk_strategy || '-'}</td>
-                          <td style={{ textAlign: 'right' }}>{b.samples}</td>
-                          <td style={{ color }}>{status}</td>
-                          <td style={{ textAlign: 'right' }}>
-                            {b.predicted_at_xbar_seconds.toFixed(1)}
-                          </td>
-                          <td style={{ textAlign: 'right' }}>
-                            {b.ping_ema_ms != null ? `${b.ping_ema_ms.toFixed(0)} ms` : '-'}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            );
-          })
-        )}
-      </div>
-
         </>
       )}
 
@@ -654,120 +550,7 @@ export function SettingsPanel() {
         <DatabasePanel servers={servers} />
       )}
 
-      {flushOpen && (
-        <EtaFlushModal
-          onClose={() => setFlushOpen(false)}
-          onDone={() => { setFlushOpen(false); void refreshTrainingStatus(); }}
-        />
-      )}
     </>
-  );
-}
-
-// ETA flush confirmation modal. End user types FLUSH verbatim and
-// optionally opts to also wipe run_timings (a true zero-state reset;
-// without that, the auto-backfill on next boot just rebuilds the
-// buckets from history).
-function EtaFlushModal({ onClose, onDone }: {
-  onClose: () => void;
-  onDone: () => void;
-}) {
-  const [confirm, setConfirm] = useState<string>('');
-  const [includeRunTimings, setIncludeRunTimings] = useState<boolean>(false);
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<{
-    in_memory_buckets_cleared: number;
-    eta_buckets_rows_deleted: number;
-    run_timings_rows_deleted: number;
-  } | null>(null);
-
-  const submit = async () => {
-    setSubmitting(true);
-    setError(null);
-    try {
-      const r = await api.etaFlushAll(includeRunTimings);
-      setResult(r);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <div
-      style={{
-        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50,
-      }}
-      onClick={onClose}
-    >
-      <div
-        className="panel"
-        style={{ maxWidth: 480, width: '90%', maxHeight: '90vh', overflowY: 'auto' }}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2>Flush ETA training data</h2>
-        {result ? (
-          <>
-            <div className="banner success" style={{ marginTop: 12 }}>
-              Flushed {result.in_memory_buckets_cleared} in-memory bucket(s),
-              {' '}{result.eta_buckets_rows_deleted} eta_buckets rows
-              {result.run_timings_rows_deleted > 0
-                ? `, ${result.run_timings_rows_deleted} run_timings rows`
-                : ''}.
-            </div>
-            <div className="row-buttons" style={{ marginTop: 16 }}>
-              <button className="primary" onClick={onDone}>Close</button>
-            </div>
-          </>
-        ) : (
-          <>
-            <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
-              Wipes every learned ETA bucket. Future predictions fall
-              back to hardcoded defaults until the predictor retrains
-              from new runs.
-            </p>
-            <label className="switch" style={{ marginTop: 8 }}>
-              <input
-                type="checkbox"
-                checked={includeRunTimings}
-                onChange={(e) => setIncludeRunTimings(e.target.checked)}
-              />
-              <span>
-                Also wipe <code>run_timings</code> history.{' '}
-                <em>Recommended only if you suspect the prior run telemetry is corrupt.</em>{' '}
-                Without this, the auto-backfill on next boot will repopulate buckets from history.
-              </span>
-            </label>
-            <label className="field" style={{ marginTop: 12 }}>
-              <span className="label">Type FLUSH to confirm</span>
-              <input
-                type="text"
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-                placeholder="FLUSH"
-                autoFocus
-              />
-            </label>
-            {error && (
-              <div className="banner error" style={{ marginTop: 8 }}>{error}</div>
-            )}
-            <div className="row-buttons" style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-              <button onClick={onClose} disabled={submitting}>Cancel</button>
-              <button
-                className="danger"
-                onClick={() => void submit()}
-                disabled={submitting || confirm.trim() !== 'FLUSH'}
-              >
-                {submitting ? 'Flushing…' : 'Flush'}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -1395,7 +1178,7 @@ function DatabasePanel({ servers }: { servers: { id: string; name: string }[] })
 
 
 // Replace-only import dialog. Operator pastes (or pastes-from-file)
-// the JSON they previously exported, types REPLACE to confirm,
+// previously-exported JSON, types REPLACE to confirm,
 // and the target table is wiped + repopulated atomically.
 function DbImportModal({
   target,
@@ -1425,6 +1208,12 @@ function DbImportModal({
   };
 
   const submit = async () => {
+    // FEUI-09: enforce the typed-REPLACE gate in the handler itself,
+    // not just via the submit button's disabled attribute.
+    if (confirm.trim() !== 'REPLACE') {
+      setError('Type REPLACE to confirm.');
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -1471,11 +1260,11 @@ function DbImportModal({
         {result ? (
           <>
             {target.kind === 'table' && result.table_id ? (
-              <div className="banner success" style={{ marginTop: 12 }}>
+              <div className="banner good" style={{ marginTop: 12 }}>
                 Replaced {result.deleted} row(s) with {result.inserted} from the import.
               </div>
             ) : (
-              <div className="banner success" style={{ marginTop: 12 }}>
+              <div className="banner good" style={{ marginTop: 12 }}>
                 Archive restore: {result.total_deleted} rows replaced with{' '}
                 {result.total_inserted} across {Object.keys(result.per_table || {}).length} table(s).
                 {result.errors && result.errors.length > 0 && (

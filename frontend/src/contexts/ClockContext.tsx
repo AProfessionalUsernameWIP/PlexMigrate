@@ -4,7 +4,6 @@
 //
 //   * ``server`` - server-side wall-clock, default. Tracks the
 //     backend's timezone (set via TZ env var in docker-compose).
-//     This is the existing behaviour pre-2026-05-12.
 //   * ``local``  - the end user's device clock, in the browser's
 //     local timezone. Useful when the end user is on the road and
 //     the server is in a different zone.

@@ -95,6 +95,24 @@ _DEFAULTS: Dict[str, Any] = {
     # silently routed via name match. Use this when every user MUST be
     # explicitly mapped before the engine writes anything for them.
     "strict_identity_resolution": False,
+    # The five-layer switch
+    # model for the user-activity filter + auto-tombstone sweeper.
+    # Every layer defaults OFF so an operator who touches nothing
+    # sees identical behaviour to today. The adoption ladder,
+    # in short:
+    #   Layer 1: sweeper daemon runs at all?
+    #   Layer 2: engine hot paths drop failing users?
+    #   Layer 3: auth_error counts toward auto-tombstone?
+    #   Layer 4: unreachable counts toward auto-tombstone?
+    #   (Layer 5 is per-server, lives on the registry row, not here.)
+    "user_activity_sweeper_enabled": False,
+    "user_activity_filter_enabled": False,
+    "auto_tombstone_on_auth_error": False,
+    "auto_tombstone_on_unreachable": False,
+    # Sweep cadence + auto-tombstone threshold. Clamps in the typed
+    # accessors below.
+    "user_activity_sweep_interval_hours": 12,
+    "user_activity_consecutive_failure_threshold": 3,
     # USER-MGMT-IDENTITY-AUDIT cosmetic follow-on: substitute the
     # stored ``display_name`` for the raw ``username`` in log lines
     # and run-history fields that reference a user. Default False
@@ -104,6 +122,20 @@ _DEFAULTS: Dict[str, Any] = {
     # the username when no display_name is stored. Pure presentation
     # tweak; routing / identity_map logic is unaffected.
     "log_use_display_name": False,
+    # When a managed_users row joins an
+    # identity_map equivalence class — either auto-linked at sync via
+    # backend_user_id or manually wired in the User Mapping panel — and
+    # any other row in the class already has a PIN stored, copy that
+    # PIN into the row's backend-natural PIN column. Same-backend
+    # rows backfill plex_home_pin_enc / emby_easy_pin_enc /
+    # jellyfin_easy_pin_enc as appropriate; cross-backend rows
+    # backfill into the destination row's natural PIN column (a Plex
+    # Home PIN's value lands in an Emby row's emby_easy_pin_enc).
+    # Additive ONLY: never overwrites an existing PIN. Default True
+    # so freshly-registered servers inherit the operator's stored PIN
+    # automatically; set False to require explicit PIN entry on every
+    # row regardless of identity_map state.
+    "auto_backfill_pin_from_identity_links": True,
     # media.db caching during snapshot + direct-transfer runs. When
     # false (default), the engine's payload-direct snapshot writer
     # (Rule 1) and direct-transfer's in-memory pipeline both run
@@ -177,103 +209,6 @@ _DEFAULTS: Dict[str, Any] = {
     "http_pool_connections": 4,
     "http_pool_maxsize_cap": 10,
 
-    # ── Adaptive ETA / training engine (Danger) ────────────────────
-    # All five values shape the engine-anchored progress ETA the
-    # dashboard surfaces as "Estimated remaining". They were
-    # hardcoded constants until the 2026-05-16 cold-start undershoot
-    # bug surfaced (a 6-minute run jumped from "Calculating..." to
-    # "Almost done" because the cold-start prediction was 70s).
-    # Surfaced under the Danger tab because tuning these can
-    # legitimately make the dashboard's "remaining" estimate
-    # misleading; end users should change them only with intent.
-
-    # Floor for the predicted ETR during the wall-clock decay
-    # window (before the engine has discovered any work to
-    # anchor against). Expressed as a fraction of predicted_total.
-    # 0.15 means: "even if the cold-start prediction is way off, the
-    # displayed remaining never drops below 15% of it." Once the
-    # engine reports progress totals, the anchored math kicks in and
-    # can grow past the original prediction if the run is slower.
-    "eta_wallclock_floor_fraction": 0.15,
-
-    # The observed-ratio (actual_elapsed / expected_elapsed)
-    # calibration is clamped between these bounds so a single
-    # anomalous phase cannot teleport the displayed ETA. 0.25 means
-    # "never display less than 25% of the predicted remaining";
-    # 4.0 means "never display more than 4x the predicted remaining."
-    "eta_calibration_ratio_min": 0.25,
-    "eta_calibration_ratio_max": 4.0,
-
-    # Completion fraction at which calibration blend reaches full
-    # weight. Before this, the displayed value blends from neutral
-    # (1.0) toward the observed ratio; this protects against early
-    # noisy timing dominating the estimate. 0.25 = full calibration
-    # weight at 25% complete; smaller = react faster but jumpier.
-    "eta_calibration_blend_threshold": 0.25,
-
-    # Asymmetric deflation on the calibration's speedup side. When
-    # the engine appears faster than predicted (observed_ratio < 1.0)
-    # it is often because lightweight metrics finished first and the
-    # item-completion fraction outran the actual time-completion
-    # fraction. Multiplying the speedup credit by this factor (default
-    # 0.5 = "credit 50% of the apparent speedup") keeps a quick early
-    # phase from cratering the displayed ETA. Set to 1.0 for the old
-    # symmetric behaviour; lower values are more conservative.
-    "eta_calibration_deflation_strength": 0.5,
-
-    # Library completion fraction the dashboard requires before it
-    # will display "Almost done" instead of the literal remaining
-    # seconds. 0.85 means: until 85% of the engine's items are
-    # complete, even a sub-5-second projected ETA shows as a number
-    # (no "Almost done" copy).
-    "eta_almost_done_progress_threshold": 0.85,
-
-    # Per-label cold-start defaults the trainer's tier-5 fallback
-    # uses on a brand-new install with zero history. A JSON object;
-    # keys are the time_operation labels. Each value is a two-element
-    # list [fixed_seconds, seconds_per_item] so the cold-start guess
-    # scales with library size: a 200-item Music library no longer
-    # inherits the same per-step time as a 50k-item Movies library.
-    # End users may also pass a single scalar for fixed-only timing;
-    # the loader accepts either shape.
-    "eta_tier5_defaults_seconds": {
-        "snapshot_watch_history":  [15.0, 0.002],
-        "snapshot_ratings":        [10.0, 0.001],
-        "snapshot_playlists":      [10.0, 0.0],
-        "snapshot_collections":    [10.0, 0.0],
-        "bulk_fetch_for_filters":  [3.0, 0.0005],
-        "restore_watch_history":   [15.0, 0.003],
-        "restore_ratings":         [10.0, 0.002],
-        "restore_playlists":       [10.0, 0.0],
-        "restore_collections":     [10.0, 0.0],
-        "direct_library_transfer": [10.0, 0.005],
-    },
-
-    # ETA cascade: when true (default), the cross-server fallback tiers
-    # (3 and 4) are skipped so the prediction never borrows another
-    # server's data. A brand-new server lands at tier 5 (rate-based
-    # default) until it has its own training data. Set false to restore
-    # the legacy cross-server cold-start fallback.
-    "eta_strict_per_server": True,
-
-    # ETA latency offset: post-regression multiplier driven by current
-    # vs trained-time ping. The four tunables below shape the
-    # asymmetric clamp; defaults are bounded and conservative on both
-    # sides. Set ``eta_latency_offset_enabled`` to false to disable the
-    # multiplier entirely (predictions stay at the regression value).
-    "eta_latency_offset_enabled": True,
-    "eta_latency_inflation_strength": 0.5,
-    "eta_latency_inflation_cap": 2.0,
-    "eta_latency_deflation_strength": 0.3,
-    "eta_latency_deflation_floor": 0.8,
-
-    # ETA engine concurrency model: the snapshotter's owner phase uses
-    # a 4-worker pool to run the four metric gathers concurrently, and
-    # the per-user phase uses an 8-worker pool. These tunables let the
-    # predictor stay in sync if the engine's pool sizes change.
-    "eta_metric_parallelism": 4,
-    "eta_user_parallelism": 8,
-
     # NOTE: ``watch_ratings_filter_strategy`` is intentionally NOT a
     # tunable - it's a snapshot run-behaviour choice that end users
     # tuning a migration may want to flip without root_admin
@@ -287,6 +222,42 @@ _DEFAULTS: Dict[str, Any] = {
     # DashboardPanel.tsx STALL_THRESHOLDS. 1.0 = ship defaults.
     # <1.0 = more sensitive (warns sooner); >1.0 = more lenient.
     "etr_color_multiplier": 1.0,
+
+    # ── Power-user: reveal the per-run "Ignore library mapping" toggle
+    # ─────────────────────────────────────────────────────────────────
+    # The restorer consults the library_mappings table to route
+    # source-library names to destination-library names when they
+    # don't match exactly. This is a SAFETY feature: an operator who
+    # has set up a mapping doesn't want a one-off run to bypass it
+    # silently. But occasionally a power user needs to force a legacy
+    # exact-name-only restore (e.g. debugging a mapping suspicion).
+    # When this tunable is True, the Run Job UI reveals a per-run
+    # "Ignore library mapping" checkbox. When False (the default),
+    # the checkbox stays hidden and every restore consults mappings.
+    "reveal_ignore_library_mapping_toggle": False,
+
+    # ── Per-user gather strategy override ────────────────────────────
+    # The "smart" watch+ratings strategy in
+    # ``_should_use_bulk`` always-bulks show/artist libraries because
+    # ``section.totalSize`` is the container count (shows / artists)
+    # while the actual filter scans leaves (episodes / tracks) which
+    # are 5-30x more. That heuristic is owner-centric: the admin's
+    # watch history typically spans many episodes so bulk amortizes.
+    # For per-user passes most managed users have sparse watch history
+    # (often <100 episodes); pulling the whole 40k-item leaf list once
+    # per user wastes bandwidth + wall-clock.
+    #
+    # ``true`` flips per-user passes on show/artist libraries to the
+    # server-side filter path even when the smart heuristic would have
+    # picked bulk. Each user's gather then asks Plex for the items
+    # they've actually watched / rated, which is cheap when sparse and
+    # only marginally more expensive when not. Owner pass behaviour is
+    # unchanged.
+    #
+    # Default false to preserve historical behaviour; flip true if
+    # snapshot runs on multi-home-user TV / Music libraries spend
+    # most of their wall-clock in per-user bulk-fetch lines.
+    "snapshot_user_pass_prefer_server_side": False,
 
     # ── Activity feed: owner display style ──────────────────────────
     # How the Plex owner is rendered in the dashboard activity feed +
@@ -327,7 +298,7 @@ _DEFAULTS: Dict[str, Any] = {
     # so existing end users don't suddenly see a new column on
     # upgrade; opt-in for end users who diagnose schedules / API
     # calls / log lines that reference servers by id. The format is
-    # locked at add-server time per Plan[SERVER-UID-IDENTITY] and
+    # locked at add-server time and
     # never changes for a registered row.
     "servers_panel_show_server_uid": False,
 
@@ -360,7 +331,7 @@ _DEFAULTS: Dict[str, Any] = {
     # accident is a CVE; the default must stay False.
     "developer_mode_enabled": False,
 
-    # ── Plan[PLAYLIST-MANAGEMENT] 2026-05-16 (end user-locked) ──────
+    # ── Playlist Management cache ──────────────────────────────────
     # Cache layer governing how often the engine re-reads playlists
     # from a backend. Per-user playlist roster + items live in
     # server_data/playlist_cache.db. Snapshots can opt into the
@@ -378,9 +349,17 @@ _DEFAULTS: Dict[str, Any] = {
     # read regardless of behaviour above. End user locked at 12 hours.
     "playlist_cache_max_age_seconds": 43200,
     # When True, a background thread refreshes stale caches
-    # automatically. Default OFF per end user (opt-in) to avoid
-    # surprise API load on end users who haven't tuned thresholds.
-    "playlist_cache_background_refresh_enabled": False,
+    # automatically. Default ON now
+    # that the UI also reads cache rows directly without firing
+    # blocking live fetches, so the cache freshness needs to come
+    # from somewhere — this thread.
+    "playlist_cache_background_refresh_enabled": True,
+    # Background refresh cadence in seconds. Operator-
+    # locked default 15 minutes; tunable [60s, 86400s]. The thread
+    # iterates every (server, user) pair currently in the cache and
+    # re-fetches via the adapter. Lower values keep playlists fresh
+    # but increase API load against source servers.
+    "playlist_cache_background_refresh_interval_seconds": 900,
     # Plex Home user auth path for Playlist Mgmt copies. Default
     # 'owner_token' uses the owner's token + the Home user's UserId
     # in the URL/body (matches existing _apply_per_user_block
@@ -389,14 +368,78 @@ _DEFAULTS: Dict[str, Any] = {
     # PIN). End user can switch at runtime for debugging.
     "playlist_mgmt_plex_home_auth_mode": "owner_token",
 
-    # 2026-05-17 (operator request): same-user no-op short-circuit
+    # Same-user no-op short-circuit
     # for Playlist Mgmt copies. 'skip' (default) returns success +
     # skipped=True without doing any work when the resolved source +
     # destination are the same (server, user). 'duplicate' lets the
     # copy proceed and creates a second playlist under the same user.
     "playlist_mgmt_same_user_behavior": "skip",
 
-    # ── Plan[MIXED-MEDIA-PLAYLISTS] 2026-05-16 (end user-locked) ────
+    # ── Playlist Transfer batch ────────────────────────────────────
+    # Default worker count for the batch primitive's internal
+    # ThreadPoolExecutor. Higher = faster on LAN; risk = source/dest
+    # API rate-limits trip. Operator can override per-submit via the
+    # batch payload; runtime override is clamped to [1, 64]. Section 8a Q2.
+    "playlist_mgmt_batch_workers": 8,
+    # Hard ceiling on items per batch submission. The UI's Playlist
+    # Transfer page reads this as the per-submit max + offers a runtime
+    # override in [1, max]. Defends against pathological multi-user
+    # selections that would block the queue for hours. Section 8a Q3.
+    "playlist_mgmt_batch_max_size": 200,
+    # Per-source-server semaphore depth: at most this many in-flight
+    # copy_playlist calls per source server, regardless of total
+    # batch parallelism. Protects against single-server rate-limit
+    # storms when two batches share a source. Section 8a Q7.
+    #
+    # The original locked default of 4
+    # was halving throughput on the typical single-source batch
+    # (batch_workers default 8, all items sharing one source -> only
+    # 4 in-flight at once). Raised to 8 so the per-source cap matches
+    # the worker default; operators who run concurrent batches against
+    # the same source can lower this to reintroduce the rate-limit
+    # safety.
+    "playlist_mgmt_batch_per_source_workers": 8,
+
+    # How the fuzzy-title resolver
+    # handles AMBIGUOUS matches (multiple candidates remain after
+    # title + type + artist/show filtering AND after the album /
+    # path-tail tiebreakers have narrowed the set). Values:
+    #   * 'strict'  - refuse to guess; record the item as missed.
+    #                 Default for safety (no surprise wrong-track
+    #                 writes). Mirrors the engine resolver's
+    #                 strict_match=True behaviour.
+    #   * 'first'   - pick the first candidate plexapi returned.
+    #                 Useful when the operator knows their library
+    #                 has duplicates but trusts Plex's ordering.
+    #   * 'all'     - include EVERY candidate in the destination
+    #                 playlist. Operator gets all versions of the
+    #                 song they wanted; cleanup is manual.
+    "playlist_mgmt_fuzzy_ambiguous_behavior": "strict",
+
+    # Per-playlist parallelism for the
+    # resolution loop. Each item's tier walk (GUID -> full-path ->
+    # path-tail -> fuzzy) is independent once the path-tail index is
+    # built, so resolution can run wide. Default 4 hits a sweet spot
+    # against the per-source semaphore (which gates the BATCH-level
+    # parallelism); operators on rate-limited Plex servers can drop
+    # this to 1. Clamped to [1, 16].
+    "playlist_mgmt_item_resolve_workers": 4,
+
+    # Max age of the persisted
+    # path-tail/full-path indexes in seconds. Indexes older than this
+    # are discarded + rebuilt on next access. Default 86400 (1 day);
+    # clamp [60, 30 days]. Set to 0 to disable persistence
+    # entirely (always rebuild from a fresh walk).
+    "playlist_cache_path_index_max_age_seconds": 86400,
+
+    # Debounce delay (ms)
+    # between the operator picking a destination server in the
+    # Playlist Transfer UI and the frontend firing the pre-warm
+    # POST. Default 3000 (3s) so a quick mis-click doesn't trigger
+    # a build; clamp [0, 10000]. Set to 0 to fire immediately.
+    "playlist_mgmt_prewarm_delay_ms": 3000,
+
+    # ── Mixed-media playlists ──────────────────────────────────────
     # How J/E mixed-media playlists are handled when restoring to
     # Plex (which forbids mixed). 'skip' (default) silently skips
     # with logging; 'dominant' writes a single playlist using the
@@ -420,6 +463,99 @@ _DEFAULTS: Dict[str, Any] = {
     # decision logged); 'decisions_only' (only when non-default
     # action taken); 'off' (silent except errors).
     "mixed_media_logging": "full",
+
+    # ── Engine Mirror DB ───────────────────────────────────────────
+    # Global default mode for the per-server metadata mirror. Enum:
+    # "auto" (consult mirror with freshness probe; D2) or
+    # "always-live" (bypass mirror reads; resolution goes live).
+    "engine_mirror_mode": "auto",
+    # Force a full re-sync of any section whose mirror_synced_at is
+    # older than this many seconds, regardless of probe verdict.
+    # Default 24h. Clamp [0, 30d].
+    "engine_mirror_max_age_seconds": 86400,
+    # Background refresher cadence. Each tick probes all registered
+    # servers + prunes old drift_events. Clamp [60, 86400].
+    "engine_mirror_refresh_interval_seconds": 3600,
+    # One-shot ack flag: first-run dialog has been shown. Set true
+    # by the FE after the operator answers Yes / Not now.
+    "engine_mirror_first_run_dialog_seen": False,
+    # Drift event retention window (D4). Clamp [1, 365].
+    "engine_mirror_drift_event_retention_days": 30,
+    # Operator-facing warning threshold when mirror DB grows past
+    # this many MB. Clamp [50, 10000].
+    "engine_mirror_db_size_mb_warning": 500,
+    # D3: even in always-live mode, the live walk writes through
+    # to the mirror so flipping back to auto later is instant.
+    "engine_mirror_always_live_writethrough": True,
+    # D5: first-run "Yes" blocks vs returns immediately while the
+    # background sync runs. Default false = immediate return +
+    # background-threaded.
+    "engine_mirror_first_run_blocking": False,
+    # D5: how many sections per server walk in parallel during
+    # first-run sync. Clamp [1, 8].
+    "engine_mirror_first_run_workers": 2,
+    # D6: snapshot writes through to mirror per section. Tunable
+    # off only for forensic snapshots that must not touch mirror.
+    "engine_mirror_snapshot_writethrough": True,
+    # D8: symmetric source + dest mirroring for direct + fan-out.
+    "engine_mirror_source_side": True,
+    # XF: cross-feed Direction 1 — bootstrap mirror from
+    # playlist_cache rows on each sync. Free data; zero API cost.
+    "engine_mirror_bootstrap_from_playlist_cache": True,
+    # Scheduler-driven pre-warm of mirror state ahead of a
+    # scheduled job's fire time. Clamp [0, 3600].
+    "schedule_prewarm_lead_seconds": 300,
+    # Master kill-switch for scheduler-driven pre-warm.
+    "schedule_prewarm_enabled": True,
+
+    # ── Developer Console ───────────────────────────────────────────
+    # The "Server Commands" developer
+    # console - a root-admin-only top-level tab that exposes direct
+    # per-item state mutation (watch count, ratings, favorites,
+    # resume position, last-played date), raw per-call backend API
+    # passthrough, and playlist / collection membership editing
+    # against any registered server. It is a TESTING tool: it lets
+    # the operator change state, snapshot it, restore it, and verify
+    # round-trips without leaving the app.
+    #
+    # Default False: the console is a power-user / debugging surface,
+    # off for normal operators. A developer or the test harness opts
+    # in via settings.json -> tunables.dev_console_enabled. Even when
+    # True, the tab + endpoints are additionally gated to the
+    # root_admin role - the tunable is the second lock, not the only
+    # one.
+    "dev_console_enabled": False,
+    # Heartbeat cadence for the dev-console WebSocket. The server the
+    # operator is actively viewing gets the ACTIVE rate; a client with
+    # no server selected gets the slower IDLE rate. Heartbeats are
+    # job-status pings only - they never call a media-server API - so
+    # the rate just governs how fast the "background job" banner
+    # updates. Clamp [2, 600] / [5, 3600].
+    "dev_console_heartbeat_active_seconds": 10,
+    "dev_console_heartbeat_idle_seconds": 60,
+    # Hard cap on how long a single dev-console connect attempt may
+    # block before the request fails with 504 instead of leaving the
+    # panel stuck on "Connecting...". Clamp [3, 120].
+    "dev_console_connect_timeout_seconds": 25,
+    # Background-refresh cadence for the per-server Server Commands
+    # mirror database. The mirror is what the console panel reads, so
+    # normal browsing never calls a media-server API. Per-server
+    # overridable so one server can be tuned independently while the
+    # operator works on it. Clamp [30, 86400].
+    "dev_console_mirror_sync_seconds": 300,
+
+    # ── Backend-agnostic affinity translation ───────────────────────
+    # Per-user item
+    # affinity has two faces - a numeric rating (Plex userRating,
+    # 0-10) and a binary favorite (Jellyfin/Emby IsFavorite). When a
+    # favorited item is restored onto a rating-only backend (Plex) it
+    # carries no numeric rating of its own, so this value is written
+    # in its place. A favorite is a strong positive signal, so the
+    # default sits at the top of the 0-10 scale; lower it if you
+    # treat favorites as merely "liked". Clamp [0.0, 10.0]. The
+    # reverse direction (rating -> favorite) uses the per-job
+    # favorite_threshold (engine default 5.0).
+    "favorite_as_rating_value": 10.0,
 }
 
 
@@ -511,6 +647,7 @@ def get(key: str) -> Any:
 _PER_SERVER_CAPABLE = frozenset((
     "plex_connect_timeout_seconds",
     "viewcount_increment_cap",
+    "dev_console_mirror_sync_seconds",
 ))
 
 
@@ -555,7 +692,9 @@ def plex_connect_timeout(server_id: Optional[str] = None) -> int:
 
 
 def plex_retry_total_budget() -> int:
-    return int(get("plex_retry_total_budget"))
+    # CONSOLE-12: coerce-with-default + floor so a malformed stored
+    # value can't crash the read. Default 4 (see _DEFAULTS).
+    return max(1, _coerce_int(get("plex_retry_total_budget"), 4))
 
 
 def plex_retry_backoff_factor() -> float:
@@ -563,7 +702,8 @@ def plex_retry_backoff_factor() -> float:
 
 
 def server_ping_timeout() -> int:
-    return int(get("server_ping_timeout_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 10 (see _DEFAULTS).
+    return max(1, _coerce_int(get("server_ping_timeout_seconds"), 10))
 
 
 def server_probe_timeout() -> int:
@@ -571,7 +711,8 @@ def server_probe_timeout() -> int:
 
 
 def scrobble_get_timeout() -> int:
-    return int(get("scrobble_get_timeout_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 10 (see _DEFAULTS).
+    return max(1, _coerce_int(get("scrobble_get_timeout_seconds"), 10))
 
 
 def scrobble_put_timeout() -> int:
@@ -580,7 +721,8 @@ def scrobble_put_timeout() -> int:
 
 # Performance
 def workers_default_cap() -> int:
-    return int(get("workers_default_cap"))
+    # CONSOLE-12: coerce-with-default + floor. Default 32 (see _DEFAULTS).
+    return max(1, _coerce_int(get("workers_default_cap"), 32))
 
 
 def scrobble_workers_default_cap() -> int:
@@ -588,7 +730,8 @@ def scrobble_workers_default_cap() -> int:
 
 
 def import_user_workers_cap() -> int:
-    return int(get("import_user_workers_cap"))
+    # CONSOLE-12: coerce-with-default + floor. Default 8 (see _DEFAULTS).
+    return max(1, _coerce_int(get("import_user_workers_cap"), 8))
 
 
 def import_library_workers_cap() -> int:
@@ -612,6 +755,20 @@ def log_use_display_name() -> bool:
     return bool(get("log_use_display_name"))
 
 
+def auto_backfill_pin_from_identity_links() -> bool:
+    """
+    True iff a managed_users row joining an identity_map equivalence
+    class should auto-inherit any PIN already stored on another row in
+    the class. Default True so freshly-registered servers + newly-
+    mapped users pick up the operator's PIN without re-entry.
+
+    Additive only: backfill never overwrites a non-empty PIN column.
+    When False, every row's PIN column is whatever the operator typed
+    on that specific row (the legacy behaviour).
+    """
+    return bool(get("auto_backfill_pin_from_identity_links"))
+
+
 def strict_identity_resolution() -> bool:
     """
     USER-MGMT-IDENTITY-AUDIT R-4 toggle. True flips the
@@ -627,6 +784,62 @@ def strict_identity_resolution() -> bool:
     return bool(get("strict_identity_resolution"))
 
 
+# ── Active-user-filter accessors ────────────────────────────────────────
+
+
+def user_activity_sweeper_enabled() -> bool:
+    """Master switch on the background user-activity sweeper.
+    When False (default) the sweeper daemon never runs probes."""
+    return bool(get("user_activity_sweeper_enabled"))
+
+
+def user_activity_filter_enabled() -> bool:
+    """Master switch on the engine-wide user-health filter.
+    When False (default) services.user_activity_filter.list_active_users
+    behaves exactly like today's list_managed_users(include_hidden=
+    False) — tombstone gate only. When True, also drops users
+    whose consecutive_auth_failures > 0."""
+    return bool(get("user_activity_filter_enabled"))
+
+
+def auto_tombstone_on_auth_error() -> bool:
+    """When True an auth_error (401) probe result counts toward the
+    auto-tombstone threshold. Off by default; recording still
+    happens regardless, only triggering changes."""
+    return bool(get("auto_tombstone_on_auth_error"))
+
+
+def auto_tombstone_on_unreachable() -> bool:
+    """When True an unreachable probe result counts toward the
+    auto-tombstone threshold. Off by default. WARNING: a server
+    outage long enough to span N sweep cycles would tombstone the
+    entire roster, not just one user — leave off unless your
+    threshold is generous enough to absorb routine maintenance."""
+    return bool(get("auto_tombstone_on_unreachable"))
+
+
+def user_activity_sweep_interval_hours() -> int:
+    """How often the sweeper probes each enabled server. Clamped
+    to [1, 168] (one hour to one week). Default 12."""
+    try:
+        v = int(get("user_activity_sweep_interval_hours"))
+    except (TypeError, ValueError):
+        return 12
+    return max(1, min(168, v))
+
+
+def user_activity_consecutive_failure_threshold() -> int:
+    """Number of consecutive failing probes before the sweeper
+    auto-tombstones a user (provided every other switch in §10.3
+    of Finding[ACTIVE-USER-FILTER] lines up). Clamped to [1, 100].
+    Default 3."""
+    try:
+        v = int(get("user_activity_consecutive_failure_threshold"))
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(100, v))
+
+
 def plexapi_autoreload_enabled() -> bool:
     """
     True iff plexapi's implicit per-item auto-reload should stay
@@ -637,6 +850,64 @@ def plexapi_autoreload_enabled() -> bool:
     Diagnostic escape hatch only.
     """
     return bool(get("plexapi_autoreload_enabled"))
+
+
+def dev_console_enabled() -> bool:
+    """
+    True iff the "Server Commands" developer console is exposed.
+    Gates BOTH the top-level frontend tab and the
+    ``/api/dev-console/*`` REST + WebSocket surface. Even when True,
+    every endpoint is additionally root_admin-gated; this tunable is
+    the on/off master switch, the role check is the access control.
+
+    Defaults to False; a developer or the test harness opts in via
+    ``settings.json`` -> ``tunables.dev_console_enabled``.
+    """
+    return bool(get("dev_console_enabled"))
+
+
+def dev_console_heartbeat_active_seconds() -> int:
+    """Heartbeat cadence for the dev-console server the operator is
+    actively viewing. Clamp [2, 600]."""
+    raw = get("dev_console_heartbeat_active_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 10
+    return max(2, min(v, 600))
+
+
+def dev_console_heartbeat_idle_seconds() -> int:
+    """Heartbeat cadence for a dev-console client with no server
+    selected. Clamp [5, 3600]."""
+    raw = get("dev_console_heartbeat_idle_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 60
+    return max(5, min(v, 3600))
+
+
+def dev_console_connect_timeout_seconds() -> int:
+    """Hard cap on a single dev-console connect attempt before the
+    request fails with 504. Clamp [3, 120]."""
+    raw = get("dev_console_connect_timeout_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 25
+    return max(3, min(v, 120))
+
+
+def dev_console_mirror_sync_seconds(server_id: Optional[str] = None) -> int:
+    """Background-refresh cadence for a server's Server Commands mirror
+    database. Per-server overridable. Clamp [30, 86400]."""
+    raw = get_per_server(server_id, "dev_console_mirror_sync_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 300
+    return max(30, min(v, 86400))
 
 
 def cache_snapshot_payloads_to_media_db() -> bool:
@@ -653,16 +924,21 @@ def cache_snapshot_payloads_to_media_db() -> bool:
 
 # Polling & Maintenance
 def frontend_server_ping_interval_ms() -> int:
-    return int(get("frontend_server_ping_interval_ms"))
+    # CONSOLE-12: coerce-with-default + floor. Default 30000 (see _DEFAULTS).
+    return max(1, _coerce_int(get("frontend_server_ping_interval_ms"), 30000))
 
 
 def scheduler_tick_seconds() -> int:
     """Was _TICK_SECONDS = 30 in server/schedules.py."""
-    return int(get("scheduler_tick_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 30.
+    return max(1, _coerce_int(get("scheduler_tick_seconds"), 30))
 
 
 def refresh_token_cleanup_interval_seconds() -> int:
-    return int(get("refresh_token_cleanup_interval_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 3600 (see _DEFAULTS).
+    return max(
+        1, _coerce_int(get("refresh_token_cleanup_interval_seconds"), 3600)
+    )
 
 
 def snapshot_sidecar_ttl_seconds() -> int:
@@ -672,7 +948,9 @@ def snapshot_sidecar_ttl_seconds() -> int:
     (sidecars persist until the snapshot row is removed). Read on
     every sweep tick - changes take effect within one cadence.
     """
-    return int(get("snapshot_sidecar_ttl_seconds"))
+    # CONSOLE-12: coerce-with-default only -- no floor, because 0 is a
+    # documented value (disables the sweep). Default 300 (see _DEFAULTS).
+    return _coerce_int(get("snapshot_sidecar_ttl_seconds"), 300)
 
 
 # Limits
@@ -682,186 +960,63 @@ def snapshot_retention_global_default() -> int:
 
 def refresh_token_ttl_seconds() -> int:
     """Was REFRESH_TOKEN_TTL_SECONDS in server/auth_router.py."""
-    return int(get("refresh_token_ttl_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 7 days.
+    return max(1, _coerce_int(get("refresh_token_ttl_seconds"), 7 * 24 * 60 * 60))
 
 
 def jwt_access_token_ttl_seconds() -> int:
     """Was JWT_TTL_SECONDS in server/auth_router.py."""
-    return int(get("jwt_access_token_ttl_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 30 minutes.
+    return max(1, _coerce_int(get("jwt_access_token_ttl_seconds"), 30 * 60))
 
 
 def log_read_max_bytes() -> int:
     """Was _MAX_READ_BYTES = 16 * 1024 * 1024 in server/log_browser.py."""
-    return int(get("log_read_max_bytes"))
+    # CONSOLE-12: coerce-with-default + floor. Default 16 MiB.
+    return max(1, _coerce_int(get("log_read_max_bytes"), 16 * 1024 * 1024))
 
 
 # Danger Zone
 def sqlite_busy_timeout_main() -> int:
-    return int(get("sqlite_busy_timeout_main_seconds"))
+    # CONSOLE-12: coerce-with-default + floor. Default 30 (see _DEFAULTS).
+    return max(1, _coerce_int(get("sqlite_busy_timeout_main_seconds"), 30))
 
 
 def sqlite_busy_timeout_short() -> int:
     return int(get("sqlite_busy_timeout_short_seconds"))
 
 
-def eta_wallclock_floor_fraction() -> float:
-    """Floor for predicted ETR wall-clock decay, as a fraction of
-    predicted_total. Clamped to [0.0, 1.0] so a bad config can't
-    push the floor above the prediction itself."""
+def favorite_as_rating_value() -> float:
+    """Numeric rating (0-10) written in place of a favorite when a
+    favorited item is restored onto a rating-only backend (Plex).
+    See _DEFAULTS for the rationale. Clamped to [0.0, 10.0]; a bad
+    config falls through to the 10.0 default."""
     try:
-        v = float(get("eta_wallclock_floor_fraction"))
+        v = float(get("favorite_as_rating_value"))
     except Exception:
-        v = 0.15
-    return max(0.0, min(1.0, v))
-
-
-def eta_calibration_ratio_bounds() -> tuple:
-    """``(min, max)`` clamps for the observed/expected ratio used to
-    calibrate the anchored ETR. Defaults (0.25, 4.0). Bad values
-    fall through to defaults."""
-    try:
-        lo = float(get("eta_calibration_ratio_min"))
-        hi = float(get("eta_calibration_ratio_max"))
-    except Exception:
-        lo, hi = 0.25, 4.0
-    if lo <= 0 or hi <= 0 or hi <= lo:
-        lo, hi = 0.25, 4.0
-    return (lo, hi)
-
-
-def eta_calibration_blend_threshold() -> float:
-    """Completion fraction at which calibration reaches full weight.
-    Clamped to (0, 1]."""
-    try:
-        v = float(get("eta_calibration_blend_threshold"))
-    except Exception:
-        v = 0.25
-    if v <= 0:
-        v = 0.25
-    return min(1.0, v)
-
-
-def eta_calibration_deflation_strength() -> float:
-    """Multiplier on the speedup credit when ``observed_ratio < 1.0``.
-    Lower values yield diminishing returns on apparent speedups so the
-    displayed ETA does not crater when lightweight metrics finish
-    first. Clamped to [0, 1]; defaults to 0.5."""
-    try:
-        v = float(get("eta_calibration_deflation_strength"))
-    except Exception:
-        v = 0.5
-    return max(0.0, min(1.0, v))
-
-
-def eta_almost_done_progress_threshold() -> float:
-    """Library-completion fraction below which the dashboard refuses
-    to render 'Almost done'. Clamped to [0, 1]."""
-    try:
-        v = float(get("eta_almost_done_progress_threshold"))
-    except Exception:
-        v = 0.85
-    return max(0.0, min(1.0, v))
-
-
-def eta_strict_per_server() -> bool:
-    """When true (default), the cascade skips tiers 3-4 so cross-server
-    data never influences a per-server prediction."""
-    try:
-        return bool(get("eta_strict_per_server"))
-    except Exception:
-        return True
-
-
-def eta_latency_offset_enabled() -> bool:
-    try:
-        return bool(get("eta_latency_offset_enabled"))
-    except Exception:
-        return True
-
-
-def _eta_latency_clamped(name: str, default: float,
-                         lo: float, hi: float) -> float:
-    """Read one of the four latency-shape tunables; clamp to a sane
-    range so a typo in settings.json can't produce a nonsensical
-    multiplier."""
-    try:
-        v = float(get(name))
-    except Exception:
-        return default
-    if v < lo or v > hi:
-        return default
-    return v
-
-
-def eta_latency_inflation_strength() -> float:
-    return _eta_latency_clamped("eta_latency_inflation_strength", 0.5, 0.0, 2.0)
-
-
-def eta_latency_inflation_cap() -> float:
-    return _eta_latency_clamped("eta_latency_inflation_cap", 2.0, 1.0, 5.0)
-
-
-def eta_latency_deflation_strength() -> float:
-    return _eta_latency_clamped("eta_latency_deflation_strength", 0.3, 0.0, 1.0)
-
-
-def eta_latency_deflation_floor() -> float:
-    return _eta_latency_clamped("eta_latency_deflation_floor", 0.8, 0.1, 1.0)
-
-
-def eta_metric_parallelism() -> int:
-    """Owner-phase metric-pool size; matches the snapshotter's 4-worker
-    ThreadPoolExecutor for the owner gather. End users rarely need to
-    change this."""
-    try:
-        v = int(get("eta_metric_parallelism"))
-    except Exception:
-        return 4
-    return max(1, v)
-
-
-def eta_user_parallelism() -> int:
-    """Per-user pool size; matches the snapshotter's 8-worker
-    ThreadPoolExecutor for the managed-user gather."""
-    try:
-        v = int(get("eta_user_parallelism"))
-    except Exception:
-        return 8
-    return max(1, v)
-
-
-def eta_tier5_defaults_seconds() -> dict:
-    """Per-label cold-start defaults. Each value is either a
-    ``[fixed_seconds, seconds_per_item]`` pair OR a single scalar
-    (interpreted as ``[scalar, 0.0]``). Returns the parsed dict on
-    success; falls back to an empty dict on any failure so callers
-    resort to their hardcoded last-resort floor."""
-    raw = get("eta_tier5_defaults_seconds")
-    if not isinstance(raw, dict):
-        return {}
-    out: dict = {}
-    for k, v in raw.items():
-        try:
-            if isinstance(v, (list, tuple)) and len(v) >= 2:
-                fixed = float(v[0])
-                per_item = float(v[1])
-                if fixed >= 0 and per_item >= 0:
-                    out[str(k)] = [fixed, per_item]
-            else:
-                f = float(v)
-                if f > 0:
-                    out[str(k)] = f
-        except (TypeError, ValueError):
-            continue
-    return out
+        v = 10.0
+    return max(0.0, min(10.0, v))
 
 
 def http_pool_connections() -> int:
-    return int(get("http_pool_connections"))
+    # CONSOLE-12: coerce-with-default + floor. Default 4 (see _DEFAULTS).
+    return max(1, _coerce_int(get("http_pool_connections"), 4))
 
 
 def http_pool_maxsize_cap() -> int:
-    return int(get("http_pool_maxsize_cap"))
+    # CONSOLE-12: coerce-with-default + floor. Default 10 (see _DEFAULTS).
+    return max(1, _coerce_int(get("http_pool_maxsize_cap"), 10))
+
+
+def snapshot_user_pass_prefer_server_side() -> bool:
+    """
+    When True, per-user gathers on show/artist libraries override the
+    smart-strategy always-bulk rule and use the server-side filter
+    path instead. Owner pass is unaffected. See the tunable docstring
+    in ``_DEFAULTS`` for the rationale (sparse watch history per
+    managed user makes the server-side filter dramatically cheaper).
+    """
+    return bool(get("snapshot_user_pass_prefer_server_side") or False)
 
 
 # Dashboard ETR colour multiplier
@@ -998,7 +1153,7 @@ def developer_mode_enabled() -> bool:
     return raw is True
 
 
-# ── Playlist Management cache tunables (Plan[PLAYLIST-MANAGEMENT]) ──────────
+# ── Playlist Management cache tunables ──────────────────────────────────────
 
 def playlist_cache_enabled() -> bool:
     """Master switch for the playlist cache. When False, every read
@@ -1040,10 +1195,30 @@ def playlist_cache_max_age_seconds() -> int:
 
 
 def playlist_cache_background_refresh_enabled() -> bool:
-    """Default OFF per end user. When True, a background thread
-    refreshes stale caches automatically."""
+    """Default ON. When True, a
+    background thread refreshes stale caches automatically. Operators
+    on rate-limited backends can flip this False to revert to manual
+    + on-pick refresh only."""
     raw = get("playlist_cache_background_refresh_enabled")
-    return bool(raw) if raw is not None else False
+    return bool(raw) if raw is not None else True
+
+
+def playlist_cache_background_refresh_interval_seconds() -> int:
+    """Cadence in seconds for the background playlist-cache refresher
+    thread. Operator-locked default 900 (15 min); clamped
+    to [60, 86400] so callers can't disable it by tuning to 0 (use
+    the enabled toggle instead) or starve the loop with a multi-week
+    interval that effectively never fires."""
+    raw = get("playlist_cache_background_refresh_interval_seconds")
+    try:
+        val = int(raw) if raw is not None else 900
+    except (TypeError, ValueError):
+        return 900
+    if val < 60:
+        return 60
+    if val > 86400:
+        return 86400
+    return val
 
 
 _PLEX_HOME_AUTH_MODES = frozenset(("owner_token", "per_user_token"))
@@ -1082,7 +1257,147 @@ def playlist_mgmt_same_user_behavior() -> str:
     return raw
 
 
-# ── Mixed-media playlist tunables (Plan[MIXED-MEDIA-PLAYLISTS]) ─────────────
+# ── Playlist Transfer batch tunables ────────────────────────────────────────
+
+
+def playlist_mgmt_batch_workers() -> int:
+    """Default worker count for the batch primitive's
+    ThreadPoolExecutor. Default 8, operator-tunable. Clamped to
+    [1, 64] (the upper
+    bound is a soft sanity limit; 64 already saturates most LAN setups
+    and exposes the source server to enough concurrent reads to trip
+    rate limits without the per-source semaphore in
+    playlist_mgmt_batch_per_source_workers).
+
+    Unknown / non-numeric values fall back to the default."""
+    raw = get("playlist_mgmt_batch_workers")
+    try:
+        val = int(raw) if raw is not None else 8
+    except (TypeError, ValueError):
+        return 8
+    if val < 1:
+        return 1
+    if val > 64:
+        return 64
+    return val
+
+
+def playlist_mgmt_batch_max_size() -> int:
+    """Hard ceiling on items per batch submission. Per Plan section
+    8a Q3: default 200, operator-tunable. The UI reads this as the
+    per-submit max + offers a runtime override in [1, max]. Clamped
+    to [1, 10000].
+
+    Unknown / non-numeric values fall back to the default."""
+    raw = get("playlist_mgmt_batch_max_size")
+    try:
+        val = int(raw) if raw is not None else 200
+    except (TypeError, ValueError):
+        return 200
+    if val < 1:
+        return 1
+    if val > 10000:
+        return 10000
+    return val
+
+
+def playlist_mgmt_batch_per_source_workers() -> int:
+    """Per-source-server semaphore depth: at most this many in-flight
+    copy_playlist calls per source server, regardless of total batch
+    parallelism. Per Plan section 8a Q7: default 4, operator-tunable.
+    Clamped to [1, 32]. Setting this AT or ABOVE
+    playlist_mgmt_batch_workers effectively disables the per-source
+    cap (the global pool becomes the bottleneck).
+
+    Unknown / non-numeric values fall back to the default."""
+    raw = get("playlist_mgmt_batch_per_source_workers")
+    try:
+        val = int(raw) if raw is not None else 4
+    except (TypeError, ValueError):
+        return 4
+    if val < 1:
+        return 1
+    if val > 32:
+        return 32
+    return val
+
+
+_PLAYLIST_FUZZY_AMBIGUOUS_MODES = frozenset(("strict", "first", "all"))
+
+
+def playlist_mgmt_prewarm_delay_ms() -> int:
+    """Debounce delay (milliseconds) between destination-server
+    pick + the pre-warm POST. Operator-locked default
+    3000; clamp [0, 10000]. The frontend reads this from the
+    settings endpoint and uses it as the setTimeout interval."""
+    raw = get("playlist_mgmt_prewarm_delay_ms")
+    try:
+        val = int(raw) if raw is not None else 3000
+    except (TypeError, ValueError):
+        return 3000
+    if val < 0:
+        return 0
+    if val > 10000:
+        return 10000
+    return val
+
+
+def playlist_cache_path_index_max_age_seconds() -> int:
+    """Max age (seconds) of the persisted path-tail / full-path
+    indexes before they're treated as stale + rebuilt.
+    Operator-locked default 86400 (1 day). Clamp [0, 30 days].
+    Set to 0 to disable persistence entirely."""
+    raw = get("playlist_cache_path_index_max_age_seconds")
+    try:
+        val = int(raw) if raw is not None else 86400
+    except (TypeError, ValueError):
+        return 86400
+    if val < 0:
+        return 0
+    # 30-day cap; longer than that and stale data drift becomes
+    # surprising for operators.
+    if val > 30 * 86400:
+        return 30 * 86400
+    return val
+
+
+def playlist_mgmt_item_resolve_workers() -> int:
+    """Per-playlist parallelism for the item resolution loop. Each
+    item's tier walk is independent once the path-tail index is
+    built, so resolution can run wide. Operator-locked
+    default 4; clamped to [1, 16]. Setting to 1 disables the
+    parallelism and reverts to the sequential loop."""
+    raw = get("playlist_mgmt_item_resolve_workers")
+    try:
+        val = int(raw) if raw is not None else 4
+    except (TypeError, ValueError):
+        return 4
+    if val < 1:
+        return 1
+    if val > 16:
+        return 16
+    return val
+
+
+def playlist_mgmt_fuzzy_ambiguous_behavior() -> str:
+    """How the playlist-copy fuzzy-title resolver handles AMBIGUOUS
+    matches (multiple candidates survive title + type + artist/show
+    filtering AND the album / path-tail tiebreakers). Operator-locked.
+
+    Values:
+      * 'strict' (default) — refuse to guess; the item is recorded
+        as missed. Safest; no surprise wrong-track writes.
+      * 'first' — pick the first candidate plexapi returned.
+      * 'all' — include every candidate in the destination playlist.
+
+    Unknown values fall back to 'strict'."""
+    raw = get("playlist_mgmt_fuzzy_ambiguous_behavior")
+    if not isinstance(raw, str) or raw not in _PLAYLIST_FUZZY_AMBIGUOUS_MODES:
+        return "strict"
+    return raw
+
+
+# ── Mixed-media playlist tunables ───────────────────────────────────────────
 
 _MIXED_MEDIA_BEHAVIORS = frozenset(("skip", "dominant", "split"))
 _MIXED_MEDIA_VIDEO_ROUTING = frozenset(("library_agnostic", "library_dominant"))
@@ -1139,3 +1454,133 @@ def mixed_media_logging() -> str:
     if not isinstance(raw, str) or raw not in _MIXED_MEDIA_LOGGING:
         return "full"
     return raw
+
+
+# ── Engine Mirror DB tunables ───────────────────────────────────────────────
+
+_ENGINE_MIRROR_MODES = frozenset(("auto", "always-live"))
+
+
+def engine_mirror_mode() -> str:
+    """Global default for mirror mode. 'auto' (consult mirror with
+    probe; default) or 'always-live' (skip mirror, go live)."""
+    raw = get("engine_mirror_mode")
+    if not isinstance(raw, str) or raw not in _ENGINE_MIRROR_MODES:
+        return "auto"
+    return raw
+
+
+def engine_mirror_max_age_seconds() -> int:
+    """Force a full re-sync of any section whose mirror_synced_at is
+    older than this many seconds, regardless of probe verdict.
+    Default 24h. Clamp [0, 30d]."""
+    raw = get("engine_mirror_max_age_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 86400
+    return max(0, min(v, 30 * 86400))
+
+
+def engine_mirror_refresh_interval_seconds() -> int:
+    """Background refresher cadence in seconds. Clamp [60, 86400]."""
+    raw = get("engine_mirror_refresh_interval_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 3600
+    return max(60, min(v, 86400))
+
+
+def engine_mirror_first_run_dialog_seen() -> bool:
+    """One-shot ack flag for the first-run dialog."""
+    return bool(get("engine_mirror_first_run_dialog_seen"))
+
+
+def engine_mirror_drift_event_retention_days() -> int:
+    """Drift event retention window. Clamp [1, 365]."""
+    raw = get("engine_mirror_drift_event_retention_days")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 30
+    return max(1, min(v, 365))
+
+
+def engine_mirror_db_size_mb_warning() -> int:
+    """Mirror DB size warning threshold (MB). Clamp [50, 10000]."""
+    raw = get("engine_mirror_db_size_mb_warning")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 500
+    return max(50, min(v, 10000))
+
+
+def engine_mirror_always_live_writethrough() -> bool:
+    """When always-live mode is selected, still update the mirror
+    as a side effect (D3). Default true."""
+    raw = get("engine_mirror_always_live_writethrough")
+    if raw is None:
+        return True
+    return bool(raw)
+
+
+def engine_mirror_first_run_blocking() -> bool:
+    """D5: first-run 'Yes' blocks vs returns immediately."""
+    return bool(get("engine_mirror_first_run_blocking"))
+
+
+def engine_mirror_first_run_workers() -> int:
+    """D5: parallel sections per server during first-run sync.
+    Clamp [1, 8]."""
+    raw = get("engine_mirror_first_run_workers")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 2
+    return max(1, min(v, 8))
+
+
+def engine_mirror_snapshot_writethrough() -> bool:
+    """D6: snapshot's per-section bulk write-through to mirror.
+    Default true."""
+    raw = get("engine_mirror_snapshot_writethrough")
+    if raw is None:
+        return True
+    return bool(raw)
+
+
+def engine_mirror_source_side() -> bool:
+    """D8: source servers also get mirrored. Default true."""
+    raw = get("engine_mirror_source_side")
+    if raw is None:
+        return True
+    return bool(raw)
+
+
+def engine_mirror_bootstrap_from_playlist_cache() -> bool:
+    """XF: cross-feed Direction 1. Default true."""
+    raw = get("engine_mirror_bootstrap_from_playlist_cache")
+    if raw is None:
+        return True
+    return bool(raw)
+
+
+def schedule_prewarm_lead_seconds() -> int:
+    """How far ahead of a scheduled job to fire mirror pre-warm.
+    Clamp [0, 3600]."""
+    raw = get("schedule_prewarm_lead_seconds")
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return 300
+    return max(0, min(v, 3600))
+
+
+def schedule_prewarm_enabled() -> bool:
+    """Master kill-switch for scheduler-driven pre-warm."""
+    raw = get("schedule_prewarm_enabled")
+    if raw is None:
+        return True
+    return bool(raw)

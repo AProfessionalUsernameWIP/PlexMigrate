@@ -1,5 +1,5 @@
 """
-Playlist cache database (Plan[PLAYLIST-MANAGEMENT]-2026-05-16, section 3.4).
+Playlist cache database.
 
 Backs the Playlist Management sub-tab. Holds a TTL-bounded cache of
 per-user playlist rosters + items so the end user's "show user X's
@@ -32,8 +32,8 @@ Three tables:
     snapshot path can decide live-vs-cache without scanning the
     item rows.
 
-``server_id`` carries the prefixed UID per
-Plan[SERVER-UID-IDENTITY] (`<service_type>_<uuid_hex>`). The boot
+``server_id`` carries the prefixed UID
+(`<service_type>_<uuid_hex>`). The boot
 UID-migration helpers in ``server/server_registry.py`` call
 :func:`rewrite_server_ids_in_playlist_cache` so this DB stays in
 sync after a bare-UUID upgrade.
@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from server.persistence import get_data_dir
+from server._db_connect import apply_additive_columns, open_db
 
 
 log = logging.getLogger("plexmigrate.server.playlist_cache_db")
@@ -86,14 +87,24 @@ CREATE TABLE IF NOT EXISTS playlist_cache (
     is_smart           INTEGER NOT NULL DEFAULT 0,
     item_count         INTEGER NOT NULL DEFAULT 0,
     fetched_at         REAL NOT NULL,
-    -- 2026-05-16 (end user request): identity-link columns. Cache rows
-    -- now carry the canonical app_user_uuid (from managed_users) plus
-    -- the auth context that was used at fetch time. Lookups can match
-    -- either user_id (legacy) or app_user_uuid (canonical). auth_kind
-    -- + role_flags help debug stale-token / mismatched-role bugs.
+    -- Identity-link columns. Cache rows carry the canonical
+    -- app_user_uuid (from managed_users) plus the auth context that
+    -- was used at fetch time. Lookups can match either user_id
+    -- (legacy) or app_user_uuid (canonical). auth_kind + role_flags
+    -- help debug stale-token / mismatched-role bugs.
     app_user_uuid      TEXT,
     auth_kind          TEXT,
     role_flags         INTEGER NOT NULL DEFAULT 0,
+    -- Library-attribution columns. ``playlist_type`` is
+    -- one of "audio" / "video" / "photo" / "" (Plex playlistType,
+    -- J/E MediaType). ``primary_library_id`` + ``primary_library_name``
+    -- record the source library that holds the majority of items so
+    -- the Playlist Mgmt UI can group per-user playlists by library.
+    -- Empty / NULL values mean "undeterminable" - the UI falls back
+    -- to a "(no library)" bucket.
+    playlist_type        TEXT NOT NULL DEFAULT '',
+    primary_library_id   TEXT,
+    primary_library_name TEXT,
     PRIMARY KEY (server_id, user_id, playlist_id)
 );
 
@@ -135,6 +146,25 @@ CREATE INDEX IF NOT EXISTS idx_playlist_cache_app_user_uuid
 CREATE INDEX IF NOT EXISTS idx_playlist_cache_refresh_app_user_uuid
     ON playlist_cache_refresh(server_id, app_user_uuid)
     WHERE app_user_uuid IS NOT NULL;
+
+-- Persisted path-tail + full-path indexes. Lets a fresh adapter
+-- start hot instead of rebuilding the index on every batch (32+
+-- seconds saved per run). One row per (server_id, scope_tag)
+-- carrying a JSON blob of {full_path: rk, ...} + {tail_key: rk,
+-- ...}. The ``built_at`` timestamp drives staleness - see
+-- ``playlist_cache_path_index_max_age_seconds`` tunable.
+CREATE TABLE IF NOT EXISTS library_path_index (
+    server_id          TEXT NOT NULL,
+    scope_tag          TEXT NOT NULL,     -- e.g. "track", "movie", "all"
+    tail_components    INTEGER NOT NULL,  -- typically 3
+    built_at           REAL NOT NULL,
+    entry_count        INTEGER NOT NULL,  -- total items represented
+    full_index_json    TEXT NOT NULL,     -- {absolute_path: rating_key}
+    tail_index_json    TEXT NOT NULL,     -- {tail_key: rating_key}
+    PRIMARY KEY (server_id, scope_tag, tail_components)
+);
+CREATE INDEX IF NOT EXISTS idx_library_path_index_built_at
+    ON library_path_index(built_at);
 """
 
 
@@ -162,10 +192,9 @@ def _role_flags_from_user(is_admin: bool, role: Optional[str]) -> int:
 
 # Additive schema migrations. ``init_playlist_cache_db`` runs the base
 # DDL above (CREATE TABLE IF NOT EXISTS preserves existing rows) and
-# then walks this list to ADD COLUMN any new columns onto pre-existing
-# tables. Each entry is (table_name, column_definition); SQLite ignores
-# duplicate ADD COLUMN attempts cleanly because we catch the "duplicate
-# column name" exception.
+# then hands this list to ``apply_additive_columns``, which ADD COLUMNs
+# any entry missing from a pre-existing table. Each entry is
+# (table_name, column_definition).
 _ADDITIVE_COLUMN_MIGRATIONS: List[Tuple[str, str]] = [
     ("playlist_cache", "app_user_uuid TEXT"),
     ("playlist_cache", "auth_kind TEXT"),
@@ -174,6 +203,13 @@ _ADDITIVE_COLUMN_MIGRATIONS: List[Tuple[str, str]] = [
     ("playlist_cache_refresh", "app_user_uuid TEXT"),
     ("playlist_cache_refresh", "auth_kind TEXT"),
     ("playlist_cache_refresh", "role_flags INTEGER NOT NULL DEFAULT 0"),
+    # Library-attribution columns. Pre-release schema bumps
+    # are free per CLAUDE.md, but cache rows are operator-replaceable
+    # (refresh re-populates), so an in-place ALTER saves the operator
+    # from re-warming on upgrade.
+    ("playlist_cache", "playlist_type TEXT NOT NULL DEFAULT ''"),
+    ("playlist_cache", "primary_library_id TEXT"),
+    ("playlist_cache", "primary_library_name TEXT"),
 ]
 
 
@@ -187,44 +223,18 @@ def init_playlist_cache_db() -> None:
             return
         path = _db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(
-            str(path),
-            timeout=30.0,
-            isolation_level=None,
+        conn = open_db(
+            path,
+            label="playlist_cache.db",
             check_same_thread=False,
+            foreign_keys=True,
+            synchronous_normal=True,
+            chmod_sidecars=True,
         )
-        conn.row_factory = sqlite3.Row
-        # Owner-only on POSIX. Same defensive chmod as media_db.
-        for _p in (path, path.with_name(path.name + "-wal"),
-                   path.with_name(path.name + "-shm")):
-            try:
-                if _p.exists():
-                    os.chmod(_p, 0o600)
-            except OSError:
-                pass
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # FK enforcement matters for the ON DELETE CASCADE on
-        # playlist_cache_items; SQLite defaults to off.
-        conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_SCHEMA)
-        # Additive migrations for pre-existing databases. CREATE TABLE
-        # IF NOT EXISTS above is a no-op when the tables already exist,
-        # so any NEW columns we tacked onto the schema definition need
-        # to be applied by hand to existing rows. Each ADD COLUMN is
-        # wrapped in its own try/except so a partial migration history
-        # doesn't block startup.
-        for table, column_def in _ADDITIVE_COLUMN_MIGRATIONS:
-            try:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
-            except sqlite3.OperationalError as exc:
-                msg = str(exc).lower()
-                if "duplicate column name" in msg:
-                    continue
-                log.warning(
-                    "playlist_cache_db: ADD COLUMN %s on %s failed: %s",
-                    column_def, table, exc,
-                )
+        # Additive migrations for pre-existing databases - apply any
+        # columns added to the schema since the DB was first created.
+        apply_additive_columns(conn, _ADDITIVE_COLUMN_MIGRATIONS)
         _conn = conn
         _initialised = True
         log.info("playlist_cache.db initialised at %s", path)
@@ -253,6 +263,47 @@ def _close_for_tests() -> None:
         _initialised = False
 
 
+# ── Per-library count (Run Job > Library Mapping panel) ─────────────
+
+def count_per_library(server_id: str) -> Dict[str, int]:
+    """Return ``{primary_library_id: distinct_playlist_count}`` for
+    one server. Empty dict on cache miss / DB hiccup so callers
+    can fall through to a live query.
+
+    A single playlist may be cached under multiple user_ids (the
+    owner's view + each managed user's view). We dedup on
+    ``playlist_id`` so the count reflects distinct playlists in
+    that library, not row count.
+
+    Used by ``/api/library-mapping/sides`` to surface per-library
+    playlist counts in the Run Job > Library Mapping panel. Cache-
+    first beats Plex live ``server.playlists()`` because the cache
+    is already on disk + carries the
+    ``primary_library_id``/``primary_library_name`` mapping the
+    operator wants displayed."""
+    try:
+        conn = _require_conn()
+    except RuntimeError:
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT primary_library_id, COUNT(DISTINCT playlist_id) AS n "
+            "FROM playlist_cache "
+            "WHERE server_id = ? "
+            "  AND primary_library_id IS NOT NULL "
+            "  AND primary_library_id <> '' "
+            "GROUP BY primary_library_id",
+            (server_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        log.debug("playlist_cache count_per_library failed: %s", exc)
+        return {}
+    return {
+        str(r["primary_library_id"]): int(r["n"] or 0)
+        for r in rows
+    }
+
+
 # ── Cache write API ─────────────────────────────────────────────────────────
 
 def upsert_playlist(
@@ -267,6 +318,9 @@ def upsert_playlist(
     app_user_uuid: Optional[str] = None,
     auth_kind: Optional[str] = None,
     role_flags: int = 0,
+    playlist_type: str = "",
+    primary_library_id: Optional[str] = None,
+    primary_library_name: Optional[str] = None,
 ) -> None:
     """Replace a cached playlist + its items in one transaction.
 
@@ -292,8 +346,10 @@ def upsert_playlist(
                 INSERT INTO playlist_cache
                     (server_id, user_id, playlist_id, name, is_smart,
                      item_count, fetched_at,
-                     app_user_uuid, auth_kind, role_flags)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     app_user_uuid, auth_kind, role_flags,
+                     playlist_type, primary_library_id,
+                     primary_library_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(server_id, user_id, playlist_id) DO UPDATE SET
                     name          = excluded.name,
                     is_smart      = excluded.is_smart,
@@ -304,13 +360,20 @@ def upsert_playlist(
                     -- away an existing tag.
                     app_user_uuid = COALESCE(excluded.app_user_uuid, playlist_cache.app_user_uuid),
                     auth_kind     = COALESCE(excluded.auth_kind, playlist_cache.auth_kind),
-                    role_flags    = excluded.role_flags
+                    role_flags    = excluded.role_flags,
+                    playlist_type = excluded.playlist_type,
+                    primary_library_id =
+                        COALESCE(excluded.primary_library_id, playlist_cache.primary_library_id),
+                    primary_library_name =
+                        COALESCE(excluded.primary_library_name, playlist_cache.primary_library_name)
                 """,
                 (
                     server_id, user_id, playlist_id,
                     name, 1 if is_smart else 0,
                     len(items), float(fetched_at),
                     app_user_uuid, auth_kind, int(role_flags or 0),
+                    str(playlist_type or ""),
+                    primary_library_id, primary_library_name,
                 ),
             )
             conn.execute(
@@ -414,10 +477,10 @@ def get_refresh_marker(
     """Return the per-user refresh marker dict or None if absent.
 
     Same strict app_user_uuid resolution as
-    :func:`list_cached_playlists` (2026-05-17 fix): when a uuid is
+    :func:`list_cached_playlists`: when a uuid is
     known, match by uuid OR by user_id with NULL uuid (legacy rows).
     Never falls back to a generic user_id match against rows tagged
-    with a DIFFERENT uuid — that was the cross-user contamination path.
+    with a DIFFERENT uuid - that is the cross-user contamination path.
     """
     if not server_id:
         return None
@@ -478,20 +541,19 @@ def list_cached_playlists(
     ``{playlist_id, name, is_smart, item_count, fetched_at, app_user_uuid,
        auth_kind, role_flags}``. Order is by ``name`` ASC.
 
-    2026-05-17 fix (end user bug report — cross-user contamination):
-    when ``app_user_uuid`` is provided, lookup is STRICT — we return
-    rows tagged with that uuid OR rows whose user_id matches AND whose
-    own app_user_uuid is NULL (legacy pre-schema-v2 rows that haven't
-    been re-stamped yet). We DO NOT fall through to a generic user_id
-    match against rows tagged with a DIFFERENT uuid — that's the path
-    that surfaced one user's playlists under another user's card when
-    cache_uid happened to alias across rows (e.g. owners cached under
-    email key colliding with managed users whose backend_user_id alias
-    matched).
+    Cross-user contamination guard: when ``app_user_uuid`` is
+    provided, lookup is STRICT - we return rows tagged with that uuid
+    OR rows whose user_id matches AND whose own app_user_uuid is NULL
+    (legacy pre-schema-v2 rows that haven't been re-stamped yet). We
+    DO NOT fall through to a generic user_id match against rows tagged
+    with a DIFFERENT uuid - that is the path that surfaces one user's
+    playlists under another user's card when cache_uid aliases across
+    rows (e.g. owners cached under email key colliding with managed
+    users whose backend_user_id alias matched).
 
     When ``app_user_uuid`` is None (caller hasn't resolved a uuid for
     this user, e.g. user not yet synced to managed_users), we fall
-    back to pure user_id match — the legacy single-key path.
+    back to pure user_id match - the legacy single-key path.
     """
     if not server_id:
         return []
@@ -499,12 +561,14 @@ def list_cached_playlists(
     if app_user_uuid:
         # Strict: rows matching THIS uuid, plus legacy untagged rows
         # whose user_id matches the caller's user_id. Excludes rows
-        # whose own app_user_uuid is set to a DIFFERENT uuid — those
+        # whose own app_user_uuid is set to a DIFFERENT uuid - those
         # belong to another user.
         rows = conn.execute(
             """
             SELECT playlist_id, name, is_smart, item_count, fetched_at,
-                   app_user_uuid, auth_kind, role_flags
+                   app_user_uuid, auth_kind, role_flags,
+                   playlist_type, primary_library_id,
+                   primary_library_name
             FROM playlist_cache
             WHERE server_id = ?
               AND (
@@ -541,7 +605,23 @@ def _row_to_cached_playlist(r: sqlite3.Row) -> Dict[str, Any]:
         "app_user_uuid": r["app_user_uuid"],
         "auth_kind": r["auth_kind"],
         "role_flags": int(r["role_flags"] or 0),
+        # Library-attribution columns. Defensive default for
+        # row factories on pre-migration DBs that haven't been re-read
+        # after the additive ALTER ran (test fixtures, etc.).
+        "playlist_type": _row_get(r, "playlist_type", "") or "",
+        "primary_library_id": _row_get(r, "primary_library_id", None),
+        "primary_library_name": _row_get(r, "primary_library_name", None),
     }
+
+
+def _row_get(r: sqlite3.Row, key: str, default: Any) -> Any:
+    """``sqlite3.Row.__getitem__`` raises IndexError for unknown keys
+    (it's not a dict). Wrap that so ``_row_to_cached_playlist`` can
+    tolerate older row shapes from pre-migration test DBs."""
+    try:
+        return r[key]
+    except (IndexError, KeyError):
+        return default
 
 
 def get_cached_playlist_items(
@@ -602,14 +682,19 @@ def is_fresh(
     *,
     threshold_seconds: float,
     now: Optional[float] = None,
+    app_user_uuid: Optional[str] = None,
 ) -> bool:
     """Return True if the per-user refresh marker is within
     ``threshold_seconds`` of ``now``. False for missing marker, errored
     refresh, or stale marker. Used by the snapshot path to decide
-    live-vs-cache without scanning the item rows."""
+    live-vs-cache without scanning the item rows.
+
+    ``app_user_uuid`` is forwarded to :func:`get_refresh_marker` so the
+    lookup uses the strict uuid-aware path and never reads a marker row
+    tagged with a different user's uuid."""
     if threshold_seconds <= 0:
         return False
-    marker = get_refresh_marker(server_id, user_id)
+    marker = get_refresh_marker(server_id, user_id, app_user_uuid=app_user_uuid)
     if marker is None:
         return False
     if marker.get("error"):
@@ -647,11 +732,10 @@ def clear_user_cache(
 ) -> int:
     """Wipe every cached row for a single user before a re-insert.
 
-    2026-05-17 (operator bug report): when a refresh discovers the
-    user's playlist list has changed (or — the original bug — when
-    pre-fix rows were written under the wrong user_id), the per-
-    playlist upsert path only OVERWRITES matching playlist_ids. Stale
-    rows with playlist_ids no longer in the live list survive forever.
+    When a refresh discovers the user's playlist list has changed (or
+    when rows were written under the wrong user_id), the per-playlist
+    upsert path only OVERWRITES matching playlist_ids. Stale rows with
+    playlist_ids no longer in the live list survive forever.
 
     This helper deletes every (server_id, user_id) OR
     (server_id, app_user_uuid) row + their CASCADE-linked item rows +
@@ -728,8 +812,8 @@ def rewrite_server_ids_in_playlist_cache(
     old_to_new: Dict[str, str],
 ) -> int:
     """Bulk-rewrite ``server_id`` references in this DB after the
-    Plan[SERVER-UID-IDENTITY] boot migration upgrades bare-UUID server
-    rows to the prefixed form. Mirrors
+    boot migration upgrades bare-UUID server rows to the prefixed
+    form. Mirrors
     ``server.media_db.rewrite_server_ids_in_identity_map``.
 
     Updates all three tables in one pass per pair, inside a single
@@ -805,3 +889,151 @@ def get_stats() -> Dict[str, Any]:
         "size_bytes": size_bytes,
         "path": str(_db_path()),
     }
+
+
+# ── Persisted path indexes ──────────────────────────────────────────
+#
+# Save / load the path-tail + full-path indexes that PlexAdapter
+# builds at the start of each batch. With persistence, a fresh
+# adapter on app restart can boot warm; with staleness checks
+# (driven by ``playlist_cache_path_index_max_age_seconds``) stale
+# indexes are discarded and rebuilt.
+
+
+def save_library_path_index(
+    server_id: str,
+    scope_tag: str,
+    tail_components: int,
+    full_index: Dict[str, str],
+    tail_index: Dict[str, str],
+) -> None:
+    """Persist a path-index pair to disk. Replaces any existing
+    row for ``(server_id, scope_tag, tail_components)``. Best-
+    effort; logs + returns silently on error so a corrupt cache
+    write never breaks a copy."""
+    if not server_id or not scope_tag:
+        return
+    try:
+        conn = _require_conn()
+        full_blob = json.dumps(full_index, ensure_ascii=False)
+        tail_blob = json.dumps(tail_index, ensure_ascii=False)
+        now = time.time()
+        # The full_index gives us the total entry count; tail and
+        # full are derived from the same walk so they have the
+        # same size.
+        entry_count = len(full_index)
+        with _DB_LOCK:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO library_path_index
+                  (server_id, scope_tag, tail_components, built_at,
+                   entry_count, full_index_json, tail_index_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    server_id, scope_tag, int(tail_components),
+                    now, entry_count, full_blob, tail_blob,
+                ),
+            )
+        log.info(
+            "save_library_path_index: persisted (server=%s scope=%s "
+            "tail=%d) -> %d entries (%d bytes full, %d bytes tail)",
+            server_id, scope_tag, tail_components, entry_count,
+            len(full_blob), len(tail_blob),
+        )
+    except Exception as exc:
+        log.warning(
+            "save_library_path_index: write failed for (%s, %s): %s",
+            server_id, scope_tag, exc,
+        )
+
+
+def load_library_path_index(
+    server_id: str,
+    scope_tag: str,
+    tail_components: int,
+    *,
+    max_age_seconds: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the persisted path-index pair for
+    ``(server_id, scope_tag, tail_components)`` IF a row exists
+    AND its ``built_at`` is within ``max_age_seconds``. Returns
+    ``None`` when missing or stale.
+
+    Shape: ``{full_index, tail_index, built_at, entry_count}``.
+
+    Best-effort; failures are logged + return None so a corrupt
+    row never breaks the live build path."""
+    if not server_id or not scope_tag:
+        return None
+    try:
+        conn = _require_conn()
+        row = conn.execute(
+            """
+            SELECT built_at, entry_count, full_index_json, tail_index_json
+            FROM library_path_index
+            WHERE server_id = ? AND scope_tag = ? AND tail_components = ?
+            """,
+            (server_id, scope_tag, int(tail_components)),
+        ).fetchone()
+        if row is None:
+            return None
+        built_at = float(row["built_at"])
+        if max_age_seconds is not None and max_age_seconds > 0:
+            age = time.time() - built_at
+            if age > max_age_seconds:
+                log.info(
+                    "load_library_path_index: cached (%s, %s) is %.0fs "
+                    "old (> %.0fs) - treating as miss to force rebuild",
+                    server_id, scope_tag, age, max_age_seconds,
+                )
+                return None
+        try:
+            full_index = json.loads(row["full_index_json"] or "{}")
+            tail_index = json.loads(row["tail_index_json"] or "{}")
+        except json.JSONDecodeError as exc:
+            log.warning(
+                "load_library_path_index: corrupted JSON for "
+                "(%s, %s): %s - ignoring", server_id, scope_tag, exc,
+            )
+            return None
+        return {
+            "full_index": full_index,
+            "tail_index": tail_index,
+            "built_at": built_at,
+            "entry_count": int(row["entry_count"]),
+        }
+    except Exception as exc:
+        log.warning(
+            "load_library_path_index: read failed for (%s, %s): %s",
+            server_id, scope_tag, exc,
+        )
+        return None
+
+
+def invalidate_library_path_index(
+    server_id: Optional[str] = None,
+    scope_tag: Optional[str] = None,
+) -> int:
+    """Drop persisted path-index rows. ``server_id=None`` +
+    ``scope_tag=None`` clears every row. Returns count deleted."""
+    try:
+        conn = _require_conn()
+        with _DB_LOCK:
+            if server_id and scope_tag:
+                cur = conn.execute(
+                    "DELETE FROM library_path_index "
+                    "WHERE server_id = ? AND scope_tag = ?",
+                    (server_id, scope_tag),
+                )
+            elif server_id:
+                cur = conn.execute(
+                    "DELETE FROM library_path_index WHERE server_id = ?",
+                    (server_id,),
+                )
+            else:
+                cur = conn.execute("DELETE FROM library_path_index")
+            return int(cur.rowcount or 0)
+    except Exception as exc:
+        log.warning("invalidate_library_path_index failed: %s", exc)
+        return 0

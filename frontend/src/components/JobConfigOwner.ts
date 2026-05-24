@@ -7,9 +7,8 @@
 // fields + writes via `set('field', value)` callbacks. The body
 // component renders identical JSX regardless of source.
 //
-// Phase E (Plan[SCHEDULES-ALIGNMENT-V2], 2026-05-16): introduced to
-// dedupe the ~400 lines of panel-stack wiring that was duplicated
-// across the two pages.
+// This interface dedupes the panel-stack wiring shared across the
+// two pages.
 
 import type {
   LibraryDescriptor,
@@ -53,11 +52,10 @@ export interface JobConfigOwner {
   setRateMode: (m: RateMode) => void;
   rateThreshold: string;
   setRateThreshold: (v: string) => void;
-  // D-OWNER trigger button was removed in Phase D (subsumed by the
-  // InlineCreateUserForm inside CrossPlatformPreflightModal), but the
-  // WorkflowStrip prop interface still carries these two for back-
-  // compat. Run Job passes the real values + onOpen; Schedules
-  // passes 0 + a no-op.
+  // The WorkflowStrip prop interface carries these two even though
+  // user creation is handled by the InlineCreateUserForm inside
+  // CrossPlatformPreflightModal. Run Job passes the real values +
+  // onOpen; Schedules passes 0 + a no-op.
   userCreateSpecCount: number;
   onOpenUserCreateModal: () => void;
 
@@ -164,9 +162,9 @@ export interface JobConfigOwner {
   setWatchRatingsStrategy: (v: WatchRatingsStrategy) => void;
 
   // ── Mixed-media playlist per-run overrides ─────────────────────
-  // Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16. All five inherit the
-  // global tunable when set to '' (string fields) or '' (numeric
-  // field — empty string in the input). The owner-builder converts
+  // All five inherit the global tunable when set to '' (string
+  // fields) or '' (numeric field - empty string in the input).
+  // The owner-builder converts
   // '' to null at submit time. UI lives in the General sub-tab of
   // PerRunSettingsPanel, gated to restore/direct modes (snapshot
   // doesn't write playlists, so the override is a no-op there).

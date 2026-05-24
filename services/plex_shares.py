@@ -1,5 +1,5 @@
 """
-Plex share-state introspection (2026-05-15).
+Plex share-state introspection.
 
 Two helpers that hit Plex.tv to answer questions the rest of the
 account-level user discovery (``account.users()``) can't answer on
@@ -26,6 +26,7 @@ auto-prune based on a single failed fetch.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -34,7 +35,27 @@ import requests
 log = logging.getLogger("plexmigrate.services.plex_shares")
 
 
-_PLEX_TV_BASE = "https://plex.tv"
+# Plex.tv base URL. Defaults to the real plex.tv but is overridable via
+# the ``PLEXMIGRATE_PLEX_TV_BASE_URL`` env var so the E2E mock can
+# answer the share-state lookups without leaking calls to the live
+# plex.tv. The override is consulted on every call (not cached) so a
+# test harness can flip it between scenarios without restarting the
+# backend. Trailing slashes are stripped to keep the joined URL shape
+# stable regardless of how the env value is configured.
+_DEFAULT_PLEX_TV_BASE = "https://plex.tv"
+
+
+def _plex_tv_base() -> str:
+    raw = (os.environ.get("PLEXMIGRATE_PLEX_TV_BASE_URL", "")
+           or _DEFAULT_PLEX_TV_BASE).strip()
+    return raw.rstrip("/") or _DEFAULT_PLEX_TV_BASE
+
+
+# Back-compat alias for callsites that imported the constant directly.
+# Kept as a module attribute so existing code reads the env value at
+# import time at the very least; the helper above is the canonical
+# read for new code.
+_PLEX_TV_BASE = _plex_tv_base()
 
 
 # ── shared_servers: who is currently shared on THIS server ──────────────────
@@ -76,8 +97,8 @@ def fetch_shared_servers(
     been keyed off a SystemAccount display name instead of the
     Plex.tv username. The two identifiers can differ - for example,
     a friend whose Plex.tv username is ``adamabuissa`` may appear as
-    ``Adam abu-issa`` in ``server.systemAccounts()``. The 2026-05-15
-    matcher set in ``_refresh_share_state`` combines all three so
+    ``Adam abu-issa`` in ``server.systemAccounts()``. The matcher
+    set in ``_refresh_share_state`` combines all three so
     either string resolves to the same shared row.
     """
     if not machine_id:
@@ -146,7 +167,7 @@ def fetch_shared_servers(
         )
         return None
 
-    url = f"{_PLEX_TV_BASE}/api/servers/{machine_id}/shared_servers"
+    url = f"{_plex_tv_base()}/api/servers/{machine_id}/shared_servers"
     try:
         resp = requests.get(
             url,
@@ -278,8 +299,7 @@ def fetch_home_users_protected_map(
     the friend's OWN home protection state (relative to their own
     server), not their relationship to ours. Using it would surface
     every PIN-protected friend as if they were one of our home users
-    and ask the end user to save a PIN we'd never use. See
-    2026-05-15 follow-up notes in Finding[USER-FILTER]-2026-05-15.md.
+    and ask the end user to save a PIN we'd never use.
     """
     # Path 1: plexapi-side. Only call ``homeUsers`` / ``home_users``;
     # do not fall back to ``users()``. See docstring.
@@ -337,7 +357,7 @@ def fetch_home_users_protected_map(
         )
         return None
 
-    url = f"{_PLEX_TV_BASE}/api/home/users"
+    url = f"{_plex_tv_base()}/api/home/users"
     try:
         resp = requests.get(
             url,

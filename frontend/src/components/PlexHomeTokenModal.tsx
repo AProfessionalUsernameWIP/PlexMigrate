@@ -3,20 +3,22 @@
 // destination admin) when the `playlist_mgmt_plex_home_auth_mode`
 // tunable is set to `per_user_token`.
 //
-// Backend endpoint (developer, 2026-05-16):
+// Backend endpoint:
 //   POST /api/managed-users/{server_id}/{username}/plex-home-token
 //
 // The backend re-authenticates db_admin on every call; this modal
 // caches the credentials in PARENT React state for the panel session
 // so the end user types them once when onboarding several Plex Home
 // users in sequence. Unmount of PlaylistManagementPanel clears the
-// cache. Match for ElevateModal-style every-time prompting would
-// require lifting cachedAdmin / setCachedAdmin out of state, but the
-// in-memory cache was developer's recommended UX for batch onboarding.
+// cache. The in-memory cache is the deliberate UX choice for batch
+// onboarding; ElevateModal-style every-time prompting would require
+// lifting cachedAdmin / setCachedAdmin out of state.
 
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type { ServerManagedUser } from '../api';
+import { errorText } from '../utils/format';
+import { Modal } from './Modal';
 
 export interface AdminCreds {
   username: string;
@@ -102,37 +104,14 @@ export function PlexHomeTokenModal({
       onAdminCached({ username: adminUsername, password: adminPassword });
       onSaved(updated);
     } catch (e) {
-      setError(String(e instanceof Error ? e.message : e));
+      setError(errorText(e));
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
-      }}
-      onClick={onClose}
-    >
-      <div
-        className="panel"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          maxWidth: 520,
-          width: 'calc(100% - 32px)',
-          maxHeight: 'calc(100vh - 32px)',
-          overflowY: 'auto',
-        }}
-      >
+    <Modal onClose={onClose} align="center" width={520} maxHeight="calc(100vh - 32px)">
         <h3 style={{ marginTop: 0 }}>
           {hasExistingToken ? 'Replace' : 'Save'} Plex Home token
         </h3>
@@ -240,7 +219,6 @@ export function PlexHomeTokenModal({
             {submitting ? 'Saving…' : hasExistingToken ? 'Replace token' : 'Save token'}
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

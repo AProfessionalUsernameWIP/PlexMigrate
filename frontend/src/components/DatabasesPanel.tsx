@@ -1,6 +1,6 @@
 // Settings > Databases sub-tab (root-admin only).
 //
-// Plan[DATABASES-VIEWER]-2026-05-16. Read-only browser for every
+// Read-only browser for every
 // SQLite database the app creates: auth.db, media.db, snapshots.db,
 // run_timings.db, playlist_cache.db, plus the per-capture snapshot
 // .db files. Schema + paginated data view; encrypted columns and
@@ -19,6 +19,8 @@
 //                    └── RowCell (per-cell formatter)
 
 import { useEffect, useMemo, useState } from 'react';
+import { formatBytes } from '../utils/format';
+import { useResourceQuery } from '../hooks/useResourceQuery';
 import {
   api,
   DatabaseCell,
@@ -73,13 +75,18 @@ export function DatabasesPanel() {
           Sensitive columns (encrypted tokens, bcrypt hashes, refresh
           token ids) are pre-redacted before they reach this page.
         </span>
-        <nav className="tabs sub-tabs" style={{ marginTop: 12, flexWrap: 'wrap' }}>
+        <nav
+          className="tabs sub-tabs"
+          style={{ marginTop: 12, flexWrap: 'wrap' }}
+          data-testid="db-list"
+        >
           {types.map((t) => (
             <button
               key={t.key}
               className={t.key === activeKey ? 'active' : ''}
               onClick={() => setActiveKey(t.key)}
               title={t.description}
+              data-testid={`db-row-${t.key}`}
             >
               {t.display_name}
               <span
@@ -348,13 +355,18 @@ function SchemaPane({
   return (
     <div className="panel" style={{ marginTop: 8 }}>
       <h3 style={{ marginTop: 0, fontSize: 14 }}>Schema</h3>
-      <nav className="tabs sub-tabs" style={{ flexWrap: 'wrap', marginBottom: 8 }}>
+      <nav
+        className="tabs sub-tabs"
+        style={{ flexWrap: 'wrap', marginBottom: 8 }}
+        data-testid="db-table-list"
+      >
         {tables.map((t) => (
           <button
             key={t.name}
             className={t.name === activeTable ? 'active' : ''}
             onClick={() => onSelect(t.name)}
             style={{ fontSize: 12 }}
+            data-testid={`db-table-row-${t.name}`}
           >
             {t.name}
             <span style={{ color: 'var(--text-dim)', marginLeft: 4, fontSize: 10 }}>
@@ -450,28 +462,25 @@ function DataBrowser({
   instanceId: string;
   table: DatabaseTable;
 }) {
-  const [page, setPage] = useState<DatabaseTableRowsPage | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [offset, setOffset] = useState(0);
   const [filterCol, setFilterCol] = useState<string>('');
   const [filterVal, setFilterVal] = useState<string>('');
   const [appliedFilterCol, setAppliedFilterCol] = useState<string>('');
   const [appliedFilterVal, setAppliedFilterVal] = useState<string>('');
 
-  useEffect(() => {
-    let cancelled = false;
-    setError(null);
-    setPage(null);
-    api.dbBrowserRows(dbType, instanceId, table.name, {
+  // Old rows stay visible during a page / filter change (the hook
+  // keeps stale data until the next fetch resolves) instead of
+  // blanking to a loading state between pages.
+  const { data: page, error } = useResourceQuery<DatabaseTableRowsPage | null>(
+    () => api.dbBrowserRows(dbType, instanceId, table.name, {
       limit: DATA_BROWSER_PAGE_SIZE,
       offset,
       filter_column: appliedFilterCol || undefined,
       filter_value: appliedFilterCol ? appliedFilterVal : undefined,
-    })
-      .then((r) => { if (!cancelled) setPage(r); })
-      .catch((e) => { if (!cancelled) setError(String(e)); });
-    return () => { cancelled = true; };
-  }, [dbType, instanceId, table.name, offset, appliedFilterCol, appliedFilterVal]);
+    }),
+    [dbType, instanceId, table.name, offset, appliedFilterCol, appliedFilterVal],
+    null,
+  );
 
   // Reset offset to 0 when table changes.
   useEffect(() => { setOffset(0); }, [dbType, instanceId, table.name]);
@@ -542,7 +551,7 @@ function DataBrowser({
           </div>
 
           {page.rows.length > 0 ? (
-            <div style={{ overflowX: 'auto' }}>
+            <div style={{ overflowX: 'auto' }} data-testid="db-table-rows">
               <table className="table" style={{ fontSize: 11 }}>
                 <thead>
                   <tr>
@@ -645,10 +654,3 @@ function RowCell({ cell }: { cell: DatabaseCell }) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n < 0) return '?';
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}

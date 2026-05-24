@@ -16,6 +16,29 @@ Construction happens in ``server/server_registry.py:connect_registered_server``
 once per connection; the resulting adapter is stored on the
 ``ServerConnection`` dataclass alongside other connection metadata.
 
+Class layout
+------------
+``PlexAdapter`` is structurally split across mixin files for sanity;
+the public interface is unchanged. Each mixin owns a cohesive method
+group, all backed by the shared instance state ``__init__`` sets up
+here:
+
+* :class:`PlexResolveMixin` (``_plex_resolve``) — the 4-tier
+  cross-server item resolvers + their helpers + test-reset hooks.
+* :class:`PlexWritesMixin` (``_plex_writes``) — per-user scrobble /
+  rating / resume HTTP writes + the read-side helpers that drive
+  exact-target writes.
+* :class:`PlexContainersMixin` (``_plex_containers``) — regular
+  playlist + collection CRUD + the chunked add helpers + the
+  per-user accountID resolver used by ``list_playlists``.
+* :class:`PlexSmartPlaylistMixin` (``_plex_smart``) — smart-playlist
+  read / write / vocabulary preflight.
+* :class:`MirrorResolveMixin` (``_mirror_resolve``) — backend-agnostic
+  mirror-first wrappers shared with the Jellyfin / Emby adapters.
+
+Connection / lifecycle / iteration methods + the per-user PlexServer
+factory + the module-level plex-coupled helpers stay here.
+
 Capability notes (PlexAdapter-specific)
 ---------------------------------------
 * ``set_favorite`` is unsupported (Plex has no per-user favorite
@@ -34,42 +57,45 @@ Capability notes (PlexAdapter-specific)
 from __future__ import annotations
 
 import logging
-from typing import Iterator, List, Optional
+import threading
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from plexapi.collection import Collection
-from plexapi.playlist import Playlist
 from plexapi.server import PlexServer
 
-import services.state as state
 from services.guid_translator import normalize_guids
-from services.resolver import _all_guids, _disable_autoreload, _safe_file_path
+from services.resolver import (
+    _all_guids,
+    _disable_autoreload,
+    _safe_file_path,
+    _section_leaf_items,
+)
 
 from . import (
-    CollectionSpec,
-    ItemRef,
     ItemSnapshot,
     LibrarySpec,
     MediaServerAdapter,
-    PlaylistSpec,
     ServerIdentity,
     UserContext,
     UserSpec,
-    WriteResult,
 )
+from ._mirror_resolve import MirrorResolveMixin
+from ._plex_containers import PlexContainersMixin
+from ._plex_resolve import PlexResolveMixin
+from ._plex_smart import PlexSmartPlaylistMixin
+from ._plex_writes import PlexWritesMixin
 
 
 log = logging.getLogger("plexmigrate.services.adapters.plex")
 
 
-# Plex `:/scrobble` URL chunking for playlist + collection adds.
-# Matches the existing chunk size used by ``services/restorer.py:
-# _create_playlist_chunked`` (~8KB URL cap with comma-separated
-# rating keys). Per-backend tunable so Jellyfin / Emby can pick their
-# own threshold.
-_PLEX_CONTAINER_CHUNK_SIZE = 100
-
-
-class PlexAdapter(MediaServerAdapter):
+class PlexAdapter(
+    PlexResolveMixin,
+    PlexWritesMixin,
+    PlexContainersMixin,
+    PlexSmartPlaylistMixin,
+    MirrorResolveMixin,
+    MediaServerAdapter,
+):
     """Plex implementation of :class:`MediaServerAdapter`.
 
     Wraps a connected ``plexapi.server.PlexServer`` instance. The
@@ -98,18 +124,59 @@ class PlexAdapter(MediaServerAdapter):
             or getattr(server, "machineIdentifier", "")
             or ""
         )
-        # Plan[PLAYLIST-MANAGEMENT] follow-up: per-user PlexServer
-        # cache so a per-user-token write doesn't pay a fresh HTTP
+        # Per-user PlexServer cache so a per-user-token write doesn't
+        # pay a fresh HTTP
         # handshake on every call. Keyed by the user's auth_token
         # (Plex's per-user X-Plex-Token). The admin server is held
         # separately on ``self._server`` and never enters this cache.
         self._per_user_servers: dict = {}
-        # 2026-05-17 path-tail resolver index. Built lazily on first
+        # Path-tail resolver index. Built lazily on first
         # ``resolve_by_path_tail`` call; cached per (adapter, depth)
         # for the lifetime of this adapter instance. See that method's
         # docstring for the matching rationale.
         self._path_tail_indexes: Dict[str, Dict[str, str]] = {}
-        # 2026-05-17 username → local SystemAccount.id map. Built lazily
+        # When several sections match an item_type hint, lock onto the
+        # FIRST section that resolves a real match so subsequent items
+        # in the same batch don't probe sibling music libraries that
+        # won't have the source items either. Keyed by lowercased
+        # item_type_hint -> section.key (str). Cleared by
+        # ``clear_library_of_truth_for_tests``.
+        self._library_of_truth: Dict[str, str] = {}
+        # Cache the per-(section, item_type, artist/show) track set so
+        # 50 tracks by one artist cost ONE Plex query, not 50. Key:
+        #   (section.key, item_type, parent_group_title)
+        # Value:
+        #   { lowercased_title: [Track, ...] }
+        # The parent_group_title is the artist for tracks, the show
+        # for episodes, "" for items with no group.
+        self._artist_track_indexes: Dict[Tuple[str, str, str], Dict[str, List[Any]]] = {}
+        # Track per-(section_key, guid_scheme) hit/miss counts. After
+        # ``_GUID_BLACKLIST_THRESHOLD`` consecutive misses with 0
+        # hits, stop probing that combination entirely for the rest
+        # of this adapter's lifetime. Plex's mbid:// resolution is the
+        # typical victim: music GUIDs never match Plex's getByGuid
+        # index, so every probe wastes ~3s on a guaranteed miss.
+        self._guid_attempt_state: Dict[Tuple[str, str], Dict[str, int]] = {}
+        # Multiple worker threads mutate these caches concurrently
+        # during per-item resolution. Most race outcomes are benign
+        # (e.g. two threads building the same artist index = wasted
+        # CPU, not wrong data). The lock makes the writes deterministic
+        # so debugging stays sane.
+        self._cache_lock = threading.Lock()
+        # Per-cache-key build-in-progress events so only the FIRST
+        # thread builds the index; others wait on the event and then
+        # read the populated cache. Without this, parallel workers
+        # race past the cache check and every one rebuilds the same
+        # ~100s index. Keyed by the path-tail cache_key string.
+        self._index_build_events: Dict[str, threading.Event] = {}
+        # Cache the raw sections list once per adapter lifetime;
+        # per-item filtering happens against this cache. Without it
+        # every per-item resolver calls
+        # self._server.library.sections() over the wire (~200ms per
+        # call, several calls per item) - tens of seconds wasted on
+        # the same fetch.
+        self._sections_cache: Optional[List[Any]] = None
+        # Username -> local SystemAccount.id map. Built lazily
         # on first ``list_playlists`` call. Plex's per-playlist
         # ``accountID`` attribute is the LOCAL account id (1, 2, 3, ...)
         # set by the server, NOT the Plex.tv user id we carry in
@@ -169,25 +236,28 @@ class PlexAdapter(MediaServerAdapter):
     def list_users(self) -> List[UserSpec]:
         """Owner + every SystemAccount on the server.
 
-        Mirrors ``server/server_registry.py:get_server_users`` but
-        returns the abstract ``UserSpec`` shape. Owner is detected
-        either by ``SystemAccount.id == 1`` (Plex convention) or by
-        name-match against ``myPlexAccount.username``."""
+        Mirrors ``server/server_registry.py:get_server_users``;
+        owner-vs-managed detection lives in the shared helper at
+        :mod:`services.plex_owner_identity` so both surfaces stay in
+        lockstep when new identification signals are added."""
+        from services.plex_owner_identity import (
+            derive_owner_identifiers,
+            dedupe_owner_against_managed,
+            is_owner_system_account,
+        )
         out: List[UserSpec] = []
-        owner_email = ""
-        owner_username = ""
+        owner_ids = {"email": "", "username": "", "account_id": "", "email_local": ""}
         try:
             account = self._server.myPlexAccount()
-            owner_email = (getattr(account, "email", "") or "").strip()
-            owner_username = (getattr(account, "username", "") or "").strip()
+            owner_ids = derive_owner_identifiers(account)
         except Exception as exc:
             log.debug("myPlexAccount unavailable: %s", exc)
 
-        if owner_email:
+        if owner_ids["email"]:
             out.append(UserSpec(
                 backend_user_id="",  # populated by the share-state refresh
-                username=owner_email,
-                display_name=owner_email,
+                username=owner_ids["email"],
+                display_name=owner_ids["email"],
                 role="owner",
                 is_admin=True,
             ))
@@ -202,13 +272,19 @@ class PlexAdapter(MediaServerAdapter):
             name = (getattr(acct, "name", "") or "").strip()
             if not name:
                 continue
-            try:
-                local_id = int(getattr(acct, "id", 0) or 0)
-            except (TypeError, ValueError):
-                local_id = 0
-            if local_id == 1:
-                continue
-            if owner_username and name == owner_username:
+            # The shared helper covers id==1 + username match + three
+            # further signals (Plex.tv accountID, email full match,
+            # email local-part match). Checking only id and username
+            # is not enough: an operator-renamed owner SystemAccount
+            # whose id != 1 would slip through and get appended as a
+            # managed user.
+            if is_owner_system_account(
+                acct,
+                owner_email=owner_ids["email"],
+                owner_username=owner_ids["username"],
+                owner_account_id=owner_ids["account_id"],
+                owner_email_local=owner_ids["email_local"],
+            ):
                 continue
             out.append(UserSpec(
                 backend_user_id="",
@@ -217,157 +293,223 @@ class PlexAdapter(MediaServerAdapter):
                 role="managed",
                 is_admin=False,
             ))
+        # Defensive last-pass dedup. Catches edge cases where a
+        # display-name we don't currently recognise as an owner signal
+        # leaks through; the owner is identified positionally by
+        # role="owner" and any matching managed row is dropped.
+        # UserSpec is a frozen dataclass so dedupe_owner_against_managed
+        # (which takes dict-shaped entries) doesn't apply directly;
+        # do the same comparison inline.
+        owner_keys = {
+            s.lower().strip()
+            for s in (owner_ids["email"], owner_ids["email_local"], owner_ids["username"])
+            if s and s.strip()
+        }
+        if owner_keys:
+            deduped: List[UserSpec] = []
+            for spec in out:
+                if spec.role == "managed" and spec.username.lower().strip() in owner_keys:
+                    continue
+                deduped.append(spec)
+            out = deduped
         return out
 
-    # ── Item resolution by GUID (restore-side cross-server matching) ──
+    def probe_user(self, username: str) -> str:
+        """Cheap "is this user OK"
+        probe for the sweeper. Plex-native path uses
+        ``myPlexAccount().user(username)`` which returns a User on
+        success, raises NotFound on missing, and raises auth
+        exceptions on token problems.
 
-    def resolve_by_guids(
-        self,
-        guids,
-        *,
-        library_id=None,
-    ):
-        """Look up the destination's ``backend_item_id`` (Plex
-        ratingKey) by walking ``guids`` and trying
-        ``server.library.getByGuid()`` on each.
+        Maps the outcomes to the cross-backend four-value enum so
+        the sweeper records the right signal without backend-specific
+        branching in the caller.
+        """
+        try:
+            account = self._server.myPlexAccount()
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "401" in msg or "unauthorized" in msg or "token" in msg:
+                # Admin-side problem; not specifically this user's
+                # fault. Best classification is 'unreachable' so the
+                # auto-tombstone-on-auth-error toggle doesn't fire on
+                # an admin token issue.
+                return "unreachable"
+            if any(s in msg for s in ("connection", "timeout", "name resolution")):
+                return "unreachable"
+            return "unknown"
+        try:
+            user = account.user(username)
+            return "ok" if user is not None else "auth_error"
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(s in msg for s in ("not found", "404")):
+                return "auth_error"
+            if "401" in msg or "unauthorized" in msg:
+                return "auth_error"
+            if any(s in msg for s in ("connection", "timeout", "name resolution")):
+                return "unreachable"
+            return "unknown"
 
-        Plex's ``getByGuid`` accepts both the modern canonical form
-        (``imdb://tt...``, ``tmdb://...``, ``tvdb://...``) and the
-        legacy agent form (``com.plexapp.agents.imdb://tt...``). The
-        engine has already normalised guids upstream via
-        ``services.guid_translator.normalize_guids``; we try the
-        normalised forms directly first, then fall back to the
-        legacy agent strings so a Plex destination running an older
-        agent version still resolves.
+    # ── Mirror integration ──────────────────────────────────────────
+    #
+    # PlexAdapter exposes two provider methods that the per-server
+    # metadata mirror's sync layer drives during sync_for_job. The
+    # mirror caches the item universe so the 4 resolver methods below
+    # can answer in milliseconds via SQL instead of seconds via live
+    # Plex API. Each resolver tries the mirror FIRST; on miss, falls
+    # through to the existing live walk so correctness is preserved.
 
-        Returns the destination's ratingKey as a string, or ``None``
-        if no guid resolves. ``library_id`` narrows the search when
-        supplied; absent or unmatched library_id falls through to a
-        server-wide getByGuid (Plex's getByGuid is section-agnostic
-        anyway)."""
-        from plexapi.exceptions import NotFound, PlexApiException
+    def iter_sections_for_mirror(self) -> List[Any]:
+        """Yield :class:`services.server_mirror.SectionInfo` for every
+        library section on this server. Used by the sync layer to
+        enumerate the universe before walking items.
 
-        # Build the candidate guid list. Each input guid produces up
-        # to two probes: its current form + the legacy agent form
-        # (when applicable) so we work against both modern and
-        # legacy Plex installs.
-        candidates: List[str] = []
-        for raw_guid in guids or ():
-            if not raw_guid or "://" not in raw_guid:
-                continue
-            candidates.append(raw_guid)
-            # Legacy-agent twin: try common scheme reversals so a
-            # destination that hasn't migrated metadata agents yet
-            # still matches.
-            legacy = _to_legacy_agent(raw_guid)
-            if legacy and legacy != raw_guid:
-                candidates.append(legacy)
-
-        # Deduplicate while preserving order so the most-likely
-        # match is tried first.
-        seen: set = set()
-        for guid in candidates:
-            if guid in seen:
-                continue
-            seen.add(guid)
+        Picks up live_total_size + live_updated_at so the sync layer
+        can decide between probe-only, delta, or full sync."""
+        from services.server_mirror import SectionInfo
+        out: List[SectionInfo] = []
+        try:
+            sections = list(self._server.library.sections())
+        except Exception as exc:
+            log.warning(
+                "iter_sections_for_mirror: library.sections() "
+                "failed: %s", exc,
+            )
+            return out
+        for s in sections:
+            total = None
+            updated = None
             try:
-                item = self._server.library.getByGuid(guid)
-            except (NotFound, PlexApiException):
-                continue
-            except Exception as exc:
-                log.debug("resolve_by_guids: getByGuid(%r) raised %s", guid, exc)
-                continue
-            if item is None:
-                continue
-            rk = getattr(item, "ratingKey", None)
+                total = int(getattr(s, "totalSize", 0) or 0) or None
+            except (TypeError, ValueError):
+                total = None
+            try:
+                ua = getattr(s, "updatedAt", None)
+                if ua is not None:
+                    updated = float(
+                        ua.timestamp() if hasattr(ua, "timestamp")
+                        else float(ua)
+                    )
+            except (TypeError, ValueError, AttributeError):
+                updated = None
+            out.append(SectionInfo(
+                section_id=str(getattr(s, "key", "") or ""),
+                name=getattr(s, "title", "") or "",
+                section_type=getattr(s, "type", "") or "",
+                live_total_size=total,
+                live_updated_at=updated,
+            ))
+        return out
+
+    def iter_section_items_for_mirror(
+        self,
+        section_id: str,
+        since_ts: Optional[float] = None,
+    ) -> Iterator[Any]:
+        """Item provider used by the sync layer. Yields
+        :class:`services.server_mirror.ItemRow` for every leaf-level
+        item in ``section_id``. When ``since_ts`` is supplied, items
+        whose ``updatedAt`` is older are skipped (delta sync).
+        """
+        from services.server_mirror import ItemRow
+        try:
+            section = next(
+                (s for s in self._server.library.sections()
+                 if str(getattr(s, "key", "") or "") == str(section_id)),
+                None,
+            )
+        except Exception:
+            section = None
+        if section is None:
+            return
+        try:
+            leaves = _section_leaf_items(section) or []
+        except Exception as exc:
+            log.warning(
+                "iter_section_items_for_mirror: section walk failed "
+                "for section_id=%s: %s", section_id, exc,
+            )
+            return
+        for it in leaves:
+            _disable_autoreload(it)
+            rk = getattr(it, "ratingKey", None)
             if rk is None:
                 continue
-            return str(rk)
-        return None
-
-    def resolve_by_path_tail(
-        self,
-        file_path: str,
-        *,
-        tail_components: int = 3,
-    ) -> Optional[str]:
-        """Last-resort cross-server resolver: match by the last N
-        components of the file path (default 3 → ``artist/album/song``).
-
-        2026-05-17 (end user request): GUID-based resolution fails for
-        music tracks that legitimately have no metadata GUIDs (local
-        files, pre-tagging-pass uploads, etc.). The source + destination
-        Plex libraries usually share the same on-disk structure beneath
-        a different root (``D:\\Music\\...`` vs ``/mnt/plex/...``), so
-        comparing the trailing path components is a reliable identity
-        check that's root-agnostic.
-
-        First call builds an in-memory path-tail index across every
-        library section (lazy + cached for the adapter's lifetime). The
-        index keys are the lowercased last-N path components joined by
-        ``/``; the value is the dest's ratingKey. Subsequent calls are
-        O(1) dict lookups. The cache is per-adapter-instance, which in
-        practice is per-orchestrator-request; we don't try to keep it
-        warm across requests.
-
-        Returns the matching dest ratingKey as a string, or ``None``
-        when no match exists. ``file_path`` empty short-circuits to None.
-        """
-        if not file_path:
-            return None
-        src_parts = _normalize_path_parts(file_path)
-        if not src_parts:
-            return None
-        n = min(tail_components, len(src_parts))
-        if n <= 0:
-            return None
-        src_key = "/".join(src_parts[-n:])
-        # Lazy build the path-tail index. Cache key includes the
-        # component depth so callers asking for different depths each
-        # get their own index.
-        cache_key = f"path-tail-{n}"
-        index = self._path_tail_indexes.get(cache_key)
-        if index is None:
-            index = {}
-            try:
-                sections = list(self._server.library.sections())
-            except Exception as exc:
-                log.warning(
-                    "resolve_by_path_tail: library.sections() failed: %s", exc,
-                )
-                self._path_tail_indexes[cache_key] = index
-                return None
-            for section in sections:
+            # since_ts gating for delta-sync.
+            if since_ts is not None:
+                ua = getattr(it, "updatedAt", None)
                 try:
-                    leaves = _section_leaf_items(section) or []
-                except Exception:
+                    ua_ts = float(
+                        ua.timestamp() if hasattr(ua, "timestamp")
+                        else float(ua) if ua is not None else 0.0
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    ua_ts = 0.0
+                if ua_ts > 0 and ua_ts <= since_ts:
                     continue
-                for it in leaves:
-                    try:
-                        fp = _safe_file_path(it)
-                        if not fp:
-                            continue
-                        parts = _normalize_path_parts(fp)
-                        if len(parts) < n:
-                            continue
-                        key = "/".join(parts[-n:])
-                        rk = getattr(it, "ratingKey", None)
-                        if rk is None:
-                            continue
-                        # First write wins — same-path collisions are
-                        # rare and the end user's source picked ONE
-                        # specific item, so any deterministic choice is
-                        # acceptable.
-                        index.setdefault(key, str(rk))
-                    except Exception:
-                        continue
-            self._path_tail_indexes[cache_key] = index
-            log.info(
-                "resolve_by_path_tail: built path-tail-%d index with "
-                "%d entries across %d section(s)",
-                n, len(index), len(sections),
+            else:
+                ua_ts = None
+                ua = getattr(it, "updatedAt", None)
+                try:
+                    if ua is not None:
+                        ua_ts = float(
+                            ua.timestamp() if hasattr(ua, "timestamp")
+                            else float(ua)
+                        )
+                except (TypeError, ValueError, AttributeError):
+                    ua_ts = None
+
+            item_type = getattr(it, "type", "") or ""
+            # The parent item's cross-server GUID feeds the resolver's
+            # hierarchy tier. Plex exposes ``grandparentGuid`` on
+            # episodes (the series GUID) + tracks (the artist GUID)
+            # for free on the bulk listing.
+            _gpg = None
+            if item_type in ("episode", "track"):
+                _gpg = str(getattr(it, "grandparentGuid", "") or "") or None
+            yield ItemRow(
+                rating_key=str(rk),
+                title=getattr(it, "title", "") or "",
+                item_type=item_type,
+                file_path=_safe_file_path(it) or None,
+                guids=tuple(g for g in _all_guids(it) if g),
+                artist=(getattr(it, "grandparentTitle", "") or None)
+                if item_type == "track" else None,
+                album=(getattr(it, "parentTitle", "") or None)
+                if item_type == "track" else None,
+                show_title=(getattr(it, "grandparentTitle", "") or None)
+                if item_type == "episode" else None,
+                season_number=getattr(it, "parentIndex", None),
+                episode_number=getattr(it, "index", None),
+                parent_rating_key=(
+                    str(getattr(it, "parentRatingKey", "") or "")
+                    or None
+                ),
+                grandparent_guid=_gpg,
+                live_updated_at=ua_ts,
             )
-        return index.get(src_key)
+
+    def _mirror_server_id(self) -> str:
+        """The app registry UID this Plex server's mirror rows are
+        keyed by.
+
+        connect_registered_server stamps the registry UID
+        (server_registry.make_server_id(), 'plex_<uuid4hex>') onto the
+        plexapi server object so the resolver + this adapter agree on
+        one key. The fallback to machineIdentifier covers ad-hoc
+        adapter construction that bypassed the registry (tests,
+        tooling); in that case the mirror simply will not be consulted
+        unless it was also populated under that same id.
+
+        The mirror-first lookup wrappers + the cold-start sync that
+        consume this UID live in MirrorResolveMixin, shared with the
+        Jellyfin / Emby adapters."""
+        return (
+            str(getattr(self._server, "_pmig_server_uid", "") or "")
+            or self._machine_id_cached
+            or ""
+        )
 
     # ── Item enumeration ───────────────────────────────────────────────
 
@@ -526,481 +668,46 @@ class PlexAdapter(MediaServerAdapter):
                 return [ep for ep in section.searchEpisodes() if getattr(ep, "userRating", 0)]
             return [m for m in section.search() if getattr(m, "userRating", 0)]
 
-    # ── Per-user watch / rating writes ─────────────────────────────────
-    #
-    # All three writes go through the direct HTTP path
-    # (``services.state._session`` + ``/:/scrobble`` etc.) rather than
-    # plexapi's higher-level methods. This matches what the existing
-    # restorer does and inherits the same token-in-header behaviour
-    # (M1: never put the token in the query string).
-
-    def set_watched(
-        self,
-        item_ref: ItemRef,
-        *,
-        view_count: int,
-        last_viewed_at: Optional[float],
-        user_context: UserContext,
-    ) -> WriteResult:
-        """Plex has no "set view count to N" endpoint; ``:/scrobble``
-        increments by 1. The adapter issues up to N calls capped by
-        ``state.VIEWCOUNT_INCREMENT_CAP`` (matches existing
-        restorer.set_watched-equivalent behaviour). The caller (engine)
-        is responsible for choosing the right ``view_count`` per the
-        merge strategy in use (``higher`` / ``sum``)."""
-        cap = int(getattr(state, "VIEWCOUNT_INCREMENT_CAP", 999))
-        increments = max(0, min(int(view_count), cap))
-        if increments == 0:
-            return WriteResult.ok("no increments needed (target count 0)")
-        token = user_context.auth_token or self._admin_token
-        url = f"{self._base_url}/:/scrobble"
-        try:
-            for _ in range(increments):
-                state._session.get(
-                    url,
-                    params={
-                        "key": item_ref.backend_item_id,
-                        "identifier": "com.plexapp.plugins.library",
-                    },
-                    headers={"X-Plex-Token": token},
-                    timeout=5,
-                )
-        except Exception as exc:
-            return WriteResult.fail(f"scrobble failed: {exc}")
-        return WriteResult.ok(f"incremented {increments} time(s)")
-
-    def set_resume_position(
-        self,
-        item_ref: ItemRef,
-        offset_ms: int,
-        *,
-        user_context: UserContext,
-    ) -> WriteResult:
-        token = user_context.auth_token or self._admin_token
-        url = f"{self._base_url}/:/progress"
-        try:
-            state._session.get(
-                url,
-                params={
-                    "key": item_ref.backend_item_id,
-                    "identifier": "com.plexapp.plugins.library",
-                    "time": int(offset_ms),
-                    "state": "stopped",
-                    "hasMDE": 1,
-                },
-                headers={"X-Plex-Token": token},
-                timeout=5,
-            )
-        except Exception as exc:
-            return WriteResult.fail(f"progress failed: {exc}")
-        return WriteResult.ok()
-
-    def set_rating(
-        self,
-        item_ref: ItemRef,
-        rating: float,
-        *,
-        user_context: UserContext,
-    ) -> WriteResult:
-        token = user_context.auth_token or self._admin_token
-        url = f"{self._base_url}/:/rate"
-        try:
-            state._session.put(
-                url,
-                params={
-                    "key": item_ref.backend_item_id,
-                    "identifier": "com.plexapp.plugins.library",
-                    "rating": float(rating),
-                },
-                headers={"X-Plex-Token": token},
-                timeout=10,
-            )
-        except Exception as exc:
-            return WriteResult.fail(f"rate failed: {exc}")
-        return WriteResult.ok()
-
-    # set_favorite stays at the ABC default (unsupported).
-
-    # ── Playlists ──────────────────────────────────────────────────────
-
-    def _local_account_id_for_username(self, username: str) -> Optional[int]:
-        """Resolve a Plex Home username to its LOCAL SystemAccount.id
-        (1, 2, 3, ...). Builds + caches the username → local_id map on
-        first call.
-
-        Why this exists: Plex's per-playlist ``accountID`` attribute
-        is the LOCAL account id, not the Plex.tv user id we carry in
-        managed_users.backend_user_id. To filter playlists to a
-        specific Plex Home user via plexapi's client-side filter, we
-        need the local id. systemAccounts() exposes both (.id =
-        local, .name = username) so a one-shot map is all we need.
-
-        Returns ``None`` when no match is found (e.g. the username is
-        an email — the owner case — and the SystemAccount stores the
-        Plex.tv username instead). The caller treats None as "skip
-        the accountID filter" so the bare playlists() call returns the
-        admin-token view (i.e. the owner's playlists)."""
-        if not username:
-            return None
-        if self._local_account_id_by_username is None:
-            mapping: Dict[str, int] = {}
-            try:
-                accts = self._server.systemAccounts() or []
-            except Exception as exc:
-                log.debug("systemAccounts() unavailable for map: %s", exc)
-                accts = []
-            for acct in accts:
-                name = (getattr(acct, "name", "") or "").strip()
-                if not name:
-                    continue
-                try:
-                    local_id = int(getattr(acct, "id", 0) or 0)
-                except (TypeError, ValueError):
-                    local_id = 0
-                if local_id <= 0:
-                    continue
-                mapping[name.lower()] = local_id
-            self._local_account_id_by_username = mapping
-            log.debug(
-                "PlexAdapter: built username→local_account_id map "
-                "with %d entries", len(mapping),
-            )
-        return self._local_account_id_by_username.get(username.lower())
-
-    def list_playlists(self, user_context: UserContext) -> List[PlaylistSpec]:
-        """All non-smart playlists for ``user_context``. Smart playlists
-        are still returned so the engine can log + skip them with the
-        criteria preserved.
-
-        2026-05-17 bug fix (operator report — managed users showing
-        owner's playlists):
-        ``PlexServer.playlists()`` returns playlists visible to the
-        authenticated token. When the auth fell back to the ADMIN
-        token (per_user_token mode + no saved per-user token OR plain
-        owner_token mode) and the target user is a managed user, the
-        bare call returned the OWNER's playlists, which we then cached
-        under the managed user's key — visible cross-user contamination.
-
-        plexapi's ``playlists(**kwargs)`` applies kwargs as a
-        client-side filter on the returned Playlist objects'
-        attributes. Each Playlist carries an ``accountID`` attribute
-        set by the server — the LOCAL SystemAccount id (1, 2, 3, ...)
-        of the user who owns it. We resolve the target user's local
-        id via :meth:`_local_account_id_for_username` and pass it as
-        ``accountID=<local_id>`` so plexapi narrows to that user's
-        playlists.
-
-        Owner case: ``username`` is typically the owner's email (from
-        myPlexAccount), which doesn't appear in systemAccounts (those
-        use the Plex.tv username). The lookup returns None and we
-        skip the filter — the admin-token bare call IS the owner's
-        view, which returns the owner's playlists correctly.
-        """
-        server = self._server_for(user_context)
-        target_username = (getattr(user_context, "username", "") or "").strip()
-        is_admin_ctx = bool(getattr(user_context, "is_admin", True))
-        # Per-user-token path: ``server`` was built with the target user's
-        # own token, so ``server.playlists()`` IS already scoped to that
-        # user. Applying the local-SystemAccount-id filter on top would
-        # be wrong — when Plex serves a managed user's playlists through
-        # a Plex Home child token, the ``accountID`` attribute often
-        # surfaces as the OWNER's local id (1), which means the filter
-        # would reject every row and we'd cache 0 playlists for a user
-        # who actually has them. We skip the filter entirely on the
-        # per-user-token path.
-        #
-        # Admin-token path: ``server.playlists()`` returns the OWNER's
-        # view regardless of the target user. We rely on the local-id
-        # filter to narrow that down to the target managed user's rows.
-        local_id = (
-            None if not is_admin_ctx
-            else self._local_account_id_for_username(target_username)
-        )
-        try:
-            playlists = server.playlists() or []
-        except Exception as exc:
-            log.warning("server.playlists() failed: %s", exc)
-            return []
-        if not is_admin_ctx:
-            log.info(
-                "PlexAdapter.list_playlists: per-user-token path for %r "
-                "returned %d playlists (no local_id filter applied).",
-                target_username, len(playlists),
-            )
-        elif local_id is not None and local_id > 1:
-            # Admin token + non-owner target: server.playlists() returned
-            # the owner's view; narrow to the target user's rows by
-            # matching Playlist.accountID against their local SystemAccount
-            # id. Robust against plexapi kwarg-filter quirks (type
-            # coercion, missing attribute, etc.).
-            before = len(playlists)
-            kept = []
-            seen_account_ids: set = set()
-            for pl in playlists:
-                try:
-                    pl_account_id = getattr(pl, "accountID", None)
-                    seen_account_ids.add(pl_account_id)
-                    # Cast both sides to int for comparison since plexapi
-                    # sometimes surfaces accountID as int and sometimes
-                    # as a numeric string depending on Plex version.
-                    if pl_account_id is not None and int(pl_account_id) == int(local_id):
-                        kept.append(pl)
-                except (TypeError, ValueError):
-                    continue
-            log.info(
-                "PlexAdapter.list_playlists: filtered %d → %d playlists "
-                "for user %r (local_id=%d). accountIDs observed: %s",
-                before, len(kept), target_username, local_id,
-                sorted(str(x) for x in seen_account_ids if x is not None),
-            )
-            playlists = kept
-        out: List[PlaylistSpec] = []
-        for pl in playlists:
-            try:
-                items_tuple = tuple(
-                    ItemRef(
-                        backend_item_id=str(getattr(it, "ratingKey", "")),
-                        guids=tuple(normalize_guids(_all_guids(it))),
-                        title=getattr(it, "title", "") or "",
-                    )
-                    for it in (pl.items() or [])
-                )
-            except Exception:
-                items_tuple = ()
-            smart_filter = None
-            try:
-                smart_filter = getattr(pl, "content", None)
-            except Exception:
-                smart_filter = None
-            out.append(PlaylistSpec(
-                playlist_id=str(getattr(pl, "ratingKey", "")),
-                name=getattr(pl, "title", "") or "",
-                is_smart=bool(getattr(pl, "smart", False)),
-                smart_filter_json=smart_filter,
-                items=items_tuple,
-            ))
-        return out
-
-    def get_playlist_items(
-        self,
-        playlist_id: str,
-        *,
-        user_context: UserContext,
-    ) -> tuple:
-        """Single-playlist item fetch via ``server.fetchItem(ratingKey)``
-        + ``.items()``. Avoids the full ``server.playlists()`` walk when
-        the caller only needs one playlist (Playlist Management copy
-        path, cache refresh).
-
-        2026-05-17: also surfaces ``file_path`` on each ItemRef so the
-        orchestrator's path-tail fallback can resolve cross-server
-        copies when GUIDs don't match (common for music tracks)."""
-        if not playlist_id:
-            return ()
-        try:
-            rk = int(playlist_id)
-        except (TypeError, ValueError):
-            return ()
-        server = self._server_for(user_context)
-        try:
-            pl = server.fetchItem(rk)
-        except Exception as exc:
-            log.debug("get_playlist_items %s fetch failed: %s", playlist_id, exc)
-            return ()
-        try:
-            return tuple(
-                ItemRef(
-                    backend_item_id=str(getattr(it, "ratingKey", "")),
-                    guids=tuple(normalize_guids(_all_guids(it))),
-                    title=getattr(it, "title", "") or "",
-                    file_path=_safe_file_path(it),
-                )
-                for it in (pl.items() or [])
-            )
-        except Exception:
-            return ()
-
-    def create_playlist(
-        self,
-        name: str,
-        items: List[ItemRef],
-        *,
-        user_context: UserContext,
-    ) -> str:
-        """Create + chunked-add. Mirrors ``restorer._create_playlist_chunked``
-        - first chunk in ``Playlist.create``, subsequent chunks via
-        ``addItems`` to stay under Plex's ~8KB ``uri=`` cap."""
-        server = self._server_for(user_context)
-        plex_items = self._resolve_items(server, items)
-        if not plex_items:
-            raise ValueError("create_playlist called with no resolvable items")
-        first_chunk = plex_items[:_PLEX_CONTAINER_CHUNK_SIZE]
-        rest = plex_items[_PLEX_CONTAINER_CHUNK_SIZE:]
-        playlist = Playlist.create(server, name, items=first_chunk)
-        for i in range(0, len(rest), _PLEX_CONTAINER_CHUNK_SIZE):
-            playlist.addItems(rest[i:i + _PLEX_CONTAINER_CHUNK_SIZE])
-        return str(getattr(playlist, "ratingKey", ""))
-
-    def add_to_playlist(
-        self,
-        playlist_id: str,
-        items: List[ItemRef],
-        *,
-        user_context: UserContext,
-    ) -> int:
-        server = self._server_for(user_context)
-        try:
-            playlist = server.fetchItem(int(playlist_id))
-        except Exception as exc:
-            raise ValueError(f"playlist {playlist_id!r} not found: {exc}") from exc
-        plex_items = self._resolve_items(server, items)
-        added = 0
-        for i in range(0, len(plex_items), _PLEX_CONTAINER_CHUNK_SIZE):
-            chunk = plex_items[i:i + _PLEX_CONTAINER_CHUNK_SIZE]
-            playlist.addItems(chunk)
-            added += len(chunk)
-        return added
-
-    # ── Collections ────────────────────────────────────────────────────
-
-    def list_collections(
-        self, library_id: Optional[str] = None,
-    ) -> List[CollectionSpec]:
-        """Per-library collections. ``library_id=None`` walks every
-        library (slow on large servers). Matches ``section.collections()``
-        per current snapshotter usage."""
-        sections = []
-        if library_id is None:
-            sections = list(self._server.library.sections())
-        else:
-            try:
-                sections = [self._server.library.sectionByID(int(library_id))]
-            except Exception as exc:
-                log.warning("sectionByID(%r) failed: %s", library_id, exc)
-                return []
-        out: List[CollectionSpec] = []
-        for section in sections:
-            try:
-                coll_list = section.collections() or []
-            except Exception as exc:
-                log.warning(
-                    "section %r collections() failed: %s",
-                    getattr(section, "title", ""), exc,
-                )
-                continue
-            sec_id = str(getattr(section, "key", ""))
-            for coll in coll_list:
-                try:
-                    items_tuple = tuple(
-                        ItemRef(
-                            backend_item_id=str(getattr(it, "ratingKey", "")),
-                            guids=tuple(normalize_guids(_all_guids(it))),
-                            title=getattr(it, "title", "") or "",
-                        )
-                        for it in (coll.items() or [])
-                    )
-                except Exception:
-                    items_tuple = ()
-                out.append(CollectionSpec(
-                    collection_id=str(getattr(coll, "ratingKey", "")),
-                    name=getattr(coll, "title", "") or "",
-                    library_id=sec_id,
-                    items=items_tuple,
-                ))
-        return out
-
-    def create_collection(
-        self,
-        name: str,
-        items: List[ItemRef],
-        *,
-        library_id: Optional[str] = None,
-    ) -> str:
-        if library_id is None:
-            raise ValueError(
-                "Plex collections require library_id (collections are library-scoped)"
-            )
-        try:
-            section = self._server.library.sectionByID(int(library_id))
-        except Exception as exc:
-            raise ValueError(f"unknown library_id {library_id!r}: {exc}") from exc
-        plex_items = self._resolve_items(self._server, items)
-        if not plex_items:
-            raise ValueError("create_collection called with no resolvable items")
-        first_chunk = plex_items[:_PLEX_CONTAINER_CHUNK_SIZE]
-        rest = plex_items[_PLEX_CONTAINER_CHUNK_SIZE:]
-        collection = Collection.create(self._server, name, section, items=first_chunk)
-        for i in range(0, len(rest), _PLEX_CONTAINER_CHUNK_SIZE):
-            collection.addItems(rest[i:i + _PLEX_CONTAINER_CHUNK_SIZE])
-        return str(getattr(collection, "ratingKey", ""))
-
-    def add_to_collection(
-        self,
-        collection_id: str,
-        items: List[ItemRef],
-    ) -> int:
-        try:
-            collection = self._server.fetchItem(int(collection_id))
-        except Exception as exc:
-            raise ValueError(f"collection {collection_id!r} not found: {exc}") from exc
-        plex_items = self._resolve_items(self._server, items)
-        added = 0
-        for i in range(0, len(plex_items), _PLEX_CONTAINER_CHUNK_SIZE):
-            chunk = plex_items[i:i + _PLEX_CONTAINER_CHUNK_SIZE]
-            collection.addItems(chunk)
-            added += len(chunk)
-        return added
-
-    # ── Helpers ────────────────────────────────────────────────────────
-
-    def _resolve_items(
-        self, server: PlexServer, items: List[ItemRef],
-    ) -> List:
-        """Convert ``ItemRef.backend_item_id`` -> plexapi items via
-        ``fetchItem``. The engine has already resolved cross-server
-        GUID matching upstream; by the time these write methods are
-        called, ``backend_item_id`` is the destination server's
-        ratingKey."""
-        resolved = []
-        for ref in items:
-            if not ref.backend_item_id:
-                continue
-            try:
-                resolved.append(server.fetchItem(int(ref.backend_item_id)))
-            except Exception as exc:
-                log.warning(
-                    "fetchItem(%r) failed: %s; skipping",
-                    ref.backend_item_id, exc,
-                )
-                continue
-        return resolved
-
 
 # ── Module-level helpers ────────────────────────────────────────────────────
 
-_CANONICAL_TO_LEGACY_AGENT = {
-    "imdb": "com.plexapp.agents.imdb",
-    "tmdb": "com.plexapp.agents.themoviedb",
-    "tvdb": "com.plexapp.agents.thetvdb",
-    "musicbrainz": "com.plexapp.agents.musicbrainz",
+# Plex item type -> entity-distinct MusicBrainz scheme. Jellyfin/Emby
+# emit these schemes natively; the Plex adapter rewrites its generic
+# ``musicbrainz://`` to the matching one so a track matches a track
+# (and never an album or artist) when comparing GUIDs across backends.
+_MB_SCHEME_BY_TYPE = {
+    "track": "mbtrack",
+    "album": "mbalbum",
+    "artist": "mbartist",
 }
 
 
-def _to_legacy_agent(canonical_guid: str) -> Optional[str]:
-    """Reverse of ``services/guid_translator.normalize_guids`` for the
-    handful of Plex agents that have legacy forms. Used by
-    :meth:`PlexAdapter.resolve_by_guids` to probe a destination that
-    hasn't migrated its metadata to the modern agent set.
+def _rewrite_mb_scheme(guid: str, scheme: str) -> str:
+    """Rewrite a generic ``musicbrainz://<id>`` GUID to
+    ``<scheme>://<id>``. Any other GUID (``plex://``, ``local://``, an
+    already entity-distinct ``mb*://``) is returned unchanged."""
+    head, sep, rest = guid.partition("://")
+    if sep and head == "musicbrainz":
+        return f"{scheme}://{rest}"
+    return guid
 
-    Returns ``None`` when there's no known legacy mapping (passes
-    through unchanged for ``plex://`` / ``mbtrack://`` etc.)."""
-    scheme, _, value = canonical_guid.partition("://")
-    if not scheme or not value:
-        return None
-    legacy_scheme = _CANONICAL_TO_LEGACY_AGENT.get(scheme.lower())
-    if not legacy_scheme:
-        return None
-    return f"{legacy_scheme}://{value}"
+
+def _music_aware_guids(item: Any) -> Tuple[str, ...]:
+    """Normalize a Plex item's GUIDs, then - for a music item - rewrite
+    the generic ``musicbrainz://<id>`` scheme to the entity-distinct
+    scheme (``mbtrack`` / ``mbalbum`` / ``mbartist``) keyed on the item
+    type. ``guid_translator`` cannot do this: a bare MBID string does
+    not say whether it is a recording, a release, or an artist id. The
+    Plex adapter knows the item type, so the disambiguation happens
+    here, leaving Plex and Jellyfin/Emby emitting the same schemes.
+
+    Non-music items are returned with their GUIDs normalized only.
+    """
+    guids = normalize_guids(_all_guids(item))
+    scheme = _MB_SCHEME_BY_TYPE.get(getattr(item, "type", "") or "")
+    if not scheme:
+        return tuple(guids)
+    return tuple(_rewrite_mb_scheme(g, scheme) for g in guids)
 
 
 def _plex_item_to_snapshot(plex_item, *, library_id: str) -> ItemSnapshot:
@@ -1039,16 +746,39 @@ def _plex_item_to_snapshot(plex_item, *, library_id: str) -> ItemSnapshot:
     season_title = ""
     artist = ""
     album = ""
+    # ADAPT-02: numeric hierarchy indices + parent GUID. Without these
+    # the restore matcher loses its parent-GUID key and the
+    # season/episode-number tiebreakers, degrading episode matching to
+    # fuzzy title. serialize_item() in resolver.py captures the same
+    # fields for the Plex-direct path, and the Jellyfin adapter captures
+    # them too - the Plex adapter path was the lone gap.
+    season_index: Optional[int] = None
+    episode_index: Optional[int] = None
+    grandparent_guid = ""
     if item_type == "episode":
         show_title = getattr(plex_item, "grandparentTitle", "") or ""
         season_title = getattr(plex_item, "parentTitle", "") or ""
+        try:
+            season_index = int(getattr(plex_item, "parentIndex", None))
+        except (TypeError, ValueError):
+            season_index = None
+        try:
+            episode_index = int(getattr(plex_item, "index", None))
+        except (TypeError, ValueError):
+            episode_index = None
+        grandparent_guid = str(
+            getattr(plex_item, "grandparentGuid", "") or ""
+        )
     elif item_type == "track":
         artist = getattr(plex_item, "grandparentTitle", "") or ""
         album = getattr(plex_item, "parentTitle", "") or ""
+        grandparent_guid = str(
+            getattr(plex_item, "grandparentGuid", "") or ""
+        )
 
     return ItemSnapshot(
         backend_item_id=str(getattr(plex_item, "ratingKey", "")),
-        guids=tuple(normalize_guids(_all_guids(plex_item))),
+        guids=tuple(_music_aware_guids(plex_item)),
         library_id=library_id,
         title=getattr(plex_item, "title", "") or "",
         type=item_type,
@@ -1060,12 +790,19 @@ def _plex_item_to_snapshot(plex_item, *, library_id: str) -> ItemSnapshot:
         user_rating=(
             float(getattr(plex_item, "userRating", 0) or 0) or None
         ),
-        is_favorite=False,  # Plex has no per-user favorite
+        # ADAPT-03: Plex has no per-user favorite concept - emit None
+        # (the ItemSnapshot contract), NOT a fabricated False. A False
+        # here triggers explicit un-favorite writes on a Plex ->
+        # Jellyfin/Emby restore, clobbering destination users' favorites.
+        is_favorite=None,
         added_at=added_epoch,
         show_title=show_title,
         season_title=season_title,
         artist=artist,
         album=album,
+        season_index=season_index,
+        episode_index=episode_index,
+        grandparent_guid=grandparent_guid,
     )
 
 

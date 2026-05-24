@@ -1,4 +1,4 @@
-// Servers ▸ Recent Runtimes (Phase 4 of the dashboard / log reorg).
+// Servers ▸ Recent Runtimes.
 //
 // Reads the per-RUN history rows captured by services/jobs.py at
 // finalisation (see server/run_timings_db.run_history). One row per
@@ -16,6 +16,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, RecentRunRow, ServerView } from '../api';
 import { UserCountChip } from './UserCountChip';
+import { formatTimestamp } from '../utils/format';
+import { useResourceQuery } from '../hooks/useResourceQuery';
 
 
 function _fmtDuration(ms: number): string {
@@ -31,10 +33,6 @@ function _fmtDuration(ms: number): string {
 }
 
 
-function _fmtTimestamp(epoch: number): string {
-  if (!Number.isFinite(epoch) || epoch <= 0) return '-';
-  return new Date(epoch * 1000).toLocaleString();
-}
 
 
 function _stateBadge(state: string): { bg: string; fg: string; label: string } {
@@ -62,35 +60,19 @@ const ALL_LIBRARIES = '__all_libs__';
 export function RecentRuntimesPanel({ servers }: { servers: ServerView[] }) {
   const [selectedServerId, setSelectedServerId] = useState<string>(ALL_SERVERS);
   const [selectedLibrary, setSelectedLibrary] = useState<string>(ALL_LIBRARIES);
-  const [rows, setRows] = useState<RecentRunRow[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const refresh = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const resp = await api.listRecentRunHistory({
-        limit: 200,
-        serverId: selectedServerId === ALL_SERVERS ? undefined : selectedServerId,
-        library: selectedLibrary === ALL_LIBRARIES ? undefined : selectedLibrary,
-      });
-      setRows(resp.runs);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Refetch whenever the server / library filter changes. Initial
-  // mount fires through the same effect because both selections start
+  // Refetches whenever the server / library filter changes. Initial
+  // mount fires through the same path because both selections start
   // as their sentinel values, so the first request hits the unfiltered
   // endpoint and the end user sees the whole instance's history.
-  useEffect(() => {
-    void refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedServerId, selectedLibrary]);
+  const { data: rows, loading, error, reload } = useResourceQuery<RecentRunRow[]>(
+    () => api.listRecentRunHistory({
+      limit: 200,
+      serverId: selectedServerId === ALL_SERVERS ? undefined : selectedServerId,
+      library: selectedLibrary === ALL_LIBRARIES ? undefined : selectedLibrary,
+    }).then((resp) => resp.runs),
+    [selectedServerId, selectedLibrary],
+    [],
+  );
 
   // Library list comes from the rows themselves (union of every
   // library every captured row touched). This auto-grows as new
@@ -167,7 +149,7 @@ export function RecentRuntimesPanel({ servers }: { servers: ServerView[] }) {
 
       <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
         <button
-          onClick={() => void refresh()}
+          onClick={reload}
           disabled={loading}
           style={{ fontSize: 12 }}
         >
@@ -189,7 +171,7 @@ export function RecentRuntimesPanel({ servers }: { servers: ServerView[] }) {
 
       {rows.length > 0 && (
         <div style={{ overflowX: 'auto' }}>
-          <table className="list" style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
+          <table data-testid="recent-runtimes-table" className="list" style={{ width: '100%', fontSize: 12, borderCollapse: 'collapse' }}>
             <thead>
               <tr>
                 <th style={{ textAlign: 'left' }}>Started</th>
@@ -206,11 +188,11 @@ export function RecentRuntimesPanel({ servers }: { servers: ServerView[] }) {
               {rows.map((r) => {
                 const badge = _stateBadge(r.state);
                 return (
-                  <tr key={r.run_id}>
-                    <td>{_fmtTimestamp(r.started_at)}</td>
+                  <tr key={r.run_id} data-testid={`recent-runtime-row-${r.run_id}`}>
+                    <td>{formatTimestamp(r.started_at)}</td>
                     <td><code style={{ fontSize: 11 }}>{r.job_type}</code></td>
                     <td>{r.server_name || '-'}</td>
-                    <td>
+                    <td data-testid="recent-runtime-libraries">
                       {(r.libraries || []).length === 0 ? '-' : (r.libraries || []).join(', ')}
                     </td>
                     <td style={{ textAlign: 'right' }}>
@@ -220,8 +202,8 @@ export function RecentRuntimesPanel({ servers }: { servers: ServerView[] }) {
                         ariaLabel="Users affected by this run"
                       />
                     </td>
-                    <td style={{ textAlign: 'right' }}>{_fmtDuration(r.duration_ms)}</td>
-                    <td>
+                    <td data-testid="recent-runtime-duration" style={{ textAlign: 'right' }}>{_fmtDuration(r.duration_ms)}</td>
+                    <td data-testid="recent-runtime-state">
                       <span
                         style={{
                           padding: '2px 6px',

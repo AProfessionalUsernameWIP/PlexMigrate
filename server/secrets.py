@@ -79,6 +79,43 @@ def _keyfile_path() -> Path:
     return get_data_dir() / _KEYFILE_NAME
 
 
+def harden_secret_file(path: Path) -> None:
+    """Best-effort: lock a freshly-created secret file down to its
+    owner on Windows.
+
+    The ``0o600`` mode passed to ``os.open`` is honoured on POSIX but
+    ignored by Windows, where the file inherits the data directory's
+    ACL - typically granting the ``Users`` / ``Authenticated Users``
+    groups read access. Strip those broad-access groups via ``icacls``
+    so a secret (the Fernet keyfile, the JWT signing secret) is not
+    readable by every local account on a multi-user Windows host.
+
+    The owner / SYSTEM / Administrators ACEs are left intact, so this
+    can never lock the service out of its own secret. POSIX is a
+    no-op (the 0o600 mode already applied). Any failure is logged,
+    never raised - a readable secret file is a hardening gap, not a
+    reason to abort startup.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import subprocess
+        # Well-known SIDs (locale-independent): BUILTIN\Users,
+        # NT AUTHORITY\Authenticated Users, Everyone. /remove:g drops
+        # only those groups' grants; the owner / SYSTEM /
+        # Administrators ACEs are untouched.
+        subprocess.run(
+            ["icacls", str(path), "/remove:g",
+             "*S-1-5-32-545", "*S-1-5-11", "*S-1-1-0"],
+            capture_output=True, timeout=10, check=False,
+        )
+    except Exception:
+        log.warning(
+            "could not harden ACL on %s; on a multi-user Windows host "
+            "the file may remain readable by other accounts", path,
+        )
+
+
 def _load_or_create_key() -> bytes:
     """
     Return the 32-byte raw key, creating the keyfile on first boot.
@@ -94,7 +131,17 @@ def _load_or_create_key() -> bytes:
         # ignores the mode and falls back to whatever the parent
         # directory's ACL allows. The bind-mount layout already
         # restricts host-side access to whoever can read server_data/.
-        fd = os.open(str(path), os.O_EXCL | os.O_CREAT | os.O_WRONLY, 0o600)
+        #
+        # O_BINARY is required on Windows: without it os.open() defaults
+        # to text mode and os.write() translates every 0x0A byte in the
+        # random key to 0x0D0A, producing a >32-byte keyfile that the
+        # length check below then rejects. O_BINARY does not exist on
+        # POSIX, where getattr falls back to 0 (a no-op).
+        fd = os.open(
+            str(path),
+            os.O_EXCL | os.O_CREAT | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
     except FileExistsError:
         return path.read_bytes()
 
@@ -103,6 +150,10 @@ def _load_or_create_key() -> bytes:
         os.write(fd, key)
     finally:
         os.close(fd)
+
+    # AUTH-07: harden the new keyfile's ACL on Windows (the 0o600
+    # mode above is POSIX-only there). Best-effort - never fatal.
+    harden_secret_file(path)
 
     # This branch is reached only on first-boot OR after a manual
     # delete of the keyfile. We can't distinguish the two reliably

@@ -1,4 +1,4 @@
-// Item 5 (admin-management plan, 2026-05-15): global tooltip toggle.
+// Global tooltip toggle.
 //
 // The Settings panel writes ``tooltips_enabled`` (root_admin only). The
 // rest of the UI reads it from this context so we don't fetch
@@ -9,7 +9,7 @@
 // can flip the value optimistically. A POST back to /api/settings
 // persists the change.
 
-import { createContext, useEffect, useState } from 'react';
+import { createContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { api } from '../api';
 
@@ -47,8 +47,13 @@ export function TooltipProvider({ children }: { children: ReactNode }) {
     return () => { cancelled = true; };
   }, []);
 
+  // Memoised so the value identity is stable across re-renders the
+  // provider gets from its parent chain - otherwise every <InfoTip />
+  // in the app re-renders whenever the outer App re-renders.
+  const value = useMemo(() => ({ enabled, setEnabled }), [enabled]);
+
   return (
-    <TooltipContext.Provider value={{ enabled, setEnabled }}>
+    <TooltipContext.Provider value={value}>
       {children}
     </TooltipContext.Provider>
   );

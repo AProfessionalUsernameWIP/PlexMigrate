@@ -44,12 +44,12 @@ def _build_servers_network() -> List[Dict[str, Any]]:
     Join every registered server against the network collector and
     return per-server telemetry suitable for the Networking tab.
 
-    Pre-v0.12.0 the Network panel read out of the per-job
-    DashboardState - invisible when idle, gone in fan-out. This
-    function reads from the process-lifetime collector keyed by
+    Reads from the process-lifetime network collector keyed by
     URL host, then joins with the registry by host so each entry
     carries the end user-friendly server name and the registry
-    id needed for the "open server settings" affordance.
+    id needed for the "open server settings" affordance. The
+    collector is process-lifetime (not per-job DashboardState) so
+    the panel still has data when idle and during fan-out.
 
     Servers the collector hasn't seen any traffic for still appear
     with empty windows - the UI treats them as "no data yet."
@@ -133,9 +133,9 @@ def _active_job_participants(job_payload: Optional[Dict[str, Any]]) -> Optional[
     """
     Return the set of server names that participate in the active job.
 
-    Used by :func:`build_dashboard_frame` (PR-2 / Phase C - ex-Phase A activity
-    feed scoping) to filter activity entries down to "this job's
-    servers." ``None`` means "no active job - emit every entry."
+    Used by :func:`build_dashboard_frame` for activity-feed scoping:
+    filtering activity entries down to "this job's servers."
+    ``None`` means "no active job - emit every entry."
     An empty set means "active job, but no named participants found"
     - in practice that only happens for legacy / malformed jobs and we
     treat it the same as no active job to be conservative.
@@ -202,7 +202,7 @@ def build_dashboard_frame() -> Dict[str, Any]:
         running, else ``None``.
       * ``job``       - slim view of the current :class:`JobRecord`.
       * ``fan_out``   - per-destination dashboards when a fan-out job
-        is active (v0.10.0). ``None`` for single-destination jobs.
+        is active. ``None`` for single-destination jobs.
       * ``server_ts`` - server time at snapshot construction (used by
         the frontend to compute live elapsed times without drifting
         from its own ``Date.now()``).
@@ -233,25 +233,25 @@ def build_dashboard_frame() -> Dict[str, Any]:
     if job_record is not None:
         job_payload = _record_to_payload(job_record)
 
-    # PR-8 - Dashboard multi-job sub-tabs. Surface every active + queued
+    # Dashboard multi-job sub-tabs. Surface every active + queued
     # job in a single list so the frontend can render one sub-tab per
-    # job when there's more than one. Backward-compat: the existing
-    # ``job`` field above stays populated with the running record so
-    # older clients keep working. Empty list when the worker is idle
-    # and nothing is queued.
+    # job when there's more than one. The ``job`` field above stays
+    # populated with the running record so older clients keep
+    # working. Empty list when the worker is idle and nothing is
+    # queued.
     jobs_payload: List[Dict[str, Any]] = [
         _record_to_payload(r) for r in get_queue().active_and_queued()
     ]
 
-    # PR-2 / Phase C - activity-feed scoping (ex-Phase A fix).
-    # During an active job, suppress feed entries tagged with a server
-    # name that isn't a participant. Untagged entries are always
-    # included (so the existing call sites need no changes), and the
-    # filter is a no-op when no job is active.
+    # Activity-feed scoping. During an active job, suppress feed
+    # entries tagged with a server name that isn't a participant.
+    # Untagged entries are always included (so the existing call
+    # sites need no changes), and the filter is a no-op when no job
+    # is active.
     participants = _active_job_participants(job_payload)
     _scope_activity(dash, participants)
 
-    # v0.10.0 - fan-out card array. ``None`` when no fan-out is active
+    # Fan-out card array. ``None`` when no fan-out is active
     # so older frontend builds that only know about ``dashboard``
     # continue to work unchanged.
     fan_out_payload: Optional[List[Dict[str, Any]]] = None
@@ -285,12 +285,12 @@ def build_dashboard_frame() -> Dict[str, Any]:
         "server_ts": time.time(),
         "dashboard": dash,
         "job": job_payload,
-        # PR-8 - every active + queued job for the multi-job sub-tab
+        # Every active + queued job for the multi-job sub-tab
         # strip. ``job`` (above) is the running one only; ``jobs``
         # mirrors what was queued through the public submission API.
         "jobs": jobs_payload,
         "fan_out": fan_out_payload,
-        # v0.12.0 - process-lifetime, server-keyed HTTP telemetry.
+        # Process-lifetime, server-keyed HTTP telemetry.
         # Always present; an idle install still gets entries for
         # every registered server (empty until the ping poll fires
         # or a job runs).
@@ -314,8 +314,31 @@ class WSManager:
         self._lock = asyncio.Lock()
         self._broadcaster_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # asyncio.Lock / Event bind to the running event loop on first
+        # use. WSManager is a process-wide singleton: fine in
+        # production (one loop for the whole process), but under pytest
+        # each test runs on a fresh loop, so primitives created under
+        # an earlier loop raise "bound to a different event loop".
+        # _ensure_loop_primitives() rebinds them when the loop changes;
+        # _loop records which loop they currently belong to.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _ensure_loop_primitives(self) -> None:
+        """Rebind ``_lock`` / ``_stop`` to the currently running event
+        loop when it has changed since they were created (the pytest
+        per-test-loop case), dropping any broadcaster task left over
+        from the now-defunct loop. A no-op in production, where the
+        loop never changes."""
+        running = asyncio.get_running_loop()
+        if self._loop is running:
+            return
+        self._loop = running
+        self._lock = asyncio.Lock()
+        self._stop = asyncio.Event()
+        self._broadcaster_task = None
 
     async def connect(self, ws: WebSocket) -> None:
+        self._ensure_loop_primitives()
         await ws.accept()
         async with self._lock:
             self._clients.add(ws)
@@ -327,6 +350,7 @@ class WSManager:
             await self.disconnect(ws)
 
     async def disconnect(self, ws: WebSocket) -> None:
+        self._ensure_loop_primitives()
         async with self._lock:
             self._clients.discard(ws)
         try:
@@ -355,12 +379,14 @@ class WSManager:
         """
         Start the 4 Hz polling task. Safe to call once at app startup.
         """
+        self._ensure_loop_primitives()
         if self._broadcaster_task is not None:
             return
         self._stop.clear()
         self._broadcaster_task = asyncio.create_task(self._tick_loop())
 
     async def stop(self) -> None:
+        self._ensure_loop_primitives()
         self._stop.set()
         if self._broadcaster_task is not None:
             await self._broadcaster_task

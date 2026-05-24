@@ -1,4 +1,4 @@
-// Vitest configuration for the PlexMigrate frontend.
+// Vitest configuration for the Hestia-MediaManager frontend.
 //
 // Extends vite.config.ts so component aliases + the React plugin
 // chain that build / dev / preview rely on also apply in tests.

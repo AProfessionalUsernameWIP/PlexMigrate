@@ -1,5 +1,3 @@
-// Phase 6 of the dashboard / log reorg.
-//
 // Inline re-authentication modal. The api.ts http<T> helper calls
 // ``onElevationRequired()`` whenever a request returns 403 with the
 // "recent password re-confirmation" marker; App.tsx registers a
@@ -29,7 +27,8 @@
 // need for the end user to know about /api/auth/elevate.
 
 import { useEffect, useRef, useState } from 'react';
-import { api } from '../api';
+import { ElevationForm } from './ElevationForm';
+import { Modal } from './Modal';
 
 
 export interface ElevateModalProps {
@@ -40,158 +39,47 @@ export interface ElevateModalProps {
 
 
 export function ElevateModal({ open, onClose }: ElevateModalProps) {
-  const [password, setPassword] = useState<string>('');
-  const [submitting, setSubmitting] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  // The shared ElevationForm owns the password / focus / reset /
+  // authElevate / error logic. This wrapper only supplies the 403-
+  // retry presentation and adapts the form's (expiresAt, cancel)
+  // callbacks to this modal's onClose(elevated: boolean) contract.
+  // ``busy`` is mirrored here so a backdrop / Escape close can't
+  // dismiss the modal mid-request.
+  const [busy, setBusy] = useState<boolean>(false);
+  const busyRef = useRef<boolean>(false);
+  busyRef.current = busy;
 
-  // Auto-focus the password input when the modal opens so the
-  // end user can start typing immediately. Reset state on each open
-  // so a previous cancel doesn't leak its password or error.
+  // Drop the local busy mirror when the modal closes so a fresh open
+  // doesn't inherit a stale "in-flight" guard.
   useEffect(() => {
-    if (open) {
-      setPassword('');
-      setError(null);
-      setSubmitting(false);
-      // Defer focus to the next frame so the input is in the DOM.
-      window.setTimeout(() => inputRef.current?.focus(), 0);
-    }
+    if (!open) setBusy(false);
   }, [open]);
 
   if (!open) return null;
 
-  const submit = async () => {
-    if (!password) {
-      setError('Password is required.');
-      inputRef.current?.focus();
-      return;
-    }
-    setSubmitting(true);
-    setError(null);
-    try {
-      await api.authElevate(password);
-      // Success: clear the in-memory password before resolving so
-      // the cleartext doesn't linger in component state beyond the
-      // moment of use.
-      setPassword('');
-      onClose(true);
-    } catch (e) {
-      // Common case: wrong password returns 401 with a generic
-      // detail. Surface inline; keep the modal open so the end user
-      // can retry without losing their place.
-      const msg = e instanceof Error ? e.message : String(e);
-      setError(msg);
-      setSubmitting(false);
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    }
-  };
-
-  const cancel = () => {
-    setPassword('');
-    setError(null);
-    onClose(false);
-  };
-
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="Confirm your password to continue"
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
-      }}
-      onClick={(ev) => {
-        // Backdrop click cancels. Inner clicks stopPropagation below.
-        if (ev.target === ev.currentTarget && !submitting) cancel();
-      }}
+    <Modal
+      onClose={() => { if (!busyRef.current) onClose(false); }}
+      align="center"
+      width={480}
+      ariaLabel="Confirm your password to continue"
     >
-      <div
-        className="panel"
-        style={{
-          background: 'var(--bg, #1f1f1f)',
-          border: '1px solid var(--border, #444)',
-          borderRadius: 6,
-          padding: 18,
-          minWidth: 360,
-          maxWidth: 480,
-          boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
-        }}
-        onClick={(ev) => ev.stopPropagation()}
-      >
-        <h2 style={{ marginTop: 0, marginBottom: 8 }}>
-          Confirm your password
-        </h2>
-        <p style={{ marginTop: 0, fontSize: 13, color: 'var(--text-dim)' }}>
-          This action is gated on a recent password re-confirmation. Confirm
-          your password to continue; the original request will retry
-          automatically. Your session role and permissions are unchanged.
-        </p>
-        <form
-          onSubmit={(ev) => {
-            ev.preventDefault();
-            if (!submitting) void submit();
-          }}
-        >
-          <label style={{ display: 'block', marginTop: 8 }}>
-            <span className="label" style={{ display: 'block', marginBottom: 4 }}>
-              Password
-            </span>
-            <input
-              ref={inputRef}
-              type="password"
-              value={password}
-              autoComplete="current-password"
-              onChange={(ev) => setPassword(ev.target.value)}
-              disabled={submitting}
-              onKeyDown={(ev) => {
-                if (ev.key === 'Escape' && !submitting) {
-                  ev.preventDefault();
-                  cancel();
-                }
-              }}
-              style={{ width: '100%' }}
-            />
-          </label>
-          {error && (
-            <div
-              className="banner error"
-              style={{ marginTop: 10, fontSize: 12 }}
-            >
-              {error}
-            </div>
-          )}
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'flex-end',
-              gap: 8,
-              marginTop: 14,
-            }}
-          >
-            <button
-              type="button"
-              onClick={cancel}
-              disabled={submitting}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="primary"
-              disabled={submitting || !password}
-            >
-              {submitting ? 'Confirming…' : 'Confirm'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+      <h2 style={{ marginTop: 0, marginBottom: 8 }}>
+        Confirm your password
+      </h2>
+      <p style={{ marginTop: 0, fontSize: 13, color: 'var(--text-dim)' }}>
+        This action is gated on a recent password re-confirmation. Confirm
+        your password to continue; the original request will retry
+        automatically. Your session role and permissions are unchanged.
+      </p>
+      <ElevationForm
+        open={open}
+        submitLabel="Confirm"
+        busyLabel="Confirming…"
+        onBusyChange={setBusy}
+        onElevated={() => onClose(true)}
+        onCancel={() => onClose(false)}
+      />
+    </Modal>
   );
 }

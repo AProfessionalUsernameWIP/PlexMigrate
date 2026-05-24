@@ -1,4 +1,4 @@
-# PlexMigrate .gitignore
+# Hestia-MediaManager .gitignore
 # What's allowed in the repo: source code, Dockerfiles, requirements,
 # the Makefile, and docs. Everything else listed below is either a
 # build artefact, a Python/Node cache, or runtime data that contains
@@ -56,6 +56,25 @@ plex_exports/
 *.plexexport (*).json
 *.plexbackup (*).json
 
+# Engine run-output archives. The snapshot / direct / fan-out engines
+# write a ``run_<server>_<libraries>_<timestamp>.zip`` of a completed
+# run, often into the repo root. Generated artefacts, never source.
+run_*.zip
+
+# Loose media / scratch files dropped at the repo root - screenshots,
+# screen recordings, stray downloads. Anchored with a leading slash so
+# real image assets under frontend/ are NOT affected.
+/*.png
+/*.jpg
+/*.jpeg
+/*.gif
+/*.webp
+/*.bmp
+/*.mp4
+/*.webm
+/*.mov
+/*.avi
+
 # SQLite databases - media.db, snapshots.db, the auth DB, and the
 # per-server snapshot .db files. All are runtime data: library
 # contents, watch history, and (for the auth / managed-user tables)
@@ -96,12 +115,55 @@ Thumbs.db
 docker-compose.override.yml
 .env.local
 
+# ── Dev blog (temporarily excluded from git pre-v0.18.0) ──────────
+# The dev blog HTML lives at frontend/public/dev-blog/ and is served
+# by Vite at /dev-blog/ when the in-app tab is enabled. Operator is
+# doing personal-cleanup polish before public exposure; the tab is
+# also commented out in frontend/src/App.tsx for this release.
+# Remove this block when the blog is ready to ship publicly.
+frontend/public/dev-blog/
+
+# ── Dev-only utilities not part of the shipped product ────────────
+# Standalone CLI fidelity scanner: referenced by dev_docs/QA_CHECKLIST
+# §19 but not wired into the in-app surface. Useful for operator-side
+# spot-checks of snapshot databases, not for end users.
+tools/
+
+# Experimental sidecar-application scaffolding (currently empty
+# placeholder; not part of v0.18.0).
+sidecar-applications/
+
+# Root-level HTML files at repo root are operator-internal review
+# docs (e.g. TEST_RESULTS_AND_NEXT_STEPS.html). The /*.md rule above
+# excludes root markdown with explicit !README/!QUICKSTART/etc.
+# allowances; this rule does the same for root HTML.
+/*.html
+
 # ── Local-only dev scaffolding (NOT for the repo) ──────────────────
 # Everything host-only lives under dev_docs/: developer working-notes,
 # the backend unit-test suite (dev_docs/tests_backend/), its
 # requirements-dev.txt, sample data/logs, reviews, specs, and the
 # CHANGELOG. None of it is part of the shipped product.
 dev_docs/
+
+# Multi-agent coordination workspace. Holds per-agent scope files
+# and the shared claudeagentwork.md handoff log; only meaningful to
+# the local agent runtime, never shipped.
+agent-context/
+
+# Per-project state directory for the local agent runtime (settings
+# for permissions / tools). Host-only, never part of the shipped
+# product.
+.claude/
+
+# Root-level test directories. The multi-agent coordination put
+# tests_backend/ (shared territory) + tests_live/ + tests_structural/
+# at the repo root; per the local-only-dev-scaffolding policy above,
+# they stay local. The 4 historically-tracked files are removed from
+# the index via `git rm --cached` so a fresh clone never sees them.
+tests_backend/
+tests_live/
+tests_structural/
 
 # Root-level Markdown is local-only working/dev docs (design notes,
 # etc.) EXCEPT the shipped docs. Add a new doc at the repo root

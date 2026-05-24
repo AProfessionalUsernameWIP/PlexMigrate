@@ -1,4 +1,4 @@
-// Plan[RUN-JOB-UI] PR-4: D-OWNER user-creation modal.
+// User-creation modal.
 //
 // End user-facing surface that lists source-side managed users not
 // present on the destination, lets the end user pick a target
@@ -7,8 +7,7 @@
 // ``user_create_specs``; ``server/jobs.py`` walks it through
 // ``services/user_creation.py`` BEFORE any item-state write.
 //
-// Two safety layers per the end user's choice on RJ-OWNER-DEFER-CREATE
-// (ship UI + backend together):
+// Two safety layers:
 //   1. Per-row "Skip" action so the end user can opt out of any
 //      individual create without aborting the whole job.
 //   2. A typed CREATE confirmation that gates the "Save and proceed"
@@ -23,6 +22,7 @@
 // managed_users.service_password_enc on the backend.
 
 import { useEffect, useMemo, useState } from 'react';
+import { Modal } from './Modal';
 
 
 export interface ProposedUser {
@@ -156,37 +156,15 @@ export function UserCreationModal({
   };
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="user-creation-modal-title"
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 20,
-      }}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+    <Modal
+      onClose={onClose}
+      align="center"
+      width={920}
+      maxHeight="90vh"
+      tone="warn"
+      ariaLabel="Create users on destination"
     >
-      <div
-        className="panel"
-        style={{
-          background: 'var(--bg-1, #1c1c1c)',
-          maxWidth: 920,
-          width: '100%',
-          maxHeight: '90vh',
-          overflow: 'auto',
-          padding: 20,
-          border: '1px solid var(--warn, #d97706)',
-        }}
-      >
-        <h2 id="user-creation-modal-title" style={{ marginTop: 0, color: 'var(--warn, #d97706)' }}>
+        <h2 style={{ marginTop: 0, color: 'var(--warn, #d97706)' }}>
           Create users on destination
         </h2>
         <p style={{ fontSize: 13, color: 'var(--text-dim)', marginTop: 0 }}>
@@ -350,7 +328,6 @@ export function UserCreationModal({
             Save and proceed
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

@@ -26,7 +26,7 @@ Tags are space-separated key=value pairs so a future SIEM pipeline can
 pull them without re-parsing. ``user_id`` may be a username or an
 ``app_user_uuid`` depending on how the caller addressed the user — the
 mixed key reflects the same dual-key reality the cache itself stores
-post-schema-v2 (2026-05-16).
+post-schema-v2.
 """
 
 from __future__ import annotations

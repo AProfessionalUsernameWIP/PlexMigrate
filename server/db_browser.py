@@ -146,6 +146,16 @@ def _playlist_cache_path() -> Optional[Path]:
     return _single_path_or_none(playlist_cache_db._db_path)
 
 
+def _collection_cache_path() -> Optional[Path]:
+    from server import collection_cache_db
+    return _single_path_or_none(collection_cache_db._db_path)
+
+
+def _server_mirror_path() -> Optional[Path]:
+    from server import server_mirror_db
+    return _single_path_or_none(server_mirror_db._db_path)
+
+
 def _snapshot_files() -> List[Dict[str, Any]]:
     """Walk the snapshot registry; return one dict per captured .db
     file with a stable instance_id (the registry row id), a label
@@ -198,6 +208,48 @@ def _snapshot_label(row: Dict[str, Any]) -> str:
     else:
         iso = "?"
     return f"{server_name} - {snapshot_name} ({iso})"
+
+
+def _dev_console_files() -> List[Dict[str, Any]]:
+    """One dict per Server Commands per-server mirror .db file. The
+    root-admin developer console keeps a disposable SQLite mirror of
+    each server's library / playlist / per-user state under
+    server_data/server_commands/. instance_id is the server id."""
+    try:
+        from server import dev_console_db
+        server_ids = dev_console_db.mirror_server_ids()
+    except Exception:
+        log.exception(
+            "dev_console_files: mirror_server_ids failed; returning empty.",
+        )
+        return []
+    names: Dict[str, str] = {}
+    try:
+        from server import server_registry
+        for row in server_registry.list_servers(include_tokens=False):
+            sid = str(row.get("id") or "")
+            if sid:
+                names[sid] = row.get("name") or ""
+    except Exception:
+        log.debug("dev_console_files: server-name lookup failed")
+    out: List[Dict[str, Any]] = []
+    for sid in server_ids:
+        path = dev_console_db.db_path(sid)
+        try:
+            size = path.stat().st_size if path.exists() else 0
+        except OSError:
+            size = 0
+        name = names.get(str(sid)) or str(sid)
+        out.append({
+            "instance_id": str(sid),
+            "label":       name,
+            "file_path":   str(path),
+            "size_bytes":  size,
+            "server_id":   str(sid),
+            "server_name": name,
+            "exists":      path.exists(),
+        })
+    return out
 
 
 _CATALOGUE: List[DatabaseType] = [
@@ -259,6 +311,53 @@ _CATALOGUE: List[DatabaseType] = [
         cardinality="single",
         sensitivity="medium",
         single_path=_playlist_cache_path,
+    ),
+    DatabaseType(
+        key="collection_cache",
+        display_name="collection_cache.db",
+        description=(
+            "Per-collection cached children list keyed on Plex's "
+            "collection.updatedAt. Each row also carries owner_user_id "
+            "so library-wide and per-managed-user collections are "
+            "separately attributable. The snapshotter's Collections "
+            "phase reads this cache to skip the expensive "
+            "/library/metadata/X/children fetch on unchanged "
+            "collections; the Servers > Overview bulk-cache button "
+            "is the operator-facing way to warm or clear it."
+        ),
+        cardinality="single",
+        sensitivity="low",
+        single_path=_collection_cache_path,
+    ),
+    DatabaseType(
+        key="server_mirror",
+        display_name="server_mirror.db",
+        description=(
+            "Per-server metadata mirror (item ids, GUIDs, full-paths, "
+            "path-tails) used by the engine's resolver as Tier-0 of "
+            "the resolution chain so cross-server transfers don't "
+            "re-fetch metadata that has not changed since the last "
+            "sync. WAL mode, integrity-check on init, drift events "
+            "recorded for the Drift History sub-tab."
+        ),
+        cardinality="single",
+        sensitivity="low",
+        single_path=_server_mirror_path,
+    ),
+    DatabaseType(
+        key="dev_console_mirror",
+        display_name="Server Commands mirrors",
+        description=(
+            "Per-server disposable SQLite mirror behind the root-admin "
+            "Server Commands console: library items, per-user watch / "
+            "rating / favorite / resume state, playlists, collections, "
+            "and staged (un-sent) commands. One file per server under "
+            "server_data/server_commands/; the console's background "
+            "sync worker rebuilds it and a schema bump drops it."
+        ),
+        cardinality="many",
+        sensitivity="medium",
+        many_lister=_dev_console_files,
     ),
     DatabaseType(
         key="snapshot_file",

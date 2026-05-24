@@ -1,5 +1,5 @@
 """
-Snapshot pipeline for PlexMigrate.
+Snapshot pipeline for Hestia-MediaManager.
 
 snapshot_watch_history / snapshot_playlists / snapshot_collections / snapshot_ratings
 gather data from a live Plex server. snapshot_library orchestrates them
@@ -25,11 +25,9 @@ from services.dashboard import (
     DashboardState,
     _advance_lib,
     _build_dashboard,
-    _check_terminal_size,
     _current_item,
     _http_lib_var,
     _keyboard_thread,
-    _make_progress,
     _thread_category,
     submit_with_context,
 )
@@ -47,6 +45,7 @@ from services.resolver import (
 )
 from services.auth import get_home_users
 from services.user_labels import owner_display_label
+from services.backend_translation import affinity_row_is_meaningful
 
 
 def _log_serialize_diag(
@@ -414,6 +413,11 @@ def snapshot_watch_history(
     We only snapshot items that have actually been watched (viewCount > 0).
     Capturing snapshot unwatched items would add noise and isn't useful for migration.
 
+    KNOWN LIMITATION (SNAP-04, operator-confirmed 2026-05-21, by design):
+    an item with a resume offset but zero completed plays is intentionally
+    NOT captured. "Watched" means completed plays only; in-progress /
+    resume-point fidelity is out of scope for the snapshot.
+
     Args:
         section: A python-plexapi LibrarySection.
         logger (Logger): Shared logger.
@@ -519,7 +523,15 @@ def snapshot_watch_history(
                             len(watched), _loop_t0, _loop_http0)
         logger.info(f"[{section.title}] Play Count snapshot: {len(watched)} item(s) found (user: {user})")
     except Exception as e:
+        # SNAP-09: do NOT swallow + return the partial list. A snapshot
+        # that silently drops part of a library's watch history is
+        # indistinguishable from a clean one, and used as a Replace
+        # restore source it writes incomplete data to the destination.
+        # Re-raise so the snapshot job fails loudly. (A user-requested
+        # Stop exits via the break above and never reaches here.) This
+        # mirrors the adapter-path fix in snapshotter_adapter.py.
         logger.error(f"Error fetching Play Count for {section.title}: {e}")
+        raise
     return watched
 
 
@@ -606,6 +618,9 @@ def build_playlist_cache(
     server: PlexServer,
     logger: logging.Logger,
     owner_id: Optional[int] = None,
+    *,
+    user_display: Optional[str] = None,
+    wanted_playlist_types: Optional[Set[str]] = None,
 ) -> List[Tuple[Any, List]]:
     """
     Fetch every playlist owned by ``owner_id`` on this server, once.
@@ -635,11 +650,27 @@ def build_playlist_cache(
     Processing panel under phase ``"fetching"`` - for a server with
     hundreds of playlists this gives the user a visible heartbeat
     during what would otherwise look like a stalled warmup.
+
+    Visibility + scope notes:
+      * ``user_display`` (optional) is the display name of the user
+        whose token-bound connection is being warmed. Used purely for
+        the dashboard activity line so the operator can tell WHICH
+        user a given warm is for instead of every warm appearing as
+        "Plex Owner".
+      * ``wanted_playlist_types`` (optional) is a set of
+        ``playlistType`` strings (``"video"``, ``"audio"``,
+        ``"photo"``) derived from the libraries the run selected.
+        Playlists outside that type set are skipped before
+        ``pl.items()`` so an audio-library snapshot doesn't pay the
+        ``items()`` cost on every video playlist (and vice versa).
+        Plex returns ``playlistType`` on the lightweight list response
+        so the filter costs no extra HTTP.
     """
     cache: List[Tuple[Any, List]] = []
     skipped_500 = 0
     skipped_not_owned = 0
     skipped_smart = 0
+    skipped_wrong_type = 0
     try:
         all_playlists = server.playlists()
     except Exception as e:
@@ -647,12 +678,7 @@ def build_playlist_cache(
         return cache
 
     server_label = getattr(server, "friendlyName", "") or "(server-wide)"
-    if state.get_dashboard():
-        state.get_dashboard().push_activity(
-            "phase", "-",
-            f"Warming playlist cache for '{server_label}' "
-            f"({owner_display_label()}, {len(all_playlists)} playlists)…",
-        )
+    user_label = user_display or owner_display_label()
     for pl in all_playlists:
         # Throttle-reduction: skip smart playlists entirely. ``pl.items()``
         # on a smart playlist makes Plex *run the filter* server-side -
@@ -673,6 +699,18 @@ def build_playlist_cache(
             # attribute). We let those through rather than guess.
             if pl_owner is not None and pl_owner != owner_id:
                 skipped_not_owned += 1
+                continue
+
+        # Type filter. Selected libraries dictate which
+        # playlist types are relevant. Plex's ``playlistType`` is set
+        # on the lightweight list response so this short-circuits
+        # ``pl.items()`` for any out-of-scope playlist (audio playlists
+        # on a video-only snapshot, photo playlists on a music-only
+        # snapshot, etc.) before any per-playlist request fires.
+        if wanted_playlist_types is not None:
+            pl_type = getattr(pl, "playlistType", None)
+            if pl_type and pl_type not in wanted_playlist_types:
+                skipped_wrong_type += 1
                 continue
 
         pl_title = getattr(pl, "title", "?")
@@ -701,6 +739,29 @@ def build_playlist_cache(
         logger.info(
             f"[{server_label}] Skipped {skipped_not_owned} playlist(s) shared to this "
             f"user - they will be exported once under their actual owner."
+        )
+    if skipped_wrong_type:
+        logger.info(
+            f"[{server_label}] Skipped {skipped_wrong_type} playlist(s) outside the "
+            f"selected libraries' types - the run only covers "
+            f"{','.join(sorted(wanted_playlist_types)) if wanted_playlist_types else '(all)'}."
+        )
+    # Dashboard activity line is emitted AFTER the loop +
+    # filters so the count reflects what was actually warmed for this
+    # user (not the total visible to their token). Skip entirely when
+    # zero playlists were fetched so a 12-home-user run doesn't flood
+    # the activity feed with "0 playlists" lines for every user who
+    # doesn't own any. The user_label (passed by caller) reports which
+    # user the warm was for instead of every line saying "Plex Owner".
+    if state.get_dashboard() and cache:
+        type_note = (
+            f", types: {','.join(sorted(wanted_playlist_types))}"
+            if wanted_playlist_types else ""
+        )
+        state.get_dashboard().push_activity(
+            "phase", "-",
+            f"Playlist cache warmed for '{server_label}' / {user_label}: "
+            f"{len(cache)} playlist(s) fetched{type_note}",
         )
     return cache
 
@@ -911,7 +972,7 @@ def snapshot_collections(
     """
     result = []
     skipped = 0
-    # PR-2 / Phase C (auth refactor - collections dedup as safety net):
+    # Collections dedup as a safety net:
     # the auth doc's premise is that user-scoped tokens make the
     # rating-key dedup at Layer 2 unnecessary because the Plex API
     # already returns only what the user sees. We keep the dedup as a
@@ -923,14 +984,30 @@ def snapshot_collections(
     try:
         raw: List[Any] = list(section.collections())
 
+        # Rating-key types are heterogeneous
+        # across the snapshot path. ``serialize_collection`` writes
+        # ``rating_key`` as an int (``getattr(collection, "ratingKey")``),
+        # while the collection-children cache stores the column as
+        # TEXT and returns ``rating_key`` as a str on hits. Owners
+        # whose collections phase served fully from the cache produce
+        # an ``owner_coll_keys`` set of strings; the per-user gather
+        # passes that set in as ``skip_rating_keys``, but plexapi's
+        # ``coll.ratingKey`` is an int, so ``in`` / subset checks
+        # quietly fail and every server-wide collection gets credited
+        # to every home user. Normalize both sides to str once here.
+        norm_skip: Optional[Set[str]] = (
+            {str(k) for k in skip_rating_keys if k is not None}
+            if skip_rating_keys else None
+        )
+
         # ── Layer 1: early exit ───────────────────────────────────────
         # Build rating-key set from the cheap metadata we already have
         # (ratingKey is always present on the list response - no extra
         # API call needed). If every key is library-wide, this user has
         # no personal collections at all; skip the entire loop.
-        if skip_rating_keys:
-            user_keys: Set[Any] = {c.ratingKey for c in raw}
-            if user_keys <= skip_rating_keys:
+        if norm_skip:
+            user_keys: Set[str] = {str(c.ratingKey) for c in raw}
+            if user_keys <= norm_skip:
                 logger.debug(
                     "[%s] No personal collections for this user - skipped (%d library-wide)",
                     section.title, len(user_keys),
@@ -948,7 +1025,7 @@ def snapshot_collections(
                 _oid = getattr(_c, "librarySectionUserID", None)
                 if _oid is not None and not _oid:
                     continue
-            if skip_rating_keys is not None and _c.ratingKey in skip_rating_keys:
+            if norm_skip is not None and str(_c.ratingKey) in norm_skip:
                 continue
             _eligible += 1
         if state.get_dashboard() and _eligible:
@@ -956,12 +1033,32 @@ def snapshot_collections(
             state.get_dashboard().add_run_total(_eligible)
 
         # DIAGNOSTIC: see _log_serialize_diag / snapshot_watch_history.
-        # For collections each iteration also calls ``coll.items()``
-        # (once in serialize_collection, again for the media log), so a
-        # high calls/item ratio here is expected - the useful signal is
-        # the absolute call count vs collection count.
+        # ``collection.items()`` hits
+        # ``/library/metadata/{X}/children`` which Plex serializes
+        # server-side per library section. Empirical data from a
+        # 316-collection Movies library: 290-376s sequential AND with
+        # 8-thread client-side parallelism (Plex is the ceiling).
+        # The real fix is to avoid the call entirely when possible:
+        # we cache per-collection children keyed on the collection's
+        # own ``updatedAt`` timestamp (cheap, comes back in the
+        # lightweight ``section.collections()`` response). Cache hit
+        # = skip the .items() call; cache miss = fetch + cache.
         _loop_t0 = time.monotonic()
         _loop_http0 = state.get_http_count()
+        cache_hits = 0
+        cache_misses = 0
+        # Resolve server_id once for cache lookups. Comes from the
+        # job runner's state set at job entry. Empty server_id
+        # disables the cache (cleanly degrades to legacy path).
+        try:
+            cache_server_id = str(getattr(state, "_snapshot_server_id", "") or "")
+        except Exception:
+            cache_server_id = ""
+        try:
+            from server import collection_cache_db
+        except Exception:
+            collection_cache_db = None  # type: ignore[assignment]
+
         for coll in raw:
             # Stop P3: item-level checkpoint (see snapshot_watch_history).
             if stop_event is not None and stop_event.is_set():
@@ -970,32 +1067,75 @@ def snapshot_collections(
                     "%d collection(s)", section.title, len(result),
                 )
                 break
-            # ── Layer 3: fast owner-detection via librarySectionUserID ─
+
+            # ── Layer 3: fast owner-detection via librarySectionUserID
             if fast_owner_detection:
                 owner_id = getattr(coll, "librarySectionUserID", None)
-                if owner_id is not None:
-                    # Attribute is populated on this Plex build.
-                    # ``0`` or falsy == library-wide (admin-created).
-                    # Any non-zero value == personal (user-created).
-                    if not owner_id:
-                        skipped += 1
-                        continue  # library-wide - skip all expensive work
-                    # Non-zero: personal collection, fall through to process
-                else:
-                    # Attribute absent - this Plex build doesn't expose it.
-                    # Fall back to rating-key check (Layer 2 below).
-                    pass
+                if owner_id is not None and not owner_id:
+                    skipped += 1
+                    continue
 
             # ── Layer 2: rating-key dedup ─────────────────────────────
-            if skip_rating_keys is not None and coll.ratingKey in skip_rating_keys:
+            if norm_skip is not None and str(coll.ratingKey) in norm_skip:
                 skipped += 1
                 layer2_skipped += 1
-                continue  # library-wide confirmed - skip all expensive work
+                continue
 
-            # This collection is either owner-level or genuinely personal
-            # - process it fully.
+            # ── Cache check ───────────────────────────────────────────
+            # Read the live collection's updatedAt from the
+            # lightweight list response (free — no extra HTTP call).
+            try:
+                live_updated_at = float(getattr(coll, "updatedAt", 0) or 0)
+                # plexapi sometimes returns datetime; convert.
+                if hasattr(coll.updatedAt, "timestamp"):
+                    live_updated_at = float(coll.updatedAt.timestamp())
+            except (AttributeError, TypeError, ValueError):
+                live_updated_at = 0.0
+
+            cached_dict: Optional[Dict] = None
+            if collection_cache_db is not None and cache_server_id:
+                try:
+                    cached_dict = collection_cache_db.lookup_cached_collection(
+                        cache_server_id, str(coll.ratingKey),
+                        live_updated_at=live_updated_at,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] collection cache lookup failed for "
+                        "%r: %s", section.title,
+                        getattr(coll, "title", "?"), exc,
+                    )
+                    cached_dict = None
+
+            if cached_dict is not None:
+                cache_hits += 1
+                with _current_item(section.title, "collection",
+                                   coll.title, phase="cached"):
+                    result.append(cached_dict)
+                if state.get_dashboard():
+                    state.get_dashboard().inc_collection()
+                if state._media_logger:
+                    state._media_logger.debug(_fmt_media_line(
+                        "EXPORT", section.title, "collection",
+                        coll.title,
+                        items=len(cached_dict.get("items") or []),
+                    ))
+                continue
+
+            # Cache miss: fetch via plexapi (the slow path) + write
+            # the result back to the cache for next time.
+            cache_misses += 1
+            try:
+                serialized = serialize_collection(coll)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] collection %r failed to serialize: %s",
+                    section.title,
+                    getattr(coll, "title", "?"), exc,
+                )
+                continue
             with _current_item(section.title, "collection", coll.title, phase="capturing"):
-                result.append(serialize_collection(coll))
+                result.append(serialized)
             if state.get_dashboard():
                 state.get_dashboard().inc_collection()
             if state._media_logger:
@@ -1007,15 +1147,52 @@ def snapshot_collections(
                     "EXPORT", section.title, "collection", coll.title,
                     items=n_members,
                 ))
+            # Write-through to the cache so the next snapshot can
+            # skip the .items() call entirely for this collection.
+            # Scope the cached entry under its owner so
+            # the operator can see WHICH user a collection belongs
+            # to in the per-server cache breakdown. librarySectionUserID
+            # is None / 0 for library-wide (admin-owned) → "_owner";
+            # a non-zero value is the managed user's id.
+            try:
+                _lsuid = getattr(coll, "librarySectionUserID", None)
+            except Exception:
+                _lsuid = None
+            owner_user_id = (
+                "_owner" if _lsuid is None or not _lsuid
+                else str(_lsuid)
+            )
+            if collection_cache_db is not None and cache_server_id:
+                try:
+                    collection_cache_db.write_collection_cache(
+                        cache_server_id, str(coll.ratingKey),
+                        serialized=serialized,
+                        live_updated_at=live_updated_at,
+                        section_id=str(getattr(section, "key", "")) or None,
+                        owner_user_id=owner_user_id,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] collection cache write failed for "
+                        "%r: %s", section.title,
+                        getattr(coll, "title", "?"), exc,
+                    )
 
         _log_serialize_diag(logger, section.title, "collections",
                             len(result), _loop_t0, _loop_http0)
+        if cache_hits or cache_misses:
+            logger.info(
+                "[%s] collections cache: %d hit(s), %d miss(es); "
+                "next snapshot will skip the .items() call for the "
+                "cached collections unless their updatedAt advances.",
+                section.title, cache_hits, cache_misses,
+            )
         logger.info(
             "[%s] Collection snapshot: %d collection(s) found%s",
             section.title, len(result),
             f" ({skipped} library-wide skipped)" if skipped else "",
         )
-        # PR-2 / Phase C: explicit signal when Layer 2 (rating-key
+        # Explicit signal when Layer 2 (rating-key
         # dedup) actually catches anything, so we can later judge
         # whether the safety net is still earning its keep after the
         # per-user-token refactor is in place. If this never logs
@@ -1159,7 +1336,11 @@ def snapshot_ratings(
                 )
                 break
             rating = getattr(item, "userRating", None)
-            if rating is not None:
+            # Keep the row only when it carries a real rating. Plex
+            # has no per-item favorite, so is_favorite is None here.
+            # affinity_row_is_meaningful is the shared predicate every
+            # capture / ingest site uses (see backend_translation).
+            if affinity_row_is_meaningful(rating, None):
                 with _current_item(section.title, item.type, item.title, phase="capturing"):
                     # Use the same serialise helper watch_history uses
                     # so the record carries ``rating_key`` and the rest
@@ -1192,7 +1373,12 @@ def snapshot_ratings(
                             len(rated), _loop_t0, _loop_http0)
         logger.info(f"[{section.title}] Ratings snapshot: {len(rated)} item(s) found (user: {user})")
     except Exception as e:
+        # SNAP-09: re-raise instead of returning a partial list - see
+        # snapshot_watch_history. A swallowed error here yields a
+        # silently incomplete ratings set that looks like a clean
+        # capture.
         logger.error(f"Error fetching ratings for {section.title}: {e}")
+        raise
     return rated
 
 
@@ -1214,7 +1400,7 @@ def snapshot_library(
     # absent from the filter list). Default True preserves historical
     # behaviour for ad-hoc / unfiltered runs.
     owner_included: bool = True,
-    # PR-3 / Phase D - four-flag data-type filter. ``skip_*`` is folded
+    # Four-flag data-type filter. ``skip_*`` is folded
     # into the include_* form by ``run_snapshot`` before this is called,
     # so the per-library gather only needs to consult the include_*
     # flags. The legacy args stay accepted for callers that haven't
@@ -1223,7 +1409,7 @@ def snapshot_library(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
-    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # Per-library
     # metric map. When provided AND this library has an entry, the
     # entry's flags OVERRIDE the four include_* booleans above for
     # this library only. Keys are library section titles; values are
@@ -1277,13 +1463,10 @@ def snapshot_library(
     # inside this function lands in run_timings with server_id=NULL,
     # and the ETA trainer's _key_from_entry drops the row on the
     # floor (it requires non-empty server_id to build a BucketKey).
-    # Bug observed 2026-05-16: 2174 of 2200 timing entries had
-    # server_id=NULL because of this gap; the trainer trained
-    # essentially nothing across 29 runs.
     if not server_id:
         server_id = getattr(state, "_snapshot_server_id", "") or ""
 
-    # Phase C (admin-management follow-up, 2026-05-15): if a per-library
+    # If a per-library
     # metric map was passed in AND this library has an entry, the
     # entry's flags OVERRIDE the four include_* booleans for this
     # library only. Every internal read below (49+ call sites) keeps
@@ -1399,11 +1582,11 @@ def snapshot_library(
 
     def gather_watch():
         if not include_watch_history:
-            # PR-6: per-library skip notices are INFO. The end user
+            # Per-library skip notices are INFO. The end user
             # uncheckd this type and seeing one confirmation per
             # library is the expected normal-operations output -
             # not noise. The redundant top-level summary line is
-            # what was removed in PR-6, not these.
+            # what was removed, not these.
             logger.info("[%s] Watch history skipped (include_watch_history=False)", lib_name)
             _advance()
             return
@@ -1435,7 +1618,7 @@ def snapshot_library(
         _advance()
 
     def gather_playlists():
-        # PR-3 / Phase D: skip_playlists (legacy) and include_playlists
+        # skip_playlists (legacy) and include_playlists
         # are honoured together - either disables the gather.
         if skip_playlists or not include_playlists:
             logger.info("[%s] Playlists skipped (include_playlists=False)", lib_name)
@@ -1556,9 +1739,30 @@ def snapshot_library(
             # regardless of the end user's force_bulk setting - the
             # single biggest missed optimisation on multi-user servers.
             user_prefetch: Optional[Dict[str, Any]] = None
+            # Per-user override knob. When
+            # ``snapshot_user_pass_prefer_server_side`` is True AND the
+            # smart strategy would otherwise force bulk on a show /
+            # artist library, this branch redirects this user's pass
+            # to the server-side filter path. Owner pass is reached
+            # via results["watch_history"] elsewhere with no override.
+            # The override is gated on the smart strategy + the
+            # leaf-mismatch library types so a force_bulk operator
+            # choice is still honored; only the smart default's
+            # always-bulk-for-show/artist rule flips.
+            _effective_user_strategy = strategy
+            if (
+                strategy == "smart"
+                and getattr(user_section, "type", "") in ("show", "artist")
+            ):
+                try:
+                    from services import tunables as _tn
+                    if _tn.snapshot_user_pass_prefer_server_side():
+                        _effective_user_strategy = "force_server_side"
+                except Exception:
+                    pass
             if include_watch_history or include_ratings:
                 if _should_use_bulk(
-                    strategy=strategy,
+                    strategy=_effective_user_strategy,
                     section=user_section,
                     include_watch_history=include_watch_history,
                     include_ratings=include_ratings,
@@ -1610,7 +1814,7 @@ def snapshot_library(
                 user_handle=username,
                 push_to_activity_feed=True,
             ) as _u_t:
-                # PR-3 / Phase D - each include_* flag gates its
+                # Each include_* flag gates its
                 # corresponding per-user gather. Defaults preserve
                 # pre-Phase-D behaviour exactly.
                 u_watch = (
@@ -1770,7 +1974,18 @@ def snapshot_library(
     }
 
     # Phase 2 - per-user gathers, only if any users exist for this run.
+    # No multiprocessing: Plex's response rate (per-server
+    # throttle) is the actual ceiling, not the GIL, so threading and
+    # MP produced equivalent wall-clock numbers in real runs. The
+    # MP code path also dropped per-user log lines under load, hiding
+    # what each user contributed. Threading is the right tool for
+    # network-bound work: the GIL releases on socket waits so
+    # multiple threads have HTTP requests in flight simultaneously.
     if n_user_tasks > 0:
+        logger.info(
+            "[%s] home-user dispatch: %d user(s), strategy=thread",
+            lib_name, n_user_tasks,
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, n_user_tasks)) as pool:
             futures = []
             for username, _, user_server in (home_users or []):
@@ -1865,7 +2080,7 @@ def snapshot_library(
         },
     }
 
-    # PR-13 fix #3: the engine is media.db-primary now. The per-
+    # The engine is media.db-primary. The per-
     # library payload we just built in memory is ingested directly
     # into media.db via :func:`server.media_db.ingest_snapshot_payload`,
     # which enforces the server-wide vs user-private dedup discipline
@@ -1993,7 +2208,7 @@ def run_snapshot(
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
     skip_playlist_prebuild: bool = False,
-    # PR-3 / Phase D - four-flag data-type filter. Defaults preserve
+    # Four-flag data-type filter. Defaults preserve
     # pre-Phase-D behaviour exactly. ``skip_*`` legacy flags are
     # honoured alongside (either disables the corresponding type).
     include_watch_history: bool = True,
@@ -2014,7 +2229,7 @@ def run_snapshot(
     # yet. A positive value caps libraries-in-parallel without
     # touching the per-library worker count.
     library_workers: int = 0,
-    # Phase C (admin-management follow-up, 2026-05-15): per-library
+    # Per-library
     # metric map sourced from the end user's selection. Forwarded to
     # ``snapshot_library`` for each library; entries override the
     # global include_* flags for that library specifically.
@@ -2077,7 +2292,7 @@ def run_snapshot(
         "settings.snapshot_library_workers" if library_workers > 0 else "settings.workers",
     )
 
-    # 2026-05-17 (operator request): pass user_filter into get_home_users
+    # Pass user_filter into get_home_users
     # so we authenticate ONLY the picked users instead of every home
     # user. The post-fetch filter below still runs as a belt-and-braces
     # check (handles the owner-included case + final whittling).
@@ -2160,12 +2375,6 @@ def run_snapshot(
     # the cache once per managed-user token, producing the "Warming
     # playlist cache for 'My Server' (N playlists)…" lines we shouldn't
     # be seeing on a watch-history-only run. Honour both gates now.
-    #
-    # PR-6: the previous "Playlist processing skipped" INFO line was
-    # removed here - it was redundant noise next to the per-library
-    # "[Music] Playlists skipped" lines emitted by gather_playlists(),
-    # which already convey the same information with per-library
-    # precision.
     if skip_playlists or not include_playlists:
         pass  # nothing to do at the top level - per-library lines cover it
     elif skip_playlist_prebuild:
@@ -2174,204 +2383,185 @@ def run_snapshot(
         run_lazy_caches = {}
         logger.info("Playlist pre-build skipped (skip_playlist_prebuild=True) - fetching lazily per server")
     else:
+        # Derive the set of relevant Plex
+        # playlistType strings from the selected libraries. Each Plex
+        # library section has a ``type`` ("movie" / "show" / "artist" /
+        # "photo") that maps to one of Plex's three playlist types
+        # ("video" / "audio" / "photo"). If the run only selected video
+        # libraries, the warm skips audio + photo playlists before
+        # calling ``pl.items()`` on them. None ↦ no filter, preserving
+        # legacy behavior for older callers / tests.
+        _type_map = {
+            "movie": "video", "show": "video",
+            "artist": "audio",
+            "photo": "photo",
+        }
+        wanted_playlist_types: Set[str] = {
+            _type_map[s.type] for s in selected_libs
+            if getattr(s, "type", None) in _type_map
+        } or {"video", "audio", "photo"}  # fall through if all unknown
+
+        # Parallel list so each warm knows the display name of the user
+        # whose token-bound connection it's warming. owner_display_label()
+        # is the owner's actual name (e.g. the Plex Owner's email/handle)
+        # at index 0; each home user's username at the matching index.
         unique_servers: List[PlexServer] = [server]
+        user_displays: List[str] = [owner_display_label()]
         for entry in home_users:
             unique_servers.append(entry[2])
+            user_displays.append(entry[0])  # title = username
 
-        def _warm(srv: PlexServer) -> Tuple[int, List[Tuple[Any, List]]]:
+        def _warm(idx_srv: Tuple[int, PlexServer]) -> Tuple[int, List[Tuple[Any, List]]]:
+            idx, srv = idx_srv
             # Register the warm thread so the dashboard's Thread Pool
             # panel shows the active workers during this phase. Pre-fix
             # the warm pool ran headless: Currently Processing showed
             # "fetching" but Active Workers stayed at 0 because no
             # category was registered for the thread.
             with _thread_category("playlists"):
-                return id(srv), build_playlist_cache(srv, logger, owner_id=server_owner_ids.get(id(srv)))
+                return id(srv), build_playlist_cache(
+                    srv, logger,
+                    owner_id=server_owner_ids.get(id(srv)),
+                    user_display=user_displays[idx],
+                    wanted_playlist_types=wanted_playlist_types,
+                )
 
+        indexed = list(enumerate(unique_servers))
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, min(len(unique_servers), 8))
         ) as warm_pool:
-            for sid, cache in warm_pool.map(_warm, unique_servers):
+            for sid, cache in warm_pool.map(_warm, indexed):
                 playlist_caches[sid] = cache
         logger.info(
             f"Playlist cache warmed: {sum(len(c) for c in playlist_caches.values())} "
-            f"playlist record(s) across {len(playlist_caches)} server connection(s)"
+            f"playlist record(s) across {len(playlist_caches)} server connection(s) "
+            f"(types: {','.join(sorted(wanted_playlist_types))})"
         )
 
-    # Stop coordination - created here so both the dashboard and small-
-    # terminal branches share one event. In server mode, the runtime
-    # patches' _server_keyboard_stub stashes a reference to this event
-    # so /api/job/stop can flip it; in CLI mode, _keyboard_thread reads
-    # raw keypresses and sets it on [Q]. snapshot_library checks it
-    # before launching per-library work so stops take effect at the
-    # next library boundary.
+    # Stop coordination. ``_keyboard_thread`` registers this event on
+    # ``state._active_stop_event`` so ``/api/job/stop`` can flip it;
+    # snapshot_library checks it before launching per-library work so
+    # stops take effect at the next library boundary.
     stop_event = threading.Event()
     kb = threading.Thread(
         target=_keyboard_thread, args=(log_dir, logger, stop_event), daemon=True
     )
     kb.start()
 
-    if _check_terminal_size():
-        # ── Small-terminal fallback: Rich Progress bars ────────────────────────
-        state._live_progress = _make_progress()
-        for sec in selected_libs:
-            state._lib_task_ids[sec.title] = state._live_progress.add_task(
-                sec.title,
-                total=4 + n_user_tasks,
-                completed=0,
-                fields={"phase": "Capturing snapshot"},
-            )
-        overall_task = state._live_progress.add_task(
-            "Overall", total=len(selected_libs), completed=0, fields={"phase": ""},
-        )
-        with Live(state._live_progress, console=console, refresh_per_second=8):
+    # If the job runner created a placeholder DashboardState before
+    # our pre-flight (Plex connect, home-user auth, playlist cache
+    # warm), augment it rather than replacing it - that preserves
+    # the activity-feed entries the user already saw and means the
+    # frontend never has to render the empty state during start-up.
+    if state.get_dashboard() is None:
+        state._dashboard = DashboardState(log_dir=log_dir)
+    else:
+        state.get_dashboard().log_dir = log_dir
+    # Owner + every home user we connected to = total users this run covers.
+    state.get_dashboard().set_user_count(1 + n_user_tasks)
+    for sec in selected_libs:
+        state.get_dashboard().add_library(sec.title, total=4 + n_user_tasks)
+        state.get_dashboard().set_library_status(sec.title, "active")
+
+    try:
+        with Live(console=console, refresh_per_second=4) as live:
+            state._live_instance = live
             with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
-                futures = {
-                    submit_with_context(
-                        pool,
+                futures_map: Dict[Any, str] = {
+                    pool.submit(
                         snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
                         stop_event, skip_collections, fast_collection_detection, skip_playlists, run_lazy_caches,
-                        owner_included,
-                        # PR-3 / Phase D - pass the four include_* flags
-                        # explicitly. ``snapshot_library`` honours both the
-                        # legacy skip_* and the new include_* (either
-                        # disables a type), so passing both is safe.
-                        include_watch_history,
-                        include_ratings,
-                        include_playlists,
-                        include_collections,
-                        # Phase C: per-library metric map. snapshot_library
-                        # uses the entry for ``sec.title`` to override the
-                        # global include_* flags for this library only.
+                        # owner_included + the four include_* flags are
+                        # passed BY KEYWORD so each binds to its real
+                        # parameter. A prior version passed them
+                        # positionally and omitted owner_included, which
+                        # shifted every include_* flag by one slot.
+                        owner_included=owner_included,
+                        include_watch_history=include_watch_history,
+                        include_ratings=include_ratings,
+                        include_playlists=include_playlists,
+                        include_collections=include_collections,
+                        # Phase C: forward the per-library metric
+                        # map. snapshot_library overrides the
+                        # global include_* booleans per library
+                        # using this map.
                         library_metrics=library_metrics,
                     ): sec.title
                     for sec in selected_libs
                 }
-                for future in concurrent.futures.as_completed(futures):
-                    lib = futures[future]
-                    exc = future.exception()
-                    if exc:
-                        logger.error(f"Snapshot failed for library '{lib}': {exc}")
-                    else:
-                        logger.info(f"{lib} → {future.result()}")
-                    state._live_progress.update(overall_task, advance=1)
-        state._live_progress = None
-        state._lib_task_ids.clear()
-
-    else:
-        # ── Full dashboard mode ────────────────────────────────────────────────
-        # If the job runner created a placeholder DashboardState before
-        # our pre-flight (Plex connect, home-user auth, playlist cache
-        # warm), augment it rather than replacing it - that preserves
-        # the activity-feed entries the user already saw and means the
-        # frontend never has to render the empty state during start-up.
-        if state.get_dashboard() is None:
-            state._dashboard = DashboardState(log_dir=log_dir)
-        else:
-            state.get_dashboard().log_dir = log_dir
-        # Owner + every home user we connected to = total users this run covers.
-        state.get_dashboard().set_user_count(1 + n_user_tasks)
-        for sec in selected_libs:
-            state.get_dashboard().add_library(sec.title, total=4 + n_user_tasks)
-            state.get_dashboard().set_library_status(sec.title, "active")
-
-        try:
-            with Live(console=console, refresh_per_second=4) as live:
-                state._live_instance = live
-                with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
-                    futures_map: Dict[Any, str] = {
-                        pool.submit(
-                            snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
-                            stop_event, skip_collections, fast_collection_detection, skip_playlists, run_lazy_caches,
-                            # PR-3 / Phase D - full-dashboard mode now
-                            # also forwards every filter flag. The
-                            # previous code silently dropped these,
-                            # which meant skip_collections/skip_playlists
-                            # only worked in small-terminal mode.
-                            include_watch_history,
-                            include_ratings,
-                            include_playlists,
-                            include_collections,
-                            # Phase C: forward the per-library metric
-                            # map. snapshot_library overrides the
-                            # global include_* booleans per library
-                            # using this map.
-                            library_metrics=library_metrics,
-                        ): sec.title
-                        for sec in selected_libs
-                    }
-                    pending = set(futures_map.keys())
-                    while pending and not stop_event.is_set():
-                        try:
-                            live.update(_build_dashboard(state.get_dashboard().to_dashboard_frame(), mode="EXPORT"))
-                        except Exception:
-                            pass
-                        done, pending = concurrent.futures.wait(pending, timeout=0.25)
-                        for fut in done:
-                            lib = futures_map[fut]
-                            exc = fut.exception()
-                            if exc:
-                                logger.error(f"Snapshot failed for library '{lib}': {exc}")
-                                state.get_dashboard().finish_library(lib, error=True)
-                                # Per-library activity entry. The server-level
-                                # "Snapshot complete" message fires from the
-                                # job runner once every library finishes (see
-                                # the console.print at end of run_snapshot
-                                # and the run-level finalize phase) - here
-                                # we say "Library failed" so the feed
-                                # reflects what actually finished.
-                                state.get_dashboard().push_activity("error", lib, "Library failed")
-                            else:
-                                logger.info(f"{lib} → {fut.result()}")
-                                state.get_dashboard().finish_library(lib)
-                                state.get_dashboard().push_activity("done", lib, "Library complete")
-                    if stop_event.is_set():
-                        for f in pending:
-                            f.cancel()
-                if not stop_event.is_set():
+                pending = set(futures_map.keys())
+                while pending and not stop_event.is_set():
                     try:
                         live.update(_build_dashboard(state.get_dashboard().to_dashboard_frame(), mode="EXPORT"))
                     except Exception:
                         pass
-                    time.sleep(3)
-        except Exception as render_err:
-            logger.warning(
-                f"Dashboard rendering unavailable ({render_err!r}). "
-                f"Running without display - see {log_dir}/ for full details."
-            )
-            with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
-                futures_map = {
-                    submit_with_context(
-                        pool,
-                        snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
-                        stop_event, skip_collections, fast_collection_detection, skip_playlists, run_lazy_caches,
-                        owner_included,
-                        # PR-3 / Phase D - pass include_* flags.
-                        include_watch_history,
-                        include_ratings,
-                        include_playlists,
-                        include_collections,
-                        # Phase C: per-library metric map.
-                        library_metrics=library_metrics,
-                    ): sec.title
-                    for sec in selected_libs
-                }
-                for fut in concurrent.futures.as_completed(futures_map):
-                    lib = futures_map[fut]
-                    exc = fut.exception()
-                    if exc:
-                        logger.error(f"Snapshot failed for library '{lib}': {exc}")
-                    else:
-                        logger.info(f"{lib} → {fut.result()}")
-        finally:
-            stop_event.set()
-            state._live_instance = None
-            # v0.13.x: do NOT clear state._dashboard here. The job worker
-            # in server/jobs.py has post-engine work to do (snapshot DB
-            # capture, registry insert, JSON-sidecar prebuild, run-dir
-            # rename) and uses ``_dash.set_finalizing("…")`` to surface
-            # what it's doing - records hit a dashboard nulled here
-            # silently. Worker's finally block nulls _dashboard once
-            # all of that completes; CLI mode is unaffected (CLI exits
-            # after the run, garbage-collecting the reference).
+                    done, pending = concurrent.futures.wait(pending, timeout=0.25)
+                    for fut in done:
+                        lib = futures_map[fut]
+                        exc = fut.exception()
+                        if exc:
+                            logger.error(f"Snapshot failed for library '{lib}': {exc}")
+                            state.get_dashboard().finish_library(lib, error=True)
+                            # Per-library activity entry. The server-level
+                            # "Snapshot complete" message fires from the
+                            # job runner once every library finishes (see
+                            # the console.print at end of run_snapshot
+                            # and the run-level finalize phase) - here
+                            # we say "Library failed" so the feed
+                            # reflects what actually finished.
+                            state.get_dashboard().push_activity("error", lib, "Library failed")
+                        else:
+                            logger.info(f"{lib} → {fut.result()}")
+                            state.get_dashboard().finish_library(lib)
+                            state.get_dashboard().push_activity("done", lib, "Library complete")
+                if stop_event.is_set():
+                    for f in pending:
+                        f.cancel()
+            if not stop_event.is_set():
+                try:
+                    live.update(_build_dashboard(state.get_dashboard().to_dashboard_frame(), mode="EXPORT"))
+                except Exception:
+                    pass
+                time.sleep(3)
+    except Exception as render_err:
+        logger.warning(
+            f"Dashboard rendering unavailable ({render_err!r}). "
+            f"Running without display - see {log_dir}/ for full details."
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_effective_lib_workers) as pool:
+            futures_map = {
+                submit_with_context(
+                    pool,
+                    snapshot_library, server, sec, output_dir, logger, home_users, playlist_caches,
+                    stop_event, skip_collections, fast_collection_detection, skip_playlists, run_lazy_caches,
+                    owner_included,
+                    # pass include_* flags.
+                    include_watch_history,
+                    include_ratings,
+                    include_playlists,
+                    include_collections,
+                    # Phase C: per-library metric map.
+                    library_metrics=library_metrics,
+                ): sec.title
+                for sec in selected_libs
+            }
+            for fut in concurrent.futures.as_completed(futures_map):
+                lib = futures_map[fut]
+                exc = fut.exception()
+                if exc:
+                    logger.error(f"Snapshot failed for library '{lib}': {exc}")
+                else:
+                    logger.info(f"{lib} → {fut.result()}")
+    finally:
+        stop_event.set()
+        state._live_instance = None
+        # v0.13.x: do NOT clear state._dashboard here. The job worker
+        # in server/jobs.py has post-engine work to do (snapshot DB
+        # capture, registry insert, JSON-sidecar prebuild, run-dir
+        # rename) and uses ``_dash.set_finalizing("…")`` to surface
+        # what it's doing - records hit a dashboard nulled here
+        # silently. Worker's finally block nulls _dashboard once
+        # all of that completes; CLI mode is unaffected (CLI exits
+        # after the run, garbage-collecting the reference).
 
     console.print(f"\n[bold green]Snapshot complete.[/bold green] Files saved to: {output_dir}\n")

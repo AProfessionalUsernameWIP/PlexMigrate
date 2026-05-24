@@ -1,4 +1,4 @@
-// ── Direct-transfer user intersection panel (v0.9.6 Feature 4) ─────────
+// ── Direct-transfer user intersection panel ─────────
 //
 // Three groups computed by raw identifier match:
 //   - Transferable : on both source AND destination → checkboxes,
@@ -17,8 +17,44 @@
 
 import type { ServerUser } from '../api';
 
+
+// Collapse duplicate rows that share the same ``plex_id``.
+// The owner row + a managed-user row representing the same human
+// (identity-linked) end up with identical plex_ids after the
+// JobFormPanel normalisation; without this dedupe both render as
+// separate checkboxes. We prefer the row with ``kind='owner'`` since
+// the operator is "still technically the owner" regardless of also
+// having a managed-user record on a peer server, and fill in
+// display_name from whichever side has one.
+function dedupeByPlexId(users: ServerUser[]): ServerUser[] {
+  const byId = new Map<string, ServerUser>();
+  for (const u of users) {
+    const key = u.plex_id;
+    if (!key) {
+      // Defensive: a row with empty plex_id can't be deduped against
+      // anything else; keep it as-is so the parent's intersection
+      // logic continues to find it on the right side.
+      byId.set(`__empty_${byId.size}`, u);
+      continue;
+    }
+    const existing = byId.get(key);
+    if (!existing) {
+      byId.set(key, u);
+      continue;
+    }
+    const owner = u.kind === 'owner' ? u : (existing.kind === 'owner' ? existing : u);
+    const other = owner === u ? existing : u;
+    byId.set(key, {
+      ...owner,
+      display_name: owner.display_name || other.display_name || '',
+    });
+  }
+  return Array.from(byId.values());
+}
+
+
 export function DirectUsersPanel(props: {
-  // v0.14 - same picker, three contexts. The mode drives copy + the
+  // Same picker, three contexts. The mode drives copy + the
   // "source only" panel's wording (the user picker re-uses the same
   // intersection logic regardless of which side is source vs dest).
   mode?: 'direct' | 'snapshot' | 'restore';
@@ -31,13 +67,25 @@ export function DirectUsersPanel(props: {
   loadError: string | null;
 }) {
   const { mode = 'direct', sourceUsers, destUsers, included, onToggle, onAll, onNone, loadError } = props;
-  // v0.9.7 Item 7: the owner is selectable alongside managed users.
+  // The owner is selectable alongside managed users.
   // Intersection is by raw identifier across both kinds; unchecking
   // the owner narrows the transfer so library-level data
   // (collections + the four owner-scoped blocks) is skipped.
+  //
+  // Dedupe by plex_id. The snapshot's owner row + a managed-user row
+  // representing the SAME human (e.g., the operator is the owner of
+  // Server A and a Plex Home managed user on Server B sharing the
+  // same Plex.tv account) collide on plex_id after the JobFormPanel
+  // owner-normalisation. Without the dedupe both rows render as
+  // separate checkboxes that toggle together (identity_map links
+  // them), which is confusing because they are the same person. We
+  // collapse duplicates here, preferring the owner row + filling in
+  // display_name from whichever side has one. ``raw_name`` keeps the
+  // owner's value (the canonical email) so the picker remains stable.
+  const dedupedSource = dedupeByPlexId(sourceUsers);
   const dstIds = new Set(destUsers.map((u) => u.plex_id));
-  const transferable = sourceUsers.filter((u) => dstIds.has(u.plex_id));
-  const sourceOnly = sourceUsers.filter((u) => !dstIds.has(u.plex_id));
+  const transferable = dedupedSource.filter((u) => dstIds.has(u.plex_id));
+  const sourceOnly = dedupedSource.filter((u) => !dstIds.has(u.plex_id));
 
   const allEmpty = sourceUsers.length === 0 && destUsers.length === 0;
 
@@ -104,16 +152,16 @@ export function DirectUsersPanel(props: {
                       onChange={() => onToggle(u.plex_id)}
                     />
                     <span>
-                      {/* v0.9.7 follow-up: prefer the operator's
-                          chosen display name (set on the Servers tab)
-                          over the raw identifier. Owner's raw_name
-                          is the Plex.tv email and gets noisy in this
-                          list; falling back to it only when no
-                          display name exists keeps the UI readable. */}
+                      {/* Prefer the operator's chosen display name
+                          (set on the Servers tab) over the raw
+                          identifier. Owner's raw_name is the Plex.tv
+                          email and gets noisy in this list; falling
+                          back to it only when no display name exists
+                          keeps the UI readable. */}
                       <strong>{u.display_name || u.raw_name}</strong>{' '}
-                      {/* v0.9.7 Item 7: Owner / Managed badge so it's
-                          clear the owner is a selectable target with
-                          a different scope than managed users. */}
+                      {/* Owner / Managed badge so it's clear the owner
+                          is a selectable target with a different scope
+                          than managed users. */}
                       <span
                         className={`tag ${u.kind === 'owner' ? 'started' : 'phase'}`}
                         style={{ fontSize: 10, marginLeft: 4 }}
@@ -140,7 +188,7 @@ export function DirectUsersPanel(props: {
                   <label key={u.plex_id} className="switch" title={copy.missingTitle}>
                     <input type="checkbox" checked={false} disabled />
                     <span>
-                      {/* v0.9.7 follow-up: prefer display_name same as the transferable list. */}
+                      {/* Prefer display_name same as the transferable list. */}
                       <strong>{u.display_name || u.raw_name}</strong>{' '}
                       <span style={{ color: 'var(--text-dim)', fontSize: 12 }}>
                         - {copy.missingLabel}
