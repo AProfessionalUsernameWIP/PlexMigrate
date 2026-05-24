@@ -3,8 +3,8 @@
 // Owns the offset tracking, sticky-bottom scroll behaviour, 2 s poll
 // loop, and the body buffer for one log file inside one run dir. Used
 // by:
-//   * LogsPanel — full-size, manual Reload button.
-//   * DashboardPanel — small height, embedded under the JobHeader so
+//   * LogsPanel - full-size, manual Reload button.
+//   * DashboardPanel - small height, embedded under the JobHeader so
 //     the user can watch the current run without switching tabs.
 //
 // Always polls when ``finished`` is false; freezes when true (typically
@@ -15,6 +15,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, LogFileContent } from '../api';
 import { isRunGoneError } from './DashboardPanel';
+import { pausableInterval } from '../utils/pausableInterval';
+import { renderHighlighted } from '../utils/highlight';
 
 const TAIL_POLL_MS = 2000;
 
@@ -44,7 +46,7 @@ export function LogTailer({
   // render the raw text blob (current behaviour, zero performance
   // regression on idle viewing). Non-empty = split into lines and
   // filter case-insensitively. The cost of per-line rendering is
-  // only paid when the operator is actively filtering.
+  // only paid when the end user is actively filtering.
   const [filter, setFilter] = useState<string>('');
 
   const offsetRef = useRef<number>(0);
@@ -84,10 +86,14 @@ export function LogTailer({
       });
   }, [runName, fileName]);
 
-  // Poll loop — appends only the new bytes via ?since=offset.
+  // Poll loop - appends only the new bytes via ?since=offset.
   useEffect(() => {
     if (!liveTail || externalFreeze || !runName || !fileName) return;
-    const tick = window.setInterval(async () => {
+    // pausableInterval's cancel fn isn't available until it returns,
+    // so hold it in a mutable binding the poll body can reach to
+    // self-cancel when the run directory disappears.
+    let stop: (() => void) | null = null;
+    stop = pausableInterval(async () => {
       try {
         const r = await api.readLogFile(runName, fileName, offsetRef.current);
         if (r.content.length > 0) setBody((prev) => prev + r.content);
@@ -95,11 +101,11 @@ export function LogTailer({
         setMeta(r);
         setLastPolledAt(Date.now());
       } catch (e) {
-        if (isRunGoneError(e)) { window.clearInterval(tick); return; }
+        if (isRunGoneError(e)) { stop?.(); return; }
         setError(String(e));
       }
     }, TAIL_POLL_MS);
-    return () => window.clearInterval(tick);
+    return () => stop?.();
   }, [liveTail, externalFreeze, runName, fileName]);
 
   // Keep the viewport pinned to the bottom whenever new bytes arrive
@@ -127,14 +133,18 @@ export function LogTailer({
       setLastPolledAt(Date.now());
       stickyRef.current = true;
     } catch (e) {
+      // Suppress the run-gone 404 the same way the initial load does:
+      // a manual Reload on a run whose directory was renamed at job
+      // end would otherwise flash a banner the user can't act on.
+      if (isRunGoneError(e)) return;
       setError(String(e));
     }
   };
 
   const statusLabel = externalFreeze
-    ? 'Tail paused — run finished'
+    ? 'Tail paused - run finished'
     : liveTail
-      ? `Live · last polled ${lastPolledAt ? new Date(lastPolledAt).toLocaleTimeString() : '—'}`
+      ? `Live · last polled ${lastPolledAt ? new Date(lastPolledAt).toLocaleTimeString() : '-'}`
       : 'Paused';
 
   // v0.9.7 Item 8: when the filter is active, split the body once
@@ -146,7 +156,7 @@ export function LogTailer({
     if (!filter) return null;
     const needle = filter.toLowerCase();
     const out: string[] = [];
-    // Split-on-newline only happens when the operator types into
+    // Split-on-newline only happens when the end user types into
     // the filter input; otherwise the raw body renders unchanged.
     for (const line of body.split('\n')) {
       if (line.toLowerCase().includes(needle)) out.push(line);
@@ -176,7 +186,7 @@ export function LogTailer({
       {error && <div className="banner error" style={{ marginBottom: 6 }}>{error}</div>}
       {meta?.truncated && (
         <div style={{ color: 'var(--warn)', fontSize: 12, marginBottom: 6 }}>
-          Truncated — older bytes not shown; new lines still append as they arrive.
+          Truncated - older bytes not shown; new lines still append as they arrive.
         </div>
       )}
 
@@ -217,6 +227,7 @@ export function LogTailer({
         ref={bodyRef}
         onScroll={onBodyScroll}
         style={{ height, maxHeight: height }}
+        data-testid="log-content"
       >
         {filteredLines === null ? (
           // Fast path: raw text blob, browser-native rendering.
@@ -236,44 +247,3 @@ export function LogTailer({
   );
 }
 
-// ── Helpers (v0.9.7 Item 8) ─────────────────────────────────────────────────
-
-// Escape a string so it can be embedded in a RegExp literal without
-// interpreting special characters. The filter input is a plain
-// substring — operators don't expect regex semantics from typing
-// e.g. "(error)" into the box.
-function escapeForRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Split ``line`` around every case-insensitive occurrence of
-// ``needle`` and wrap the matched chunks in ``<mark>`` so the
-// matched substring is visually highlighted. Returns a React node
-// (array of strings + spans) suitable for direct rendering. Empty
-// ``needle`` short-circuits to the plain string.
-function renderHighlighted(line: string, needle: string): React.ReactNode {
-  if (!needle) return line;
-  const re = new RegExp(escapeForRegex(needle), 'gi');
-  const parts: React.ReactNode[] = [];
-  let lastIndex = 0;
-  let m: RegExpExecArray | null;
-  let keyCount = 0;
-  while ((m = re.exec(line)) !== null) {
-    if (m.index > lastIndex) {
-      parts.push(line.slice(lastIndex, m.index));
-    }
-    parts.push(
-      <mark key={keyCount++} className="log-match">
-        {m[0]}
-      </mark>
-    );
-    lastIndex = m.index + m[0].length;
-    // Avoid an infinite loop on zero-length matches (shouldn't happen
-    // with our escaping, but defensive).
-    if (m.index === re.lastIndex) re.lastIndex++;
-  }
-  if (lastIndex < line.length) {
-    parts.push(line.slice(lastIndex));
-  }
-  return parts;
-}
