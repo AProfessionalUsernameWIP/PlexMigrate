@@ -159,7 +159,12 @@ def _get_logger() -> logging.Logger:
             "DB-access events for this run will NOT be recorded.",
             file_path, exc,
         )
-        _active_target = target
+        # Do NOT cache ``target`` here. Every handler was removed
+        # above, so the logger currently has none; caching the target
+        # would make the next _get_logger() call short-circuit and
+        # leave the audit trail permanently dark after one transient
+        # open failure. Leaving _active_target as None forces a retry.
+        _active_target = None
         return log
     handler.setFormatter(logging.Formatter(
         "[%(asctime)s] [%(levelname)s] %(message)s",

@@ -27,8 +27,11 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
+import { errorText, formatBytes } from '../utils/format';
+import { pausableInterval } from '../utils/pausableInterval';
+import { renderHighlighted } from '../utils/highlight';
 
-type AppLogCategory = 'db-access' | 'playlist-cache' | 'auth' | 'network' | 'debug';
+type AppLogCategory = 'app' | 'db-access' | 'playlist-cache' | 'sync' | 'user-activity' | 'auth' | 'network' | 'debug';
 
 interface CategoryDef {
   key: AppLogCategory;
@@ -37,6 +40,12 @@ interface CategoryDef {
 }
 
 const CATEGORIES: CategoryDef[] = [
+  {
+    key: 'app',
+    label: 'App',
+    description:
+      'Every plexmigrate.* server-side log line at INFO+ level. Covers the user-token capture flow (Refresh users, server-add), the owner-token mirror decisions, scheduler ticks, and every other event the per-run job logs do not capture. The right place to look when something happened "outside" a snapshot or restore run.',
+  },
   {
     key: 'db-access',
     label: 'Database Access',
@@ -48,6 +57,18 @@ const CATEGORIES: CategoryDef[] = [
     label: 'Playlist Cache',
     description:
       'Every playlist-cache refresh attempt — bulk per-server (triggered by Servers ▸ Refresh and by the Playlist Transfer column Refresh button) and per-user. Each line records server, action, durations, and per-user success/error counts.',
+  },
+  {
+    key: 'sync',
+    label: 'Sync Activity',
+    description:
+      'Sync engine activity from the polling worker: per-cycle reconcile traces, watch-count math, playlist merge decisions, and any sync-initiated playlist copies. Routed here (not into runtime.log) so it never bleeds into a running job’s per-run log. Manual / operator-initiated playlist copies continue to write to runtime.log.',
+  },
+  {
+    key: 'user-activity',
+    label: 'User Activity Sweep',
+    description:
+      'Auth-health probe results from the user-activity sweeper. Each line records (server, user, probe result) and any auto-tombstone decisions. Surfaced here so an operator can audit which users have been failing auth and which were tombstoned automatically. The sweeper itself is off by default; turn it on under Settings > Tunables > Polling > User Activity, then enable per-server auto-tombstone under each server\'s edit panel.',
   },
   {
     key: 'auth',
@@ -72,17 +93,6 @@ const CATEGORIES: CategoryDef[] = [
 const TAIL_POLL_MS = 2000;
 
 
-function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return '-';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
-}
 
 
 interface BackupEntry {
@@ -144,7 +154,7 @@ export function ApplicationLogsPanel() {
         if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
       });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(errorText(e));
       setContent('');
       setNote('');
       setPath('');
@@ -177,9 +187,16 @@ export function ApplicationLogsPanel() {
     if (!liveTail) return;
     if (note) return;
     if (selectedBackup) return;
-    const tick = window.setInterval(async () => {
+    // ``cancelled`` guards a stale in-flight poll: a category or
+    // backup switch tears this effect down, but a readAppLog request
+    // already dispatched still resolves. Without the guard its bytes
+    // and next_offset would splice another log's tail into the
+    // freshly-switched view (offsetRef is shared across categories).
+    let cancelled = false;
+    const stop = pausableInterval(async () => {
       try {
         const r = await api.readAppLog(category, 0, offsetRef.current);
+        if (cancelled) return;
         // rotated_during_poll means the file shrank between polls
         // (logrotate fired). Reset the body to the new tail and
         // surface the banner so the end user knows older bytes
@@ -195,10 +212,11 @@ export function ApplicationLogsPanel() {
         offsetRef.current = r.next_offset;
         setLastPolledAt(Date.now());
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        if (cancelled) return;
+        setError(errorText(e));
       }
     }, TAIL_POLL_MS);
-    return () => window.clearInterval(tick);
+    return () => { cancelled = true; stop(); };
   }, [liveTail, category, note, selectedBackup]);
 
   // Keep the viewport pinned to the bottom when new content arrives
@@ -258,7 +276,7 @@ export function ApplicationLogsPanel() {
         </div>
       </div>
       <p style={{ color: 'var(--text-dim)', fontSize: 12, marginTop: 4 }}>
-        Application-level logs about the PlexMigrate app itself. Per-job
+        Application-level logs about the Hestia-MediaManager app itself. Per-job
         run logs (snapshot / restore / direct transfer) live under{' '}
         <strong>Servers &gt; Logs</strong> grouped by source server.
       </p>
@@ -281,9 +299,35 @@ export function ApplicationLogsPanel() {
       {def && (
         <>
           <h3 style={{ fontSize: 13, margin: '0 0 6px' }}>{def.label}</h3>
-          <p style={{ color: 'var(--text-dim)', fontSize: 12, marginBottom: 10 }}>
+          <p style={{ color: 'var(--text-dim)', fontSize: 12, marginBottom: 6 }}>
             {def.description}
           </p>
+          {path && (
+            <div
+              style={{
+                color: 'var(--text-dim)',
+                fontSize: 11,
+                marginBottom: 10,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+              title="Resolved on-disk path. Useful for tailing from a shell (e.g. `tail -f <path>`)."
+            >
+              <span>File:</span>
+              <code style={{ userSelect: 'all' }}>{path}</code>
+              <button
+                type="button"
+                onClick={() => {
+                  if (path) void navigator.clipboard?.writeText(path);
+                }}
+                style={{ fontSize: 11, padding: '0 6px' }}
+                title="Copy path to clipboard"
+              >
+                Copy
+              </button>
+            </div>
+          )}
         </>
       )}
 
@@ -345,10 +389,9 @@ export function ApplicationLogsPanel() {
         </div>
       )}
 
-      {(path || sizeBytes > 0) && (
+      {sizeBytes > 0 && (
         <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--text-dim)', marginBottom: 6 }}>
-          {path && <span>Path: <code>{path}</code></span>}
-          {sizeBytes > 0 && <span>Size: {formatBytes(sizeBytes)}</span>}
+          <span>Size: {formatBytes(sizeBytes)}</span>
         </div>
       )}
 
@@ -414,34 +457,4 @@ export function ApplicationLogsPanel() {
       )}
     </div>
   );
-}
-
-
-// Render one line with the matched substring wrapped in a <mark>.
-// Case-insensitive match; preserves the original casing in the
-// output. Empty needle returns the line verbatim.
-function renderHighlighted(line: string, needle: string): React.ReactNode {
-  if (!needle) return line;
-  const lower = line.toLowerCase();
-  const lowerNeedle = needle.toLowerCase();
-  const out: React.ReactNode[] = [];
-  let cursor = 0;
-  while (cursor < line.length) {
-    const found = lower.indexOf(lowerNeedle, cursor);
-    if (found === -1) {
-      out.push(line.slice(cursor));
-      break;
-    }
-    if (found > cursor) out.push(line.slice(cursor, found));
-    out.push(
-      <mark
-        key={`m-${found}`}
-        style={{ background: 'var(--accent-warn, #ffd54a)', color: 'inherit' }}
-      >
-        {line.slice(found, found + needle.length)}
-      </mark>
-    );
-    cursor = found + needle.length;
-  }
-  return <>{out}</>;
 }

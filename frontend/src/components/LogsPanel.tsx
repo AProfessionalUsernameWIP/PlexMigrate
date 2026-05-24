@@ -8,20 +8,38 @@
 // The live-tail logic itself lives in LogTailer so both LogsPanel and
 // the embedded panel on DashboardPanel can use the same component.
 //
-// PR-12 follow-up - per-run delete and clear-all delete. Both fire
+// Per-run delete and clear-all delete both fire
 // against shutil.rmtree on the backend; best-effort, with errors
 // surfaced in the response banner. A run currently being written to
 // by the engine may fail to delete on Windows (file locks); the
-// end user can retry once the job finishes.
+// user can retry once the job finishes.
 
 import { useEffect, useMemo, useState } from 'react';
 import { api, LogFile, LogRun, ServerView, getAccessToken } from '../api';
 import { LogTailer } from './LogTailer';
-import {
-  BackendTabStrip,
-  BackendType,
-  backendCounts,
-} from './BackendTabStrip';
+import { Modal } from './Modal';
+import { formatBytes, formatTimestamp } from '../utils/format';
+import { pausableInterval } from '../utils/pausableInterval';
+
+
+// Per-server sub-tab view selector. 'all' shows every run for the
+// selected server; 'direct' adds the sibling 'Direct Transfers'
+// bucket that surfaces combined-slug direct-transfer runs.
+type ViewMode = 'all' | 'direct';
+
+
+// Mirror of server/server_registry.py backend_aware_slug(): ASCII-fold
+// the name, collapse non-alphanumeric runs to single hyphens, then
+// append the backend. Direct-transfer run dirs encode each end as this
+// "<safe-name>-<service>" slug, so the reverse-map must key by the same
+// shape, not the raw display name (which would miss any name with a
+// space, dot, or other punctuation).
+function backendAwareSlug(name: string, serviceType: string): string {
+  const folded = (name || '').replace(/[^\x00-\x7F]/g, '');
+  const bare =
+    folded.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'server';
+  return `${bare}-${(serviceType || 'plex').toLowerCase()}`;
+}
 
 
 // Auth-aware blob download. The auth middleware rejects a plain
@@ -78,13 +96,17 @@ export function LogsPanel() {
     | null
   >(null);
 
-  // Phase C of the backend-filter UI restructure (Finding[BACKEND-
-  // FILTER-AUDIT]-2026-05-16.md). Logs are runs, not servers; the
-  // filter joins ``run.server_id`` to the registry's service_type
-  // client-side. Once developer ships service_type on the log-list
-  // response shape (TODO-AGENT-2-3 in the Finding), the join here
-  // can be retired in favour of a direct read.
-  const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
+  // Per-server sub-tabs replace the per-
+  // backend filter strip. Each registered server gets its own tab
+  // showing only the runs whose server_slug reverse-maps to that
+  // server. ``viewMode`` adds a sibling 'Direct Transfers' bucket
+  // that surfaces runs whose slug is ``<src>-to-<dst>`` (combined
+  // direct-transfer slug emitted by jobs._run_direct); the slug is
+  // split + reverse-mapped to BOTH ends, so a single direct-transfer
+  // run shows up under whichever server tab the operator picks
+  // within the Direct Transfers view.
+  const [viewMode, setViewMode] = useState<ViewMode>('all');
+  const [selectedServerKey, setSelectedServerKey] = useState<string>('');
   const [registeredServers, setRegisteredServers] = useState<ServerView[]>([]);
 
   // ── Run directory list ─────────────────────────────────────────────────
@@ -110,8 +132,7 @@ export function LogsPanel() {
   // The Refresh button stays for impatient end users.
   useEffect(() => {
     refreshRuns();
-    const id = window.setInterval(refreshRuns, 15_000);
-    return () => window.clearInterval(id);
+    return pausableInterval(refreshRuns, 15_000);
   }, []);
 
   // When the user picks a run, fetch its file list and clear the file
@@ -130,60 +151,154 @@ export function LogsPanel() {
   const runIsFinished =
     !!selectedRun && (selectedRun.endsWith('_PASS') || selectedRun.endsWith('_FAIL'));
 
-  // Phase C: backend-of-each-run lookup + filtered visible list.
-  // Build a server_id -> backend map from the registry, default
-  // unknown ids to 'plex' so historical runs continue to render
-  // under the original backend label.
-  const idToBackend = useMemo(() => {
-    const out: Record<string, BackendType> = {};
-    for (const s of registeredServers) {
-      const t = ((s as unknown as { service_type?: string }).service_type) || 'plex';
-      out[s.id] = (t === 'jellyfin' || t === 'emby') ? t : 'plex';
-    }
-    return out;
-  }, [registeredServers]);
+  // Per-server sub-tabs + a 'Direct Transfers' view that splits
+  // combined ``<src>-to-<dst>`` slugs and shows each end under its
+  // own server tab. Helpers below classify each run + compute which
+  // tab keys exist.
 
-  const runBackend = (r: LogRun): BackendType => {
-    const id = r.server_id;
-    if (id && idToBackend[id]) return idToBackend[id];
-    return 'plex';
+  // Stable key for grouping: prefer server_id when the slug reverse-
+  // maps to a registered server, otherwise fall back to the slug
+  // itself (so runs from a since-removed server still get their own
+  // tab, labelled by slug). The special key "__unknown__" catches
+  // runs whose dir-name didn't carry a slug at all.
+  const runIsDirect = (r: LogRun): boolean =>
+    !!(r.server_slug && r.server_slug.includes('-to-'));
+
+  const directEnds = (
+    r: LogRun,
+  ): { srcKey: string; srcLabel: string; dstKey: string; dstLabel: string } | null => {
+    const slug = r.server_slug || '';
+    if (!slug.includes('-to-')) return null;
+    const [srcSlug, dstSlug] = slug.split('-to-', 2);
+    // Reverse-map each end against the registry. We can't always
+    // resolve to an id because backend_aware_slug() is non-trivial;
+    // fall back to the slug as the label when the map misses.
+    const slugToServer: Record<string, { id: string; name: string }> = {};
+    for (const s of registeredServers) {
+      // Key by the backend's "<safe-name>-<service>" slug (see
+      // backendAwareSlug above) so a server whose display name carries
+      // spaces, dots, or other punctuation still resolves. A half that
+      // matches no registered server (e.g. a since-removed server)
+      // still falls back to the raw slug as its label below.
+      slugToServer[backendAwareSlug(s.name, s.service_type || 'plex')] = {
+        id: s.id,
+        name: s.name,
+      };
+    }
+    const srcMatch = slugToServer[srcSlug];
+    const dstMatch = slugToServer[dstSlug];
+    return {
+      srcKey: srcMatch?.id || `slug:${srcSlug}`,
+      srcLabel: srcMatch?.name || srcSlug,
+      dstKey: dstMatch?.id || `slug:${dstSlug}`,
+      dstLabel: dstMatch?.name || dstSlug,
+    };
   };
 
-  const visibleRuns = useMemo(
-    () => runs.filter((r) => runBackend(r) === activeBackend),
+  // List of server tabs for the currently-selected view. Each tab
+  // carries a key (used for routing), a display label, and the count
+  // of runs that fall in that bucket. Order: alphabetical by label,
+  // with "(no server)" pinned last.
+  type ServerTab = { key: string; label: string; count: number };
+  const serverTabs: ServerTab[] = useMemo(() => {
+    const out: Map<string, ServerTab> = new Map();
+    const add = (key: string, label: string) => {
+      const cur = out.get(key);
+      if (cur) {
+        cur.count += 1;
+      } else {
+        out.set(key, { key, label, count: 1 });
+      }
+    };
+    if (viewMode === 'direct') {
+      for (const r of runs) {
+        if (!runIsDirect(r)) continue;
+        const ends = directEnds(r);
+        if (!ends) continue;
+        add(ends.srcKey, ends.srcLabel);
+        add(ends.dstKey, ends.dstLabel);
+      }
+    } else {
+      // 'all' view groups every run by its single server (or
+      // "(no server)" when the run-dir name didn't carry a slug
+      // OR when the slug points at a since-removed registration).
+      for (const r of runs) {
+        if (runIsDirect(r)) {
+          // Direct-transfer runs ALSO surface under both ends in the
+          // 'all' view, so the operator looking at "Plex-A" sees the
+          // direct-transfer run there as well. This matches the
+          // operator's "union" framing: the same physical run is
+          // visible under either participating server's tab.
+          const ends = directEnds(r);
+          if (ends) {
+            add(ends.srcKey, ends.srcLabel);
+            add(ends.dstKey, ends.dstLabel);
+          } else {
+            add('__unknown__', '(no server)');
+          }
+          continue;
+        }
+        const id = r.server_id;
+        const name = r.server_name;
+        if (id && name) {
+          add(id, name);
+        } else if (r.server_slug) {
+          add(`slug:${r.server_slug}`, r.server_slug);
+        } else {
+          add('__unknown__', '(no server)');
+        }
+      }
+    }
+    const list = Array.from(out.values()).sort((a, b) => {
+      if (a.key === '__unknown__') return 1;
+      if (b.key === '__unknown__') return -1;
+      return a.label.localeCompare(b.label);
+    });
+    return list;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [runs, idToBackend, activeBackend],
-  );
+  }, [runs, viewMode, registeredServers]);
 
-  // BackendTabStrip's counts represent how many RUNS each backend
-  // has (not how many servers). Synthesize one pseudo ServerView per
-  // run so the strip's count-in-parens reads "Plex (47)" / "Jellyfin
-  // (3)" rather than the registry-derived totals.
-  const stripServers = useMemo(() => {
-    return runs.map((r) => ({
-      id: `run:${r.name}`,
-      name: r.name,
-      service_type: runBackend(r),
-    })) as unknown as ServerView[];
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runs, idToBackend]);
-
-  // Auto-correct activeBackend when its bucket is empty and another
-  // backend has runs. Same pattern as the other panels.
+  // Auto-pick the first server tab when the current selection is
+  // empty or stale (e.g. after switching view mode, or when the only
+  // server with runs in this view is different).
   useEffect(() => {
-    if (runs.length === 0) return;
-    const counts = backendCounts(stripServers);
-    if (counts[activeBackend] === 0) {
-      const fallback = (['plex', 'jellyfin', 'emby'] as BackendType[])
-        .find((b) => counts[b] > 0);
-      if (fallback) setActiveBackend(fallback);
+    if (serverTabs.length === 0) {
+      if (selectedServerKey) setSelectedServerKey('');
+      return;
+    }
+    const stillExists = serverTabs.some((t) => t.key === selectedServerKey);
+    if (!stillExists) {
+      setSelectedServerKey(serverTabs[0].key);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stripServers, activeBackend]);
+  }, [serverTabs]);
 
-  // If the currently-selected run is filtered out by the backend
-  // change, clear the selection so the file viewer doesn't show
-  // stale content.
+  const visibleRuns = useMemo(() => {
+    if (!selectedServerKey) return [];
+    return runs.filter((r) => {
+      if (viewMode === 'direct') {
+        if (!runIsDirect(r)) return false;
+        const ends = directEnds(r);
+        if (!ends) return false;
+        return ends.srcKey === selectedServerKey
+          || ends.dstKey === selectedServerKey;
+      }
+      // 'all' view: include the run when EITHER end matches.
+      if (runIsDirect(r)) {
+        const ends = directEnds(r);
+        if (!ends) return false;
+        return ends.srcKey === selectedServerKey
+          || ends.dstKey === selectedServerKey;
+      }
+      if (r.server_id) return r.server_id === selectedServerKey;
+      if (r.server_slug) return `slug:${r.server_slug}` === selectedServerKey;
+      return selectedServerKey === '__unknown__';
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runs, viewMode, selectedServerKey]);
+
+  // If the currently-selected run is filtered out by a view change,
+  // clear the selection so the file viewer doesn't show stale content.
   useEffect(() => {
     if (!selectedRun) return;
     const stillVisible = visibleRuns.some((r) => r.name === selectedRun);
@@ -259,23 +374,74 @@ export function LogsPanel() {
                 </button>
               </div>
             </div>
-            {/* Phase C: backend filter strip above the run list.
-                Auto-hidden when only one backend has runs. The strip's
-                count reflects RUN count per backend (not server count)
-                so the end user sees the actual workload distribution
-                across backends. */}
-            <BackendTabStrip
-              servers={stripServers}
-              activeBackend={activeBackend}
-              onChange={setActiveBackend}
-              style={{ marginTop: 8 }}
-            />
+            {/* Per-server sub-tabs + a
+                Direct Transfers view. The top-level mode strip picks
+                between "All runs" (every run grouped by server) and
+                "Direct Transfers" (only ``<src>-to-<dst>`` runs,
+                still grouped per server). The bottom strip is the
+                per-server tabs that scope which server's runs the
+                table shows. */}
+            <nav
+              style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}
+            >
+              <button
+                type="button"
+                onClick={() => setViewMode('all')}
+                className={viewMode === 'all' ? 'primary' : ''}
+                title="All logs grouped by server. Direct-transfer runs appear under either participating server's tab."
+              >
+                All logs
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('direct')}
+                className={viewMode === 'direct' ? 'primary' : ''}
+                title="Only direct-transfer runs (those whose log-dir slug is in the form 'src-to-dst'). Each run shows under either source or destination."
+              >
+                Direct Transfers
+              </button>
+            </nav>
+            {serverTabs.length > 0 && (
+              <nav
+                data-testid="log-server-tabs"
+                style={{
+                  display: 'flex',
+                  gap: 4,
+                  marginTop: 8,
+                  flexWrap: 'wrap',
+                  borderBottom: '1px solid var(--border)',
+                  paddingBottom: 4,
+                }}
+              >
+                {serverTabs.map((t) => (
+                  <button
+                    key={t.key}
+                    type="button"
+                    onClick={() => setSelectedServerKey(t.key)}
+                    className={selectedServerKey === t.key ? 'primary' : ''}
+                    data-testid={`log-server-tab-${t.key}`}
+                    title={
+                      viewMode === 'direct'
+                        ? `${t.label}: ${t.count} direct-transfer run(s) where this server was source or destination.`
+                        : `${t.label}: ${t.count} log run(s) for this server.`
+                    }
+                  >
+                    {t.label} ({t.count})
+                  </button>
+                ))}
+              </nav>
+            )}
             {runs.length === 0 ? (
               <div className="empty">No log directories yet. Run a job first.</div>
+            ) : serverTabs.length === 0 ? (
+              <div className="empty">
+                {viewMode === 'direct'
+                  ? 'No direct-transfer runs yet. Run a server-to-server transfer to populate.'
+                  : 'No log directories yet. Run a job first.'}
+              </div>
             ) : visibleRuns.length === 0 ? (
               <div className="empty">
-                No log directories for the selected backend. Switch backends
-                above or run a job against this backend to populate.
+                No runs for the selected server in this view.
               </div>
             ) : (
               // Run directories list. Renders at its natural height; the
@@ -291,10 +457,11 @@ export function LogsPanel() {
                   <tbody>
                     {visibleRuns.map((r) => (
                       <tr key={r.name}
+                          data-testid="log-row"
                           onClick={() => setSelectedRun(r.name)}
                           style={{ cursor: 'pointer', background: r.name === selectedRun ? 'var(--bg-panel)' : undefined }}>
                         <td className="mono">{r.name}</td>
-                        <td>{formatTs(r.mtime)}</td>
+                        <td>{formatTimestamp(r.mtime)}</td>
                         <td className="num">{r.file_count}</td>
                         <td>
                           {r.passed === true && <span className="tag done">PASS</span>}
@@ -380,7 +547,7 @@ export function LogsPanel() {
         <div className="panel">
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8, flexWrap: 'wrap' }}>
             <h2 style={{ margin: 0 }}>{selectedFile}</h2>
-            {/* PR-13 fix #5 - escape hatch for log files bigger than
+            {/* Escape hatch for log files bigger than
                 the 16 MB live-tail cap. Fetches with the auth bearer
                 so the auth middleware accepts the request, then
                 triggers a save dialog via a synthetic <a> element. */}
@@ -485,21 +652,7 @@ export function ConfirmDeleteModal({
   };
 
   return (
-    <div
-      onClick={onCancel}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 460, maxWidth: '92vw' }}
-      >
+    <Modal onClose={onCancel} width={460}>
         <h2 style={{ marginTop: 0 }}>{title}</h2>
         <div className="banner error" style={{ fontSize: 12 }}>{body}</div>
         {confirmWord && (
@@ -523,20 +676,10 @@ export function ConfirmDeleteModal({
           </button>
           <button onClick={onCancel} disabled={submitting}>Cancel</button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function formatTs(ts: number): string {
-  return new Date(ts * 1000).toLocaleString();
-}
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}

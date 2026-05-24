@@ -20,6 +20,8 @@ import { useEffect, useState } from 'react';
 import { api, ManagedUser, Role } from '../api';
 import { permissionSummaryForRole, ROLE_RANK, useAuthContext } from '../contexts/AuthContext';
 import { useElevation } from '../contexts/ElevationContext';
+import { Modal } from './Modal';
+import { useConfirm } from './ConfirmModal';
 
 
 export function UserAccountsExplorer() {
@@ -224,11 +226,14 @@ function UserDetailView({
       setSubmitting(false);
     }
   };
+  const confirm = useConfirm();
   const onRevokeRoot = async (username: string) => {
-    if (!confirm(
-      `Revoke root_admin from ${username}? They will become an admin. ` +
-      `This is blocked if they are the last root.`
-    )) return;
+    if (!(await confirm({
+      body:
+        `Revoke root_admin from ${username}? They will become an admin. ` +
+        `This is blocked if they are the last root.`,
+      danger: true,
+    }))) return;
     const ok = await elevation.requireElevation(`revoke root from ${username}`);
     if (!ok) return;
     setError(null); setOk(null); setSubmitting(true);
@@ -382,6 +387,7 @@ function UserDetailView({
                 className="primary"
                 onClick={() => onGrantRoot(user.username)}
                 title="Promote this account to root_admin. Requires password re-confirm."
+                data-testid="user-grant-root"
               >
                 Grant root…
               </button>
@@ -476,7 +482,7 @@ function AddUserModal({ onClose, onCreated }: { onClose: () => void; onCreated: 
   };
 
   return (
-    <ModalShell title="Add account" onClose={onClose}>
+    <Modal title="Add account" onClose={onClose}>
       {error && <div className="banner error">{error}</div>}
       <label className="field">
         <span className="label">Username</span>
@@ -538,7 +544,7 @@ function AddUserModal({ onClose, onCreated }: { onClose: () => void; onCreated: 
         </button>
         <button onClick={onClose} disabled={submitting}>Cancel</button>
       </div>
-    </ModalShell>
+    </Modal>
   );
 }
 
@@ -575,7 +581,7 @@ function ResetPasswordModal({
   };
 
   return (
-    <ModalShell title={`Reset password for ${username}`} onClose={onClose}>
+    <Modal title={`Reset password for ${username}`} onClose={onClose}>
       <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 8 }}>
         Sets a new password for <code className="mono">{username}</code>. Their existing
         JWT remains valid until expiry; future logins will require the new password.
@@ -609,7 +615,7 @@ function ResetPasswordModal({
         </button>
         <button onClick={onClose} disabled={submitting}>Cancel</button>
       </div>
-    </ModalShell>
+    </Modal>
   );
 }
 
@@ -644,7 +650,7 @@ function DeleteUserModal({
   };
 
   return (
-    <ModalShell title={`Delete ${username}?`} onClose={onClose}>
+    <Modal title={`Delete ${username}?`} onClose={onClose}>
       <div className="banner error" style={{ fontSize: 12 }}>
         This permanently removes the account. The user will be unable to log in
         afterwards; any existing JWT they hold becomes useless on its next
@@ -670,44 +676,11 @@ function DeleteUserModal({
         </button>
         <button onClick={onClose} disabled={submitting}>Cancel</button>
       </div>
-    </ModalShell>
+    </Modal>
   );
 }
 
 
-// ── Shared modal shell ──────────────────────────────────────────────────────
-
-function ModalShell({
-  title,
-  onClose,
-  children,
-}: {
-  title: string;
-  onClose: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 520, maxWidth: '92vw', maxHeight: '80vh', overflowY: 'auto' }}
-      >
-        <h2 style={{ marginTop: 0 }}>{title}</h2>
-        {children}
-      </div>
-    </div>
-  );
-}
 
 
 // ── Tiny helpers ────────────────────────────────────────────────────────────

@@ -39,7 +39,21 @@ import threading
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# restoration.log is written by this module DIRECTLY, not through the
+# logging framework, so the handler-level TokenScrubFilter never sees
+# these lines. Scrub here instead so a credential embedded in a
+# reason / detail / title (e.g. a plexapi exception whose __str__
+# captured a tokenised request URL) never lands in restoration.log.
+# Best-effort: if the scrubber module is somehow unavailable, fall
+# back to the identity function so logging still works.
+try:
+    from server.log_scrubber import scrub as _token_scrub
+except Exception:  # pragma: no cover - scrubber is defence-in-depth
+    def _token_scrub(text: str) -> str:  # type: ignore[misc]
+        return text
 
 
 # Status constants - exposed for test pinning + caller-side use.
@@ -334,7 +348,12 @@ class RestorationLogWriter:
             ]
             for k, v in extras:
                 parts.append(f"{k}={v}")
-            line = " ".join(parts) + "\n"
+            # Scrub any credential (X-Plex-Token, Fernet blob, ...)
+            # before the line touches disk. reason= strings routinely
+            # embed a raw exception message, and this writer bypasses
+            # the logging framework so the handler-level scrubber
+            # never gets a chance to redact it.
+            line = _token_scrub(" ".join(parts)) + "\n"
 
             with self._lock:
                 if self._closed:

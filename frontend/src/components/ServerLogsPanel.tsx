@@ -18,6 +18,7 @@ import { useEffect, useState } from 'react';
 import { api, getAccessToken, LogFile, LogRun, ServerView } from '../api';
 import { LogTailer } from './LogTailer';
 import { ConfirmDeleteModal } from './LogsPanel';
+import { formatBytes, formatTimestamp } from '../utils/format';
 
 
 // Same blob-download pattern LogsPanel uses; copied verbatim because
@@ -51,22 +52,7 @@ async function downloadBlob(
   }
 }
 
-function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return '-';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[i]}`;
-}
 
-function formatTs(epochSeconds: number): string {
-  if (!Number.isFinite(epochSeconds) || epochSeconds <= 0) return '-';
-  return new Date(epochSeconds * 1000).toLocaleString();
-}
 
 const ORPHAN_KEY_PREFIX = '__orphan__|';
 const UNATTRIBUTED_KEY = '__unattributed__';
@@ -395,7 +381,7 @@ function ServerLogGroup({
                 }}
               >
                 <td className="mono">{r.name}</td>
-                <td>{formatTs(r.mtime)}</td>
+                <td>{formatTimestamp(r.mtime)}</td>
                 <td className="num">{r.file_count}</td>
                 <td>
                   {r.passed === true && <span className="tag done">PASS</span>}

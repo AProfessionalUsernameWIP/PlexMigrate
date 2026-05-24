@@ -1,11 +1,11 @@
 // First-boot setup screen - rendered exactly once per fresh install,
 // when /api/auth/status reports ``setup_needed: true``.
 //
-// Item 1 (admin-management plan, 2026-05-15): the setup is a TWO-STEP
-// wizard now. Step 1 collects the end user's day-to-day admin credentials.
-// Step 2 collects a SEPARATE root account credential. Both are submitted
-// atomically via /api/auth/setup-v2 so a partial setup cannot leave the
-// install with only one account.
+// The setup is a TWO-STEP wizard. Step 1 collects the end user's
+// day-to-day admin credentials. Step 2 collects a SEPARATE root
+// account credential. Both are submitted atomically via
+// /api/auth/setup-v2 so a partial setup cannot leave the install with
+// only one account.
 //
 // The setup endpoint returns an access token alongside the user row
 // (the admin account), so a successful setup transitions straight
@@ -80,7 +80,7 @@ export function SetupPage({ onSetupComplete }: Props) {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">PlexMigrate</div>
+        <div className="brand"><span className="wordmark-badge">HM²</span><span className="wordmark-text">Hestia-MediaManager</span></div>
       </header>
       <main className="main" style={{ display: 'flex', justifyContent: 'center', paddingTop: 40 }}>
         <form
@@ -110,10 +110,10 @@ export function SetupPage({ onSetupComplete }: Props) {
                 admin account most of the time, switch to root only when
                 you need to.
               </p>
-              {error && <div className="banner error">{error}</div>}
-              <CredentialFieldset value={admin} onChange={setAdmin} />
+              {error && <div className="banner error" data-testid="setup-error">{error}</div>}
+              <CredentialFieldset value={admin} onChange={setAdmin} testIdPrefix="setup-admin" />
               <div className="row-buttons">
-                <button type="submit" className="primary" disabled={!adminValid}>
+                <button type="submit" className="primary" disabled={!adminValid} data-testid="setup-next">
                   Next: create root account
                 </button>
               </div>
@@ -131,7 +131,7 @@ export function SetupPage({ onSetupComplete }: Props) {
                 <code> server_data/auth.db </code> and redo this setup. Your
                 Plex data is preserved either way.
               </p>
-              {error && <div className="banner error">{error}</div>}
+              {error && <div className="banner error" data-testid="setup-error">{error}</div>}
               {!usernamesDiffer && root.username.trim() && (
                 <div className="banner error">
                   Root and admin accounts must have different usernames.
@@ -141,6 +141,7 @@ export function SetupPage({ onSetupComplete }: Props) {
                 value={root}
                 onChange={setRoot}
                 usernameHelp="Must differ from your admin username."
+                testIdPrefix="setup-root"
               />
               <div className="row-buttons" style={{ gap: 8 }}>
                 <button type="button" onClick={() => { setError(null); setStep(1); }}>
@@ -150,6 +151,7 @@ export function SetupPage({ onSetupComplete }: Props) {
                   type="submit"
                   className="primary"
                   disabled={busy || !rootValid || !usernamesDiffer}
+                  data-testid="setup-submit"
                 >
                   {busy ? 'Creating both accounts…' : 'Finish setup and sign in'}
                 </button>
@@ -170,14 +172,20 @@ function CredentialFieldset({
   value,
   onChange,
   usernameHelp,
+  testIdPrefix,
 }: {
   value: CredentialFields;
   onChange: (next: CredentialFields) => void;
   usernameHelp?: string;
+  // Distinct prefix per step so the admin and root field-sets don't
+  // share testids when both are present in the DOM (they're rendered
+  // conditionally so it shouldn't actually collide, but defensive).
+  testIdPrefix?: string;
 }) {
   const patch = (k: keyof CredentialFields, v: string) =>
     onChange({ ...value, [k]: v });
   const passwordsMatch = value.password === value.confirm;
+  const tid = (suffix: string) => testIdPrefix ? `${testIdPrefix}-${suffix}` : undefined;
 
   return (
     <>
@@ -192,6 +200,7 @@ function CredentialFieldset({
           autoComplete="username"
           value={value.username}
           onChange={(e) => patch('username', e.target.value)}
+          data-testid={tid('username')}
         />
       </label>
       <label className="field">
@@ -204,6 +213,7 @@ function CredentialFieldset({
           autoComplete="off"
           value={value.displayName}
           onChange={(e) => patch('displayName', e.target.value)}
+          data-testid={tid('display-name')}
         />
       </label>
       <label className="field">
@@ -216,6 +226,7 @@ function CredentialFieldset({
           autoComplete="new-password"
           value={value.password}
           onChange={(e) => patch('password', e.target.value)}
+          data-testid={tid('password')}
         />
       </label>
       <label className="field">
@@ -225,6 +236,7 @@ function CredentialFieldset({
           autoComplete="new-password"
           value={value.confirm}
           onChange={(e) => patch('confirm', e.target.value)}
+          data-testid={tid('password-confirm')}
         />
         {value.confirm && !passwordsMatch && (
           <span className="help" style={{ color: 'var(--bad)' }}>

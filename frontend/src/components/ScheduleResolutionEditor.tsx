@@ -14,7 +14,6 @@
 // schedule's resolutions_status badge re-computes against the
 // current dest roster.
 
-import { useEffect, useState } from 'react';
 import { api } from '../api';
 import type {
   PreflightResponse,
@@ -22,6 +21,9 @@ import type {
   Schedule,
 } from '../api';
 import { CrossPlatformPreflightModal } from './CrossPlatformPreflightModal';
+import { errorText } from '../utils/format';
+import { useResourceQuery } from '../hooks/useResourceQuery';
+import { Modal } from './Modal';
 
 interface Props {
   open: boolean;
@@ -40,20 +42,17 @@ export function ScheduleResolutionEditor({
   onClose,
   onSaved,
 }: Props) {
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [response, setResponse] = useState<PreflightResponse | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    setLoading(true);
-    setError(null);
-    setResponse(null);
-    api.schedulesCrossPlatformPreflight(schedule as unknown as Record<string, unknown>)
-      .then((r) => setResponse(r))
-      .catch((e) => setError(String(e instanceof Error ? e.message : e)))
-      .finally(() => setLoading(false));
-  }, [open, schedule]);
+  // Re-runs the schedule preflight whenever the editor opens or the
+  // schedule changes; skips the call entirely while closed.
+  const { data: response, loading, error, setError } = useResourceQuery<PreflightResponse | null>(
+    () => (
+      open
+        ? api.schedulesCrossPlatformPreflight(schedule as unknown as Record<string, unknown>)
+        : Promise.resolve(null)
+    ),
+    [open, schedule],
+    null,
+  );
 
   if (!open) return null;
 
@@ -74,26 +73,14 @@ export function ScheduleResolutionEditor({
 
   if (error || !response) {
     return (
-      <div
-        onClick={onClose}
-        style={{
-          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
-          zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}
-      >
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="panel"
-          style={{ padding: 20, maxWidth: 480 }}
-        >
+      <Modal onClose={onClose} align="center" width={480}>
           <div className="banner error" style={{ fontSize: 13 }}>
             Could not load preflight: {error || 'unknown error'}
           </div>
           <div style={{ marginTop: 12, display: 'flex', justifyContent: 'flex-end' }}>
             <button onClick={onClose}>Close</button>
           </div>
-        </div>
-      </div>
+      </Modal>
     );
   }
 
@@ -114,7 +101,7 @@ export function ScheduleResolutionEditor({
           onSaved();
           onClose();
         } catch (e) {
-          setError(String(e instanceof Error ? e.message : e));
+          setError(errorText(e));
         }
       }}
     />

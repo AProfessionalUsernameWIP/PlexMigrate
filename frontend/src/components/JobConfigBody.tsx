@@ -18,12 +18,11 @@
 //     confirm_replace + confirm_additive_merge checkboxes; Run Job
 //     passes nothing).
 //
-// Modals + Submit/Save buttons stay in each page's wrapper — they're
+// Modals + Submit/Save buttons stay in each page's wrapper - they're
 // page-specific and depend on each page's submit/save state machine.
 //
-// Phase E (Plan[SCHEDULES-ALIGNMENT-V2], 2026-05-16): introduced to
-// dedupe the ~400 lines of panel-stack wiring that was duplicated
-// across JobFormPanel and SchedulesPanel.
+// This component dedupes the panel-stack wiring shared across
+// JobFormPanel and SchedulesPanel.
 
 import type { ReactNode } from 'react';
 import type { JobConfigOwner } from './JobConfigOwner';
@@ -49,6 +48,12 @@ interface Props {
   // additive Merge) injected below RestoreModeSelector. Run Job
   // passes nothing (uses the typed-REPLACE modal at submit time).
   restorationModeExtras?: ReactNode;
+  // Per-run library mapping editor slot. Run Job mounts
+  // RunJobLibraryMappingPanel here so the mapping panel sits right
+  // after DataToMigratePanel - same "what's leaving / where's it
+  // going" cluster as the data + libs picker - and just above
+  // PerRunSettingsPanel. Schedules passes nothing.
+  libraryMappingSlot?: ReactNode;
 }
 
 export function JobConfigBody({
@@ -56,6 +61,7 @@ export function JobConfigBody({
   topSlot,
   restoreSourceSlot,
   restorationModeExtras,
+  libraryMappingSlot,
 }: Props) {
   const {
     idScope,
@@ -209,6 +215,62 @@ export function JobConfigBody({
           pointerEvents: serversReady ? 'auto' : 'none',
         }}
       >
+        {/* Restore source sits at the top of the gated body so the
+            workflow reads top-down for restore jobs:
+              1. Pick the snapshot / file (restore source)
+              2. Pick the restoration mode (Merge / Replace)
+              3. Pick which users to include
+              4. Pick what data + libraries to migrate
+              5. Pick per-run library mapping overrides (advanced)
+              6. Per-run engine settings
+            The slot is empty for non-restore modes, so this is a
+            no-op for snapshot / direct flows. */}
+        {restoreSourceSlot}
+
+        {/* Restoration mode sits right under the restore source. The
+            Merge / Replace choice is part of "what kind of restore am
+            I doing", locked in before picking users + libraries. */}
+        {(mode === 'restore' || mode === 'direct') && (
+          <div className="panel">
+            <h2 style={{ marginTop: 0 }}>Restoration mode</h2>
+            <RestoreModeSelector
+              mode={restoreMode}
+              autoCaptureBeforeReplace={autoCaptureBeforeReplace}
+              mergeWatchStrategy={mergeWatchStrategy}
+              onMergeWatchStrategyChange={setMergeWatchStrategy}
+              onModeChange={setRestoreMode}
+              onAutoCaptureChange={setAutoCaptureBeforeReplace}
+              idPrefix={`${idScope}-restore`}
+            />
+            {restorationModeExtras}
+          </div>
+        )}
+
+        {(mode === 'restore' || mode === 'direct')
+          && restoreMode === 'merge'
+          && mergeWatchStrategy === 'sum' && (
+          <div
+            className="banner"
+            style={{
+              background: 'rgba(245, 166, 35, 0.10)',
+              border: '1px solid var(--warn, #f5a623)',
+              color: 'var(--text, inherit)',
+              marginTop: 8,
+              padding: '10px 12px',
+              borderRadius: 6,
+              fontSize: 12,
+            }}
+          >
+            <strong style={{ color: 'var(--warn, #f5a623)' }}>
+              Combine totals is not idempotent.
+            </strong>{' '}
+            Each run adds the snapshot's stored view counts on top of the
+            destination's current counts. Re-running the same snapshot doubles
+            the contribution. Use only when the snapshot represents activity
+            that should accumulate alongside the destination's own plays.
+          </div>
+        )}
+
         <div className="section-header">
           <h2 style={{ marginBottom: 4 }}>Scope - what to migrate</h2>
           <span className="help" style={{ color: 'var(--text-dim)', fontSize: 12 }}>
@@ -244,6 +306,48 @@ export function JobConfigBody({
           </div>
         )}
 
+        {/* Diagnostic empty-state hint. When fan-out is on + the mode
+            supports per-user selection but the user lists haven't
+            loaded, surface exactly which gate is blocking, so the end
+            user can tell whether they haven't picked a snapshot,
+            haven't picked a destination, are waiting on a fetch, or
+            have hit a bug. */}
+        {includeManagedUsers && userSectionMode && (sourceUsers === null || destUsers === null) && (
+          <div
+            className="banner"
+            style={{
+              padding: '8px 12px',
+              fontSize: 12,
+              background: 'rgba(74, 122, 252, 0.08)',
+              border: '1px solid rgba(74, 122, 252, 0.35)',
+              borderRadius: 4,
+            }}
+          >
+            <strong>Loading user list…</strong>
+            {mode === 'restore' && !selectedSnapshot && (
+              <> Pick a snapshot above to see captured users.</>
+            )}
+            {mode === 'restore' && destServerIds.size === 0 && (
+              <> Pick at least one destination server to see its user list.</>
+            )}
+            {mode !== 'restore' && !sourceServerId && (
+              <> Pick a source server to see its users.</>
+            )}
+            {mode === 'direct' && sourceServerId && destServerIds.size > 0 && destServerIds.has(sourceServerId) && (
+              <> The source server is also picked as a destination —
+              same-server direct transfers don't expose a user picker.
+              Pick a different destination, or switch to Snapshot mode
+              if you want to capture and replay users on the same server.</>
+            )}
+            {mode === 'restore' && selectedSnapshot && destServerIds.size > 0 && (
+              <> Reading snapshot + destination users…</>
+            )}
+            {mode !== 'restore' && sourceServerId && (mode !== 'direct' || destServerIds.size === 0 || !destServerIds.has(sourceServerId)) && (
+              <> Reading source + destination users…</>
+            )}
+          </div>
+        )}
+
         {/* UserFilterPanel (when fan-out is on AND user lists have
             loaded) OR owner-only hint (when fan-out is off).
             Restore-from-snapshot mode: the credential filters apply
@@ -259,10 +363,14 @@ export function JobConfigBody({
               sourceServerId={sourceServerId || null}
               mode={mode === 'restore' ? 'restore' : 'capture'}
               credentialServerIds={
+                /* destServerIds carries actual server IDs already
+                   (state setter is wired through setDestServerIds at
+                   JobFormPanel.tsx:1507). Earlier code did a
+                   name-keyed lookup that always returned undefined →
+                   the credential filter ran against an empty server
+                   list. Pass the IDs straight through. */
                 mode === 'restore'
-                  ? Array.from(destServerIds)
-                      .map((name) => servers.find((s) => s.name === name)?.id)
-                      .filter((x): x is string => !!x)
+                  ? Array.from(destServerIds).filter(Boolean)
                   : undefined
               }
               disabled={mode === 'restore' ? destServerIds.size === 0 : !sourceServerId}
@@ -281,37 +389,39 @@ export function JobConfigBody({
         )}
 
         {/* DirectUsersPanel for the user selection grid. */}
-        {includeManagedUsers && userSectionMode && sourceUsers !== null && destUsers !== null && (
-          <DirectUsersPanel
-            mode={mode}
-            sourceUsers={userFilterActive
-              ? sourceUsers.filter((u) => userFilteredIds.has(u.plex_id))
-              : sourceUsers}
-            destUsers={destUsers}
-            included={includedUsers}
-            onToggle={(plex_id) => {
-              const next = new Set(includedUsers);
-              if (next.has(plex_id)) next.delete(plex_id);
-              else next.add(plex_id);
-              setIncludedUsers(next);
-            }}
-            onAll={() => {
-              const dstIds = new Set(destUsers.map((u) => u.plex_id));
-              setIncludedUsers(new Set(
-                sourceUsers
-                  .filter((u) => dstIds.has(u.plex_id))
-                  .map((u) => u.plex_id),
-              ));
-            }}
-            onNone={() => setIncludedUsers(new Set())}
-            loadError={usersError}
-          />
-        )}
-
-        {/* Restore source slot (page-specific): Run Job's snapshot/file
-            picker, OR Schedules' input_files textarea. Rendered between
-            user pickers and DataToMigratePanel. */}
-        {restoreSourceSlot}
+        {includeManagedUsers && userSectionMode && sourceUsers !== null && destUsers !== null && (() => {
+          // The picker renders this narrowed list when the attribute
+          // filter is active. FECORE-04: onAll must operate on the
+          // SAME narrowed list, otherwise "All" re-adds filtered-out
+          // users that are invisible in the picker.
+          const pickerSourceUsers = userFilterActive
+            ? sourceUsers.filter((u) => userFilteredIds.has(u.plex_id))
+            : sourceUsers;
+          return (
+            <DirectUsersPanel
+              mode={mode}
+              sourceUsers={pickerSourceUsers}
+              destUsers={destUsers}
+              included={includedUsers}
+              onToggle={(plex_id) => {
+                const next = new Set(includedUsers);
+                if (next.has(plex_id)) next.delete(plex_id);
+                else next.add(plex_id);
+                setIncludedUsers(next);
+              }}
+              onAll={() => {
+                const dstIds = new Set(destUsers.map((u) => u.plex_id));
+                setIncludedUsers(new Set(
+                  pickerSourceUsers
+                    .filter((u) => dstIds.has(u.plex_id))
+                    .map((u) => u.plex_id),
+                ));
+              }}
+              onNone={() => setIncludedUsers(new Set())}
+              loadError={usersError}
+            />
+          );
+        })()}
 
         <DataToMigratePanel
           mode={mode}
@@ -328,52 +438,12 @@ export function JobConfigBody({
           atLeastOneType={atLeastOneType}
         />
 
-        {/* Restoration mode panel + page-specific extras (Schedules'
-            persistent confirm checkboxes). */}
-        {(mode === 'restore' || mode === 'direct') && (
-          <div className="panel">
-            <h2 style={{ marginTop: 0 }}>Restoration mode</h2>
-            <RestoreModeSelector
-              mode={restoreMode}
-              autoCaptureBeforeReplace={autoCaptureBeforeReplace}
-              mergeWatchStrategy={mergeWatchStrategy}
-              onMergeWatchStrategyChange={setMergeWatchStrategy}
-              onModeChange={setRestoreMode}
-              onAutoCaptureChange={setAutoCaptureBeforeReplace}
-              idPrefix={`${idScope}-restore`}
-            />
-            {restorationModeExtras}
-          </div>
-        )}
-
-        {/* Sum-mode non-idempotency warning, rendered as a sibling
-            of the Restoration mode panel. Same trigger logic both
-            pages used. Schedules supplements with a stronger
-            additive-merge warning inside restorationModeExtras. */}
-        {(mode === 'restore' || mode === 'direct')
-          && restoreMode === 'merge'
-          && mergeWatchStrategy === 'sum' && (
-          <div
-            className="banner"
-            style={{
-              background: 'rgba(245, 166, 35, 0.10)',
-              border: '1px solid var(--warn, #f5a623)',
-              color: 'var(--text, inherit)',
-              marginTop: 8,
-              padding: '10px 12px',
-              borderRadius: 6,
-              fontSize: 12,
-            }}
-          >
-            <strong style={{ color: 'var(--warn, #f5a623)' }}>
-              Combine totals is not idempotent.
-            </strong>{' '}
-            Each run adds the snapshot's stored view counts on top of the
-            destination's current counts. Re-running the same snapshot doubles
-            the contribution. Use only when the snapshot represents activity
-            that should accumulate alongside the destination's own plays.
-          </div>
-        )}
+        {/* Per-run library mapping overrides slot. Sits directly
+            below DataToMigratePanel because they operate on the same
+            selection ("here are the libraries you're moving").
+            Collapsed-by-default advanced section; Run Job mounts
+            RunJobLibraryMappingPanel here. */}
+        {libraryMappingSlot}
 
         <PerRunSettingsPanel
           mode={mode}

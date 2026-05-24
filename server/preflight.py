@@ -1,8 +1,8 @@
 """
-PR-12 preflight checks. Today the only check is the PIN preflight:
-for each managed user in scope on the relevant server(s), confirm
-that the end user has stored either an auth token or a Plex Home
-PIN in :mod:`server.media_db`.
+Preflight checks. The only check is the PIN preflight: for each
+managed user in scope on the relevant server(s), confirm that the
+end user has stored either an auth token or a Plex Home PIN in
+:mod:`server.media_db`.
 
 A managed user with neither credential on file is at risk: the engine
 falls back to admin-token impersonation, which can return incomplete
@@ -57,11 +57,10 @@ def compute_pin_preflight(
     supplied (mirrors the per-user transfer scope used by
     :class:`DirectTransferIn`).
 
-    PR-Backends: ``source_service_type`` / ``dest_service_types``
-    disambiguate same-named-different-backend servers (TODO-AGENT-2-5
-    from Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). Pre-PR-Backends
-    callers omit them and we default to "plex" - matches the existing
-    behaviour for installs without duplicate names.
+    ``source_service_type`` / ``dest_service_types`` disambiguate
+    same-named-different-backend servers. Legacy callers omit them and
+    we default to "plex" - matches the behaviour for installs without
+    duplicate names.
     """
     # Restore is the only mode that bypasses per-user auth (the file
     # is the source of truth; the admin token writes everyone's data
@@ -129,13 +128,18 @@ def compute_pin_preflight(
         if not server_id:
             continue
         try:
-            users = media_db.list_managed_users(server_id, include_hidden=False)
+            # Route the preflight permission check through the shared
+            # activity filter so a tombstoned user never trips a
+            # PIN-missing warning (the engine won't touch them on the
+            # actual run either).
+            from services.user_activity_filter import list_active_users
+            users = list_active_users(server_id)
         except Exception:
             # media.db hiccup. Treat as "no managed users to worry
             # about" rather than failing the preflight - the job
             # submission still goes through and the engine handles
             # missing-auth at the per-user level as before.
-            log.exception("list_managed_users failed for server %r", server_id)
+            log.exception("list_active_users failed for server %r", server_id)
             continue
         servers_checked.append(sname)
         for u in users:
@@ -150,11 +154,11 @@ def compute_pin_preflight(
                 continue
             if u.get("has_token") or u.get("has_pin"):
                 continue
-            # Share-state gate (2026-05-15). Pre-fix this branch flagged
-            # every credential-less row as "PIN-protected," which
-            # included stale users the end user had un-shared on
-            # Plex.tv. Two new flags from /api/servers/{mid}/shared_servers
-            # + /api/home/users now tell us which is which:
+            # Share-state gate. Flagging every credential-less row as
+            # "PIN-protected" would include stale users the end user
+            # had un-shared on Plex.tv. Two flags from
+            # /api/servers/{mid}/shared_servers + /api/home/users tell
+            # us which is which:
             #   * active_share=False -> user is gone from this server.
             #     The engine's share-state gate already drops them; no
             #     point asking the end user to save a PIN for a row

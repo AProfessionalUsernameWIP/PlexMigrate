@@ -1,5 +1,5 @@
 """
-Persistence layer for the PlexMigrate server.
+Persistence layer for the Hestia-MediaManager server.
 
 The server keeps two pieces of state on disk so they survive container
 restarts and rebuilds:
@@ -77,8 +77,11 @@ _FILE_LOCK = threading.Lock()
 # ── Default documents ────────────────────────────────────────────────────────
 
 # The schema for settings.json. Any key omitted from an on-disk
-# document is filled in with these defaults on load - that keeps the
-# server compatible with older settings files when new fields are added.
+# document is filled in with these defaults on load, keeping the
+# server compatible with older settings files. Per-key rationale -
+# when and why to change a value - lives in
+# dev_docs/settings-reference.md; the comments here are held to one
+# terse line per key (a clamp range or other non-obvious constraint).
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "plex_url": "http://host.docker.internal:32400",
     "plex_token": "",
@@ -88,203 +91,88 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "scrobble_workers": 8,
     "verbose": False,
     "strict_match": True,
-    # PR-13 - snapshot retention. Global ceiling + optional per-server
-    # override map ({server_id: int}). Override applies only when
-    # strictly lower than the global; never higher. See
-    # ``snapshot_registry.effective_retention_for`` for the resolution.
+    # Global snapshot-retention ceiling; the per-server override map
+    # may only lower it for a given server, never raise it.
     "snapshot_retention_global": 30,
     "snapshot_retention_per_server": {},
-    # Global default for the snapshot JSON-sidecar toggle. None or
-    # False means "off"; the end user-set per-server map below or the
-    # per-job toggle override at job-fire time.
     "prebuild_json_sidecar_default": False,
-    # Owner-phase watch+ratings capture strategy.
-    #   "smart" (default) - bulk-fetch the library once when BOTH
-    #       watch-history and ratings are wanted on the owner phase,
-    #       filter locally; server-side filter when only one is wanted.
-    #   "force_bulk" - always bulk-fetch + local filter, even for
-    #       single-type runs (best for rate-limited Plex servers).
-    #   "force_server_side" - always use server-side filter scans, no
-    #       shared prefetch (best when bandwidth back from the server
-    #       is the constraint).
-    # Per-server override accepted under
-    # ``snapshot_defaults_per_server[server_id].watch_ratings_filter_strategy``.
+    # Owner-phase watch+ratings capture strategy:
+    # "smart" | "force_bulk" | "force_server_side".
     "watch_ratings_filter_strategy": "smart",
-    # Smart-mode size threshold (items). When strategy=="smart" and the
-    # library is NOT a show library, the bulk-fetch path is selected
-    # ONLY if the library has at least this many items AND both
-    # watch_history and ratings are being captured. Below the threshold
-    # the server-side filter path is preferred because the bulk fetch
-    # would pull the entire library (potentially thousands of items)
-    # over the wire to filter for a handful of watched / rated ones.
-    # Show libraries always bulk-fetch under smart mode regardless of
-    # size because the server-side path costs 2-3 filtered scans per
-    # show. Default 5000 is the audit's recommended starting point;
-    # end users on rate-limited Plex servers may want a lower number
-    # (favouring bulk), while end users with constrained back-channel
-    # bandwidth may want it higher.
+    # Smart-mode bulk-fetch size threshold, in library items.
     "smart_bulk_threshold_items": 5000,
-    # Run-timings retention. The run_timings.db keeps per-operation
-    # timing rows for ETR training and dashboard post-mortems. After
-    # every flush, only the most recent N distinct run_ids survive.
-    # 0 disables retention enforcement (end user escape hatch: keep
-    # everything; file grows unbounded). Default 200 matches the
-    # decision recorded in Plan[DEVOPS]-2026-05-15.md (D2).
+    # run_timings.db retention: keep the most recent N distinct
+    # run_ids after each flush. 0 disables enforcement (unbounded).
     "run_timings_retention_count": 200,
-    # Snapshot integrity validation (Feature 2).
-    # ``validate_snapshot_after_capture`` runs the structural
-    # validator at the end of build_snapshot_db_from_payloads, before
-    # the capture is considered successful. Default ON because the
-    # check is cheap and catches malformed captures at the source.
-    # ``validate_snapshot_before_restore`` runs the validator before
-    # restore primitives fire against the destination. Default OFF
-    # because it adds wall time to every restore; end users who want
-    # belt-and-suspenders enable it. Both defaults match the
-    # decisions recorded in Plan[DEVOPS]-2026-05-15.md (D4 / D5).
+    # Snapshot structural validation. after-capture defaults on (cheap,
+    # catches malformed captures); before-restore defaults off (it adds
+    # wall time to every restore).
     "validate_snapshot_after_capture": True,
     "validate_snapshot_before_restore": False,
-    # Log rotation knobs. Applied today to ``db_access.log`` via
-    # services.db_access_log; other application-log writers (auth,
-    # network, debug) will read the same tunables when their
-    # backing handlers ship. Per-run job logs are governed by their
-    # own retention policy (delete-all under Servers > Logs) and are
-    # not size-rotated.
+    # Application-log rotation (applied today to db_access.log).
     "log_rotate_max_size_mb": 50,
     "log_rotate_backup_count": 5,
-    # Per-server snapshot-time defaults map (Servers ▸ Advanced Settings).
-    # See SettingsIn.snapshot_defaults_per_server for the recognised fields.
+    # Per-server snapshot-time defaults; see SettingsIn.snapshot_defaults_per_server.
     "snapshot_defaults_per_server": {},
-    # Direct-transfer resolver-tier policy. Tier 2 (filepath suffix)
-    # defaults ON; Tier 3 (fuzzy title) defaults OFF. The flip applies
-    # only at the direct-transfer call boundary - snapshot/import paths
-    # keep both fallbacks active regardless.
+    # Direct-transfer resolver-tier policy: filepath fallback on, fuzzy
+    # off. snapshot/import paths keep both fallbacks active regardless.
     "transfer_resolution": {
         "allow_filepath_fallback": True,
         "allow_fuzzy_fallback": False,
     },
-    # v0.13.x: restore-mode defaults. End users pick per-job in the UI;
-    # the per-server override in ``snapshot_defaults_per_server`` wins
-    # when set; this global block is the final fallback. Merge is the
-    # safe default everywhere - Replace requires explicit opt-in per
-    # job AND a typed-REPLACE confirmation in the modal.
+    # Global restore-mode fallback (per-server / per-job overrides win).
+    # merge_watch_strategy: "higher" (idempotent) or "sum"; ignored when
+    # mode == "replace".
     "restore_defaults": {
         "mode": "merge",
         "auto_capture_before_replace": True,
-        # v0.13.x sub-strategy for Merge mode's watch-count math.
-        # "higher" = destination ends at max(stored, current) (legacy,
-        # idempotent); "sum" = current + stored (end user opt-in, not
-        # idempotent). Ignored when mode == "replace".
         "merge_watch_strategy": "higher",
     },
-    # v0.13.x: library-level concurrency cap for the file-mediated
-    # restore path. Today the engine hard-caps at min(3, libraries);
-    # this tunable replaces the hard 3 with an end user-controlled
-    # ceiling. Lower it (e.g. to 1) when Plex rate-limits multi-library
-    # API bursts; raise it when the destination is over-provisioned
-    # and idle. The min(value, library_count) clamp still applies, so
-    # setting this higher than the actual library count just caps at
-    # the count. Direct transfer remains serial in this release - this
-    # tunable does not apply there.
+    # Libraries-in-parallel cap for the file-mediated restore path;
+    # clamped to min(value, library_count). Does not apply to direct
+    # transfer (serial).
     "restore_library_workers": 3,
-    # v0.13.x: library-level concurrency cap for the snapshot path.
-    # Today snapshot reuses ``workers`` (the per-library HTTP worker
-    # count) as the library-level pool size, which means lowering
-    # per-library concurrency also lowers libraries-in-parallel and
-    # vice-versa. This tunable decouples the two axes:
-    #   * ``0`` (default) - inherit from ``workers`` (today's behavior,
-    #     so an upgrade is a no-op).
-    #   * Positive integer - explicit cap on libraries-in-parallel
-    #     independent of the per-library worker count.
-    # Lower to 1 to serialise snapshot libraries while keeping the
-    # per-library HTTP pool at its full size.
+    # Libraries-in-parallel cap for the snapshot path. 0 = inherit from
+    # ``workers``; a positive integer decouples it from the HTTP pool.
     "snapshot_library_workers": 0,
-    # v0.13.x: per-fan-out destination concurrency cap. Today fan-out
-    # spawns one worker thread per destination so N destinations run
-    # in parallel. ``0`` (default) preserves that - no cap. A positive
-    # integer caps the pool: ``1`` makes destinations run one at a time
-    # (which is what an end user should pick if all destinations live
-    # behind the same network bottleneck or the source Plex is the
-    # constraint), ``2`` runs at most two at a time, etc. Independent
-    # of restore_library_workers: each destination still uses its own
-    # within-job library concurrency value.
+    # Per-fan-out destination concurrency cap. 0 = no cap (one worker
+    # thread per destination).
     "fan_out_destination_workers": 0,
-    # media.db retention + cascade-delete policy. cascade_delete is
-    # the greedy-restrictive default (auto-purges per-server rows on
-    # server removal); end users who want to preserve data must
-    # explicitly set prevent_cascade_delete = true before deleting.
-    # prune_stale_*_days are placeholders - the sweep logic itself
-    # lands in a later commit.
+    # media.db retention + cascade-delete policy. prune_stale_*_days
+    # are placeholders (the sweep logic is not yet shipped).
     "media_db_retention": {
         "cascade_delete_on_server_remove": True,
         "prevent_cascade_delete": False,
         "prune_stale_watch_events_days": 0,
         "prune_stale_server_data_days": 0,
     },
-    # Rule 2: library-walk job cadence. The walk ticks
-    # server_items.last_seen_at for every item present on each
-    # registered server; the Prune Missing Items action reads those
-    # timestamps. Defaults: enabled, every 24h. Interval is floored
-    # at 1h to prevent thrashing large libraries.
-    # ``stale_threshold_days`` is the default value the Prune UI's
-    # slider opens at; end users override per-prune.
+    # Library-walk job cadence; interval_seconds is floored at 1h by
+    # the scheduler. stale_threshold_days is the Prune UI slider's
+    # opening value.
     "library_walk": {
         "enabled": True,
         "interval_seconds": 86400,
         "stale_threshold_days": 7,
     },
-    # PR-12: per-server rate limit for the user-token capture
-    # ``server.user_capture.capture_managed_user_tokens`` fires on
-    # every server add / update / reconnect. Each capture attempt hits
-    # plex.tv (``account.users()`` plus ``user.get_token`` /
-    # ``signInHomeUser`` per user), so a chatty end user clicking Test
-    # Connection in a tight loop could trip plex.tv's rate limiter.
-    # Default 4/hour/server (one attempt every 15 minutes). Floored at
-    # 1/hour by the gate. End user-triggered "Refresh users" bypasses
-    # the throttle.
+    # Per-server cap on user-token capture attempts; floored at 1/hour.
     "user_token_capture_throttle_per_hour": 4,
-    # Item 1 (admin-management plan, 2026-05-15): sudo-style elevation
-    # TTL for root_admin destructive writes. Default 600s (10 min) is
-    # the sudo convention. Floored at 60s, ceiled at 3600s by the
-    # elevation helper so an end user can't accidentally disable the
-    # protection by writing 0 or set a year-long elevation.
+    # sudo-style elevation TTL for root_admin destructive writes;
+    # clamped to [60, 3600] seconds by the elevation helper.
     "elevation_ttl_seconds": 600,
-    # Item 1: tracks which version of the first-boot setup has run.
-    # 1 = legacy single-account setup ran (pre-Item-1). 2 = v2
-    # two-step setup OR an upgrade-split happened. The frontend reads
-    # this via /api/auth/status to decide whether to show the forced
-    # upgrade-split modal on a legacy install's first post-upgrade
-    # login.
-    "auth_setup_version": 1,
-    # Item 2 follow-up (admin-management plan): when true, the
-    # Refresh-server button additionally attempts to detect rotated
-    # tokens by overwriting any stored token whose Plex-side value has
-    # changed. Default false: Refresh is additive only. Rotation is
-    # otherwise driven by the dedicated per-user "Rotate token" button
-    # in User Management. End user-only setting (root_admin to write).
+    # When true, Refresh-server also overwrites any stored token whose
+    # Plex-side value changed.
     "auto_rotate_tokens_on_refresh": False,
-    # Item 3 follow-up (admin-management plan): when true, the
-    # cross-server PIN migration prompt matches by username string in
-    # addition to Plex user ID. Default false: ID match only, which
-    # protects against the rare case of unrelated Plex.tv accounts
-    # each having a managed user named "alice". End user-only setting.
+    # When true, PIN migration matches managed users by username as
+    # well as Plex user id.
     "pin_migration_allow_username_fallback": False,
-    # Item 5 (admin-management plan): global tooltip toggle. When
-    # false, the InfoTip component renders no popover affordance and
-    # the verbose body text stays in the Help tab only. Default true:
-    # discoverability beats noise. Root_admin to write.
+    # Global InfoTip popover toggle.
     "tooltips_enabled": True,
-    # System Tunables nested map. Empty by default; the
-    # ``services.tunables`` module owns the source-of-truth defaults
-    # so callers always read a value even when this map is empty.
-    # End users populate keys via Settings ▸ Tunables (root_admin
-    # only) and the saved values override the module defaults.
+    # System Tunables override map; services.tunables owns the
+    # source-of-truth defaults.
     "tunables": {},
-    # Per-server tunable overrides. {server_id: {tunable_key: value}}.
-    # Only consulted by tunables that explicitly support per-server
-    # resolution (currently ``plex_connect_timeout_seconds`` and
-    # ``viewcount_increment_cap``); all other tunables stay global.
+    # Per-server tunable overrides: {server_id: {tunable_key: value}}.
     "tunables_per_server": {},
-    # ETR colour multiplier (Phase 4). 1.0 = ship defaults.
+    # ETR colour multiplier; 1.0 = ship defaults.
     "etr_color_multiplier": 1.0,
 }
 
@@ -296,14 +184,14 @@ def load_settings() -> Dict[str, Any]:
     Return a complete settings dict. Missing file or missing keys are
     backfilled from ``_DEFAULT_SETTINGS``.
 
-    v0.9.5: if the on-disk document carries ``"_encrypted": True``,
-    the ``plex_token`` field is decrypted before being returned. If
-    the marker is absent, the field is treated as plaintext (legacy /
-    pre-migration shape) and returned as-is - the v0.8→v0.9 migration
-    in ``server_registry.migrate_legacy_settings`` is the one path
-    that depends on this; once it runs, ``_clear_legacy_fields`` writes
-    an empty string back through ``save_settings``, which sets the
-    marker for all subsequent loads.
+    If the on-disk document carries ``"_encrypted": True``, the
+    ``plex_token`` field is decrypted before being returned. If the
+    marker is absent, the field is treated as plaintext (legacy shape)
+    and returned as-is - the legacy-settings migration in
+    ``server_registry.migrate_legacy_settings`` is the one path that
+    depends on this; once it runs, ``_clear_legacy_fields`` writes an
+    empty string back through ``save_settings``, which sets the marker
+    for all subsequent loads.
     """
     path = _settings_path()
     if not path.exists():
@@ -368,16 +256,16 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     Keys not present in ``settings`` retain their previous values -
     this is a partial update.
 
-    v0.9.5: the ``plex_token`` field is encrypted before write and
-    the ``_encrypted`` marker is set. The returned dict still holds
-    the plaintext token so callers that immediately consume the
-    document don't need to know about encryption.
+    The ``plex_token`` field is encrypted before write and the
+    ``_encrypted`` marker is set. The returned dict still holds the
+    plaintext token so callers that immediately consume the document
+    don't need to know about encryption.
 
-    Hot-reload (Phase 3): when a save changes any HTTP-related
-    tunable (retry budget, backoff, pool sizes) the function rebuilds
-    every live requests Session's HTTPAdapter via
-    ``services.auth.invalidate_sessions``. The tunables module's
-    mtime-keyed cache invalidates automatically on the next read.
+    When a save changes any HTTP-related tunable (retry budget,
+    backoff, pool sizes) the function rebuilds every live requests
+    Session's HTTPAdapter via ``services.auth.invalidate_sessions``.
+    The tunables module's mtime-keyed cache invalidates automatically
+    on the next read.
     """
     with _FILE_LOCK:
         existing = load_settings()
@@ -486,18 +374,17 @@ def rename_schedules_for_server(
     ``dest_service_types``) matches ``service_type``. Returns the
     number of schedule rows rewritten.
 
-    Fix for the rename-vs-schedule bug (TODO-AGENT-2-1 in
-    Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md): pre-fix, renaming a
-    server left every schedule referencing its old name dangling. The
-    scheduler would fail to resolve the source or - worse, if the old
-    name had been reassigned - silently target a different server.
+    Without this rewrite, renaming a server would leave every schedule
+    referencing its old name dangling: the scheduler would fail to
+    resolve the source or - worse, if the old name had been reassigned
+    - silently target a different server.
 
     Called by :func:`server_registry.update_server` whenever a name
     field changes. Best-effort: schedule file unavailable / locked
     paths are reported in the return tuple but never raise.
 
     ``service_type`` filters so renaming a Plex server doesn't touch
-    same-named-different-backend Jellyfin / Emby schedules. Pre-PR-Backends
+    same-named-different-backend Jellyfin / Emby schedules. Legacy
     schedules without ``source_service_type`` default to "plex" on read.
     """
     target_service = (service_type or "plex").lower()
@@ -547,17 +434,17 @@ def delete_schedules_by_server_name(
     Remove every schedule whose ``source_server_name`` AND
     ``source_service_type`` match. Returns the number of rows removed.
 
-    Used by the server-removal cascade (v0.9.5+): when a registered
-    server is deleted, schedules that fire against it can never run
-    again, so they're cleared in lockstep rather than left to log a
-    "no source_server_name set" warning every 30 seconds.
+    Used by the server-removal cascade: when a registered server is
+    deleted, schedules that fire against it can never run again, so
+    they're cleared in lockstep rather than left to log a "no
+    source_server_name set" warning every 30 seconds.
 
-    PR-Backends: ``service_type`` filters by the schedule's
-    ``source_service_type`` field. Pre-PR-Backends rows that omit the
-    field are read as "plex" - so deleting a Plex server with the
-    default keyword removes legacy schedules cleanly. Deleting an Emby
-    server only matches schedules explicitly stamped with
-    ``source_service_type='emby'``; same-named Plex schedules survive.
+    ``service_type`` filters by the schedule's ``source_service_type``
+    field. Legacy rows that omit the field are read as "plex" - so
+    deleting a Plex server with the default keyword removes legacy
+    schedules cleanly. Deleting an Emby server only matches schedules
+    explicitly stamped with ``source_service_type='emby'``; same-named
+    Plex schedules survive.
     """
     server_type = (service_type or "plex").lower()
     with _FILE_LOCK:
@@ -586,26 +473,43 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
     a half-written file. This matters because both files are read on
     every request.
 
-    M14: the temp file is chmod'd to ``0o600`` before the replace so
-    the destination (``settings.json`` / ``servers.json``) is never
+    The temp file is chmod'd to ``0o600`` before the replace so the
+    destination (``settings.json`` / ``servers.json``) is never
     world-readable - both can carry Fernet-encrypted Plex tokens, and
-    the keyfile lives in the same directory. M16: ``chmod`` only has
-    real effect on POSIX hosts; on Windows the data-directory ACL is
-    the actual security boundary and must be locked down separately.
+    the keyfile lives in the same directory. ``chmod`` only has real
+    effect on POSIX hosts; on Windows the data-directory ACL is the
+    actual security boundary and must be locked down separately.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
+        # Force the data blocks to disk before the rename. os.replace
+        # is atomic against torn writes; the fsync makes it durable
+        # against a power loss between the write and the rename.
+        fh.flush()
+        os.fsync(fh.fileno())
     try:
         os.chmod(tmp, 0o600)
     except OSError:
         # Best-effort; never block a settings write on a chmod failure.
         pass
     os.replace(tmp, path)
+    # Best-effort POSIX rename durability: fsync the parent directory
+    # so the rename entry itself survives a crash. Not every platform
+    # allows opening a directory; a settings write must never fail on
+    # this nicety, hence the broad OSError swallow.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
-# ── Path validation (v0.9.5) ─────────────────────────────────────────────────
+# ── Path validation ──────────────────────────────────────────────────────────
 
 # Catches Windows-style host paths that won't work inside the Linux
 # container: drive-letter roots (``C:\``, ``Y:/``, ``z:\foo``) and UNC
@@ -635,12 +539,12 @@ def validate_container_path(path: str, field_label: str) -> None:
     default fallback (``./snapshots``, ``./plex_logs``) so leaving a
     field blank is a valid "use default" signal.
 
-    M10: two additional containment checks beyond the Windows-path
-    guard. Bind-mounting an export drive at an arbitrary container
-    path (e.g. ``/app/nas_exports``) is a supported, documented
-    workflow, so we do NOT confine to a single data root - but a path
-    must not (1) contain a ``..`` component, or (2) resolve to the
-    ``server_data/`` directory or anything inside it. ``server_data/``
+    Two additional containment checks beyond the Windows-path guard.
+    Bind-mounting an export drive at an arbitrary container path (e.g.
+    ``/app/nas_exports``) is a supported, documented workflow, so we do
+    NOT confine to a single data root - but a path must not (1) contain
+    a ``..`` component, or (2) resolve to the ``server_data/`` directory
+    or anything inside it. ``server_data/``
     holds the keyfile, ``auth.db``, ``settings.json``, and
     ``media.db``; letting an authenticated caller aim a snapshot write
     or import read at it would expose or clobber credentials.
@@ -652,9 +556,9 @@ def validate_container_path(path: str, field_label: str) -> None:
     if not path:
         return
 
-    # M10 (1): no parent-directory traversal. Normalise separators
-    # first - ``_WINDOWS_PATH_RE`` only catches drive-letter / UNC
-    # *prefixes*, so an embedded ``foo\..\bar`` would slip past it.
+    # No parent-directory traversal. Normalise separators first -
+    # ``_WINDOWS_PATH_RE`` only catches drive-letter / UNC *prefixes*,
+    # so an embedded ``foo\..\bar`` would slip past it.
     if ".." in path.replace("\\", "/").split("/"):
         raise ValueError(
             f"{field_label} {path!r} contains a '..' path component. "
@@ -662,7 +566,7 @@ def validate_container_path(path: str, field_label: str) -> None:
             f"direct path to the target directory."
         )
 
-    # M10 (2): must not resolve into the credentials directory.
+    # Must not resolve into the credentials directory.
     try:
         data_dir = get_data_dir().resolve()
         resolved = Path(path).resolve()
@@ -715,7 +619,7 @@ def redact_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 
-# ── PR-13 startup migrations ────────────────────────────────────────────────
+# ── Startup migrations ───────────────────────────────────────────────────────
 
 def migrate_output_dir_setting() -> None:
     """
@@ -762,15 +666,14 @@ def relocate_legacy_exports() -> int:
     is nothing to relocate. Errors on individual files are logged
     and counted but don't stop the sweep.
 
-    Registry-aware (post-bug-3): any ``.plexexport.json`` whose stem
-    matches a ``snapshot_name`` in ``snapshots.db`` is a current
-    sidecar produced by ``materialise_sidecar``, NOT a legacy archive.
-    Pre-fix, every boot moved those fresh sidecars into ``legacy/``,
-    making the registry's ``prebuilt_json_path`` go stale and the file
-    show up in the wrong UI panel. We skip any file the registry
-    claims, in either of two ways: a stem matching a row's
-    ``snapshot_name``, OR a file_path matching a row's
-    ``prebuilt_json_path`` exactly.
+    Registry-aware: any ``.plexexport.json`` whose stem matches a
+    ``snapshot_name`` in ``snapshots.db`` is a current sidecar produced
+    by ``materialise_sidecar``, NOT a legacy archive. Moving those
+    fresh sidecars into ``legacy/`` would make the registry's
+    ``prebuilt_json_path`` go stale and the file show up in the wrong
+    UI panel, so we skip any file the registry claims, in either of
+    two ways: a stem matching a row's ``snapshot_name``, OR a file_path
+    matching a row's ``prebuilt_json_path`` exactly.
     """
     import shutil
     log = logging.getLogger("plexmigrate.server.persistence")
@@ -781,9 +684,10 @@ def relocate_legacy_exports() -> int:
 
     # Build the don't-touch set from the snapshot registry. Best-effort:
     # if the registry isn't initialised yet (very early boot, fresh
-    # install) this returns an empty set and we behave like the
-    # pre-fix version - which is the right thing on a clean install
-    # where there's nothing in the registry to protect anyway.
+    # install) this returns an empty set and every top-level
+    # .plexexport.json is treated as legacy - which is the right thing
+    # on a clean install where there's nothing in the registry to
+    # protect anyway.
     protected_stems: set = set()
     protected_paths: set = set()
     try:

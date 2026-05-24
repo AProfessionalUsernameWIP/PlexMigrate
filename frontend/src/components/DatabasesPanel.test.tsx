@@ -1,5 +1,4 @@
-// Tests for the DatabasesPanel developer shipped as part of
-// Plan[DATABASES-VIEWER]. Covers: catalogue tab strip, type-tab
+// Tests for the DatabasesPanel. Covers: catalogue tab strip, type-tab
 // selection drives an instances API call, single-instance types
 // render the viewer directly, RowCell formatter renders the
 // pre-formatted display value (and security-aware substitutions

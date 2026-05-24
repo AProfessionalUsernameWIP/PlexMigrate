@@ -66,6 +66,21 @@ def scrub(text: str) -> str:
     return _FERNET_PATTERN.sub(_FERNET_REPLACEMENT, text)
 
 
+def safe_error(exc: BaseException) -> str:
+    """Render an exception as a client-safe one-line string.
+
+    plexapi / ``requests`` exceptions routinely embed the full request
+    URL in their ``__str__``, and Plex URLs carry the auth token as a
+    query parameter. Any exception text bound for a client-visible
+    field (``rec.error``, a fan-out ``dest_result.error``, a dashboard
+    frame, an ``HTTPException`` detail) must pass through here so the
+    token is redacted before it leaves the server. The logging filter
+    only covers text that goes through a logging handler; this is the
+    companion for text that travels over the API / WebSocket instead.
+    """
+    return scrub(f"{type(exc).__name__}: {exc}")
+
+
 class TokenScrubFilter(logging.Filter):
     """
     Strips ``X-Plex-Token=<value>`` from a log record before any

@@ -1,4 +1,4 @@
-// Phase A (admin-management plan follow-up, 2026-05-15): user filter panel.
+// User filter panel.
 //
 // Sits ABOVE the user-selection list on the Run Job and Schedules
 // forms. End user picks filter criteria; only users matching every
@@ -18,8 +18,7 @@
 //                              not on any other registered server
 //
 // All filters are AND-combined: a user must satisfy every active
-// filter to populate. Empty filter set = every user populates
-// (matches the pre-Phase-A behaviour).
+// filter to populate. Empty filter set = every user populates.
 //
 // The panel asks the parent for the live user list (kind/plex_id/
 // raw_name/display_name) and a map of plex_id -> {has_token, has_pin}
@@ -62,7 +61,7 @@ interface Props {
   // the credential on EVERY id in this list to pass the filter.
   //
   // Defaults to ``[sourceServerId]`` when omitted (snapshot / direct
-  // mode — credentials must exist on the source so the engine can
+  // mode - credentials must exist on the source so the engine can
   // authenticate to capture / mirror them).
   //
   // Restore mode passes the DESTINATION ids: during restore the engine
@@ -234,6 +233,10 @@ export function UserFilterPanel({
         if (!passes) continue;
       }
 
+      // Cross-server presence filters. Both branches are meaningless
+      // when there are no OTHER servers to compare against, so each
+      // short-circuits on an empty other_server_ids list (keeps the
+      // user rather than applying a vacuous filter).
       if (showCrossServerFilters && criteria.present_on_all_servers) {
         if (!crossPresence) {
           // Still loading; treat as filtered-out for now. The effect
@@ -241,17 +244,21 @@ export function UserFilterPanel({
           // resolves.
           continue;
         }
-        const everywhere = crossPresence.other_server_ids.every((sid) =>
-          (crossPresence.usernames_by_server[sid] || new Set()).has(u.raw_name)
-        );
-        if (!everywhere && crossPresence.other_server_ids.length > 0) continue;
+        if (crossPresence.other_server_ids.length > 0) {
+          const everywhere = crossPresence.other_server_ids.every((sid) =>
+            (crossPresence.usernames_by_server[sid] || new Set()).has(u.raw_name)
+          );
+          if (!everywhere) continue;
+        }
       }
       if (showCrossServerFilters && criteria.present_only_here) {
         if (!crossPresence) continue;
-        const anywhereElse = crossPresence.other_server_ids.some((sid) =>
-          (crossPresence.usernames_by_server[sid] || new Set()).has(u.raw_name)
-        );
-        if (anywhereElse) continue;
+        if (crossPresence.other_server_ids.length > 0) {
+          const anywhereElse = crossPresence.other_server_ids.some((sid) =>
+            (crossPresence.usernames_by_server[sid] || new Set()).has(u.raw_name)
+          );
+          if (anywhereElse) continue;
+        }
       }
       out.add(u.plex_id);
     }

@@ -136,8 +136,7 @@ def list_runs() -> List[Dict[str, Any]]:
                 slug_to_server[slug] = {
                     "server_id": sv.get("id") or "",
                     "server_name": sv.get("name") or "",
-                    # TODO-AGENT-2-3 (from Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md):
-                    # ship service_type on the log-list row so the
+                    # TODO: ship service_type on the log-list row so the
                     # Logs panel's backend-tier filter can join via
                     # the response shape instead of an extra
                     # registry round-trip per row.
@@ -173,7 +172,7 @@ def list_runs() -> List[Dict[str, Any]]:
             "server_slug": slug,
             "server_id": (match or {}).get("server_id") or None,
             "server_name": (match or {}).get("server_name") or None,
-            # TODO-AGENT-2-3: backend discriminator so the Logs panel
+            # TODO: backend discriminator so the Logs panel
             # can filter without joining through the registry per row.
             # ``None`` when the slug doesn't resolve (server removed
             # or run from a since-deleted registration); the frontend
@@ -205,7 +204,7 @@ def list_files(run_name: str) -> List[Dict[str, Any]]:
     return files
 
 
-# ── Slug-scoped cascade helpers (v0.9.5) ─────────────────────────────────────
+# ── Slug-scoped cascade helpers ──────────────────────────────────────────────
 
 def _slug_dir_pattern(slug: str) -> "re.Pattern[str]":
     """
@@ -401,14 +400,13 @@ def delete_all_runs() -> Tuple[int, List[str]]:
 # ``GET /api/logs/{run}/{file}/download`` endpoint serves as a
 # regular HTTP attachment, bypassing this cap).
 #
-# Pre-PR-13 fix #5 this was 4 MB - too aggressive given typical
-# snapshot-run log sizes. 16 MB covers the vast majority of runs in
-# the viewer without forcing the end user to download.
+# 16 MB covers the vast majority of runs in the viewer without
+# forcing the end user to download; a smaller cap such as 4 MB is too
+# aggressive given typical snapshot-run log sizes.
 #
-# Hot-reload (Phase 3): the cap is read from
-# ``services.tunables.log_read_max_bytes`` at each read so an end user
-# bumping it via Settings ▸ Tunables takes effect on the next request.
-# The constant below is the historical fallback.
+# The cap is read from ``services.tunables.log_read_max_bytes`` at
+# each read so an end user bumping it via Settings ▸ Tunables takes
+# effect on the next request. The constant below is the fallback.
 _MAX_READ_BYTES_FALLBACK = 16 * 1024 * 1024
 
 

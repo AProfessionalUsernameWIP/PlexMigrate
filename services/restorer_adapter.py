@@ -3,18 +3,18 @@ Backend-agnostic restore engine. Used for Jellyfin / Emby
 destinations; Plex still routes through ``services/restorer.py`` to
 keep its plexapi-specific code paths untouched.
 
-Scope (MVP for PR-Backends Phase 1)
------------------------------------
+Scope
+-----
 Per-library watch_history + ratings restore. The engine consumes a
 snapshot payload produced by either ``services/snapshotter.py``
 (Plex source) or ``services/snapshotter_adapter.py`` (Jellyfin / Emby
 source) - both produce the same per-library dict shape so this
-restore code is source-agnostic. Cross-backend (Plex source ->
-Jellyfin destination etc.) is the Phase 2 deliverable in
-PR-CrossPolish; this MVP works for same-backend or trivially
-matching content where GUID resolution succeeds.
+restore code is source-agnostic. Full cross-backend restore (Plex
+source -> Jellyfin destination etc.) is not complete; the engine
+currently works for same-backend or trivially matching content
+where GUID resolution succeeds.
 
-Out of scope for MVP (deferred to PR-CrossPolish):
+Not yet supported:
 - Playlist + collection restore
 - D-RATE numeric+favorite mapping
 - D-COL-SCOPE library-prefixed collection names
@@ -48,6 +48,27 @@ from services.adapters import (
     MediaServerAdapter,
     UserContext,
     WriteResult,
+)
+from services.backend_translation import translate_affinity
+from services.media_state_writer import resolve_view_count_target
+
+
+# ── Re-exported from services.restore_preflight ──────────────────────────────
+# The preflight dry-run subsystem moved to its own module. Re-exported
+# here so the import surface is unchanged: app.py still does
+# ``from services.restorer_adapter import dry_run_resolve_users`` etc.
+from services.restore_preflight import (
+    DestUserOption,
+    DryRunReport,
+    LibraryTypeNote,
+    PROPOSED_RESOLUTION_VALUES,
+    TombstoneNote,
+    UserResolutionRecord,
+    UserRowCounts,
+    ZeroRowSkip,
+    _load_tombstoned_dest_usernames,
+    _normalise_dest_role,  # noqa: F401
+    dry_run_resolve_users,
 )
 
 
@@ -113,6 +134,18 @@ def restore_payload_adapter(
     include_ratings: bool = True,
     include_playlists: bool = True,
     include_collections: bool = True,
+    # Parity with services.restorer.run_restore: "merge"
+    # (default, additive) or "replace" (destructive point-in-time
+    # mirror). Replace mode adds a post-loop sweep that deletes
+    # destination playlists / collections absent from the source so
+    # the destination ends up as an exact mirror — closing the
+    # adapter-path gap operator hit on the Plex-direct path.
+    mode: str = "merge",
+    # RESTORE-04: watch-count merge strategy. "higher" raises the
+    # destination to max(stored, current); "sum" adds stored on top of
+    # current. Mirrors services.restorer.run_restore's parameter of the
+    # same name. Ignored in Replace mode (Replace is an overwrite).
+    merge_watch_strategy: str = "higher",
     # PR-Phase-3: per-user fan-out on restore. When True (default),
     # the engine walks each library's ``users`` map and replays each
     # source user's data against the matching destination user.
@@ -121,12 +154,15 @@ def restore_payload_adapter(
     # that's the D-OWNER flow end user-confirms via the modal).
     include_managed_users: bool = True,
     user_filter: Optional[List[str]] = None,
-    # PR-CrossPolish D-RATE (locked in Plan section 11.5): when source
-    # rating is >= ``favorite_threshold``, also write IsFavorite=true
-    # on backends that expose it. Plex's set_favorite returns
-    # not_supported and the restorer counts those separately so the
-    # end user isn't surprised by "skipped" rows.
+    # Affinity translation knobs.
+    # ``favorite_threshold`` is the rating-to-favorite cutoff (a
+    # source rating >= this writes IsFavorite=true on Jellyfin /
+    # Emby). ``favorite_as_rating_value`` is the reverse: the numeric
+    # rating written when a favorited item is restored onto a
+    # rating-only backend (Plex). Both feed services.backend_translation
+    # .translate_affinity, the single chokepoint for the conversion.
     favorite_threshold: float = 5.0,
+    favorite_as_rating_value: float = 10.0,
     # PR-CrossPolish D-COL-SCOPE (locked in Plan section 11.5): when
     # writing a library-scoped collection (Plex source) to a server-
     # wide BoxSet (Jellyfin / Emby destination), prefix the
@@ -141,7 +177,7 @@ def restore_payload_adapter(
     # server_id, for example).
     source_server_id: str = "",
     dest_server_id: str = "",
-    # Plan[CROSS-PLATFORM-PREFLIGHT] step 6: belt-and-braces
+    # Belt-and-braces
     # enforcement of block-class verdicts. When True (default), the
     # engine runs dry_run_resolve_users at the top of this function
     # and refuses to write if any source admin has no resolution path
@@ -152,7 +188,7 @@ def restore_payload_adapter(
     # data. Pass False as a CLI escape hatch when the end user
     # explicitly knows the consequences.
     enforce_preflight: bool = True,
-    # Plan[CROSS-PLATFORM-PREFLIGHT] follow-up: end user-authored per-job
+    # End user-authored per-job
     # resolutions from the preflight modal (Map / Drop). Keyed by
     # destination_server_id; each value is a CrossPlatformPreflightAckIn
     # dict. Drop decisions skip the user; Map decisions act as priority-0
@@ -174,7 +210,7 @@ def restore_payload_adapter(
     log_ = logger or log
     result = RestoreResult(started_at=time.time())
 
-    # Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: pick up the run-level
+    # Pick up the run-level
     # mixed-media config jobs.py stashed on state. None means the
     # caller didn't go through the job dispatch (CLI direct, tests);
     # the engine treats every playlist row as pass-through in that
@@ -186,7 +222,7 @@ def restore_payload_adapter(
     # When the caller didn't supply source_server_id explicitly, pull
     # it off the payload's snapshot_meta. Current-shape .db snapshots
     # populate snapshot_meta.server_id at capture time.
-    # Plan[IDENTITY-UTILIZATION-AUDIT]-2026-05-17 R-3: ALSO pull the
+    # ALSO pull the
     # source service_type (snapshot_meta.backend) so the per-user
     # fan-out can forward it to the resolver chain's step 2.
     source_service_type: Optional[str] = None
@@ -261,12 +297,14 @@ def restore_payload_adapter(
             _apply_watch_history(
                 adapter, lib_name, lib.get("watch_history") or [],
                 user_context, result.watch_history, stop_event, log_,
+                mode=mode, merge_watch_strategy=merge_watch_strategy,
             )
         if include_ratings:
             _apply_ratings(
                 adapter, lib_name, lib.get("ratings") or [],
                 user_context, result.ratings, stop_event, log_,
                 favorite_threshold=favorite_threshold,
+                favorite_as_rating_value=favorite_as_rating_value,
             )
         if include_playlists:
             _apply_playlists(
@@ -282,7 +320,7 @@ def restore_payload_adapter(
                 apply_col_scope_prefix=apply_col_scope_prefix,
             )
 
-        # Per-user fan-out (Phase 3). The library payload's ``users``
+        # Per-user fan-out. The library payload's ``users``
         # dict carries per-managed-user watch_history + ratings
         # captured at snapshot time. Resolve each source username to
         # a destination user (matched by username, case-insensitive)
@@ -303,6 +341,7 @@ def restore_payload_adapter(
                 include_watch_history=include_watch_history,
                 include_ratings=include_ratings,
                 favorite_threshold=favorite_threshold,
+                favorite_as_rating_value=favorite_as_rating_value,
                 include_playlists=include_playlists,
                 include_collections=include_collections,
                 apply_col_scope_prefix=apply_col_scope_prefix,
@@ -310,7 +349,31 @@ def restore_payload_adapter(
                 dest_server_id=dest_server_id,
                 cross_platform_resolutions=cross_platform_resolutions,
                 source_service_type=source_service_type,
+                mode=mode,
+                merge_watch_strategy=merge_watch_strategy,
             )
+
+    # Replace-mode dest-only sweep: a destination playlist /
+    # collection absent from the source snapshot is a row the operator
+    # has chosen to overwrite (Replace = exact mirror). Sweep runs
+    # once after every library has been processed so a multi-library
+    # restore sees the full source-side title set before deciding
+    # what to delete. Merge mode is additive and leaves dest-only
+    # rows alone. Adapter delete_playlist / delete_collection return
+    # ``unsupported`` on backends that don't expose deletion (the
+    # default base-class behaviour); counts go into the result's
+    # ``unsupported`` bucket so the run summary surfaces the gap.
+    if mode == "replace":
+        _replace_dest_only_sweep(
+            adapter,
+            libraries=libraries or [],
+            user_context=user_context,
+            result=result,
+            include_playlists=include_playlists,
+            include_collections=include_collections,
+            apply_col_scope_prefix=apply_col_scope_prefix,
+            logger=log_,
+        )
 
     result.finished_at = time.time()
     log_.info(
@@ -336,19 +399,46 @@ def _apply_watch_history(
     counts: RestoreCounts,
     stop_event: Optional[threading.Event],
     logger: logging.Logger,
+    *,
+    mode: str = "merge",
+    merge_watch_strategy: str = "higher",
 ) -> None:
+    """Apply watch_history rows to the destination via ``adapter``.
+
+    Exact-target wiring (Replace mode):
+      * Replace mode interprets the snapshot's ``view_count`` as the
+        ABSOLUTE target the destination should end at. The function
+        reads the destination's current count via
+        ``adapter.get_current_view_count`` and passes both to
+        ``adapter.set_watched(view_count=N, current_view_count=C)``.
+        Plex uses C to choose unscrobble + scrobble math so the
+        destination lands exactly on N; Jellyfin/Emby ignore C
+        (UserData writes exact PlayCount in one call).
+      * Merge mode honours ``merge_watch_strategy`` (RESTORE-04):
+        ``higher`` brings the destination up to
+        ``max(stored, current)``; ``sum`` lands it at
+        ``current + stored``. Both read the destination's current
+        count; when that read is unavailable (the Jellyfin / Emby
+        base default) the target falls back to the stored count,
+        which is the pre-RESTORE-04 behaviour for those backends.
+    """
+    is_replace = str(mode or "merge").lower() == "replace"
     for row in rows:
         if stop_event is not None and stop_event.is_set():
             return
         view_count = int(row.get("view_count") or 0)
-        if view_count <= 0:
+        if view_count <= 0 and not is_replace:
+            # Merge mode: zero contributes nothing; skip.
+            # Replace mode: zero IS the target — we still need to fire
+            # the write so a destination row with current > 0 gets
+            # cleared.
             counts.skipped_zero_state += 1
             continue
         guids = tuple(row.get("guids") or ())
         if not guids:
             counts.skipped_no_match += 1
             continue
-        dest_item_id = _resolve_destination_item(adapter, guids)
+        dest_item_id = _resolve_destination_item(adapter, guids, row)
         if not dest_item_id:
             counts.skipped_no_match += 1
             logger.debug(
@@ -365,11 +455,37 @@ def _apply_watch_history(
         last_viewed_epoch: Optional[float] = None
         if isinstance(last_viewed, (int, float)):
             last_viewed_epoch = float(last_viewed)
+        # Read the destination's current count whenever it affects the
+        # write. Replace mode always needs it (exact-target math).
+        # Merge mode needs it to honour merge_watch_strategy
+        # (RESTORE-04). The adapter returns None when the read isn't
+        # available (the Jellyfin / Emby base default); set_watched is
+        # then passed current_view_count=None and the merge target
+        # falls back to the stored count.
+        current_view_count: Optional[int] = None
+        try:
+            current_view_count = adapter.get_current_view_count(
+                item_ref, user_context=user_context,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] watch: get_current_view_count failed for "
+                "%r: %s; falling back to delta-mode.",
+                library_name, row.get("title"), exc,
+            )
+            current_view_count = None
+        target_view_count = resolve_view_count_target(
+            stored_view_count=view_count,
+            current_view_count=current_view_count,
+            mode=mode,
+            strategy=merge_watch_strategy,
+        )
         result = adapter.set_watched(
             item_ref,
-            view_count=view_count,
+            view_count=target_view_count,
             last_viewed_at=last_viewed_epoch,
             user_context=user_context,
+            current_view_count=current_view_count,
         )
         _bump_from_result(counts, result, library_name, row, logger, "watch")
 
@@ -384,19 +500,47 @@ def _apply_ratings(
     logger: logging.Logger,
     *,
     favorite_threshold: float = 5.0,
+    favorite_as_rating_value: float = 10.0,
 ) -> None:
+    # A ratings row carries the
+    # neutral per-user affinity (numeric rating + favorite face).
+    # translate_affinity converts it into what the destination
+    # backend can store: a numeric rating for Plex, a favorite flag
+    # (plus optional numeric rating) for Jellyfin / Emby.
+    dest_backend = str(getattr(adapter, "backend", "") or "")
     for row in rows:
         if stop_event is not None and stop_event.is_set():
             return
-        rating = row.get("user_rating")
-        if rating is None or float(rating) <= 0:
+        # Read the neutral affinity. ``user_rating`` is the engine
+        # shape; ``rating`` is the snapshot-serializer shape - accept
+        # both so this works for live payloads and round-tripped .db
+        # snapshots.
+        _rating_raw = row.get("user_rating")
+        if _rating_raw is None:
+            _rating_raw = row.get("rating")
+        try:
+            src_rating = None if _rating_raw is None else float(_rating_raw)
+        except (TypeError, ValueError):
+            src_rating = None
+        _fav_raw = row.get("is_favorite")
+        src_fav = None if _fav_raw is None else bool(_fav_raw)
+
+        spec = translate_affinity(
+            source_rating=src_rating,
+            source_is_favorite=src_fav,
+            dest_backend=dest_backend,
+            favorite_threshold=favorite_threshold,
+            favorite_as_rating_value=favorite_as_rating_value,
+        )
+        if not spec.wrote_anything:
             counts.skipped_zero_state += 1
             continue
+
         guids = tuple(row.get("guids") or ())
         if not guids:
             counts.skipped_no_match += 1
             continue
-        dest_item_id = _resolve_destination_item(adapter, guids)
+        dest_item_id = _resolve_destination_item(adapter, guids, row)
         if not dest_item_id:
             counts.skipped_no_match += 1
             logger.debug(
@@ -409,37 +553,40 @@ def _apply_ratings(
             guids=guids,
             title=str(row.get("title") or ""),
         )
-        result = adapter.set_rating(
-            item_ref,
-            float(rating),
-            user_context=user_context,
-        )
-        _bump_from_result(counts, result, library_name, row, logger, "rating")
 
-        # D-RATE: when the source rating clears the favorite threshold,
-        # also flip IsFavorite on the destination. On backends without
-        # a per-user favorite (Plex) set_favorite returns
-        # ``not_supported`` and we silently skip it; the numeric
-        # Rating write above is the only path that landed data.
-        if float(rating) >= favorite_threshold:
-            fav_result = adapter.set_favorite(
-                item_ref, True, user_context=user_context,
+        # The numeric rating write is the primary, counted write when
+        # present. A favorite-only row (no rating to land) promotes
+        # the favorite write into that role so the row still counts.
+        rating_written = False
+        if spec.rating is not None:
+            result = adapter.set_rating(
+                item_ref, float(spec.rating), user_context=user_context,
             )
-            if fav_result.success:
-                # Don't double-count writes - the rating write already
-                # bumped ``written``. The favorite is a paired write,
-                # not a separate row.
-                pass
+            _bump_from_result(
+                counts, result, library_name, row, logger, "rating",
+            )
+            rating_written = True
+
+        if spec.is_favorite is not None:
+            fav_result = adapter.set_favorite(
+                item_ref, bool(spec.is_favorite), user_context=user_context,
+            )
+            if not rating_written:
+                # Favorite-only row: this write IS the row's outcome.
+                _bump_from_result(
+                    counts, fav_result, library_name, row, logger,
+                    "favorite",
+                )
             elif fav_result.unsupported:
-                # Expected on Plex; record once per-library to avoid
-                # spamming errors with the same message.
+                # Paired write; the rating already counted. Expected
+                # on Plex - record once per library, don't spam.
                 msg = (
                     f"[{library_name}] favorite skipped: "
                     f"{fav_result.detail or 'backend has no per-user favorite'}"
                 )
                 if msg not in counts.errors:
                     counts.errors.append(msg)
-            else:
+            elif not fav_result.success:
                 logger.warning(
                     "[%s] favorite write failed for %r: %s",
                     library_name, row.get("title"), fav_result.detail,
@@ -555,17 +702,24 @@ def _apply_per_user_block(
     include_watch_history: bool,
     include_ratings: bool,
     favorite_threshold: float,
+    favorite_as_rating_value: float = 10.0,
     include_playlists: bool = False,
     include_collections: bool = False,
     apply_col_scope_prefix: bool = True,
     source_server_id: str = "",
     dest_server_id: str = "",
     cross_platform_resolutions: Optional[Dict[str, Any]] = None,
-    # Plan[IDENTITY-UTILIZATION-AUDIT]-2026-05-17 R-3: source service
+    # Source service
     # type from snapshot_meta.backend so the resolver chain step 2
     # (backend_user_id direct match within service_type) can fire.
     # None when the snapshot doesn't carry the backend field.
     source_service_type: Optional[str] = None,
+    # Forwarded to _apply_watch_history so Replace mode
+    # per-user fan-out hits exact targets on Plex destinations.
+    mode: str = "merge",
+    # RESTORE-04: forwarded to _apply_watch_history so per-user
+    # fan-out honours the watch-count merge strategy.
+    merge_watch_strategy: str = "higher",
 ) -> None:
     """Walk the per-user payload for one library and replay each
     source user's state to the matching destination user.
@@ -622,7 +776,7 @@ def _apply_per_user_block(
             library_name, exc,
         )
         return
-    # Tombstone write-side filter (Plan[CROSS-PLATFORM-PREFLIGHT] Q-4):
+    # Tombstone write-side filter:
     # the end user-marked-hidden destination users are excluded from
     # dest_by_username + dest_admins before any resolution fires. The
     # preflight surfaces the exclusion as a TombstoneNote so the
@@ -655,7 +809,7 @@ def _apply_per_user_block(
         if filter_set is not None and normalised not in filter_set:
             continue
         source_role = str((source_payload or {}).get("role") or "").strip().lower()
-        # Plan[IDENTITY-UTILIZATION-AUDIT]-2026-05-17 R-3: forward the
+        # Forward the
         # source user's backend_user_id (carried in the per-user
         # payload block by the snapshot serializer) + the snapshot's
         # source service_type so step 2 of the resolution chain
@@ -707,7 +861,7 @@ def _apply_per_user_block(
         # Per-user UserContext retains the admin token because
         # Jellyfin / Emby admin tokens can write any user's
         # state via the UserId in the URL. Plex (which doesn't
-        # appear here in Phase 3 - per-user fan-out for Plex is
+        # appear here - per-user fan-out for Plex is
         # the existing get_home_users path) would need real per-
         # user tokens; the adapter's set_watched falls back to
         # the admin token when auth_token is empty.
@@ -723,6 +877,7 @@ def _apply_per_user_block(
                 adapter, library_name,
                 list(rows_block.get("watch_history") or []),
                 per_user_ctx, result.watch_history, stop_event, logger,
+                mode=mode, merge_watch_strategy=merge_watch_strategy,
             )
         if include_ratings:
             _apply_ratings(
@@ -730,6 +885,7 @@ def _apply_per_user_block(
                 list(rows_block.get("ratings") or []),
                 per_user_ctx, result.ratings, stop_event, logger,
                 favorite_threshold=favorite_threshold,
+                favorite_as_rating_value=favorite_as_rating_value,
             )
         # Legacy .plexexport.json files store playlists + collections
         # under each user (because Plex Home users authored them);
@@ -777,7 +933,7 @@ def _apply_playlists(
         and watch state on the items were applied by the earlier
         passes.
 
-    Mixed-media handling (Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16):
+    Mixed-media handling:
     when ``mixed_media_config`` is provided, the rows are run through
     the strategy driver before write so mixed-source playlists are
     skipped / split / collapsed-to-dominant per the end user's choice
@@ -810,7 +966,7 @@ def _apply_playlists(
             guids = tuple(item.get("guids") or ())
             if not guids:
                 continue
-            dest_id = _resolve_destination_item(adapter, guids)
+            dest_id = _resolve_destination_item(adapter, guids, item)
             if not dest_id:
                 continue
             item_refs.append(ItemRef(
@@ -884,7 +1040,7 @@ def _apply_collections(
             guids = tuple(item.get("guids") or ())
             if not guids:
                 continue
-            dest_id = _resolve_destination_item(adapter, guids)
+            dest_id = _resolve_destination_item(adapter, guids, item)
             if not dest_id:
                 continue
             item_refs.append(ItemRef(
@@ -919,14 +1075,311 @@ def _apply_collections(
             )
 
 
+def _replace_dest_only_sweep(
+    adapter: MediaServerAdapter,
+    *,
+    libraries: List[Dict[str, Any]],
+    user_context: UserContext,
+    result: RestoreResult,
+    include_playlists: bool,
+    include_collections: bool,
+    apply_col_scope_prefix: bool,
+    logger: logging.Logger,
+) -> None:
+    """Replace-mode finale: delete destination playlists / collections
+    absent from the source. Mirrors the orchestration-level sweep that
+    lives in :mod:`services.restorer` for the Plex-direct path so a
+    Jellyfin / Emby destination ends up an exact mirror in Replace mode
+    too.
+
+    Playlists: identified by ``name``. Source titles are collected
+    across every library in this restore so a multi-library run sees
+    one consolidated set before deciding what to delete on the dest.
+
+    Collections: identified by the *destination-side* name, which on
+    Jellyfin / Emby is prefixed by source library (D-COL-SCOPE) to
+    prevent BoxSet name collisions across libraries. The sweep applies
+    the same prefix so the comparison stays apples-to-apples — without
+    it, a collection whose source name was ``Marvel`` would compare
+    against a dest name ``Movies / Marvel`` and always look orphaned.
+    """
+    target_backend = (adapter.backend or "plex").lower()
+    needs_collection_prefix = (
+        apply_col_scope_prefix and target_backend in ("jellyfin", "emby")
+    )
+
+    # The set of destination library_ids that participated in this
+    # restore. Used to scope playlist + collection deletion so an
+    # unrelated dest-only library's containers are never touched.
+    # Without this, a Replace run on source "Music" against a
+    # destination that also has a separate "Audio Files" library
+    # would wipe out the latter's playlists, because scoping by
+    # Plex's broad playlistType (audio) rather than the actual
+    # library id is too coarse.
+    #
+    # Cross-backend mapping note: the payload carries source-side
+    # library identifiers but the dest sweep must check against
+    # dest-side identifiers. We bridge that by matching the source
+    # library NAME (which is what the engine already uses to pick
+    # destination libraries everywhere else) to the dest's
+    # ``LibrarySpec.library_id``.
+    restored_library_ids: set = set()
+    try:
+        _dest_libs_by_name = {
+            (lib.name or ""): lib for lib in (adapter.list_libraries() or [])
+        }
+    except Exception as exc:
+        logger.warning(
+            "Replace sweep: list_libraries failed (%s); skipping sweep "
+            "(scope undeterminable).", exc,
+        )
+        _dest_libs_by_name = {}
+    for lib in libraries:
+        src_name = str(lib.get("library") or "")
+        if src_name and src_name in _dest_libs_by_name:
+            restored_library_ids.add(
+                str(_dest_libs_by_name[src_name].library_id)
+            )
+        else:
+            # Fall back to the payload's own library_id when name
+            # match fails — same-backend transfers carry matching ids.
+            lib_id = lib.get("library_id") or lib.get("library_section_id")
+            if lib_id is not None and str(lib_id):
+                restored_library_ids.add(str(lib_id))
+
+    # ── Playlist sweep (admin context + per-managed-user) ───────────────
+    if include_playlists and restored_library_ids:
+        source_playlist_titles: set = set()
+        for lib in libraries:
+            for pl in (lib.get("playlists") or []):
+                name = (pl.get("name") or "").strip()
+                if name:
+                    source_playlist_titles.add(name)
+            # Per-user playlists count toward the same dest-only
+            # consideration set so a managed user's dest-only playlist
+            # also gets pruned in Replace mode.
+            for udata in (lib.get("users") or {}).values():
+                if not isinstance(udata, dict):
+                    continue
+                for pl in (udata.get("playlists") or []):
+                    name = (pl.get("name") or "").strip()
+                    if name:
+                        source_playlist_titles.add(name)
+
+        # Build the contexts we need to sweep. The admin / owner
+        # context catches owner-scope playlists; per-managed-user
+        # contexts catch user-private playlists on backends where
+        # ``list_playlists(owner_ctx)`` doesn't see them (Jellyfin /
+        # Emby per-user playlists). On Plex, ``list_playlists`` is
+        # server-wide so the extra per-user passes are mostly no-ops
+        # but the same delete is idempotent (returns failure for a
+        # missing id).
+        contexts_to_sweep: List[UserContext] = [user_context]
+        try:
+            for u in adapter.list_users() or []:
+                if u.role == "owner":
+                    continue
+                if u.backend_user_id and u.backend_user_id != user_context.backend_user_id:
+                    contexts_to_sweep.append(UserContext(
+                        backend_user_id=u.backend_user_id,
+                        username=u.username,
+                        auth_token=user_context.auth_token,
+                    ))
+        except Exception as exc:
+            logger.debug(
+                "Replace sweep: list_users failed (%s); per-user pass "
+                "skipped.", exc,
+            )
+
+        seen_playlist_ids: set = set()
+        for ctx in contexts_to_sweep:
+            try:
+                dest_playlists = adapter.list_playlists(ctx)
+            except Exception as exc:
+                logger.warning(
+                    "Replace sweep: list_playlists failed for context %r (%s); "
+                    "skipping this context.", ctx.backend_user_id, exc,
+                )
+                continue
+            for spec in dest_playlists:
+                if spec.playlist_id in seen_playlist_ids:
+                    continue
+                title = (spec.name or "").strip()
+                if not title or title in source_playlist_titles:
+                    continue
+                # Library-scope check: the playlist's items must all
+                # live inside libraries we restored. An empty playlist
+                # or one with items missing ``library_id`` is skipped
+                # conservatively — we can't classify its scope so we
+                # don't risk deleting it.
+                item_libs = {
+                    str(it.library_id) for it in spec.items
+                    if getattr(it, "library_id", None)
+                }
+                if not item_libs:
+                    logger.debug(
+                        "Replace sweep: playlist %r has no resolvable "
+                        "library_id on items; skipping (conservative).",
+                        title,
+                    )
+                    continue
+                if not item_libs.issubset(restored_library_ids):
+                    logger.debug(
+                        "Replace sweep: playlist %r has items outside "
+                        "restored library scope (item libs=%s, "
+                        "restored=%s); skipping.",
+                        title, sorted(item_libs),
+                        sorted(restored_library_ids),
+                    )
+                    continue
+                wr = adapter.delete_playlist(
+                    spec.playlist_id, user_context=ctx,
+                )
+                seen_playlist_ids.add(spec.playlist_id)
+                if wr.success:
+                    result.playlists.written += 1
+                    logger.info(
+                        "Replace: deleted destination-only playlist %r (id=%s).",
+                        title, spec.playlist_id,
+                    )
+                elif wr.unsupported:
+                    result.playlists.unsupported += 1
+                    if wr.detail and wr.detail not in result.playlists.errors:
+                        result.playlists.errors.append(wr.detail)
+                else:
+                    result.playlists.failed += 1
+                    detail = (
+                        f"replace-sweep: delete playlist {title!r} failed: "
+                        f"{wr.detail or 'unknown'}"
+                    )
+                    result.playlists.errors.append(detail)
+                    logger.warning(detail)
+
+    # ── Collection sweep ────────────────────────────────────────────────
+    if include_collections and restored_library_ids:
+        source_collection_titles: set = set()
+        for lib in libraries:
+            source_lib = str(lib.get("library") or "")
+            for c in (lib.get("collections") or []):
+                raw_name = (c.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                if (
+                    needs_collection_prefix
+                    and source_lib
+                    and not raw_name.startswith(source_lib + " /")
+                ):
+                    source_collection_titles.add(f"{source_lib} / {raw_name}")
+                else:
+                    source_collection_titles.add(raw_name)
+        try:
+            dest_collections = adapter.list_collections()
+        except Exception as exc:
+            logger.warning(
+                "Replace sweep: list_collections failed (%s); skipping collection sweep.",
+                exc,
+            )
+            dest_collections = []
+        for spec in dest_collections:
+            title = (spec.name or "").strip()
+            if not title or title in source_collection_titles:
+                continue
+            # Collections on Plex are inherently library-scoped via
+            # ``CollectionSpec.library_id``. On Jellyfin / Emby
+            # BoxSets are server-wide and ``library_id`` is None; for
+            # those backends we fall back to scoping by the items'
+            # library_id (same approach as the playlist sweep). If a
+            # collection has no items AND no library_id, the scope is
+            # indeterminate — skip conservatively.
+            scope_lib: Optional[str] = (
+                str(spec.library_id) if spec.library_id is not None else None
+            )
+            item_libs = {
+                str(it.library_id) for it in spec.items
+                if getattr(it, "library_id", None)
+            }
+            if scope_lib is not None:
+                if scope_lib not in restored_library_ids:
+                    continue
+            elif item_libs:
+                if not item_libs.issubset(restored_library_ids):
+                    continue
+            else:
+                # No library info at all — don't delete.
+                continue
+            wr = adapter.delete_collection(spec.collection_id)
+            if wr.success:
+                result.collections.written += 1
+                logger.info(
+                    "Replace: deleted destination-only collection %r (id=%s).",
+                    title, spec.collection_id,
+                )
+            elif wr.unsupported:
+                result.collections.unsupported += 1
+                if wr.detail and wr.detail not in result.collections.errors:
+                    result.collections.errors.append(wr.detail)
+            else:
+                result.collections.failed += 1
+                detail = (
+                    f"replace-sweep: delete collection {title!r} failed: "
+                    f"{wr.detail or 'unknown'}"
+                )
+                result.collections.errors.append(detail)
+                logger.warning(detail)
+
+
 def _resolve_destination_item(
     adapter: MediaServerAdapter, guids,
+    row: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Wrap ``adapter.resolve_by_guids`` so a backend that hasn't
-    implemented it (Plex's PlexAdapter today) returns None cleanly."""
+    """Resolve a source row to a destination ``backend_item_id``.
+
+    Tier 1 — GUID: ``adapter.resolve_by_guids``. A backend that
+    hasn't implemented it (Plex's PlexAdapter today) returns None
+    cleanly.
+
+    Tier 2 - hierarchy: when the GUID match misses AND ``row`` carries
+    hierarchy fields (show_title / parent_index / episode_index for
+    episodes; artist / album for tracks) AND the adapter exposes
+    ``resolve_by_hierarchy``, fall back to a hierarchy match. This
+    gives cross-backend Plex->Jellyfin/Emby restore a second axis
+    when the two servers' metadata agents produced no shared GUID.
+    Best-effort: any failure returns None and the caller logs the
+    skip exactly as before."""
     try:
         result = adapter.resolve_by_guids(tuple(guids))
-        return result if result else None
+        if result:
+            return result
+    except Exception:
+        pass
+    # Tier 2 — hierarchy fallback.
+    if row is None:
+        return None
+    item_type = str(row.get("type") or "")
+    if item_type not in ("episode", "track"):
+        return None
+    resolve_hier = getattr(adapter, "resolve_by_hierarchy", None)
+    if not callable(resolve_hier):
+        return None
+
+    def _int_or_none(v: Any) -> Optional[int]:
+        if v in (None, ""):
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        return resolve_hier(
+            item_type=item_type,
+            title=str(row.get("title") or ""),
+            show_title=str(row.get("show_title") or ""),
+            season_number=_int_or_none(row.get("parent_index")),
+            episode_number=_int_or_none(row.get("episode_index")),
+            artist=str(row.get("artist") or ""),
+            album=str(row.get("album") or ""),
+        ) or None
     except Exception:
         return None
 
@@ -954,558 +1407,6 @@ def _bump_from_result(
     )
     counts.errors.append(detail)
     logger.warning(detail)
-
-
-# ── Preflight dry-run (Plan[CROSS-PLATFORM-PREFLIGHT] step 1) ────────────────
-#
-# Pure resolution dry-run. Walks the payload's per-user blocks across
-# every library and computes what _apply_per_user_block would do at
-# write time, without touching the destination. Powers the
-# POST /api/jobs/cross-platform-preflight + schedules variant endpoints.
-
-@dataclass(frozen=True)
-class DestUserOption:
-    backend_user_id: str
-    username: str
-    role: str             # 'owner' | 'admin' | 'managed'
-    is_tombstoned: bool
-
-
-@dataclass(frozen=True)
-class UserRowCounts:
-    watch_history: int
-    ratings: int
-    playlists: int
-    collections: int
-
-
-@dataclass(frozen=True)
-class UserResolutionRecord:
-    source_username: str
-    source_role: str               # 'owner' | 'admin' | 'managed'
-    source_row_counts: UserRowCounts
-    proposed_resolution: str       # one of the 8 PROPOSED_RESOLUTION_VALUES
-    proposed_dest_user_id: Optional[str]
-    proposed_dest_username: Optional[str]
-    proposed_dest_role: Optional[str]
-    needs_ack: bool
-    blocks_submit: bool
-    warnings: List[str]
-    available_dest_users: List[DestUserOption]
-
-
-@dataclass(frozen=True)
-class LibraryTypeNote:
-    source_library: str
-    source_type: str
-    dest_type_used: str
-    message: str
-
-
-@dataclass(frozen=True)
-class TombstoneNote:
-    dest_username: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class ZeroRowSkip:
-    source_username: str
-    empty_signals: List[str]
-    filter_flags_in_effect: List[str]
-    message: str
-
-
-@dataclass(frozen=True)
-class DryRunReport:
-    source_kind: str               # 'plex' | 'jellyfin' | 'emby' | 'unknown'
-    dest_kind: str
-    source_server_id: str
-    dest_server_id: str
-    is_cross_platform: bool
-    source_admin_count: int
-    dest_admin_count: int
-    resolutions: List[UserResolutionRecord]
-    smart_playlists_skipped: int
-    smart_playlist_names: List[str]
-    library_type_notes: List[LibraryTypeNote]
-    tombstoned_users_excluded: List[TombstoneNote]
-    zero_row_skipped: List[ZeroRowSkip]
-    overall_verdict: str           # 'ok' | 'ack_required' | 'blocked'
-    blocking_reasons: List[str]
-
-
-PROPOSED_RESOLUTION_VALUES = frozenset({
-    "identity_map",
-    "direct_match",
-    "single_admin_fallback",
-    "role_flip_ack",
-    "tombstone_blocked",
-    "zero_row_skip",
-    "no_match",
-    "multi_admin_collapse",
-})
-
-
-def _normalise_dest_role(user_spec: Any, dest_kind: str) -> str:
-    """Translate a UserSpec's role/is_admin into the end user-facing
-    three-tier label. Plex admins surface as 'owner' (Plex has one
-    owner per server); J/E admins surface as 'admin' (multi-admin
-    capable). Non-admins surface as 'managed' regardless of backend.
-    """
-    if not getattr(user_spec, "is_admin", False):
-        return "managed"
-    return "owner" if (dest_kind or "").lower() == "plex" else "admin"
-
-
-def _load_tombstoned_dest_usernames(
-    dest_server_id: str, logger: logging.Logger,
-) -> set:
-    """Read the tombstoned-or-globally-hidden subset of managed_users
-    for the destination server. Returns lowercased usernames.
-
-    Defensive: empty set on empty server_id or any failure. Tombstone
-    enforcement is best-effort - if the lookup fails the engine still
-    works against the live roster, it just doesn't filter."""
-    sid = (dest_server_id or "").strip()
-    if not sid:
-        return set()
-    try:
-        from server.media_db import list_managed_users
-        rows = list_managed_users(sid, include_hidden=True) or []
-    except Exception as exc:
-        logger.debug("tombstone lookup failed: %s", exc)
-        return set()
-    return {
-        (r.get("username") or "").strip().lower()
-        for r in rows
-        if r.get("hidden_scope") != "none"
-    }
-
-
-def dry_run_resolve_users(
-    payload: Dict[str, Any],
-    adapter: MediaServerAdapter,
-    *,
-    source_server_id: str = "",
-    dest_server_id: str = "",
-    include_watch_history: bool = True,
-    include_ratings: bool = True,
-    include_playlists: bool = True,
-    include_collections: bool = True,
-    include_managed_users: bool = True,
-    user_filter: Optional[List[str]] = None,
-    cross_platform_resolutions: Optional[Dict[str, Any]] = None,
-    logger: Optional[logging.Logger] = None,
-) -> DryRunReport:
-    """Compute every per-user resolution the restore engine would
-    fire for this (payload, destination) pair, without writing.
-
-    The result powers the cross-platform preflight modal: end user
-    sees what would happen to each source user before any destructive
-    operation. See Plan[CROSS-PLATFORM-PREFLIGHT]-2026-05-16.md for
-    the verdict semantics and Plan[UI-FOR-PREFLIGHT]-2026-05-16.md
-    for the data shape this maps to on the wire."""
-    log_ = logger or log
-
-    # Auto-derive source_server_id from snapshot_meta when caller
-    # didn't supply one. Current-shape .db snapshots always populate
-    # snapshot_meta.server_id at capture time; the auto-derive is the
-    # convenience path for callers (CLI, tests) that have a payload
-    # but no separate id to hand in.
-    meta: Dict[str, Any] = {}
-    if isinstance(payload, dict):
-        m = payload.get("snapshot_meta") or {}
-        if isinstance(m, dict):
-            meta = m
-    if not source_server_id:
-        source_server_id = str(meta.get("server_id") or "")
-
-    source_kind = (str(meta.get("backend") or "").strip().lower()) or "unknown"
-    dest_kind = ((getattr(adapter, "backend", "") or "").strip().lower()) or "unknown"
-    is_cross_platform = (
-        source_kind in ("plex", "jellyfin", "emby")
-        and dest_kind in ("plex", "jellyfin", "emby")
-        and source_kind != dest_kind
-    )
-
-    # Destination roster, split into active vs tombstoned subsets.
-    try:
-        dest_users_raw = adapter.list_users() or []
-    except Exception as exc:
-        log_.warning("dry_run_resolve_users: list_users failed: %s", exc)
-        dest_users_raw = []
-
-    tombstoned_set = _load_tombstoned_dest_usernames(dest_server_id, log_)
-    dest_users_active = [
-        u for u in dest_users_raw
-        if (u.username or "").strip().lower() not in tombstoned_set
-    ]
-    dest_admins = [u for u in dest_users_active if getattr(u, "is_admin", False)]
-    dest_by_username = {
-        (u.username or "").strip().lower(): u
-        for u in dest_users_active
-        if u.username
-    }
-    dest_tombstoned_by_username = {
-        (u.username or "").strip().lower(): u
-        for u in dest_users_raw
-        if u.username and (u.username or "").strip().lower() in tombstoned_set
-    }
-
-    available_dest_users = [
-        DestUserOption(
-            backend_user_id=u.backend_user_id or "",
-            username=u.username,
-            role=_normalise_dest_role(u, dest_kind),
-            is_tombstoned=False,
-        )
-        for u in dest_users_active
-    ]
-
-    # Walk libraries; aggregate per-source-user row counts across
-    # them and collect smart-playlist names.
-    libraries_iter = []
-    if isinstance(payload, dict) and "libraries" in payload:
-        libraries_iter = payload.get("libraries") or []
-    elif isinstance(payload, dict):
-        libraries_iter = [payload]
-
-    per_user_counts: Dict[str, Dict[str, int]] = {}
-    per_user_role: Dict[str, str] = {}
-    # Per-source-user backend_user_id (when present in the payload).
-    # Plan[IDENTITY-UTILIZATION-AUDIT]-2026-05-17 R-3: forward this to
-    # the resolver so step 2 of the resolution chain (backend_user_id
-    # direct match) can fire on cross-server restores.
-    per_user_backend_user_id: Dict[str, str] = {}
-    smart_playlist_names: List[str] = []
-
-    for lib in libraries_iter:
-        if not isinstance(lib, dict):
-            continue
-        for pl in (lib.get("playlists") or []):
-            if isinstance(pl, dict) and pl.get("is_smart"):
-                name = str(pl.get("name") or "")
-                if name and name not in smart_playlist_names:
-                    smart_playlist_names.append(name)
-        users_block = lib.get("users") or {}
-        if not isinstance(users_block, dict):
-            continue
-        for u_name, u_payload in users_block.items():
-            if not isinstance(u_name, str) or not u_name.strip():
-                continue
-            if not isinstance(u_payload, dict):
-                u_payload = {}
-            counts = per_user_counts.setdefault(u_name, {
-                "watch_history": 0, "ratings": 0,
-                "playlists": 0, "collections": 0,
-            })
-            counts["watch_history"] += len(u_payload.get("watch_history") or [])
-            counts["ratings"] += len(u_payload.get("ratings") or [])
-            counts["playlists"] += len(u_payload.get("playlists") or [])
-            counts["collections"] += len(u_payload.get("collections") or [])
-            role = str(u_payload.get("role") or "").strip().lower()
-            if role and u_name not in per_user_role:
-                per_user_role[u_name] = role
-            # Capture backend_user_id once per user (first non-empty
-            # value wins). The snapshot serializer emits this field
-            # in every per-user block when known; legacy payloads
-            # without it leave the dict empty and step 2 short-
-            # circuits naturally inside the resolver.
-            buid = str(u_payload.get("backend_user_id") or "").strip()
-            if buid and u_name not in per_user_backend_user_id:
-                per_user_backend_user_id[u_name] = buid
-            for pl in (u_payload.get("playlists") or []):
-                if isinstance(pl, dict) and pl.get("is_smart"):
-                    name = str(pl.get("name") or "")
-                    if name and name not in smart_playlist_names:
-                        smart_playlist_names.append(name)
-
-    source_admin_count_seen = sum(
-        1 for r in per_user_role.values()
-        if r in ("owner", "admin")
-    )
-
-    # Per-job end user decisions: same shape and semantics the engine
-    # applies at write time. Drop decisions skip the user; Map
-    # decisions feed the resolver as priority-0 overrides so the
-    # verdict reflects what would actually happen.
-    dropped_usernames, per_job_overrides = _extract_per_job_overrides(
-        cross_platform_resolutions, dest_server_id,
-    )
-
-    filter_set: Optional[set] = None
-    if user_filter is not None:
-        filter_set = {
-            u.strip().lower() for u in user_filter
-            if isinstance(u, str) and u.strip()
-        }
-    if dropped_usernames:
-        if filter_set is None:
-            filter_set = {
-                (k or "").strip().lower()
-                for k in per_user_counts.keys()
-                if isinstance(k, str) and k.strip()
-            } - dropped_usernames
-        else:
-            filter_set = filter_set - dropped_usernames
-
-    # When fan-out is disabled the per-user resolution doesn't apply.
-    # Modal still wants the smart-playlist + library-type info.
-    if not include_managed_users:
-        return DryRunReport(
-            source_kind=source_kind,
-            dest_kind=dest_kind,
-            source_server_id=source_server_id,
-            dest_server_id=dest_server_id,
-            is_cross_platform=is_cross_platform,
-            source_admin_count=source_admin_count_seen,
-            dest_admin_count=len(dest_admins),
-            resolutions=[],
-            smart_playlists_skipped=len(smart_playlist_names),
-            smart_playlist_names=smart_playlist_names,
-            library_type_notes=[],
-            tombstoned_users_excluded=[],
-            zero_row_skipped=[],
-            overall_verdict="ok",
-            blocking_reasons=[],
-        )
-
-    resolutions: List[UserResolutionRecord] = []
-    tombstoned_users_excluded: List[TombstoneNote] = []
-    zero_row_skipped: List[ZeroRowSkip] = []
-    blocking_reasons: List[str] = []
-    # Track multi-admin collapse: dest_user_id -> [source usernames].
-    admin_resolution_targets: Dict[str, List[str]] = {}
-
-    for source_username, counts in per_user_counts.items():
-        normalised = source_username.strip().lower()
-        if filter_set is not None and normalised not in filter_set:
-            continue
-        source_role = per_user_role.get(source_username, "managed")
-
-        # Effective row counts AFTER the end user's filter flags.
-        eff = {
-            "watch_history": counts["watch_history"] if include_watch_history else 0,
-            "ratings": counts["ratings"] if include_ratings else 0,
-            "playlists": counts["playlists"] if include_playlists else 0,
-            "collections": counts["collections"] if include_collections else 0,
-        }
-        if (eff["watch_history"] + eff["ratings"]
-                + eff["playlists"] + eff["collections"]) == 0:
-            empty_signals = [
-                k for k, v in counts.items() if v == 0
-            ]
-            filter_flags = []
-            if not include_watch_history:
-                filter_flags.append("include_watch_history=false")
-            if not include_ratings:
-                filter_flags.append("include_ratings=false")
-            if not include_playlists:
-                filter_flags.append("include_playlists=false")
-            if not include_collections:
-                filter_flags.append("include_collections=false")
-            zero_row_skipped.append(ZeroRowSkip(
-                source_username=source_username,
-                empty_signals=empty_signals,
-                filter_flags_in_effect=filter_flags,
-                message=(
-                    f"Skipped {source_username!r}: no rows"
-                    + (f" ({', '.join(filter_flags)})" if filter_flags else "")
-                ),
-            ))
-            continue
-
-        # Plan[IDENTITY-UTILIZATION-AUDIT]-2026-05-17 R-3: forward the
-        # source user's backend_user_id + the snapshot's source service
-        # type so step 2 of the resolution chain (backend_user_id direct
-        # match within service_type) can fire. Missing values short-
-        # circuit the step naturally inside the resolver.
-        dest_user = _resolve_destination_user(
-            source_username=source_username,
-            source_role=source_role,
-            dest_by_username=dest_by_username,
-            dest_admins=dest_admins,
-            source_server_id=source_server_id,
-            dest_server_id=dest_server_id,
-            logger=log_,
-            per_job_overrides=per_job_overrides,
-            source_backend_user_id=per_user_backend_user_id.get(source_username) or None,
-            source_service_type=source_kind if source_kind != "unknown" else None,
-        )
-
-        warnings: List[str] = []
-        proposed_resolution = "no_match"
-        proposed_dest_user_id: Optional[str] = None
-        proposed_dest_username: Optional[str] = None
-        proposed_dest_role: Optional[str] = None
-
-        if dest_user is None and normalised in dest_tombstoned_by_username:
-            tomb = dest_tombstoned_by_username[normalised]
-            proposed_resolution = "tombstone_blocked"
-            tombstoned_users_excluded.append(TombstoneNote(
-                dest_username=tomb.username,
-                reason=(
-                    f"Source user {source_username!r} would map to tombstoned "
-                    f"destination user {tomb.username!r}. Unhide under "
-                    f"Servers > User Management to enable writes."
-                ),
-            ))
-        elif dest_user is not None:
-            proposed_dest_user_id = dest_user.backend_user_id or ""
-            proposed_dest_username = dest_user.username
-            proposed_dest_role = _normalise_dest_role(dest_user, dest_kind)
-            # Classify which resolution path fired.
-            # Priority-0: per-job override (end user picked Map in the
-            # modal without persist_as_identity_map). Surface as
-            # identity_map (semantically equivalent - explicit end user
-            # decision) with a warning naming the non-persisted nature.
-            hit_via_per_job_override = (
-                normalised in per_job_overrides
-                and per_job_overrides[normalised] == proposed_dest_user_id
-            )
-            hit_via_map = False
-            if not hit_via_per_job_override and source_server_id and dest_server_id:
-                try:
-                    from server.media_db import get_identity_maps_for_user
-                    for link in get_identity_maps_for_user(
-                        source_server_id, source_username,
-                    ) or []:
-                        if link.get("other_server_id") != dest_server_id:
-                            continue
-                        target_handle = (link.get("other_user_handle") or "").strip().lower()
-                        if target_handle == (dest_user.username or "").strip().lower():
-                            hit_via_map = True
-                            break
-                except Exception:
-                    pass
-            if hit_via_per_job_override:
-                proposed_resolution = "identity_map"
-                warnings.append(
-                    f"Applied via per-job override (operator Map decision "
-                    f"not persisted as identity-map entry). Tick "
-                    f"'Save my decisions as identity-map entries' next "
-                    f"run to skip the prompt."
-                )
-            elif hit_via_map:
-                proposed_resolution = "identity_map"
-            elif normalised == (dest_user.username or "").strip().lower():
-                # Direct name match. Role flip check.
-                source_admin_tier = source_role in ("owner", "admin")
-                dest_admin_tier = proposed_dest_role in ("owner", "admin")
-                if source_admin_tier != dest_admin_tier:
-                    proposed_resolution = "role_flip_ack"
-                    warnings.append(
-                        f"Direct name match but role differs: source role "
-                        f"{source_role!r}, destination role {proposed_dest_role!r}. "
-                        f"Confirm intent before writing."
-                    )
-                else:
-                    proposed_resolution = "direct_match"
-            elif source_role in ("owner", "admin") and len(dest_admins) == 1:
-                proposed_resolution = "single_admin_fallback"
-                warnings.append(
-                    f"Resolved via single-admin convention. Add an identity-map "
-                    f"entry to lock this in and skip the prompt next run."
-                )
-
-            if source_role in ("owner", "admin") and proposed_dest_user_id:
-                admin_resolution_targets.setdefault(
-                    proposed_dest_user_id, []
-                ).append(source_username)
-
-        # Verdict per row.
-        needs_ack = False
-        blocks_submit = False
-        if proposed_resolution in ("identity_map", "direct_match"):
-            pass
-        elif proposed_resolution in (
-            "single_admin_fallback", "role_flip_ack", "tombstone_blocked"
-        ):
-            needs_ack = True
-        elif proposed_resolution == "no_match":
-            if source_role in ("owner", "admin"):
-                blocks_submit = True
-                blocking_reasons.append(
-                    f"Source {source_role} {source_username!r} has no "
-                    f"destination resolution (no identity map, no direct name "
-                    f"match, no single-admin fallback). Add a mapping, create "
-                    f"on the destination, or drop the user."
-                )
-            else:
-                needs_ack = True
-
-        resolutions.append(UserResolutionRecord(
-            source_username=source_username,
-            source_role=source_role,
-            source_row_counts=UserRowCounts(
-                watch_history=counts["watch_history"],
-                ratings=counts["ratings"],
-                playlists=counts["playlists"],
-                collections=counts["collections"],
-            ),
-            proposed_resolution=proposed_resolution,
-            proposed_dest_user_id=proposed_dest_user_id,
-            proposed_dest_username=proposed_dest_username,
-            proposed_dest_role=proposed_dest_role,
-            needs_ack=needs_ack,
-            blocks_submit=blocks_submit,
-            warnings=warnings,
-            available_dest_users=available_dest_users,
-        ))
-
-    # Multi-admin collapse second pass: when multiple source admins
-    # resolve to the same destination user, surface as an ack-class
-    # collapse warning so the end user can choose to refine.
-    for dest_uid, src_names in admin_resolution_targets.items():
-        if len(src_names) <= 1:
-            continue
-        collapse_msg = (
-            f"Multi-admin collapse: source admins "
-            f"{', '.join(repr(n) for n in src_names)} all map to one "
-            f"destination user; their artifacts will share one account."
-        )
-        for idx, r in enumerate(resolutions):
-            if (r.source_username in src_names
-                    and r.proposed_dest_user_id == dest_uid):
-                new_warnings = list(r.warnings) + [collapse_msg]
-                resolutions[idx] = UserResolutionRecord(
-                    source_username=r.source_username,
-                    source_role=r.source_role,
-                    source_row_counts=r.source_row_counts,
-                    proposed_resolution="multi_admin_collapse",
-                    proposed_dest_user_id=r.proposed_dest_user_id,
-                    proposed_dest_username=r.proposed_dest_username,
-                    proposed_dest_role=r.proposed_dest_role,
-                    needs_ack=True,
-                    blocks_submit=False,
-                    warnings=new_warnings,
-                    available_dest_users=r.available_dest_users,
-                )
-
-    overall_verdict = "ok"
-    if any(r.blocks_submit for r in resolutions):
-        overall_verdict = "blocked"
-    elif any(r.needs_ack for r in resolutions):
-        overall_verdict = "ack_required"
-
-    return DryRunReport(
-        source_kind=source_kind,
-        dest_kind=dest_kind,
-        source_server_id=source_server_id,
-        dest_server_id=dest_server_id,
-        is_cross_platform=is_cross_platform,
-        source_admin_count=source_admin_count_seen,
-        dest_admin_count=len(dest_admins),
-        resolutions=resolutions,
-        smart_playlists_skipped=len(smart_playlist_names),
-        smart_playlist_names=smart_playlist_names,
-        library_type_notes=[],  # TODO: per-library compatibility checks
-        tombstoned_users_excluded=tombstoned_users_excluded,
-        zero_row_skipped=zero_row_skipped,
-        overall_verdict=overall_verdict,
-        blocking_reasons=blocking_reasons,
-    )
 
 
 __all__ = [

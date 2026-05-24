@@ -5,8 +5,7 @@
 // keep visible help text short while still surfacing the full
 // context on demand.
 //
-// Item 5 (admin-management plan, 2026-05-15): InfoTip supports two
-// modes:
+// InfoTip supports two modes:
 //   * Legacy mode (children prop): the parent passes the body as
 //     JSX. Used by older call sites that haven't been migrated to
 //     the help_content registry yet.
@@ -20,7 +19,7 @@
 // all in either mode; the help content is still reachable via the
 // Help tab.
 //
-// Positioning (2026-05-15 follow-up): the popover uses ``position:
+// Positioning: the popover uses ``position:
 // fixed`` and computes its placement from the button's
 // ``getBoundingClientRect()``. This escapes any ancestor with
 // ``overflow: hidden`` / ``overflow: auto`` / a ``transform`` that

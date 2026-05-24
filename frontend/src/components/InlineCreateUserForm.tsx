@@ -16,6 +16,7 @@
 import { useState } from 'react';
 import { api } from '../api';
 import type { CppDestUserOption, InlineCreateUserBody, InlineCreateUserResponse } from '../api';
+import { errorText } from '../utils/format';
 
 interface Props {
   destinationServerId: string;
@@ -151,7 +152,7 @@ export function InlineCreateUserForm({
               const res: InlineCreateUserResponse = await api.jobsInlineCreateUser(body);
               onCreated(res.user, res.was_newly_created);
             } catch (e) {
-              setError(String(e instanceof Error ? e.message : e));
+              setError(errorText(e));
             } finally {
               setSubmitting(false);
             }

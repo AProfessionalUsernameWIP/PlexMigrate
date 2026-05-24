@@ -1,5 +1,5 @@
 """
-Item serialization and four-tier resolution for PlexMigrate.
+Item serialization and four-tier resolution for Hestia-MediaManager.
 
 serialize_item / serialize_playlist / serialize_collection convert live
 plexapi objects to JSON-ready dicts for the export file. resolve_item
@@ -195,9 +195,36 @@ def serialize_item(item, user: str = "") -> Dict:
     if item.type == "episode":
         data["show_title"] = getattr(item, "grandparentTitle", "")
         data["season_title"] = getattr(item, "parentTitle", "")
+        # numeric
+        # season + episode indices. ``parentIndex`` is the season
+        # number, ``index`` the episode number. Without these,
+        # cross-server episode matching can't disambiguate same-
+        # titled episodes ("Pilot" exists in S1 of every show).
+        _pi = getattr(item, "parentIndex", None)
+        if _pi is not None:
+            try:
+                data["parent_index"] = int(_pi)
+            except (TypeError, ValueError):
+                pass
+        _ei = getattr(item, "index", None)
+        if _ei is not None:
+            try:
+                data["episode_index"] = int(_ei)
+            except (TypeError, ValueError):
+                pass
+        # The series' cross-server GUID — the strongest hierarchy
+        # match key (immune to localized titles + agent drift).
+        _gpg = getattr(item, "grandparentGuid", "") or ""
+        if _gpg:
+            data["grandparent_guid"] = str(_gpg)
     elif item.type == "track":
         data["artist"] = getattr(item, "grandparentTitle", "")
         data["album"] = getattr(item, "parentTitle", "")
+        # The artist's cross-server GUID — same role as the series
+        # GUID for episodes.
+        _gpg = getattr(item, "grandparentGuid", "") or ""
+        if _gpg:
+            data["grandparent_guid"] = str(_gpg)
 
     if data.get("last_viewed_at"):
         try:
@@ -479,7 +506,93 @@ def _resolve_item_impl(
         if filepath:
             filepath = filepath.replace(old_root, new_root, 1).replace("\\", "/")
 
-    # ── TIER 0: DB rating-key cache (v0.12.1) ─────────────────────────────────
+    # ── TIER 0: server_mirror.db rating-key cache ─────────────────────────────
+    # The mirror DB
+    # caches the per-server item universe across multiple resolution
+    # signals (GUID, full path, path tail). It is fed by snapshot
+    # write-through + the cross-feed Direction 1 playlist_cache
+    # bootstrap + operator-triggered Sync Now actions. Mirror lookup
+    # is microseconds (one SQL query, indexed) versus media.db's Tier
+    # 0 which is comparable but narrower in coverage.
+    #
+    # Falls through cleanly when the mirror DB is uninitialised
+    # (tests / CLI-only), empty for this server (cold start), or in
+    # always-live mode (operator opt-out).
+    try:
+        from server import server_mirror_db
+        # Probe init state without raising; resolution stays correct
+        # if the mirror is not available.
+        try:
+            server_mirror_db.get_connection()
+            _mirror_ready = True
+        except (RuntimeError, ImportError):
+            _mirror_ready = False
+    except ImportError:
+        _mirror_ready = False
+    if _mirror_ready:
+        try:
+            from services import server_mirror as _sm
+            # the mirror is
+            # keyed on the app registry UID (stamped onto the server
+            # object by connect_registered_server), not the backend-
+            # native machineIdentifier. Fall back to machineIdentifier
+            # for servers connected outside the registry path.
+            machine_id = str(
+                getattr(server, "_pmig_server_uid", "") or ""
+            ) or str(getattr(server, "machineIdentifier", "") or "")
+            if machine_id:
+                mirror_mode = _sm.effective_mode_for(machine_id)
+            else:
+                mirror_mode = "always-live"
+        except Exception:
+            mirror_mode = "always-live"
+            machine_id = ""
+        if machine_id and mirror_mode != "always-live":
+            try:
+                mirror_rk: Optional[str] = None
+                if guids:
+                    mirror_rk = _sm.lookup_by_guids(
+                        server_id=machine_id, guids=guids,
+                    )
+                if mirror_rk is None and filepath:
+                    mirror_rk = _sm.lookup_by_full_path(
+                        server_id=machine_id, file_path=filepath,
+                        item_type_hint=item_type or None,
+                    )
+                if mirror_rk is None and filepath:
+                    mirror_rk = _sm.lookup_by_path_tail(
+                        server_id=machine_id, file_path=filepath,
+                        tail_components=3,
+                        item_type_hint=item_type or None,
+                    )
+                if mirror_rk is not None:
+                    try:
+                        item = server.fetchItem(int(mirror_rk))
+                        if item:
+                            logger.debug(
+                                "[TIER:mirror] Resolved '%s' via mirror "
+                                "ratingKey=%s on %s",
+                                title, mirror_rk, machine_id,
+                            )
+                            return item, "mirror", ""
+                    except (NotFound, PlexApiException, ValueError):
+                        # Mirror row is stale: item was removed or
+                        # re-keyed live-side. Fall through to live
+                        # tiers; a successful match will refresh the
+                        # row on the next snapshot writethrough.
+                        pass
+                    except Exception as e:
+                        logger.debug(
+                            "[TIER:mirror] fetchItem failed for '%s' "
+                            "(rating_key=%s): %s", title, mirror_rk, e,
+                        )
+            except Exception as e:
+                logger.debug(
+                    "[TIER:mirror] lookup failed for '%s': %s",
+                    title, e,
+                )
+
+    # ── TIER 0b: media.db rating-key cache (v0.12.1) ──────────────────────────
     # The fastest possible resolution path. If a previous run on this
     # server already wrote this item's per-server ratingKey to
     # ``server_items`` (keyed by upstream GUID like imdb://tt0133093),
@@ -488,15 +601,21 @@ def _resolve_item_impl(
     #
     # Falls through cleanly when the DB has no record - empty DB,
     # first run against a new server, etc. - so this is purely
-    # additive. The CLI / server-mode lazy import keeps the resolver
-    # importable in environments that don't have the server package
-    # available (CLI-only checkouts).
+    # additive.
     try:
         from server import media_db
         machine_id = str(getattr(server, "machineIdentifier", "") or "")
-        if machine_id and guids:
+        # ``server_items`` rows are keyed by the canonical registry id
+        # (``servers.id``), not by the backend-native ``machineIdentifier``
+        # that lives on the live plexapi handle. Translate at this
+        # boundary so the WHERE clause downstream matches what the
+        # snapshotter wrote via ``ingest_snapshot_payload``. Without this
+        # translation the lookup never hits and every resolve degrades to
+        # the slower network-bound tiers below.
+        registry_id = media_db.resolve_registry_id(machine_id) if machine_id else None
+        if registry_id and guids:
             cached_rk = media_db.find_rating_key_on_server(
-                guids=guids, server_id=machine_id,
+                guids=guids, server_id=registry_id,
             )
             if cached_rk is not None:
                 try:
@@ -504,7 +623,8 @@ def _resolve_item_impl(
                     if item:
                         logger.debug(
                             f"[TIER:DB] Resolved '{title}' via cached "
-                            f"ratingKey={cached_rk} on {machine_id}"
+                            f"ratingKey={cached_rk} on {registry_id} "
+                            f"(machine_id={machine_id})"
                         )
                         return item, "DB", ""
                 except (NotFound, PlexApiException):
@@ -628,6 +748,83 @@ def _resolve_item_impl(
         except Exception as e:
             logger.debug(f"[TIER:filepath] Scan error for '{title}': {e}")
 
+    # ── TIER 2.75: Hierarchy match ─────────────────────────────────────────────
+    # A hierarchy match (parent GUID / show / artist +
+    # leaf coordinates) is a stronger signal than a bare fuzzy
+    # title match, so it runs immediately BEFORE the fuzzy tier.
+    #
+    # Resolves the classic ambiguity: two episodes both titled
+    # "Pilot" are indistinguishable by title, but
+    # (series GUID OR show_title) + season + episode is unique.
+    # Same for a track titled "Intro" under a known artist + album.
+    #
+    # Backed by the server_mirror.db hierarchy index. Falls through
+    # cleanly when the mirror is uninitialised / cold / always-live
+    # mode, or when the stored item carries no hierarchy fields
+    # (movies, old pre-v17 snapshots).
+    if item_type in ("episode", "track"):
+        try:
+            from server import server_mirror_db as _smdb
+            try:
+                _smdb.get_connection()
+                _h_mirror_ready = True
+            except (RuntimeError, ImportError):
+                _h_mirror_ready = False
+        except ImportError:
+            _h_mirror_ready = False
+        if _h_mirror_ready:
+            try:
+                from services import server_mirror as _sm_h
+                # Phase 4C: app registry UID is the mirror key; fall
+                # back to machineIdentifier for non-registry servers.
+                _h_machine_id = str(
+                    getattr(server, "_pmig_server_uid", "") or ""
+                ) or str(getattr(server, "machineIdentifier", "") or "")
+                _h_mode = (
+                    _sm_h.effective_mode_for(_h_machine_id)
+                    if _h_machine_id else "always-live"
+                )
+            except Exception:
+                _h_machine_id = ""
+                _h_mode = "always-live"
+            if _h_machine_id and _h_mode != "always-live":
+                def _h_int(v: Any) -> Optional[int]:
+                    if v in (None, ""):
+                        return None
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        return None
+                try:
+                    hier_rk = _sm_h.lookup_by_hierarchy(
+                        server_id=_h_machine_id,
+                        item_type=item_type,
+                        title=title,
+                        grandparent_guid=(stored.get("grandparent_guid") or None),
+                        show_title=(stored.get("show_title") or None),
+                        season_number=_h_int(stored.get("parent_index")),
+                        episode_number=_h_int(stored.get("episode_index")),
+                        artist=(stored.get("artist") or None),
+                        album=(stored.get("album") or None),
+                    )
+                    if hier_rk is not None:
+                        cand = server.fetchItem(int(hier_rk))
+                        if cand and (
+                            not item_type
+                            or getattr(cand, "type", "") == item_type
+                        ):
+                            logger.debug(
+                                "[TIER:hierarchy] Resolved '%s' via "
+                                "hierarchy ratingKey=%s",
+                                title, hier_rk,
+                            )
+                            return cand, "hierarchy", ""
+                except Exception as e:
+                    logger.debug(
+                        "[TIER:hierarchy] lookup failed for '%s': %s",
+                        title, e,
+                    )
+
     # ── TIER 3: Fuzzy Title Match ──────────────────────────────────────────────
     if _allow_fuzzy:
         try:
@@ -728,12 +925,28 @@ def resolve_item(
                 state.get_dashboard().inc_suffix()
             elif tier == "fuzzy":
                 state.get_dashboard().inc_fuzzy()
-            # ALWAYS log the tier name (including "DB") into the
-            # per-tier summary counter. Distinct from the existing
-            # inc_guid / inc_filepath / etc. accumulators which feed
-            # the Match Resolution panel; this one feeds the run
-            # summary + the fuzzy-match warning banner in transfer
-            # mode.
+            # "mirror" tier is a
+            # new resolution path. The Match Resolution panel does
+            # not yet have a per-tier counter for it (Phase 2.5
+            # frontend task); count as GUID for now since most
+            # mirror hits are upstream GUID matches.
+            elif tier == "mirror":
+                state.get_dashboard().inc_guid()
+            # the
+            # "hierarchy" tier is a new resolution path. The Match
+            # Resolution panel has no per-tier counter for it yet;
+            # count as a suffix-class match (a strong-but-not-GUID
+            # signal) so the panel's accumulators stay meaningful.
+            # The exact tier name still lands in inc_tier below for
+            # the run summary.
+            elif tier == "hierarchy":
+                state.get_dashboard().inc_suffix()
+            # ALWAYS log the tier name (including "DB" + "mirror")
+            # into the per-tier summary counter. Distinct from the
+            # existing inc_guid / inc_filepath / etc. accumulators
+            # which feed the Match Resolution panel; this one feeds
+            # the run summary + the fuzzy-match warning banner in
+            # transfer mode.
             state.get_dashboard().inc_tier(tier)
     return item, tier, reason
 

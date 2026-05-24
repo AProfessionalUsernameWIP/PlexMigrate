@@ -1,5 +1,4 @@
-// Shared user-count chip with delayed hover-to-reveal user list
-// (Phase 5 of the dashboard / log reorg).
+// Shared user-count chip with delayed hover-to-reveal user list.
 //
 // End user-facing contract:
 // * Renders the count number inline. Looks like an interactive

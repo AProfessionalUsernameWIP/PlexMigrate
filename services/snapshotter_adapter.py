@@ -1,8 +1,37 @@
 """
 Backend-agnostic snapshot engine. Used for Jellyfin / Emby sources;
 Plex still routes through ``services/snapshotter.py`` to keep its
-perf-tuned plexapi-specific code paths untouched (deliberate two-engine
-split documented in Plan[MULTI-BACKEND]-2026-05-15.md section 11.5).
+perf-tuned plexapi-specific code paths untouched (a deliberate
+two-engine split).
+
+Known follow-ups:
+
+  * **Bulk-walk consolidation.** Today ``_capture_watch_history`` and
+    ``_capture_ratings`` each call ``adapter.iter_items()`` separately
+    even though both could share a single full-library walk per
+    (user, library). The response carries ``UserData.PlayCount`` AND
+    ``UserData.Rating`` AND ``UserData.IsFavorite`` in one go; we just
+    iterate it twice. Halving the walk count (2 -> 1 per user per
+    library) would meaningfully reduce snapshot time on large servers.
+    Pattern: introduce a ``_capture_user_state_bulk`` that walks the
+    library once and yields both watch_history + ratings tuples.
+
+  * **Episode parent-context GUIDs.** Emby episodes often carry TVDB
+    or TMDB IDs on the SERIES, not the episode itself. The current
+    GUID extraction in ``_jellyfin_item_to_snapshot`` reads only the
+    episode's ProviderIds. Cross-server episode matching degrades
+    when only one side has provider IDs. The fix is to also fetch
+    the parent Series item (one extra call per series, cacheable
+    per run) and emit the series GUIDs alongside the episode's
+    show_title for the matcher. Out of scope for this pass.
+
+  * **Backend version awareness.** Emby vs Jellyfin diverge on
+    occasional response shapes; specific Emby releases also change
+    UserData field semantics. The adapter has no version
+    introspection. A future hardening pass should record the
+    server's reported version at server_identity() time and gate
+    quirk-fixes on it.
+
 
 Scope (MVP for PR-Backends Phase 1)
 -----------------------------------
@@ -58,6 +87,7 @@ from services.adapters import (
     UserContext,
     item_snapshot_to_engine_dict,
 )
+from services.backend_translation import affinity_row_is_meaningful
 
 
 log = logging.getLogger("plexmigrate.services.snapshotter_adapter")
@@ -130,6 +160,18 @@ def snapshot_library_adapter(
     log_ = logger or log
     section_key = stable_section_key(library_id)
 
+    # Dashboard wiring: the adapter
+    # path had ZERO state.get_dashboard() calls, which is why the
+    # Run dashboard's per-library card, progress bars, run totals,
+    # and activity feed all stayed empty during Emby / Jellyfin
+    # snapshot runs. The Plex path emits these events throughout
+    # ``services/snapshotter.py``; this block mirrors the same
+    # contract so the dashboard updates identically on both engines.
+    from services import state as _state
+    _dash = _state.get_dashboard()
+    if _dash is not None:
+        _dash.set_library_phase(library_name, "Capturing snapshot…")
+
     log_.info(
         "[%s] snapshot start (adapter=%s, library_id=%s, section_key=%d)",
         library_name, adapter.backend, library_id, section_key,
@@ -150,12 +192,30 @@ def snapshot_library_adapter(
             adapter, library_id, library_name, user_context,
             user_label, stop_event, log_,
         )
+        if _dash is not None:
+            n = len(watch_history)
+            if n:
+                _dash.add_batch_total("watch", n)
+                _dash.add_run_total(n)
+                for _ in range(n):
+                    _dash.inc_watch()
+            _dash.set_library_phase(library_name, "Watch History ✓")
+            _dash.advance_library(library_name)
 
     if include_ratings:
         ratings = _capture_ratings(
             adapter, library_id, library_name, user_context,
             user_label, stop_event, log_,
         )
+        if _dash is not None:
+            n = len(ratings)
+            if n:
+                _dash.add_batch_total("rating", n)
+                _dash.add_run_total(n)
+                for _ in range(n):
+                    _dash.inc_rating()
+            _dash.set_library_phase(library_name, "Ratings ✓")
+            _dash.advance_library(library_name)
 
     playlists: List[Dict[str, Any]] = []
     collections: List[Dict[str, Any]] = []
@@ -163,10 +223,28 @@ def snapshot_library_adapter(
         playlists = _capture_playlists(
             adapter, library_name, user_context, user_label, log_,
         )
+        if _dash is not None:
+            n = len(playlists)
+            if n:
+                _dash.add_batch_total("playlist", n)
+                _dash.add_run_total(n)
+                for _ in range(n):
+                    _dash.inc_playlist()
+            _dash.set_library_phase(library_name, "Playlists ✓")
+            _dash.advance_library(library_name)
     if include_collections:
         collections = _capture_collections(
             adapter, library_id, library_name, log_,
         )
+        if _dash is not None:
+            n = len(collections)
+            if n:
+                _dash.add_batch_total("collection", n)
+                _dash.add_run_total(n)
+                for _ in range(n):
+                    _dash.inc_collection()
+            _dash.set_library_phase(library_name, "Collections ✓")
+            _dash.advance_library(library_name)
 
     # Stamp media.db with what we captured. Best-effort: the legacy
     # JSON output is still produced even if the DB write fails (the
@@ -214,6 +292,17 @@ def _capture_watch_history(
     logger: logging.Logger,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    # Diagnostic counters. Original goal was to surface
+    # whether 0 captured rows meant "API returned nothing" vs "API
+    # returned items but none had PlayCount > 0." A later iteration
+    # also tracks ``max_view_count`` seen across the
+    # full walk so we can tell apart "user genuinely has 0 plays on
+    # this server" (max=0 across 1000s of items) from "API is leaking
+    # the wrong user's UserData" (some items show >0 if the request
+    # is actually scoped to the URL user).
+    total_seen = 0
+    skipped_no_view_count = 0
+    max_view_count_seen = 0
     try:
         for snap in adapter.iter_items(
             library_id,
@@ -228,18 +317,74 @@ def _capture_watch_history(
                 break
             if not isinstance(snap, ItemSnapshot):
                 continue
-            if (snap.view_count or 0) <= 0:
-                # Adapter's filter wasn't authoritative; double-check
-                # because snapshot rows must reflect "actually watched."
+            total_seen += 1
+            vc = int(snap.view_count or 0)
+            if vc > max_view_count_seen:
+                max_view_count_seen = vc
+            if vc <= 0:
+                # Client-side filter: snapshot rows must reflect
+                # "actually watched." On Jellyfin/Emby this is the
+                # ONLY filter; we walk the full
+                # library and pick out rows with PlayCount > 0.
+                #
+                # KNOWN LIMITATION (SNAP-04, operator-confirmed
+                # 2026-05-21, by design): an item with a resume offset
+                # but zero completed plays is intentionally NOT
+                # captured. "Watch history" here means completed plays
+                # only; in-progress / resume-point fidelity is out of
+                # scope for the snapshot.
+                skipped_no_view_count += 1
                 continue
             out.append(item_snapshot_to_engine_dict(snap, user=user_label))
+            # Parity with Plex media.log:
+            # emit one line per captured item to the per-run
+            # ``media.log`` surface. The Plex snapshot path does this
+            # via ``state._media_logger.debug(_fmt_media_line(...))``;
+            # the adapter path was silent, leaving the operator with
+            # only summary counters to verify capture. Including the
+            # hierarchy fields lets the operator tail media.log and
+            # watch episodes / tracks stream by with full show /
+            # season / artist context.
+            try:
+                from services import state as _state
+                from services.logging_ops import _fmt_media_line
+                if getattr(_state, "_media_logger", None) is not None:
+                    _state._media_logger.debug(_fmt_media_line(
+                        "EXPORT", library_name, snap.type,
+                        snap.title or "(no title)",
+                        user=user_label,
+                        plays=vc,
+                        show=snap.show_title or None,
+                        season=snap.season_index,
+                        episode=snap.episode_index,
+                        artist=snap.artist or None,
+                        album=snap.album or None,
+                        path=snap.file_path or None,
+                    ))
+            except Exception:
+                # Media-log emit is observability only. A failure here
+                # must not break the capture loop.
+                pass
     except Exception as exc:
+        # Do NOT swallow the error and return the partial list: a
+        # snapshot that silently drops part of a library's watch
+        # history is indistinguishable from a clean one, and if used
+        # as a Replace-mode restore source it writes incomplete data
+        # to the destination. Re-raise so the snapshot job fails
+        # loudly and the operator re-runs - registering a
+        # half-captured snapshot as a success is the dangerous
+        # outcome. A user-requested stop is handled by the break
+        # above and never reaches here.
         logger.error(
-            "[%s] watch-history capture failed: %s", library_name, exc,
+            "[%s] watch-history capture failed after %d row(s): %s",
+            library_name, len(out), exc,
         )
+        raise
     logger.info(
-        "[%s] watch-history captured %d row(s) (user=%s)",
-        library_name, len(out), user_label,
+        "[%s] watch-history captured %d row(s) (user=%s, total_items=%d, "
+        "skipped_no_play=%d, max_play_count_seen=%d)",
+        library_name, len(out), user_label, total_seen, skipped_no_view_count,
+        max_view_count_seen,
     )
     return out
 
@@ -269,13 +414,45 @@ def _capture_ratings(
             if not isinstance(snap, ItemSnapshot):
                 continue
             rating = snap.user_rating
-            if rating is None or rating <= 0:
+            is_fav = bool(snap.is_favorite)
+            # Keep the row when it carries a real rating OR is
+            # favorited. affinity_row_is_meaningful is the shared
+            # predicate (see backend_translation) so this capture
+            # filter matches the Plex capture and both ingest paths.
+            if not affinity_row_is_meaningful(rating, is_fav):
                 continue
             out.append(item_snapshot_to_engine_dict(snap, user=user_label))
+            # Parity with Plex media.log for the ratings
+            # capture surface. See the watch-history loop above for
+            # the rationale.
+            try:
+                from services import state as _state
+                from services.logging_ops import _fmt_media_line
+                if getattr(_state, "_media_logger", None) is not None:
+                    _state._media_logger.debug(_fmt_media_line(
+                        "EXPORT-RATING", library_name, snap.type,
+                        snap.title or "(no title)",
+                        user=user_label,
+                        rating=rating,
+                        show=snap.show_title or None,
+                        season=snap.season_index,
+                        episode=snap.episode_index,
+                        artist=snap.artist or None,
+                        album=snap.album or None,
+                        path=snap.file_path or None,
+                    ))
+            except Exception:
+                pass
     except Exception as exc:
+        # See _capture_watch_history: swallowing the error and
+        # returning a partial list yields a silently incomplete
+        # ratings set that looks like a clean capture. Re-raise so
+        # the snapshot job fails loudly instead.
         logger.error(
-            "[%s] ratings capture failed: %s", library_name, exc,
+            "[%s] ratings capture failed after %d row(s): %s",
+            library_name, len(out), exc,
         )
+        raise
     logger.info(
         "[%s] ratings captured %d row(s) (user=%s)",
         library_name, len(out), user_label,
@@ -406,6 +583,10 @@ def _ingest_to_media_db(
             section_key=section_key,
             section_title=library_name or library_id,
             section_type=library_type or "",
+            # CONSOLE-08: preserve the raw GUID library id so the
+            # snapshot->mirror writethrough can key section_id on it,
+            # matching the live mirror sync (which uses the GUID).
+            library_guid=library_id,
         )
     except AttributeError:
         # Older media_db revisions don't expose upsert_library_section
@@ -456,8 +637,11 @@ def _ingest_to_media_db(
                     rating_key=str(row.get("rating_key") or ""),
                     section_key=section_key,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "[%s] upsert_server_item failed for %r: %s",
+                    library_name, row.get("title"), exc,
+                )
             media_db.record_watch_event(
                 item_id=item_id,
                 server_id=server_id,
@@ -479,7 +663,14 @@ def _ingest_to_media_db(
     # Ratings.
     for row in ratings:
         rating_val = row.get("user_rating")
-        if rating_val is None:
+        # Keep the row when it has a real rating OR is favorited. A
+        # favorite-only row (Jellyfin/Emby item with no numeric
+        # rating) is stored with rating 0.0 + is_favorite 1.
+        # affinity_row_is_meaningful is the shared capture/ingest
+        # predicate (see backend_translation).
+        _fav_raw = row.get("is_favorite")
+        is_fav = None if _fav_raw is None else bool(_fav_raw)
+        if not affinity_row_is_meaningful(rating_val, is_fav):
             continue
         try:
             item_id = media_db.upsert_item(
@@ -493,7 +684,8 @@ def _ingest_to_media_db(
                 item_id=item_id,
                 server_id=server_id,
                 user_handle=user_context.username or "",
-                rating=float(rating_val),
+                rating=float(rating_val) if rating_val is not None else 0.0,
+                is_favorite=is_fav,
                 section_key=section_key,
             )
         except Exception as exc:
@@ -568,6 +760,40 @@ def run_snapshot_adapter(
         is_admin=True,
     )
 
+    # The owner-phase used to run
+    # unconditionally for EVERY snapshot regardless of user_filter
+    # - on Emby/Jellyfin servers with multiple admins, that meant
+    # selecting one admin still captured the other's data because
+    # the registry's primary-owner happened to be the un-filtered
+    # admin.
+    #
+    # ``owner_in_filter`` is the single gate used downstream to
+    # decide whether to capture the owner's watch_history /
+    # ratings / playlists. When the filter is None (capture
+    # everyone), the gate opens. When the filter is supplied and
+    # the owner's username is one of the selected entries, the
+    # gate opens. Otherwise the owner-phase still runs (so the
+    # library scaffold + per-user fan-out attach point is built)
+    # but with capture flags forced false - no Ares rows land in
+    # the snapshot when the operator only wanted Kai.
+    if user_filter is None:
+        owner_in_filter = True
+    else:
+        _filter_set = {
+            u.strip() for u in user_filter
+            if isinstance(u, str) and u.strip()
+        }
+        owner_in_filter = (owner_ctx.username or "") in _filter_set
+    if not owner_in_filter:
+        log_.info(
+            "run_snapshot_adapter: owner %r not in user_filter %r; "
+            "owner-phase will run as a scaffolding pass (no "
+            "watch_history / ratings / playlists captured for the "
+            "owner). Per-user fan-out will capture filtered users "
+            "normally.",
+            owner_ctx.username, user_filter,
+        )
+
     all_libraries = adapter.list_libraries()
     if library_names:
         wanted = {n.lower() for n in library_names if n}
@@ -585,7 +811,10 @@ def run_snapshot_adapter(
     managed_user_contexts: List[Any] = []
     if include_managed_users:
         managed_user_contexts = _resolve_managed_user_contexts(
-            adapter, admin_token, user_filter, logger=log_,
+            adapter, admin_token, user_filter,
+            primary_owner_id=identity.owner_user_id or "",
+            server_id=server_id or identity.machine_id or "",
+            logger=log_,
         )
 
     log_.info(
@@ -596,11 +825,219 @@ def run_snapshot_adapter(
         len(managed_user_contexts),
     )
 
+    # Register each library with the dashboard up front so
+    # the Libraries panel shows the full list with totals before any
+    # phase work begins. Mirrors snapshotter.py:2501-2504 for the
+    # Plex path.
+    #
+    # The per-library total must match what advance_library actually
+    # gets called for, otherwise the bar caps short of 100% even
+    # though the library is functionally complete. The breakdown:
+    #
+    #   * Virtual libraries (boxsets/playlists CollectionType) carry
+    #     no leaf items - watch/rating capture is skipped, per-user
+    #     fan-out is skipped. Total = 1 (so the bar can complete via
+    #     finish_library after the anchor attach).
+    #   * Real libraries get one advance per: watch_history (if
+    #     include_watch_history), ratings (if include_ratings),
+    #     anchor collection attach (only on anchor library, if
+    #     include_collections AND server has collections), anchor
+    #     playlist attach (same conditions), plus n_user_tasks for
+    #     the per-user fan-out.
+    from services import state as _state
+    _run_dash = _state.get_dashboard()
+    n_user_tasks = len(managed_user_contexts)
+
+    def _lib_total(_lib: Any) -> int:
+        is_virtual = _lib.type in ("boxsets", "playlists")
+        is_anchor = _lib.name == collections_anchor_name
+        if is_virtual:
+            return 1
+        total = 0
+        if include_watch_history:
+            total += 1
+        if include_ratings:
+            total += 1
+        if is_anchor and include_collections and server_wide_collections:
+            total += 1
+        if is_anchor and include_playlists and owner_playlists:
+            total += 1
+        total += n_user_tasks
+        return max(1, total)
+
+    # set_user_count drives RunCoverage's "Users (incl. owner)" stat.
+    # Mirrors snapshotter.py:2501 for the Plex path. Pre-fix the
+    # adapter path never called this, so the panel always showed 0
+    # users regardless of how many managed users were captured.
+    #
+    # Library registration is deferred to after server-wide
+    # collections + playlists + anchor selection have been computed,
+    # because ``_lib_total`` depends on those values to know whether
+    # a given library will receive the anchor-attach advance_library
+    # tick (otherwise the bar would cap short of 100%).
+    if _run_dash is not None:
+        _run_dash.set_user_count(1 + n_user_tasks)
+
+    # Jellyfin / Emby BoxSets AND
+    # playlists are SERVER-WIDE — they don't belong to any single
+    # library. Pre-fix the per-library loop called
+    # ``adapter.list_collections(library_id=lib.id)`` and
+    # ``adapter.list_playlists(user_context)`` for each library; both
+    # adapters ignored the library scope (correctly, since they're
+    # server-wide) and returned the SAME full lists every time. With N libraries selected the operator's snapshot
+    # ended up with the same 333 BoxSets duplicated 4x in the payload
+    # (once per library), and the snapshot.db builder then wrote them
+    # under N different ``section_key`` values, inflating row counts
+    # by Nx.
+    #
+    # Fix: capture server-wide collections ONCE here, suppress the
+    # per-library collection capture entirely, and attach the result
+    # to exactly ONE library payload after the loop. This matches the
+    # operator's stated rule: "globally accessible collections are
+    # accounted ONCE under an admin." Per-user fan-out continues to
+    # skip collections (managed users have no private collections in
+    # the Emby/Jellyfin model by default).
+    #
+    # For the snapshot.db builder the collections need a section_key
+    # to anchor against. We attach them to the FIRST selected library;
+    # if the operator's selection includes the synthetic
+    # "Collections" / "BoxSets" library, prefer that as the anchor
+    # since it's semantically the right home. The chosen anchor is
+    # logged so the operator can see where the BoxSets landed.
+    server_wide_collections: List[Dict[str, Any]] = []
+    if include_collections and target_libraries:
+        try:
+            specs = adapter.list_collections() or []
+            for spec in specs:
+                server_wide_collections.append({
+                    "name": spec.name,
+                    "source_library": "(server-wide)",
+                    "source_library_id": None,
+                    "library_id": spec.library_id,
+                    "items": [
+                        {
+                            "title": ref.title,
+                            "guids": list(ref.guids),
+                            "rating_key": ref.backend_item_id,
+                        }
+                        for ref in (spec.items or ())
+                    ],
+                })
+            log_.info(
+                "server-wide collections captured: %d (will attach to one library "
+                "payload to avoid per-library duplication)",
+                len(server_wide_collections),
+            )
+        except Exception as exc:
+            log_.warning(
+                "server-wide collections capture failed: %s; continuing without collections.",
+                exc,
+            )
+
+    # Owner-phase playlists: capture once per run. Jellyfin/Emby
+    # playlists are server-wide and per-user-owned; the owner sees
+    # their own playlists via list_playlists(owner_ctx). Pre-fix this
+    # was called per library inside snapshot_library_adapter, producing
+    # the same N-fold duplication as collections.
+    #
+    # The owner-phase playlist
+    # capture is gated by ``owner_in_filter``. When the operator
+    # filtered to a non-owner user (e.g. "Kai only" with Ares as
+    # the registry primary owner), capturing Ares's playlists too
+    # was the same scope leak as the watch_history capture below.
+    owner_playlists: List[Dict[str, Any]] = []
+    if include_playlists and target_libraries and owner_in_filter:
+        try:
+            owner_playlists = _capture_playlists(
+                adapter, "(server-wide)", owner_ctx, owner_ctx.username or "Owner", log_,
+            )
+        except Exception as exc:
+            log_.warning(
+                "owner playlists capture failed: %s; continuing without playlists.",
+                exc,
+            )
+
+    # Managed-user playlists: capture once per managed user (not per
+    # library). Each user has their own private playlists in Emby/
+    # Jellyfin; this captures them all and attaches to that user's
+    # entry under the anchor library's ``users`` dict below.
+    managed_user_playlists: Dict[str, List[Dict[str, Any]]] = {}
+    if include_playlists and managed_user_contexts:
+        for _ctx in managed_user_contexts:
+            try:
+                managed_user_playlists[_ctx.username] = _capture_playlists(
+                    adapter, "(server-wide)", _ctx, _ctx.username or "Managed", log_,
+                )
+            except Exception as exc:
+                log_.warning(
+                    "managed user %r playlists capture failed: %s",
+                    _ctx.username, exc,
+                )
+                managed_user_playlists[_ctx.username] = []
+
+    # Decide which library payload anchors the server-wide
+    # collections + playlists. Both attach to the SAME anchor so all
+    # the server-wide content lives in one place. Prefer a library
+    # whose name strongly suggests it's the BoxSet / Collections
+    # virtual library; fall back to the first selected one. The
+    # anchor is set whenever there's ANY server-wide content to
+    # attach (collections OR owner playlists OR managed-user
+    # playlists), not only when collections are present.
+    collections_anchor_name: Optional[str] = None
+    _have_server_wide_content = bool(
+        server_wide_collections
+        or owner_playlists
+        or any(managed_user_playlists.values())
+    )
+    if _have_server_wide_content:
+        _collections_keywords = ("collection", "boxset", "box set", "boxsets", "box sets")
+        for _lib in target_libraries:
+            if any(kw in _lib.name.lower() for kw in _collections_keywords):
+                collections_anchor_name = _lib.name
+                break
+        if collections_anchor_name is None:
+            collections_anchor_name = target_libraries[0].name
+        log_.info(
+            "server-wide content anchored to library %r "
+            "(collections=%d, owner_playlists=%d, managed_user_playlists=%d)",
+            collections_anchor_name,
+            len(server_wide_collections),
+            len(owner_playlists),
+            sum(len(v) for v in managed_user_playlists.values()),
+        )
+
+    # Register each library with the dashboard now that
+    # ``collections_anchor_name`` / ``server_wide_collections`` /
+    # ``owner_playlists`` are all known. ``_lib_total`` reads those
+    # closures to decide whether the anchor library's bar should
+    # include +1 for the collection attach and/or +1 for the playlist
+    # attach, so the bar can reach 100% on every library at run end.
+    if _run_dash is not None:
+        for lib in target_libraries:
+            _run_dash.add_library(lib.name, total=_lib_total(lib))
+
     per_library: List[Dict[str, Any]] = []
     for lib in target_libraries:
+        if _run_dash is not None:
+            _run_dash.set_library_status(lib.name, "active")
+            _run_dash.push_activity(
+                "started", lib.name, "Snapshot started",
+            )
         if stop_event is not None and stop_event.is_set():
             log_.info("run_snapshot_adapter: stop requested; halting.")
             break
+        # Skip watch/rating capture for Jellyfin/Emby
+        # virtual libraries (``boxsets`` is the auto-created BoxSets
+        # library, ``playlists`` is the auto-created Playlists
+        # library). These libraries contain BoxSet / Playlist
+        # entities, not leaf items, so the ``/Users/{uid}/Items?ParentId=X``
+        # walk returns BoxSets / playlists that have no view_count
+        # semantics. Running watch_history / ratings against them is
+        # wasted work; the per-user fan-out is similarly skipped.
+        # The library still receives the anchor attachment for
+        # server-wide collections (matches the operator's mental
+        # model of "Collections" being where collections live).
+        _is_virtual_library = lib.type in ("boxsets", "playlists")
         lib_payload = snapshot_library_adapter(
             adapter,
             library_id=lib.library_id,
@@ -608,16 +1045,36 @@ def run_snapshot_adapter(
             library_type=lib.type,
             server_id=server_id or identity.machine_id,
             user_context=owner_ctx,
-            include_watch_history=include_watch_history,
-            include_ratings=include_ratings,
-            include_playlists=include_playlists,
-            include_collections=include_collections,
+            # owner-phase data capture is gated by
+            # ``owner_in_filter``. The library scaffold (id, name,
+            # type, anchor for collections + playlists, attachment
+            # point for the per-user fan-out) is always built; only
+            # the owner's PER-USER data (watch_history + ratings)
+            # is suppressed when the operator's filter excluded
+            # them. Pre-fix this ran unconditionally and captured
+            # the wrong admin's data on multi-admin Emby installs.
+            include_watch_history=(
+                include_watch_history and not _is_virtual_library
+                and owner_in_filter
+            ),
+            include_ratings=(
+                include_ratings and not _is_virtual_library
+                and owner_in_filter
+            ),
+            # Per-library playlist + collection capture is suppressed
+            # here: we captured server-wide playlists + BoxSets once
+            # above and will attach them to a single anchor library
+            # after the loop.
+            include_playlists=False,
+            include_collections=False,
             logger=log_,
             stop_event=stop_event,
         )
         # Per-user fan-out for this library. The library payload's
         # ``users`` dict gets one entry per managed user captured.
-        if managed_user_contexts:
+        # Skipped for virtual libraries (boxsets/playlists) since they
+        # carry no per-user leaf state.
+        if managed_user_contexts and not _is_virtual_library:
             per_user_block: Dict[str, Dict[str, Any]] = {}
             for ctx in managed_user_contexts:
                 if stop_event is not None and stop_event.is_set():
@@ -635,8 +1092,121 @@ def run_snapshot_adapter(
                     logger=log_,
                     stop_event=stop_event,
                 )
+                # Per-user advance: each managed-user pass counts as
+                # one step in the library's progress bar (matches the
+                # ``4 + n_user_tasks`` total declared in add_library).
+                if _run_dash is not None:
+                    _run_dash.advance_library(lib.name)
+                # Attach managed user's once-captured playlists on the
+                # anchor library only. Other libraries' per-user
+                # blocks keep playlists=[] (server-wide content lives
+                # in one place).
+                if lib.name == collections_anchor_name:
+                    per_user_block[ctx.username]["playlists"] = list(
+                        managed_user_playlists.get(ctx.username, [])
+                    )
             lib_payload["users"] = per_user_block
+        # attach the once-per-run server-wide collections
+        # AND playlists to the chosen anchor library, BEFORE the
+        # owner-block mirror below so they flow into both the top-
+        # level shape (for the JSON sidecar) and the users[owner]
+        # shape (for the snapshot.db builder). Every other library
+        # payload has empty collections/playlists, which is correct:
+        # BoxSets and playlists are server-wide, not per-library, and
+        # double-counting them under every library is what produced
+        # the operator-reported 4x duplication.
+        if lib.name == collections_anchor_name:
+            if server_wide_collections:
+                lib_payload["collections"] = list(server_wide_collections)
+                if _run_dash is not None:
+                    n = len(server_wide_collections)
+                    if n:
+                        _run_dash.add_batch_total("collection", n)
+                        _run_dash.add_run_total(n)
+                        for _ in range(n):
+                            _run_dash.inc_collection()
+                    # advance the library step for the collection
+                    # attach (matches the +1 in _lib_total above when
+                    # is_anchor+include_collections+server has collections)
+                    _run_dash.advance_library(lib.name)
+            if owner_playlists:
+                lib_payload["playlists"] = list(owner_playlists)
+                if _run_dash is not None:
+                    n = len(owner_playlists)
+                    if n:
+                        _run_dash.add_batch_total("playlist", n)
+                        _run_dash.add_run_total(n)
+                        for _ in range(n):
+                            _run_dash.inc_playlist()
+                    # advance for the playlist attach step
+                    _run_dash.advance_library(lib.name)
+
+        # Mirror owner-phase data into the ``users`` dict under a
+        # role="owner" entry. The snapshot.db build path
+        # (``server/snapshot_capture.py::build_snapshot_db_from_payloads``)
+        # walks ``payload["users"][handle]`` blocks only - its
+        # ``_find_owner_block`` looks for an entry whose ``role`` is
+        # "owner". The adapter previously emitted owner-phase data at
+        # the TOP LEVEL of the payload only, so the consumer found an
+        # empty owner block and wrote zero rows for items / watch
+        # events / ratings / playlists / collections, producing an
+        # effectively empty snapshot.db. The top-level fields stay
+        # populated because the JSON sidecar serialiser reads that
+        # shape; the ``users[owner]`` block is the new addition
+        # consumed by the snapshot.db builder.
+        owner_handle = owner_ctx.username or "Owner"
+        users_dict = lib_payload.setdefault("users", {})
+        # Collision-safe key. A managed user captured into
+        # ``per_user_block`` above can share the owner's username on a
+        # multi-admin Emby/Jellyfin server. Writing the owner-mirror
+        # block under a colliding key would silently overwrite that
+        # managed user's captured watch/ratings with the owner's data.
+        # The snapshot.db builder finds the owner block by
+        # ``role == "owner"``, not by key, so a suffixed key is safe.
+        owner_key = owner_handle
+        _owner_suffix = 2
+        while owner_key in users_dict:
+            owner_key = f"{owner_handle} ({_owner_suffix})"
+            _owner_suffix += 1
+        users_dict[owner_key] = {
+            "role": "owner",
+            "display_name": owner_ctx.username or "Owner",
+            "backend_user_id": owner_ctx.backend_user_id or "",
+            "watch_history": list(lib_payload.get("watch_history") or []),
+            "ratings": list(lib_payload.get("ratings") or []),
+            "playlists": list(lib_payload.get("playlists") or []),
+            "collections": list(lib_payload.get("collections") or []),
+        }
         per_library.append(lib_payload)
+        # Library complete: ``finish_library`` snaps completed=total
+        # AND sets status=done. Using set_library_status alone (the
+        # earlier pass) left completed at whatever number
+        # advance_library had bumped it to, so the bar stayed at
+        # ~71% but the status flipped to "done" which turned the bar
+        # green. The two contracts disagreed -> operator-reported
+        # "bar turning green at 71% as if it were 100%." Mirrors
+        # snapshotter.py:1912 (Plex path).
+        if _run_dash is not None:
+            _run_dash.finish_library(lib.name, error=False)
+            _run_dash.push_activity(
+                "done", lib.name, "Library complete",
+            )
+        # Bridge to the Rule-1 payload-direct collector so
+        # the post-run wrapper (``server/jobs.py::_capture_snapshot_db``)
+        # can build the snapshot.db file. The Plex path appends at
+        # ``services/snapshotter.py:2144``; the adapter path was
+        # missing this contract, which is why Emby/Jellyfin snapshot
+        # runs completed with "no per-library payload" warnings even
+        # though the engine had captured everything successfully.
+        try:
+            from services import state as _state
+            _state._snapshot_payloads.append(lib_payload)
+        except Exception:
+            log_.exception(
+                "[%s] failed to append payload to state collector; "
+                "snapshot.db build will skip this library.",
+                lib.name,
+            )
 
     return {
         "snapshot_meta": {
@@ -656,6 +1226,8 @@ def _resolve_managed_user_contexts(
     admin_token: str,
     user_filter: Optional[List[str]],
     *,
+    primary_owner_id: str,
+    server_id: str,
     logger: logging.Logger,
 ) -> List[Any]:
     """Enumerate the source's managed users + return one
@@ -664,8 +1236,23 @@ def _resolve_managed_user_contexts(
     Emby admin tokens can read any user's UserData via
     ``/Users/{userId}/Items`` - no per-user authentication required.
 
-    Owner / admin rows are skipped (already captured in the
-    owner-phase pass)."""
+    Skip rules:
+
+    * The **primary owner** (the user whose ``backend_user_id``
+      matches ``primary_owner_id``) is skipped because the owner-phase
+      pass in :func:`run_snapshot_adapter` already captures that
+      user's state.
+    * Users without a ``backend_user_id`` are skipped (can't address
+      them on the API).
+    * Users not in ``user_filter`` (when supplied) are skipped.
+
+    Non-primary admin users are CAPTURED. Emby / Jellyfin allow
+    multiple administrators on a single server; pre-fix, the broad
+    ``is_admin`` skip silently dropped every non-primary admin from
+    the fan-out, which meant any data those users had (watch state,
+    ratings, playlists) was never captured. The primary owner is the
+    only user that needs to be skipped to avoid double-capture, not
+    every admin."""
     from services.adapters import UserContext as _UserContext
     try:
         users = adapter.list_users()
@@ -677,21 +1264,93 @@ def _resolve_managed_user_contexts(
         filter_set = {u.strip() for u in user_filter if isinstance(u, str) and u.strip()}
     contexts: List[Any] = []
     for user in users or []:
-        if user.role == "owner" or user.is_admin:
-            continue
-        if filter_set is not None and user.username not in filter_set:
-            continue
+        if primary_owner_id and user.backend_user_id == primary_owner_id:
+            continue  # captured by owner-phase
         if not user.backend_user_id:
             logger.debug(
-                "managed user %r has no backend_user_id; skipping fan-out.",
+                "user %r has no backend_user_id; skipping fan-out.",
                 user.username,
             )
             continue
+        if filter_set is not None and user.username not in filter_set:
+            continue
+        # Prefer the user's OWN stored
+        # auth_token over the admin's. Operator reported the Emby
+        # admin-impersonation flow returning UserData populated for
+        # the admin instead of the URL user even after the
+        # Authorization-header UserId override. The bullet-proof fix
+        # is to authenticate AS the target user with their own token.
+        # ``services.playlist_copy._lookup_plex_home_token`` does the
+        # same managed_users.auth_token_enc lookup; reuse the helper
+        # so the storage contract stays in one place. Falls back to
+        # the admin token when no per-user token is stored (the
+        # legacy admin-impersonation path still works with all the
+        # fixes if the operator hasn't supplied a
+        # per-user token yet).
+        per_user_token = admin_token
+        per_user_token_source = "admin (no per-user token stored)"
+        # Inspect the row state directly so we can distinguish:
+        #   (a) no row matching (server_id, username) at all
+        #   (b) row exists but auth_token_enc is NULL
+        #   (c) row exists, column populated, decrypt silently failed
+        # All three currently surface as "no per-user token stored" via
+        # the helper; this extra log makes the distinction obvious in
+        # the run log without leaking the actual ciphertext.
+        try:
+            from server import media_db as _media_db
+            _conn = _media_db._require_conn()
+            _row = _conn.execute(
+                "SELECT auth_token_enc IS NOT NULL AS has_token, "
+                "       length(auth_token_enc) AS enc_len "
+                "FROM managed_users WHERE server_id = ? AND username = ?",
+                (server_id, user.username),
+            ).fetchone()
+            if _row is None:
+                _row_state = (
+                    f"no row matching (server_id={server_id!r}, "
+                    f"username={user.username!r})"
+                )
+            elif not _row["has_token"]:
+                _row_state = "row found but auth_token_enc is NULL"
+            else:
+                _row_state = (
+                    f"row found with auth_token_enc populated "
+                    f"(enc_len={_row['enc_len']})"
+                )
+            logger.info(
+                "managed user %r: managed_users row state = %s",
+                user.username, _row_state,
+            )
+        except Exception:
+            logger.exception(
+                "managed user %r: row-state diagnostic query failed.",
+                user.username,
+            )
+
+        try:
+            from services.playlist_copy import _lookup_plex_home_token
+            stored = _lookup_plex_home_token(server_id, user.username)
+            if stored:
+                per_user_token = stored
+                per_user_token_source = (
+                    f"per-user token from managed_users.auth_token_enc "
+                    f"(len={len(stored)})"
+                )
+        except Exception:
+            logger.exception(
+                "managed user %r: per-user token lookup failed; "
+                "falling back to admin token + URL-path impersonation.",
+                user.username,
+            )
+        logger.info(
+            "managed user %r: auth source = %s (server_id=%r)",
+            user.username, per_user_token_source, server_id,
+        )
         contexts.append(_UserContext(
             backend_user_id=user.backend_user_id,
             username=user.username,
-            auth_token=admin_token,
-            is_admin=False,
+            auth_token=per_user_token,
+            is_admin=bool(user.is_admin),
         ))
     return contexts
 
@@ -753,6 +1412,13 @@ def _capture_per_user_block(
                 library_name, user_context.username,
             )
     return {
+        # Identity fields the snapshot.db builder reads when writing
+        # the ``server_users`` row for this per-user block. Pre-fix
+        # these were missing, so the builder fell back to
+        # ``display_name=handle`` and ``backend_user_id=None``.
+        "role": "managed",
+        "display_name": user_context.username or "",
+        "backend_user_id": user_context.backend_user_id or "",
         "watch_history": watch_history,
         "ratings": ratings,
         "playlists": [],

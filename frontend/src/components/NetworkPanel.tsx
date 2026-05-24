@@ -23,7 +23,7 @@
 // every registered server; this inline panel is scoped to the active
 // job's source/dest servers only so the Dashboard view stays focused.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   BarElement,
   CategoryScale,
@@ -39,6 +39,7 @@ import {
 import { Bar, Line } from 'react-chartjs-2';
 
 import { api, DashboardFrame, JobPayload, ServerNetworkState } from '../api';
+import { pausableInterval } from '../utils/pausableInterval';
 
 
 ChartJS.register(
@@ -171,7 +172,13 @@ interface Props {
 export function NetworkPanel({ frame, scopedDest = null }: Props) {
   const job = frame?.job ?? null;
   const serversNetwork = frame?.servers_network ?? [];
-  const relevant = relevantServers(job, serversNetwork, scopedDest);
+  // Memoised so an unrelated re-render (e.g. a local setActiveName)
+  // does not produce a fresh array and re-fire the dependent effects
+  // below on every WebSocket frame.
+  const relevant = useMemo(
+    () => relevantServers(job, serversNetwork, scopedDest),
+    [job, serversNetwork, scopedDest],
+  );
 
   // Selected tab. Defaults to the first relevant entry (the source for
   // snapshot/direct, the first destination for import). Reset when the
@@ -212,8 +219,7 @@ export function NetworkPanel({ frame, scopedDest = null }: Props) {
       }
     };
     tick();
-    const handle = window.setInterval(tick, PING_INTERVAL_MS);
-    return () => window.clearInterval(handle);
+    return pausableInterval(tick, PING_INTERVAL_MS);
   }, [relevantIdsKey]);
 
   if (!job) {

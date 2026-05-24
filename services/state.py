@@ -1,5 +1,5 @@
 """
-Shared module-level state for PlexMigrate.
+Shared module-level state for Hestia-MediaManager.
 
 All mutable globals and module-level singletons live here so every service
 module can access or mutate them via:
@@ -34,7 +34,6 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from rich.console import Console
-from rich.progress import Progress
 
 # ── Version ───────────────────────────────────────────────────────────────────
 # v0.8.0: introduced the optional Docker + FastAPI + React web layer.
@@ -77,7 +76,7 @@ from rich.progress import Progress
 #         server_items(item_id, server_id, rating_key).
 # The engine itself is unchanged across these releases - these VERSION bumps
 # label the release that ships the new wrapper layer.
-VERSION = "0.12.3"
+VERSION = "0.18.0"
 
 # ── Thread Pool Size ──────────────────────────────────────────────────────────
 # MAX_WORKERS caps how many parallel threads the script may run at once.
@@ -274,6 +273,11 @@ _snapshot_payloads: List[Dict[str, Any]] = []
 _console_handler: Optional[logging.Handler] = None
 _media_logger: Optional[logging.Logger] = None
 _live_instance: Optional[Any] = None      # active Live context; set in run_snapshot/run_restore
+# The stop_event of the currently-running engine job, or None between
+# runs. ``dashboard._keyboard_thread`` registers it here at run start;
+# ``server.runtime_patches.signal_stop`` / ``signal_hard_stop`` read it
+# so the ``/api/job/stop`` endpoint can flip the flag.
+_active_stop_event: Optional[threading.Event] = None
 # Per-run restoration log writer (services.restoration_log.RestorationLogWriter
 # or its null-writer shim). ``run_restore`` opens this at the top of every
 # import job and closes it in the finally-block; the per-metric helpers
@@ -428,7 +432,7 @@ def get_dashboard() -> Optional[Any]:
 
 # ── Mixed-media playlist run config ──────────────────────────────────────────
 #
-# Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: jobs.py resolves the
+# jobs.py resolves the
 # end user's per-run + global mixed-media config once per restore
 # invocation and stashes the result here so the engine modules
 # (services/restorer.py + services/restorer_adapter.py) can read it
@@ -469,25 +473,6 @@ def get_mixed_media_per_user_configs() -> Optional[Dict[str, Any]]:
         return _mixed_media_per_user_configs
 
 
-# ── Small-Terminal Fallback Progress State ────────────────────────────────────
-# Used when the terminal is < 80×22 (Rich Progress bars instead of dashboard).
-_live_progress: Optional[Progress] = None
-_lib_task_ids: Dict[str, Any] = {}
-
-# ── OS-Specific Plex Data Directory Paths ────────────────────────────────────
-PLEX_DB_PATHS: Dict[str, List[str]] = {
-    "win32": [
-        os.path.expandvars(r"%LOCALAPPDATA%\Plex Media Server"),
-    ],
-    "linux": [
-        os.path.expandvars("$PLEX_HOME/Library/Application Support/Plex Media Server"),
-        "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server",
-    ],
-    "darwin": [
-        os.path.expandvars("~/Library/Application Support/Plex Media Server"),
-    ],
-}
-
 # ── Troubleshooting Category Lookup Table ─────────────────────────────────────
 # HARDCODED intentionally - dynamic generation could produce wrong advice.
 TROUBLESHOOT_CATEGORIES: Dict[str, Dict] = {
@@ -504,7 +489,7 @@ TROUBLESHOOT_CATEGORIES: Dict[str, Dict] = {
             'Select "Fix Match" from the context menu.',
             "Search for the correct album on MusicBrainz and select it.",
             "Wait for Plex to finish matching (may take a few minutes per album).",
-            "Re-run plexmigrate.py --snapshot to capture the updated GUIDs.",
+            "Re-run a snapshot to capture the updated GUIDs.",
         ],
     },
     "file_path_not_found": {
@@ -513,7 +498,7 @@ TROUBLESHOOT_CATEGORIES: Dict[str, Dict] = {
             "The file exists on the old server but could not be found at the same "
             "path on the new one. This usually means your media drive is mounted at "
             "a different location, or the folder structure changed during the move. "
-            "PlexMigrate automatically attempts suffix matching (comparing the last "
+            "Hestia-MediaManager automatically attempts suffix matching (comparing the last "
             "2–3 path components without the root prefix) so cross-platform moves "
             "between Windows and Linux are often resolved without any configuration. "
             "If this item still failed, the tail of the path may have also changed."
@@ -562,7 +547,7 @@ TROUBLESHOOT_CATEGORIES: Dict[str, Dict] = {
         "explanation": (
             "This item was already in the playlist on the target server and was "
             "skipped to avoid duplicates. This is expected behaviour - "
-            "PlexMigrate never adds duplicate items to existing playlists."
+            "Hestia-MediaManager never adds duplicate items to existing playlists."
         ),
         "steps": [
             "No action required - this item is already correctly in the playlist.",
@@ -583,7 +568,7 @@ TROUBLESHOOT_CATEGORIES: Dict[str, Dict] = {
         "title": "Rating Already Set - Skipped",
         "explanation": (
             "This item already has a star rating on the target server. "
-            "PlexMigrate treats the target rating as authoritative and never "
+            "Hestia-MediaManager treats the target rating as authoritative and never "
             "overwrites it, even if the export contains a different value."
         ),
         "steps": [
@@ -743,17 +728,14 @@ def reset_run_state() -> None:
     fields**: ``_lib_successes``, ``_lib_failures``,
     ``_failure_categories``, and the resolver flags.
 
-    L2 caveat: ``_snapshot_payloads`` and ``_lib_task_ids`` are NOT
-    ContextVars - they are plain process-global containers, and the
-    two lines below mutate them in place. Under fan-out, N destination
-    threads clear these same globals concurrently. This is harmless
-    *only* because neither is written on the server-mode fan-out
-    paths: ``_snapshot_payloads`` is appended to exclusively by
-    ``snapshotter.snapshot_library`` (not exercised by fan-out
-    direct/restore), and ``_lib_task_ids`` is populated only in the
-    terminal / Rich-progress branch (never in server/dashboard mode).
-    If either ever starts being written on a concurrent server-mode
-    path, it must be promoted to a ContextVar first or it will race.
+    L2 caveat: ``_snapshot_payloads`` is NOT a ContextVar - it is a
+    plain process-global list mutated in place by the line below.
+    Under fan-out, N destination threads clear it concurrently. This
+    is harmless *only* because it is appended to exclusively by
+    ``snapshotter.snapshot_library`` (not exercised by the fan-out
+    direct/restore paths). If it ever starts being written on a
+    concurrent server-mode path, it must be promoted to a ContextVar
+    first or it will race.
     """
     # Install fresh empty dicts in the calling context's accumulators
     # (rather than ``.clear()`` on whatever was there - clearing would
@@ -777,10 +759,9 @@ def reset_run_state() -> None:
     # this is what makes module-level state correct across threads
     # that read ``state._snapshot_payloads`` outside this function.
     _snapshot_payloads[:] = []
-    _lib_task_ids.clear()
     # PR-13 fix #3 hotfix: ``_run_trigger``, ``_run_schedule_name`` and
     # ``_snapshot_server_id`` are PUBLISHED into state by the job
-    # runner (``server/jobs.py``) and the CLI (``plexmigrate.py``)
+    # runner (``server/jobs.py``)
     # BEFORE ``run_snapshot`` / ``run_restore`` / ``run_direct_transfer``
     # fires. ``reset_run_state`` runs at the TOP of those engine
     # entrypoints, so clearing these fields here would wipe the values

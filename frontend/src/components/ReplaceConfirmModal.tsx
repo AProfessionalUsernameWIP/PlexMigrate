@@ -12,6 +12,7 @@
 // so this modal is the UX layer of a two-layer protection.
 
 import { useEffect, useState } from 'react';
+import { Modal } from './Modal';
 
 interface Props {
   open: boolean;
@@ -50,24 +51,8 @@ export function ReplaceConfirmModal({
   const ready = typed.trim() === REQUIRED_TYPED;
 
   return (
-    <div
-      onClick={onCancel}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex',
-        alignItems: 'flex-start',
-        justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 520, maxWidth: '94vw' }}
-      >
+    <Modal onClose={onCancel} width={520}>
+      <div data-testid="replace-modal">
         <h2 style={{ marginTop: 0 }}>
           <span style={{ color: 'var(--warn, #f5a623)' }}>Replace</span> will overwrite destination data
         </h2>
@@ -139,6 +124,7 @@ export function ReplaceConfirmModal({
           Type <code style={{ background: 'var(--panel-alt, #1b2233)', padding: '0 4px' }}>REPLACE</code>{' '}
           (uppercase, exact match) to confirm:
           <input
+            data-testid="replace-modal-input"
             type="text"
             value={typed}
             onChange={(e) => setTyped(e.target.value)}
@@ -163,8 +149,9 @@ export function ReplaceConfirmModal({
           className="row-buttons"
           style={{ marginTop: 16, display: 'flex', gap: 8, justifyContent: 'flex-end' }}
         >
-          <button onClick={onCancel}>Cancel</button>
+          <button data-testid="replace-modal-cancel" onClick={onCancel}>Cancel</button>
           <button
+            data-testid="replace-modal-confirm"
             className="primary"
             disabled={!ready}
             onClick={() => {
@@ -180,6 +167,6 @@ export function ReplaceConfirmModal({
           </button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

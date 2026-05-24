@@ -1,5 +1,5 @@
 """
-Snapshot serializer (v0.15+). Reads a per-server snapshot ``.db`` file
+Snapshot serializer. Reads a per-server snapshot ``.db`` file
 (produced by :mod:`server.snapshot_capture`) and rebuilds a
 ``.plexexport.json``-shaped payload from it.
 
@@ -140,11 +140,12 @@ def build_payload_from_db(
         # observed and required versions.
         try:
             meta_row = conn.execute(
-                "SELECT schema_version FROM snapshot_meta LIMIT 1"
+                "SELECT schema_version, captured_at FROM snapshot_meta LIMIT 1"
             ).fetchone()
             observed_version = int(meta_row["schema_version"] or 0) if meta_row else 0
         except sqlite3.OperationalError:
             observed_version = 0
+            meta_row = None
         if observed_version < SNAPSHOT_SCHEMA_VERSION:
             raise SnapshotSchemaMismatch(
                 f"Snapshot file {snapshot_db_path.name} has schema_version "
@@ -219,8 +220,7 @@ def build_payload_from_db(
                     "display_name": r["display_name"],
                     "backend": r["backend"],
                     "backend_user_id": r["backend_user_id"],
-                    # v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-2):
-                    # surface the snapshot's canonical user identifier
+                    # Surface the snapshot's canonical user identifier
                     # in the .plexexport.json sidecar. Older snapshots
                     # (v15 and earlier) carry NULL here; the JSON
                     # emitter writes null, matching the legacy shape.
@@ -305,6 +305,10 @@ def build_payload_from_db(
                 continue
             entry = dict(base)
             entry["rating"] = float(r["rating"])
+            # Carry the backend-neutral favorite face. None for Plex
+            # (no favorite concept); 0/1 for Jellyfin/Emby.
+            _fav = r["is_favorite"] if "is_favorite" in r.keys() else None
+            entry["is_favorite"] = None if _fav is None else bool(_fav)
             _bucket(section_key, (r["user_handle"] or "").strip())["ratings"].append(entry)
 
         # ── playlists (filtered per section) ───────────────────────────
@@ -353,9 +357,21 @@ def build_payload_from_db(
     finally:
         conn.close()
 
+    # Prefer the caller-supplied timestamp; otherwise fall back to the
+    # snapshot file's own ``snapshot_meta.captured_at`` so a
+    # reconstructed payload reports when the snapshot was REALLY
+    # taken, and only use "now" when neither is available.
+    _file_captured_at: Optional[float] = None
+    if meta_row is not None:
+        try:
+            _raw_cap = meta_row["captured_at"]
+            _file_captured_at = float(_raw_cap) if _raw_cap is not None else None
+        except (IndexError, KeyError, TypeError, ValueError):
+            _file_captured_at = None
+    _captured_ts = captured_at_ts if captured_at_ts is not None else _file_captured_at
     captured_iso = (
-        datetime.fromtimestamp(float(captured_at_ts), tz=timezone.utc).isoformat()
-        if captured_at_ts is not None
+        datetime.fromtimestamp(float(_captured_ts), tz=timezone.utc).isoformat()
+        if _captured_ts is not None
         else datetime.now(tz=timezone.utc).isoformat()
     )
 
@@ -452,6 +468,38 @@ def _item_to_payload(row: sqlite3.Row) -> Dict[str, Any]:
     fp = row["filepath_suffix"]
     if fp:
         out["filepath"] = fp
+    # Emit the hierarchy columns so a DB -> JSON sidecar round-trip
+    # preserves them. Snapshot schema is v17+ by the time the
+    # serializer runs (older files are refused at load), but
+    # ``_row_keys`` stays defensive so a freshly-built DB missing a
+    # column never raises. Empty / NULL values are omitted to keep
+    # movie rows + GUID-less items clean.
+    keys = set(row.keys())
+
+    def _emit_str(json_key: str, col: str) -> None:
+        if col in keys:
+            v = row[col]
+            if v not in (None, ""):
+                out[json_key] = str(v)
+
+    def _emit_int(json_key: str, col: str) -> None:
+        if col in keys:
+            v = row[col]
+            if v is not None:
+                try:
+                    out[json_key] = int(v)
+                except (TypeError, ValueError):
+                    pass
+
+    _emit_str("show_title", "show_title")
+    _emit_str("artist", "artist")
+    _emit_str("album", "album")
+    _emit_str("grandparent_guid", "grandparent_guid")
+    # ``parent_index`` is the JSON key the engine + snapshot_capture
+    # use for items.season_index (kept for shape-compat with the
+    # adapter path's engine dict).
+    _emit_int("parent_index", "season_index")
+    _emit_int("episode_index", "episode_index")
     return out
 
 
@@ -550,10 +598,10 @@ def _build_users_block(
             "role": meta["role"],
             "display_name": meta.get("display_name"),
             "backend_user_id": meta.get("backend_user_id"),
-            # v16 (Finding[IDENTITY-UTILIZATION-AUDIT] R-2): emit the
-            # canonical app-generated user identifier. Old snapshots
-            # (v15-) write null here; v16+ snapshots write the value
-            # populated by snapshot_capture._write_snapshot_users +
+            # Emit the canonical app-generated user identifier. Old
+            # snapshots (v15-) write null here; v16+ snapshots write
+            # the value populated by
+            # snapshot_capture._write_snapshot_users +
             # _write_server_user_row. End users who share a .plexexport
             # sidecar across installs surface the source install's
             # canonical identity natively.

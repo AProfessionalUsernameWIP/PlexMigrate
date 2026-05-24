@@ -1,9 +1,8 @@
-// Phase C (admin-management follow-up, 2026-05-15): per-library
-// metric matrix.
+// Per-library metric matrix.
 //
-// Replaces the four global include_* checkboxes (Watch history,
-// Ratings, Playlists, Collections) with a per-library grid: one row
-// per selected library, four checkboxes per row. The end user can
+// A per-library grid replacing four global include_* checkboxes
+// (Watch history, Ratings, Playlists, Collections): one row per
+// selected library, four checkboxes per row. The end user can
 // have one library capture only watch history while another captures
 // everything else, etc. The engine consults this map per library at
 // gather time.
@@ -41,14 +40,14 @@ interface Props {
   // an entry.
   value: LibraryMetricsMap | null | undefined;
   onChange: (next: LibraryMetricsMap) => void;
-  // 2026-05-16: optional snapshot-gating set. Metrics in this set are
+  // Optional snapshot-gating set. Metrics in this set are
   // not available in the upstream data source (e.g. restoring from a
   // snapshot whose ``captured_types`` did not include ratings) and
   // render as visually-disabled checkboxes forced to false. The header
   // "all" checkbox + row "all/none" button skip these columns when
   // computing aggregate state. Defaults to an empty set; surfaces
   // that don't have snapshot gating (snapshot / direct modes) pass
-  // nothing and see today's behaviour.
+  // nothing and see the ungated behaviour.
   unavailableMetrics?: ReadonlySet<keyof LibraryMetricsRow>;
   // Optional copy override for the column-header tooltip on
   // unavailable metrics. End user-facing language varies by surface
@@ -155,7 +154,7 @@ export function LibraryMetricsMatrix({
       <legend style={{ padding: '0 6px', fontWeight: 600 }}>Per-library metrics</legend>
       <span className="help" style={{ marginTop: 0 }}>
         Pick which data types each selected library should capture. Checkboxes
-        default to everything-on (the pre-per-library behaviour) so you only
+        default to everything-on so you only
         need to UNcheck the metrics a given library should skip. The header
         row's checkboxes toggle a whole metric column on or off across every
         library at once.

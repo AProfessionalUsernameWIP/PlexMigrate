@@ -12,6 +12,7 @@ import {
   AuthProvider,
   ALL_PERMISSIONS,
 } from '../contexts/AuthContext';
+import { ConfirmProvider } from '../components/ConfirmModal';
 import type { Permission, Role } from '../api';
 
 export interface RenderWithAuthOptions {
@@ -41,7 +42,9 @@ export function renderWithAuth(
       lastLogin={null}
       createdAt={null}
     >
-      {ui}
+      {/* Components migrated to useConfirm() need this provider in the
+          tree; bundling it here keeps per-component tests provider-free. */}
+      <ConfirmProvider>{ui}</ConfirmProvider>
     </AuthProvider>,
   );
 }

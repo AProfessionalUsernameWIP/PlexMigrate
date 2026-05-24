@@ -1,5 +1,5 @@
 """
-Direct server-to-server transfer orchestrator (v0.9.0).
+Direct server-to-server transfer orchestrator.
 
 Reads watch history, playlists, collections, and ratings from one
 registered Plex server (the *source*) and writes them straight into
@@ -114,44 +114,75 @@ def run_direct_transfer(
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
     include_playlists: Optional[bool] = None,
-    # PR-3 / Phase D - four-flag data-type filter. ``include_playlists``
-    # already exists from PR-1 / Phase B; the other three follow the
-    # same shape. The legacy ``skip_*`` flags are honoured alongside.
+    # Four-flag data-type filter. The legacy ``skip_*`` flags are
+    # honoured alongside these include_* flags.
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
-    # Phase C (admin-management follow-up, 2026-05-15): per-library
-    # metric filter. Forwarded into both the in-memory transfer path
-    # (_transfer_one_library) and the chained-fallback path
-    # (_chained_fallback_library) so library_metrics applies end-to-
-    # end. Keys are library names; values are dicts with the four
-    # boolean fields.
+    # Per-library metric filter. Forwarded into both the in-memory
+    # transfer path (_transfer_one_library) and the chained-fallback
+    # path (_chained_fallback_library) so library_metrics applies
+    # end-to-end. Keys are library names; values are dicts with the
+    # four boolean fields.
     library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
-    # v0.13.x: restore mode forwarded into restore_export_file by both
-    # the in-memory path (_transfer_one_library) and the chained-
-    # fallback path (_chained_fallback_library). Default "merge" =
-    # additive; "replace" = destructive point-in-time. The job worker
-    # in server/jobs.py handles the pre-Replace safety-belt snapshot
+    # Restore mode forwarded into restore_export_file by both the
+    # in-memory path (_transfer_one_library) and the chained-fallback
+    # path (_chained_fallback_library). Default "merge" = additive;
+    # "replace" = destructive point-in-time. The job worker in
+    # server/jobs.py handles the pre-Replace safety-belt snapshot
     # and the confirm_replace gate before calling this.
     mode: str = "merge",
-    # v0.13.x: Merge sub-strategy for watch-count math. "higher" =
-    # destination ends at max(stored, current) (legacy); "sum" =
-    # destination ends at current + stored (end user opt-in). Ignored
-    # when mode=="replace".
+    # Merge sub-strategy for watch-count math. "higher" = destination
+    # ends at max(stored, current); "sum" = destination ends at
+    # current + stored (end user opt-in). Ignored when mode=="replace".
     merge_watch_strategy: str = "higher",
+    # Per-run override that bypasses the library mapping table. False
+    # (default) = consult the saved mapping table the same way the
+    # snapshot-restore path does, so unmapped libraries route to their
+    # declared equivalents and unmappable libraries get skipped with
+    # a clear warning. True = exact-name match only, no table lookup.
+    # Surfaced as a first-class checkbox on the Run Job form;
+    # resolution happens at the top of ``run_direct_transfer``'s
+    # per-library loop via ``library_mapping_lookup.resolve_for_one_library``,
+    # which is the same helper the snapshot-restore engine uses.
+    ignore_library_mapping: bool = False,
+    # Per-run source-name → dest-name overrides. Same shape as
+    # ``run_restore``'s matching kwarg. Beats both the saved mapping
+    # table and the ``ignore_library_mapping`` flag for any source name
+    # that has an entry (the empty string is a deliberate per-run
+    # skip). Resolved at the top of the per-library loop via the
+    # shared ``resolve_for_one_library`` helper, then the resolved
+    # destination name is plumbed into restore_export_file via
+    # ``target_section_name_override`` so the per-library payload
+    # lands in the correct destination library (source name is kept
+    # in the payload's ``library`` field for source-side DB ingest).
+    library_mapping_overrides: Optional[Dict[str, str]] = None,
+    # Server IDs (added so direct_transfer can thread them through to
+    # restore_export_file's library_mappings lookup). Optional for
+    # backward compat with callers that don't have them; without
+    # both IDs the same-server short-circuit / mapping consult cannot
+    # fire and the path degrades to exact-name match.
+    source_server_id: Optional[str] = None,
+    dest_server_id: Optional[str] = None,
 ) -> None:
     """
     Drive an end-to-end direct transfer.
 
     Workflow per library:
         1. Find the source library section by friendly name.
-        2. Find the destination library section by the same name -
-           we require exact name match because reliable cross-server
-           mapping by anything else (key, type) is fragile in Plex.
+        2. Resolve source library name → destination library name via
+           ``library_mapping_lookup.resolve_for_one_library`` (same
+           helper the snapshot-restore engine uses). Resolution order:
+           per-run ``library_mapping_overrides`` entry first; then
+           ``ignore_library_mapping`` / same-server short-circuit for
+           exact-name-only; otherwise consult the saved
+           ``library_mappings`` table (operator → exact → auto).
         3. Run the four snapshot gather primitives against the source
            into an in-memory dict matching the .plexexport.json shape.
         4. Hand that dict to ``restore_export_file`` against the
-           destination via ``preloaded_data``.
+           destination via ``preloaded_data``, with
+           ``target_section_name_override`` set to the resolved
+           destination name so the renamed library is the write target.
 
     Args:
         source_server / source_url / source_token / source_owner:
@@ -175,9 +206,23 @@ def run_direct_transfer(
     # items, which isn't useful.
     src_by_name = {s.title: s for s in source_server.library.sections()}
     dst_by_name = {s.title: s for s in dest_server.library.sections()}
+    dst_titles: Set[str] = set(dst_by_name)
 
     if not library_names:
-        library_names = sorted(set(src_by_name) & set(dst_by_name))
+        # Auto-discover: union of (exact name on both) ∪ (source
+        # libraries that the per-run override map routes somewhere
+        # viable on the dest). The mapping table itself is consulted
+        # per-library at section-resolution time below; here we only
+        # widen the implicit list when the operator supplied an
+        # override map so an unmapped library is genuinely transferred.
+        library_names = sorted(
+            set(src_by_name) & set(dst_by_name)
+            | {
+                src_name
+                for src_name, dst_name in (library_mapping_overrides or {}).items()
+                if src_name in src_by_name and dst_name and dst_name in dst_titles
+            }
+        )
         if not library_names:
             raise ValueError(
                 "No libraries exist on both servers - nothing to transfer."
@@ -230,17 +275,16 @@ def run_direct_transfer(
     else:
         state.get_dashboard().log_dir = log_dir
 
-    # PR-1 / Phase B (skip-playlists end-to-end): normalize the two
-    # historical flags into one internal include flag. When
-    # ``include_playlists`` is supplied explicitly (Phase D pathway),
-    # use it. Otherwise derive it from the legacy ``skip_playlists``
-    # boolean (False ⇒ include, True ⇒ exclude). The downstream workers
-    # only see ``include_playlists`` so the gating logic doesn't need
-    # to know about the legacy field at all.
+    # Normalize the two flags into one internal include flag. When
+    # ``include_playlists`` is supplied explicitly, use it. Otherwise
+    # derive it from the ``skip_playlists`` boolean (False ⇒ include,
+    # True ⇒ exclude). The downstream workers only see
+    # ``include_playlists`` so the gating logic doesn't need to know
+    # about the ``skip_playlists`` field at all.
     if include_playlists is None:
         include_playlists = not skip_playlists
-    # PR-3 / Phase D: ``skip_collections`` similarly disables the
-    # collection phase; honour both inputs.
+    # ``skip_collections`` similarly disables the collection phase;
+    # honour both inputs.
     if skip_collections:
         include_collections = False
 
@@ -259,10 +303,10 @@ def run_direct_transfer(
         "Direct transfer data types: %s",
         ", ".join(_included) if _included else "(none)",
     )
-    # v0.13.x: restore-mode header. Same forensic-trail rationale as
-    # the matching log line in services.restorer.run_restore - the
-    # mode + sub-strategy are recorded at INFO so runtime.log makes
-    # it obvious whether a destination was additive-merged or
+    # Restore-mode header. Same forensic-trail rationale as the
+    # matching log line in services.restorer.run_restore - the mode +
+    # sub-strategy are recorded at INFO so runtime.log makes it
+    # obvious whether a destination was additive-merged or
     # destructively-replaced.
     if mode == "replace":
         logger.info("Direct transfer mode: REPLACE (destination overwritten).")
@@ -276,12 +320,11 @@ def run_direct_transfer(
                 "Direct transfer mode: merge (additive, watch counts keep HIGHER of stored/current)."
             )
 
-    # ── v0.9.6 Feature 4 / v0.9.7 Item 7: per-user data + owner ──────
-    # Compute the effective per-user roster. Pre-Feature 4 direct
-    # transfer was owner-only; we now propagate managed-user data when
-    # the same managed username exists on both source and destination,
-    # AND the owner is a first-class filter target (v0.9.7) - when
-    # the end user unchecks the owner the engine skips the entire
+    # ── Per-user data + owner ──────────────────────────────────────
+    # Compute the effective per-user roster. Managed-user data
+    # propagates when the same managed username exists on both source
+    # and destination, and the owner is a first-class filter target -
+    # when the end user unchecks the owner the engine skips the entire
     # library-level ``payload["items"]`` block (watch_history,
     # playlists, library-level collections, ratings) for that run.
     #
@@ -301,7 +344,7 @@ def run_direct_transfer(
     }
     transferable: Set[str] = set(src_users_by_name) & set(dst_users_by_name)
 
-    # v0.12.3 - owner is NEVER a home user in Plex's API model
+    # Owner is NEVER a home user in Plex's API model
     # (account.users() returns managed + linked accounts only).
     # The end user's filter list ships with the owner's email
     # inline alongside managed usernames because the Run Job form
@@ -395,9 +438,8 @@ def run_direct_transfer(
     effective_src_home = [src_users_by_name[n] for n in sorted(included)]
     effective_dst_home = [dst_users_by_name[n] for n in sorted(included)]
 
-    # v0.9.7 Item 7: actionable run-log line when the owner is
-    # unchecked, so the end user sees exactly what they're skipping.
-    # Verbatim from the spec.
+    # Actionable run-log line when the owner is unchecked, so the end
+    # user sees exactly what they're skipping.
     if not owner_included:
         logger.info(
             "[user-filter] Owner excluded - library-level collections "
@@ -406,10 +448,9 @@ def run_direct_transfer(
         )
 
     # One INFO line at transfer start so the end user can audit what
-    # went where straight from the run log. v0.12.3 - was previously
-    # hardcoded to say "owner always included" even when the owner
-    # was excluded, contradicting the "Owner excluded" line above. Now
-    # the message reflects the actual ``owner_included`` state.
+    # went where straight from the run log. The message reflects the
+    # actual ``owner_included`` state so it never contradicts the
+    # "Owner excluded" line above.
     logger.info(
         "Direct transfer per-user scope: owner %s; "
         "%d managed user(s) included: %s",
@@ -418,11 +459,9 @@ def run_direct_transfer(
         sorted(included) if included else "none",
     )
 
-    # User count for the dashboard reflects the actual roster:
-    # owner counts as 1 only when owner_included is True. Was always
-    # ``1 + len(included)`` before (treating owner as always present)
-    # which made the dashboard's home_user_count wrong on owner-
-    # excluded runs.
+    # User count for the dashboard reflects the actual roster: owner
+    # counts as 1 only when owner_included is True, so the dashboard's
+    # home_user_count stays correct on owner-excluded runs.
     state.get_dashboard().set_user_count(
         (1 if owner_included else 0) + len(included)
     )
@@ -446,25 +485,76 @@ def run_direct_transfer(
                 continue
 
             src_section = src_by_name.get(lib_name)
-            dst_section = dst_by_name.get(lib_name)
             if src_section is None:
                 logger.warning(f"Library {lib_name!r} not found on source - skipping.")
                 state.get_dashboard().finish_library(lib_name, error=True)
                 continue
-            if dst_section is None:
-                logger.warning(f"Library {lib_name!r} not found on destination - skipping.")
+
+            # Resolve source library name → destination library name via
+            # the shared mapping helper. The same helper runs on the
+            # snapshot-restore path (services.restorer.engine.run_restore)
+            # so a snapshot-then-restore and an in-memory direct transfer
+            # pick the SAME destination library for any given source
+            # library. Inputs: the per-run overrides (Run Job form), the
+            # ignore-mapping flag (power-user override), the source/dest
+            # server IDs (consulted by the saved-mapping table lookup),
+            # and the live destination titles. Outcome is one of
+            # OK / SKIP / NO_MATCH; only OK proceeds.
+            from services.library_mapping_lookup import (
+                resolve_for_one_library,
+                RESOLVE_OK,
+                RESOLVE_SKIP,
+            )
+            _src_lib_id = str(getattr(src_section, "key", "") or "")
+            _status, _dest_lib_name = resolve_for_one_library(
+                source_library_name=lib_name,
+                source_library_id=_src_lib_id,
+                source_server_id=source_server_id or "",
+                dest_server_id=dest_server_id or "",
+                dest_library_names=dst_titles,
+                library_mapping_overrides=library_mapping_overrides,
+                ignore_library_mapping=ignore_library_mapping,
+                logger=logger,
+            )
+            if _status == RESOLVE_SKIP:
+                # Operator-confirmed (or per-run override) explicit skip.
+                # Mark the dashboard library as done with no error so the
+                # run summary reflects an intentional skip, not a failure.
+                state.get_dashboard().finish_library(lib_name)
+                continue
+            if _status != RESOLVE_OK or _dest_lib_name is None:
+                logger.warning(
+                    "Library %r has no destination counterpart "
+                    "(destination has: %r). Skipping; either rename the "
+                    "library on the destination to match, set up a Library "
+                    "Mapping under Servers, or supply a per-run override.",
+                    lib_name, sorted(dst_titles),
+                )
                 state.get_dashboard().finish_library(lib_name, error=True)
                 continue
 
-            # v0.9.1: attempt the in-memory direct transfer first. If
-            # it fails for any reason (network blip mid-gather, OOM,
-            # unexpected API response, etc.), fall back to a chained
+            dst_section = dst_by_name.get(_dest_lib_name)
+            if dst_section is None:
+                # Defensive: helper already validated against dst_titles
+                # but the underlying section dict might be out of sync
+                # if Plex changed mid-run.
+                logger.warning(
+                    f"Library {_dest_lib_name!r} resolved as destination for "
+                    f"source {lib_name!r} but is no longer present - skipping."
+                )
+                state.get_dashboard().finish_library(lib_name, error=True)
+                continue
+
+            # Attempt the in-memory direct transfer first. If it fails
+            # for any reason (network blip mid-gather, OOM, unexpected
+            # API response, etc.), fall back to a chained
             # snapshot-then-import for this library without aborting
             # the whole job. The user sees the fallback in the
             # activity feed; the end result is identical either way.
             try:
                 _transfer_one_library(
                     lib_name=lib_name,
+                    dest_lib_name=_dest_lib_name,
                     src_section=src_section,
                     source_server=source_server,
                     source_owner=source_owner,
@@ -488,8 +578,16 @@ def run_direct_transfer(
                     include_collections=include_collections,
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
-                    # Phase C: per-library metric override map.
+                    # Per-library metric override map.
                     library_metrics=library_metrics,
+                    # Forward to the underlying restore_export_file
+                    # call so direct transfer honours the mapping
+                    # table identically to the snapshot-restore path.
+                    # Plus the per-run override map.
+                    ignore_library_mapping=ignore_library_mapping,
+                    library_mapping_overrides=library_mapping_overrides,
+                    source_server_id=source_server_id,
+                    dest_server_id=dest_server_id,
                 )
             except DirectTransferUnavailable as exc:
                 logger.warning(
@@ -502,6 +600,7 @@ def run_direct_transfer(
                 )
                 _chained_fallback_library(
                     lib_name=lib_name,
+                    dest_lib_name=_dest_lib_name,
                     src_section=src_section,
                     source_server=source_server,
                     source_owner=source_owner,
@@ -526,8 +625,15 @@ def run_direct_transfer(
                     include_collections=include_collections,
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
-                    # Phase C: per-library metric override map.
+                    # Per-library metric override map.
                     library_metrics=library_metrics,
+                    # Forward to the underlying restore_export_file
+                    # call inside the fallback. Plus the per-run
+                    # override map.
+                    ignore_library_mapping=ignore_library_mapping,
+                    library_mapping_overrides=library_mapping_overrides,
+                    source_server_id=source_server_id,
+                    dest_server_id=dest_server_id,
                 )
             except Exception as exc:
                 # Any unexpected exception in the direct path: log and
@@ -544,6 +650,7 @@ def run_direct_transfer(
                 )
                 _chained_fallback_library(
                     lib_name=lib_name,
+                    dest_lib_name=_dest_lib_name,
                     src_section=src_section,
                     source_server=source_server,
                     source_owner=source_owner,
@@ -568,10 +675,136 @@ def run_direct_transfer(
                     include_collections=include_collections,
                     mode=mode,
                     merge_watch_strategy=merge_watch_strategy,
-                    # Phase C: per-library metric override map.
+                    # Per-library metric override map.
                     library_metrics=library_metrics,
+                    # Forward to the underlying restore_export_file
+                    # call inside the fallback. Plus the per-run
+                    # override map.
+                    ignore_library_mapping=ignore_library_mapping,
+                    library_mapping_overrides=library_mapping_overrides,
+                    source_server_id=source_server_id,
+                    dest_server_id=dest_server_id,
                 )
             state.get_dashboard().finish_library(lib_name)
+
+        # Replace-mode dest-only playlist sweep - scoped by destination
+        # LIBRARY KEY (not the playlistType family). Without library-
+        # level scoping, a Replace direct-transfer where source has ONE
+        # audio library ("Music") and destination has TWO ("Music" +
+        # "Audio Files") would delete playlists from the dest-only
+        # library because both libraries share ``playlistType="audio"``.
+        # Library-level scoping only considers playlists whose items
+        # all live inside libraries explicitly chosen to transfer.
+        #
+        # Two passes:
+        #   * Owner pass via admin-authenticated source/dest servers.
+        #   * Per-user pass via each home user's user-authenticated
+        #     PlexServer. Plex playlists are owned by the user that
+        #     created them; the per-user pass only deletes that user's
+        #     own dest-only playlists.
+        if (
+            mode == "replace"
+            and (include_playlists is not False)
+            and not skip_playlists
+        ):
+            try:
+                # Destination-side library section keys we actually
+                # transferred. Anything outside this set is preserved.
+                restored_library_keys: Set[str] = set()
+                for ln in library_names:
+                    sec = dst_by_name.get(ln)
+                    if sec is None:
+                        continue
+                    key = getattr(sec, "key", None)
+                    if key is not None:
+                        restored_library_keys.add(str(key))
+                # Source titles in scope: only playlists whose items
+                # live entirely within the source-side libraries we
+                # transferred. This prevents the sweep from carrying
+                # over a stray title from an unrelated source-side
+                # library (mirror of the dest-side scope check).
+                source_library_keys_src: Set[str] = set()
+                for ln in library_names:
+                    sec = src_by_name.get(ln)
+                    if sec is None:
+                        continue
+                    key = getattr(sec, "key", None)
+                    if key is not None:
+                        source_library_keys_src.add(str(key))
+
+                def _src_titles_in_scope(plex_server) -> Set[str]:
+                    titles: Set[str] = set()
+                    for pl in plex_server.playlists():
+                        try:
+                            item_lib_keys: Set[str] = set()
+                            empty = True
+                            for it in (pl.items() or []):
+                                empty = False
+                                lib_key = getattr(it, "librarySectionID", None)
+                                if lib_key is None:
+                                    item_lib_keys = set()
+                                    break
+                                item_lib_keys.add(str(lib_key))
+                            if empty or not item_lib_keys:
+                                continue
+                            if not item_lib_keys.issubset(source_library_keys_src):
+                                continue
+                            t = getattr(pl, "title", "") or ""
+                            if t:
+                                titles.add(t)
+                        except Exception:
+                            continue
+                    return titles
+
+                from services.restorer import purge_dest_only_playlists
+
+                # Owner sweep.
+                deleted = purge_dest_only_playlists(
+                    dest_server,
+                    _src_titles_in_scope(source_server),
+                    restored_library_keys,
+                    logger,
+                )
+                if deleted:
+                    logger.info(
+                        "Replace: removed %d destination-only owner "
+                        "playlist(s) absent from source.", deleted,
+                    )
+                # Per-managed-user sweep. ``effective_src_home`` and
+                # ``effective_dst_home`` are aligned to the same sorted
+                # username list above so positional pairing is safe.
+                user_pairs = zip(
+                    effective_src_home or [], effective_dst_home or [],
+                )
+                for (src_name, _src_tok, src_user_server), (dst_name, _dst_tok, dst_user_server) in user_pairs:
+                    if src_name != dst_name:
+                        # Defensive: shouldn't happen given the sorted
+                        # pairing above, but skip rather than risk
+                        # cross-user deletion.
+                        continue
+                    try:
+                        deleted = purge_dest_only_playlists(
+                            dst_user_server,
+                            _src_titles_in_scope(src_user_server),
+                            restored_library_keys,
+                            logger,
+                        )
+                        if deleted:
+                            logger.info(
+                                "Replace: removed %d destination-only "
+                                "playlist(s) for managed user %r absent "
+                                "from source.", deleted, dst_name,
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Replace: per-user dest-only playlist sweep "
+                            "failed for %r; continuing.", dst_name,
+                        )
+            except Exception:
+                logger.exception(
+                    "Replace: dest-only playlist sweep failed; "
+                    "continuing without it."
+                )
     finally:
         # Leave DashboardState in place for ~3 s so the WebSocket
         # broadcaster gets one more snapshot with the final counters.
@@ -579,7 +812,7 @@ def run_direct_transfer(
         pass
 
 
-# ── Import-total estimator (v0.9.7 Item 6) ───────────────────────────────────
+# ── Import-total estimator ────────────────────────────────────────────────────
 
 def _compute_import_total(
     payload: Dict[str, Any],
@@ -601,8 +834,8 @@ def _compute_import_total(
     already short-circuits for them, so including their items would
     inflate the total and prevent the bar from reaching 100%.
     """
-    # v0.13.0: unified users map. Owner is identified by role='owner'
-    # and is always counted (we always restore the owner block);
+    # Unified users map. Owner is identified by role='owner' and is
+    # always counted (we always restore the owner block);
     # managed users are counted only when the destination has a matching
     # home user (otherwise their work is skipped at restore time).
     users_block = payload.get("users", {}) or {}
@@ -622,7 +855,7 @@ def _compute_import_total(
     return total
 
 
-# ── Per-user gather (v0.9.6 Feature 4) ───────────────────────────────────────
+# ── Per-user gather ───────────────────────────────────────────────────────────
 
 def _gather_users_data(
     lib_name: str,
@@ -632,8 +865,8 @@ def _gather_users_data(
     skip_collections: bool = False,
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
-    # PR-3 / Phase D - four-flag data-type filter. ``include_playlists``
-    # is honoured alongside ``skip_playlists`` (either disables).
+    # Four-flag data-type filter. ``include_playlists`` is honoured
+    # alongside ``skip_playlists`` (either disables).
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_playlists: bool = True,
@@ -642,7 +875,7 @@ def _gather_users_data(
     """
     Build the ``payload["users"]`` dict for one library by reading each
     source-side managed user's watch history, ratings, playlists, and
-    personal collections (v0.9.7 Item 9).
+    personal collections.
 
     Shared by the in-memory direct path and the chained-fallback path
     so both produce identical per-user payloads. Best-effort: a user
@@ -671,8 +904,8 @@ def _gather_users_data(
                     lib_name, uname,
                 )
                 continue
-            # PR-3 / Phase D - each include_* flag gates the
-            # corresponding per-user gather independently.
+            # Each include_* flag gates the corresponding per-user
+            # gather independently.
             u_watch = (
                 snapshot_watch_history(user_section, logger, user=uname)
                 if include_watch_history else []
@@ -688,8 +921,8 @@ def _gather_users_data(
                 )
                 if include_playlists else []
             )
-            # v0.9.7 Item 9 / v0.12.3: personal collections using the
-            # same three-layer optimisation as the snapshotter's gather_user.
+            # Personal collections using the same three-layer
+            # optimisation as the snapshotter's gather_user.
             # skip_rating_keys handles early-exit + per-item dedup;
             # fast_owner_detection uses librarySectionUserID when available.
             u_collections = (
@@ -743,25 +976,44 @@ def _transfer_one_library(
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
     include_playlists: bool = True,
-    # PR-3 / Phase D - additional include_* flags. ``include_playlists``
-    # already arrives normalised from ``run_direct_transfer``.
+    # Additional include_* flags. ``include_playlists`` already
+    # arrives normalised from ``run_direct_transfer``.
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
-    # v0.13.x restore mode (merge / replace). Forwarded into
+    # Restore mode (merge / replace). Forwarded into
     # restore_export_file when this function calls it below.
     mode: str = "merge",
     merge_watch_strategy: str = "higher",
-    # Phase C (admin-management follow-up, 2026-05-15): per-library
-    # metric map. When this library has an entry, the entry's flags
-    # override the include_* booleans for this library only.
+    # Per-library metric map. When this library has an entry, the
+    # entry's flags override the include_* booleans for this library
+    # only.
     library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
+    # Pass-through for the per-run library-mapping bypass + the server
+    # IDs that the restorer needs to consult the mapping table. Plus
+    # the per-run override map.
+    ignore_library_mapping: bool = False,
+    library_mapping_overrides: Optional[Dict[str, str]] = None,
+    source_server_id: Optional[str] = None,
+    dest_server_id: Optional[str] = None,
+    # Destination library name (after mapping resolution at the caller
+    # boundary in ``run_direct_transfer``). When None / unset, defaults
+    # to ``lib_name`` so legacy direct callers (without mapping support)
+    # keep working unchanged.
+    dest_lib_name: Optional[str] = None,
 ) -> None:
     """
     Transfer a single library source→dest. See :func:`run_direct_transfer`
     for the high-level contract.
     """
-    # Phase C: per-library metric override. Same pattern as in the
+    # ``dest_lib_name`` is the post-mapping destination library title.
+    # All source-side reads use ``lib_name``; all destination-side
+    # writes use ``dest_lib_name``. When the caller didn't resolve a
+    # mapping (legacy code paths), default to lib_name so the
+    # destination lookup behaves the same as before.
+    if not dest_lib_name:
+        dest_lib_name = lib_name
+    # Per-library metric override. Same pattern as in the
     # snapshotter / restorer entry points - apply the map once at the
     # top of the function so every downstream local include_* read
     # gets the per-library value automatically.
@@ -796,18 +1048,18 @@ def _transfer_one_library(
     # snapshotter functions to label each item.
     saved_owner = state._plex_owner_name
     state._plex_owner_name = source_owner
-    # v0.9.7 Item 7: gate the owner-side gather on the end user's
-    # filter choice. When the owner is unchecked we still advance the
-    # phase counter (the per-library dashboard total reserves 4 ticks
-    # for the snapshot side) but skip the four export_* calls - the
-    # library-level items[] block lands empty and the import side's
-    # owner-scoped path becomes a no-op.
+    # Gate the owner-side gather on the end user's filter choice. When
+    # the owner is unchecked we still advance the phase counter (the
+    # per-library dashboard total reserves 4 ticks for the snapshot
+    # side) but skip the four export_* calls - the library-level
+    # items[] block lands empty and the import side's owner-scoped
+    # path becomes a no-op.
     try:
         if owner_included:
-            # PR-3 / Phase D - gate each owner-side gather on its
-            # include_* flag. The corresponding phase counter still
-            # advances so the per-library bar tracks consistently
-            # regardless of which types are migrated.
+            # Gate each owner-side gather on its include_* flag. The
+            # corresponding phase counter still advances so the
+            # per-library bar tracks consistently regardless of which
+            # types are migrated.
             watch_history = (
                 snapshot_watch_history(src_section, logger, user=source_owner)
                 if include_watch_history else []
@@ -851,15 +1103,15 @@ def _transfer_one_library(
     finally:
         state._plex_owner_name = saved_owner
 
-    # ── Per-user gather (v0.9.6 Feature 4, v0.9.7 Item 9) ────────────
+    # ── Per-user gather ──────────────────────────────────────────────
     # Each transferable managed user reads their data on the source
     # via their own token-bound PlexServer connection. The data lands
     # in payload["users"][username] in the on-disk schema's shape so
     # restore_export_file's existing per-user import loop can replay
     # it under the matching destination user's token.
     #
-    # v0.9.7 Item 9: per-user collections need the owner's collection
-    # rating-key set so library-level collections (visible to every
+    # Per-user collections need the owner's collection rating-key set
+    # so library-level collections (visible to every
     # user via section.collections()) don't get double-counted into
     # every user's payload.
     owner_coll_keys_inmem: Set[Any] = {
@@ -870,14 +1122,14 @@ def _transfer_one_library(
         skip_collections=skip_collections,
         fast_collection_detection=fast_collection_detection,
         skip_playlists=skip_playlists,
-        # PR-3 / Phase D - per-user gather honours all four flags.
+        # Per-user gather honours all four flags.
         include_watch_history=include_watch_history,
         include_ratings=include_ratings,
         include_playlists=include_playlists,
         include_collections=include_collections,
     )
 
-    # ── Build the v0.13.0 unified-users payload ──────────────────────
+    # ── Build the unified-users payload ──────────────────────────────
     # The owner is folded into ``users`` with ``role='owner'``; managed
     # users are ``role='managed'``. ``restore_export_file`` reads the
     # owner block via its role and the managed users via the same map.
@@ -913,8 +1165,17 @@ def _transfer_one_library(
         }
 
     payload: Dict[str, Any] = {
+        # ``library`` carries the SOURCE library title - matches what
+        # the snapshotter writes for an on-disk export. The DB ingestion
+        # below uses this name for the source-side media.db row, and the
+        # source name is the right anchor for that table.
+        # ``restore_export_file`` resolves the destination section via
+        # the ``target_section_name_override`` kwarg we pass below
+        # (which is the post-mapping destination name); this dual-name
+        # split keeps the source-side cache labelled by source and the
+        # destination-side write routed to the renamed library.
         "library": lib_name,
-        # v0.15 library-section identity anchor. ``ingest_snapshot_payload``
+        # Library-section identity anchor. ``ingest_snapshot_payload``
         # asserts on these fields and refuses to write rows without them;
         # the snapshotter populates them on every per-library payload,
         # and direct-transfer must do the same so the source-side media.db
@@ -943,7 +1204,7 @@ def _transfer_one_library(
         },
     }
 
-    # ── v0.12.1 - DB ingestion of the source-side payload ───────────
+    # ── DB ingestion of the source-side payload ──────────────────────
     # We use the source server's Plex ``machineIdentifier`` as the
     # DB's ``server_id`` because (a) it's stable across registry
     # renames, (b) it's already on the PlexServer instance, and (c)
@@ -969,13 +1230,12 @@ def _transfer_one_library(
         )
 
     # ── Phase 2: merge into the destination ──────────────────────────
-    # v0.9.7 Item 6: widen the library's progress total from the
-    # placeholder 8 to the real per-item count BEFORE handing off to
-    # ``restore_export_file``. Each per-item ``_advance_lib`` call
-    # inside the import path now contributes to a meaningful bar
-    # instead of saturating at 8 after the first few items - which
-    # was the root cause of the top-level ETA climbing rather than
-    # counting down during the import phase.
+    # Widen the library's progress total from the placeholder 8 to the
+    # real per-item count BEFORE handing off to ``restore_export_file``.
+    # Each per-item ``_advance_lib`` call inside the import path then
+    # contributes to a meaningful bar instead of saturating at 8 after
+    # the first few items, which would make the top-level ETA climb
+    # rather than count down during the import phase.
     #
     # Total = 4 (snapshot phases already completed, counted above) +
     # one tick per per-item or per-row operation the import side
@@ -999,13 +1259,13 @@ def _transfer_one_library(
     state._plex_owner_name = "Plex Owner"  # dest owner not strictly needed; labels only
     try:
         sections_by_name = {s.title: s for s in dest_server.library.sections()}
-        # PR-1 / Phase B (skip-playlists end-to-end): only prefetch the
-        # destination's playlist map when we actually intend to import
-        # playlists AND the source-side payload carries any. Without
-        # this gate, even ``skip_playlists=True`` runs paid a wasted
+        # Only prefetch the destination's playlist map when we
+        # actually intend to import playlists AND the source-side
+        # payload carries any. Without this gate, even
+        # ``skip_playlists=True`` runs would pay a wasted
         # ``dest_server.playlists()`` round-trip per library.
-        # v0.13.0: owner is just another user in the unified map, so
-        # one any() walks both owner and managed-user blocks at once.
+        # Owner is just another user in the unified map, so one any()
+        # walks both owner and managed-user blocks at once.
         payload_has_playlists = any(
             isinstance(u, dict) and bool(u.get("playlists"))
             for u in (payload.get("users", {}) or {}).values()
@@ -1019,6 +1279,14 @@ def _transfer_one_library(
         # The synthetic placeholder makes the run-log message explain
         # what happened ("direct://source/<library>") for forensic value.
         synthetic_path = f"direct://{lib_name}"
+        # ``target_section_name_override`` is the post-mapping
+        # destination library title. When the operator routed
+        # ``Source Movies`` → ``Dest Movies (Renamed)`` via either a
+        # per-run override or a saved mapping, the override here is the
+        # renamed name and restore_export_file looks up the destination
+        # section by that title rather than the source name embedded in
+        # the payload. When the source and dest names match, this is a
+        # no-op (override == payload['library']).
         restore_export_file(
             dest_server, synthetic_path, dest_token, dest_url,
             logger, log_dir, remap, strict_match,
@@ -1033,19 +1301,24 @@ def _transfer_one_library(
             include_collections=include_collections,
             mode=mode,
             merge_watch_strategy=merge_watch_strategy,
+            target_section_name_override=dest_lib_name,
+            # Forward source/dest identity so the per-user fan-out's
+            # identity_map resolver fires in cross-backend transfers.
+            source_server_id=source_server_id,
+            dest_server_id=dest_server_id,
         )
     finally:
         state._plex_base_url = prev_url
         state._plex_token = prev_tok
 
-    # v0.9.7 Item 6: no longer post-advance(4); the per-item advances
-    # inside ``restore_export_file`` already filled the bar up to the
+    # No post-advance here: the per-item advances inside
+    # ``restore_export_file`` already filled the bar up to the
     # recomputed total. Anything else is a no-op via ``min(... ,
     # lib.total)`` clamping in advance_library.
     state.get_dashboard().push_activity("done", lib_name, "Direct transfer complete")
 
 
-# ── Chained-snapshot fallback worker (v0.9.1) ──────────────────────────────────
+# ── Chained-snapshot fallback worker ──────────────────────────────────────────
 
 def sweep_stale_tmp_exports(
     output_dir: str, max_age_seconds: float = 7 * 24 * 3600,
@@ -1107,19 +1380,28 @@ def _chained_fallback_library(
     fast_collection_detection: bool = False,
     skip_playlists: bool = False,
     include_playlists: bool = True,
-    # PR-3 / Phase D - additional include_* flags.
+    # Additional include_* flags.
     include_watch_history: bool = True,
     include_ratings: bool = True,
     include_collections: bool = True,
-    # v0.13.x restore mode forwarded to restore_export_file at the
-    # end of the chained-fallback flow.
+    # Restore mode forwarded to restore_export_file at the end of the
+    # chained-fallback flow.
     mode: str = "merge",
     merge_watch_strategy: str = "higher",
-    # Phase C (admin-management follow-up, 2026-05-15): per-library
-    # metric map. Forwarded to restore_export_file at the end of the
-    # chained-fallback so the per-library choice applies on the
-    # restore phase of the fallback.
+    # Per-library metric map. Forwarded to restore_export_file at the
+    # end of the chained-fallback so the per-library choice applies on
+    # the restore phase of the fallback.
     library_metrics: Optional[Dict[str, Dict[str, bool]]] = None,
+    # Same forward as _transfer_one_library so the chained fallback
+    # also honours the mapping table.
+    ignore_library_mapping: bool = False,
+    library_mapping_overrides: Optional[Dict[str, str]] = None,
+    source_server_id: Optional[str] = None,
+    dest_server_id: Optional[str] = None,
+    # Destination library name (after mapping resolution at the caller
+    # boundary). See ``_transfer_one_library`` for the rationale; same
+    # default of ``lib_name`` so legacy direct callers keep working.
+    dest_lib_name: Optional[str] = None,
 ) -> None:
     """
     Fallback path used by :func:`run_direct_transfer` when the
@@ -1141,21 +1423,26 @@ def _chained_fallback_library(
     if needed). The activity feed receives a clear message at each
     step boundary so the user can tell where the process is.
     """
+    # Match _transfer_one_library: default dest_lib_name to lib_name
+    # when the caller didn't resolve a mapping. All source-side reads
+    # use lib_name; all destination-side writes use dest_lib_name.
+    if not dest_lib_name:
+        dest_lib_name = lib_name
     # Reset progress for the chained path so the library bar runs
     # from 0 to 8 again - the user gets a visual restart that matches
-    # the rhetorical "we tried direct, now we're trying chained."
+    # the direct-then-chained retry sequence.
     state.get_dashboard().set_library_status(lib_name, "active")
     state.get_dashboard().set_library_phase(lib_name, "Chained: gathering from source…")
 
     # ── Phase 1: gather from source into a dict (same as direct) ──────
-    # v0.9.7 Item 7: gate the owner-side gather on the end user's
-    # filter choice, identical to the in-memory path.
+    # Gate the owner-side gather on the end user's filter choice,
+    # identical to the in-memory path.
     saved_owner = state._plex_owner_name
     state._plex_owner_name = source_owner
     try:
         if owner_included:
-            # PR-3 / Phase D - gate each owner-side gather on its
-            # include_* flag, identical to the in-memory direct path.
+            # Gate each owner-side gather on its include_* flag,
+            # identical to the in-memory direct path.
             watch_history = (
                 snapshot_watch_history(src_section, logger, user=source_owner)
                 if include_watch_history else []
@@ -1198,15 +1485,15 @@ def _chained_fallback_library(
         skip_collections=skip_collections,
         fast_collection_detection=fast_collection_detection,
         skip_playlists=skip_playlists,
-        # PR-3 / Phase D - pass include_* into the chained path's
-        # per-user gather so it matches the in-memory path exactly.
+        # Pass include_* into the chained path's per-user gather so it
+        # matches the in-memory path exactly.
         include_watch_history=include_watch_history,
         include_ratings=include_ratings,
         include_playlists=include_playlists,
         include_collections=include_collections,
     )
 
-    # v0.13.0 unified-users payload (matches the in-memory path above).
+    # Unified-users payload (matches the in-memory path above).
     owner_display = source_owner or "Plex Owner"
     owner_json_key = owner_display
     _used = set(users_data.keys())
@@ -1240,7 +1527,7 @@ def _chained_fallback_library(
 
     payload: Dict[str, Any] = {
         "library": lib_name,
-        # v0.15 library-section identity anchor. See the matching block
+        # Library-section identity anchor. See the matching block
         # in ``_transfer_one_library`` for the rationale; this chained-
         # fallback path must populate the same fields so the source-side
         # media.db seeding below succeeds.
@@ -1265,8 +1552,8 @@ def _chained_fallback_library(
         },
     }
 
-    # v0.12.1 - DB ingestion mirrors the in-memory direct-transfer
-    # path. See the longer note at the equivalent call site in
+    # DB ingestion mirrors the in-memory direct-transfer path. See
+    # the longer note at the equivalent call site in
     # ``_transfer_one_library``. Identical contract so the chained
     # fallback doesn't leave a gap in the DB cache.
     try:
@@ -1310,8 +1597,8 @@ def _chained_fallback_library(
     )
 
     # ── Phase 3: import that file into the destination ────────────────
-    # v0.9.7 Item 6: same per-item total recompute as the in-memory
-    # path so the chained fallback's progress bar behaves identically.
+    # Same per-item total recompute as the in-memory path so the
+    # chained fallback's progress bar behaves identically.
     import_total = _compute_import_total(payload, home_user_names={u[0] for u in (dest_home_users or [])})
     state.get_dashboard().set_library_total(
         lib_name,
@@ -1326,10 +1613,9 @@ def _chained_fallback_library(
     state._plex_owner_name = "Plex Owner"
     try:
         sections_by_name = {s.title: s for s in dest_server.library.sections()}
-        # PR-1 / Phase B (skip-playlists end-to-end): mirror the
-        # in-memory path's gate. Only prefetch destination playlists
-        # when we'll actually use them.
-        # v0.13.0: unified users map - one any() covers owner + managed.
+        # Mirror the in-memory path's gate. Only prefetch destination
+        # playlists when we'll actually use them.
+        # Unified users map - one any() covers owner + managed.
         payload_has_playlists = any(
             isinstance(u, dict) and bool(u.get("playlists"))
             for u in (payload.get("users", {}) or {}).values()
@@ -1352,6 +1638,15 @@ def _chained_fallback_library(
             include_collections=include_collections,
             mode=mode,
             merge_watch_strategy=merge_watch_strategy,
+            # Post-mapping destination library title. When the operator
+            # routed source → renamed-dest, this override steers the
+            # restore_export_file section lookup to the renamed library
+            # instead of the source name in payload['library'].
+            target_section_name_override=dest_lib_name,
+            # Forward source/dest identity so the per-user fan-out's
+            # identity_map resolver fires in cross-backend transfers.
+            source_server_id=source_server_id,
+            dest_server_id=dest_server_id,
         )
     except Exception as exc:
         # M2: the import failed, so Phase 4's unlink is never reached -

@@ -18,8 +18,11 @@
 
 import { useEffect, useState } from 'react';
 import { api, PlaylistMgmtStructuredError } from '../api';
-import type { PlaylistDetail, PlaylistSpec } from '../api';
+import type { PlaylistDetail, PlaylistSpec, SmartPlaylistPreview } from '../api';
 import { PlaylistDetailView } from './PlaylistDetailView';
+import { Modal } from './Modal';
+import { SmartFilterTree } from './SmartFilterTree';
+import { errorText } from '../utils/format';
 
 interface Props {
   side: 'source' | 'dest';
@@ -42,6 +45,17 @@ interface Props {
   // remove the user from the relevant checked-Set so the card doesn't
   // keep re-rendering after a refresh.
   onUserNotFound?: () => void;
+  // Parent-owned set of playlist_type values to INCLUDE
+  // (e.g. {'audio','video','photo'}). When undefined, no filter is
+  // applied. Playlists with empty playlist_type (older cache rows)
+  // always render so an older cache doesn't disappear from
+  // the UI after the operator unticks a type.
+  playlistTypeFilter?: Set<string>;
+  // Smart Playlist mode. When
+  // true the source card lists SMART playlists as selectable and
+  // hides regular ones (the inverse of copy mode), and each smart row
+  // gets an "Inspect filter" expander. No effect on the dest side.
+  smartMode?: boolean;
 }
 
 export function UserPlaylistsCard({
@@ -56,6 +70,8 @@ export function UserPlaylistsCard({
   collisionNames,
   refreshNonce,
   onUserNotFound,
+  playlistTypeFilter,
+  smartMode = false,
 }: Props) {
   const [playlists, setPlaylists] = useState<PlaylistSpec[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +87,41 @@ export function UserPlaylistsCard({
   const [detail, setDetail] = useState<PlaylistDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
+
+  // Smart Playlist mode: per-row decoded-filter inspector. Previews
+  // are fetched lazily (one live round-trip each) only when the
+  // operator expands a smart playlist row.
+  const [previews, setPreviews] = useState<Map<string, SmartPlaylistPreview>>(new Map());
+  const [previewLoading, setPreviewLoading] = useState<Set<string>>(new Set());
+  const [previewErrors, setPreviewErrors] = useState<Map<string, string>>(new Map());
+  const [expandedFilterId, setExpandedFilterId] = useState<string | null>(null);
+
+  const loadPreview = async (playlistId: string) => {
+    if (previews.has(playlistId) || previewLoading.has(playlistId)) return;
+    setPreviewLoading((s) => new Set(s).add(playlistId));
+    setPreviewErrors((m) => {
+      const n = new Map(m);
+      n.delete(playlistId);
+      return n;
+    });
+    try {
+      const p = await api.previewSmartPlaylist(serverId, playlistId);
+      setPreviews((m) => new Map(m).set(playlistId, p));
+    } catch (e) {
+      setPreviewErrors((m) => new Map(m).set(playlistId, errorText(e)));
+    } finally {
+      setPreviewLoading((s) => {
+        const n = new Set(s);
+        n.delete(playlistId);
+        return n;
+      });
+    }
+  };
+
+  const toggleFilter = (playlistId: string) => {
+    setExpandedFilterId((cur) => (cur === playlistId ? null : playlistId));
+    void loadPreview(playlistId);
+  };
 
   // Initial fetch + refetch on refresh nonce bump
   useEffect(() => {
@@ -90,7 +141,7 @@ export function UserPlaylistsCard({
           setUserMissing(true);
           return;
         }
-        setError(String(e instanceof Error ? e.message : e));
+        setError(errorText(e));
       });
     return () => { cancelled = true; };
   }, [serverId, userId, refreshNonce]);
@@ -111,7 +162,7 @@ export function UserPlaylistsCard({
       ) {
         setUserMissing(true);
       } else {
-        setError(String(e instanceof Error ? e.message : e));
+        setError(errorText(e));
       }
     } finally {
       setRefreshing(false);
@@ -124,10 +175,19 @@ export function UserPlaylistsCard({
     setDetailError(null);
     setDetailLoading(true);
     try {
-      const d = await api.playlistMgmtGetDetail(serverId, userId, p.playlist_id);
+      // A smart playlist's item list is a live filter evaluation.
+      // The per-user playlist cache stores smart playlists with an
+      // EMPTY item list (list_playlists skips the slow per-smart-
+      // playlist items() walk for performance), so a cached read
+      // would show "Empty playlist". Force a live fetch for smart
+      // playlists so the server evaluates the filter and returns the
+      // real, current matching items.
+      const d = await api.playlistMgmtGetDetail(
+        serverId, userId, p.playlist_id, p.is_smart,
+      );
       setDetail(d);
     } catch (e) {
-      setDetailError(String(e instanceof Error ? e.message : e));
+      setDetailError(errorText(e));
     } finally {
       setDetailLoading(false);
     }
@@ -201,144 +261,299 @@ export function UserPlaylistsCard({
       ) : playlists === null ? (
         <div className="empty" style={{ fontSize: 12 }}>Loading playlists…</div>
       ) : (() => {
-        // 2026-05-16 (operator request): smart playlists are never
-        // offered up for transfer — their definition is criteria-based
-        // and not portable across backends (or even across servers).
-        // Filter them out on the SOURCE side entirely so they don't
-        // clutter the picker; dest side keeps showing them so the
-        // end user can see what's already on the target.
-        const visible = side === 'source'
-          ? playlists.filter((p) => !p.is_smart)
-          : playlists;
-        const hiddenSmartCount = side === 'source'
+        // Source side shows one playlist kind at a time: copy mode
+        // shows regular playlists (a smart playlist's items are not
+        // what gets transferred), Smart Playlist mode shows smart
+        // playlists (their filter is what gets migrated). The dest
+        // side always shows everything so the operator can spot name
+        // collisions.
+        let visible: PlaylistSpec[];
+        if (side !== 'source') {
+          visible = playlists;
+        } else if (smartMode) {
+          visible = playlists.filter((p) => p.is_smart);
+        } else {
+          visible = playlists.filter((p) => !p.is_smart);
+        }
+        // Count of the hidden OTHER kind on the source side: smart
+        // playlists in copy mode, regular playlists in smart mode.
+        const hiddenOtherCount = side === 'source'
           ? playlists.length - visible.length
           : 0;
+        // Type filter (parent-owned). Apply BEFORE
+        // grouping so the per-library summary line + group headers
+        // reflect what's actually shown. A playlist with no
+        // playlist_type (older cache rows) always passes - better
+        // than disappearing silently when the operator unticks a type.
+        let hiddenByTypeCount = 0;
+        if (playlistTypeFilter) {
+          const before = visible.length;
+          visible = visible.filter((p) => {
+            const t = (p.playlist_type || '').toLowerCase();
+            if (!t) return true;
+            return playlistTypeFilter.has(t);
+          });
+          hiddenByTypeCount = before - visible.length;
+        }
         if (visible.length === 0) {
+          let emptyMsg: string;
+          if (hiddenByTypeCount > 0) {
+            emptyMsg = `No playlists match the current type filter. (${hiddenByTypeCount} hidden by the Audio/Video/Photo checkboxes.)`;
+          } else if (smartMode && side === 'source') {
+            emptyMsg = hiddenOtherCount > 0
+              ? `No smart playlists for this user. (${hiddenOtherCount} regular playlist${hiddenOtherCount === 1 ? '' : 's'} hidden: Smart Playlist mode shows only smart playlists.)`
+              : 'No smart playlists found for this user.';
+          } else if (hiddenOtherCount > 0) {
+            emptyMsg = `No transferable playlists. (${hiddenOtherCount} smart playlist${hiddenOtherCount === 1 ? '' : 's'} hidden: migrate these from the Smart Playlist tab.)`;
+          } else {
+            emptyMsg = 'No playlists found for this user.';
+          }
           return (
-            <div className="empty" style={{ fontSize: 12 }}>
-              {hiddenSmartCount > 0
-                ? `No transferable playlists. (${hiddenSmartCount} smart playlist${hiddenSmartCount === 1 ? '' : 's'} hidden — smart playlists can't be copied because their criteria don't port across servers.)`
-                : 'No playlists found for this user.'}
-            </div>
+            <div className="empty" style={{ fontSize: 12 }}>{emptyMsg}</div>
           );
         }
+        // Group rendered playlists by
+        // their source library so the user can see "3 from Music,
+        // 2 from Movies" instead of one undifferentiated list. Group
+        // label preference order:
+        //   1. primary_library_name (best — friendly library title)
+        //   2. primary_library_id   (stable when name absent)
+        //   3. playlist_type        (audio/video/photo, when neither
+        //      library_id nor name is available — typical for J/E
+        //      whose lightweight list response doesn't carry library)
+        //   4. "(no library)"       (terminal fallback)
+        const groupKeyFor = (p: PlaylistSpec): string => {
+          if (p.primary_library_name) return p.primary_library_name;
+          if (p.primary_library_id) return `lib:${p.primary_library_id}`;
+          if (p.playlist_type) return `type:${p.playlist_type}`;
+          return '(no library)';
+        };
+        const groupLabelFor = (p: PlaylistSpec, key: string): string => {
+          if (p.primary_library_name) return p.primary_library_name;
+          if (p.primary_library_id) return `Library ${p.primary_library_id}`;
+          if (p.playlist_type) {
+            const t = p.playlist_type;
+            return t.charAt(0).toUpperCase() + t.slice(1) + ' playlists';
+          }
+          return key;
+        };
+        const grouped = new Map<string, { label: string; items: PlaylistSpec[] }>();
+        for (const p of visible) {
+          const k = groupKeyFor(p);
+          const cur = grouped.get(k);
+          if (cur) {
+            cur.items.push(p);
+          } else {
+            grouped.set(k, { label: groupLabelFor(p, k), items: [p] });
+          }
+        }
+        // Stable display order: alphabetical by group label, with the
+        // "(no library)" bucket pinned last so it doesn't push real
+        // libraries down the list.
+        const groupEntries = Array.from(grouped.entries()).sort(([, a], [, b]) => {
+          const aTerminal = a.label === '(no library)';
+          const bTerminal = b.label === '(no library)';
+          if (aTerminal && !bTerminal) return 1;
+          if (!aTerminal && bTerminal) return -1;
+          return a.label.localeCompare(b.label);
+        });
         return (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 320, overflowY: 'auto' }}>
-          {hiddenSmartCount > 0 && (
+          {hiddenOtherCount > 0 && (
             <div className="empty" style={{ fontSize: 11, marginBottom: 4 }}>
-              {hiddenSmartCount} smart playlist{hiddenSmartCount === 1 ? '' : 's'} hidden (not transferable).
+              {smartMode
+                ? `${hiddenOtherCount} regular playlist${hiddenOtherCount === 1 ? '' : 's'} hidden (Smart Playlist mode).`
+                : `${hiddenOtherCount} smart playlist${hiddenOtherCount === 1 ? '' : 's'} hidden (migrate from the Smart Playlist tab).`}
             </div>
           )}
-          {visible.map((p) => {
-            const isSelected = side === 'source' && (selectedPlaylistIds?.has(p.playlist_id) ?? false);
-            const isCollision = side === 'dest' && (collisionNames?.has(p.name) ?? false);
-            const checkable = side === 'source';
-            return (
+          {hiddenByTypeCount > 0 && (
+            <div className="empty" style={{ fontSize: 11, marginBottom: 4 }}>
+              {hiddenByTypeCount} playlist{hiddenByTypeCount === 1 ? '' : 's'} hidden by the type filter.
+            </div>
+          )}
+          {/* Operator-facing summary so they see "3 from Music, 2 from
+              Movies" at a glance before scrolling. */}
+          {groupEntries.length > 1 && (
+            <div
+              style={{
+                fontSize: 11,
+                color: 'var(--text-dim)',
+                paddingBottom: 4,
+                borderBottom: '1px solid var(--border, rgba(255,255,255,0.08))',
+                marginBottom: 4,
+              }}
+            >
+              {groupEntries
+                .map(([, g]) => `${g.items.length} from ${g.label}`)
+                .join(' · ')}
+            </div>
+          )}
+          {groupEntries.map(([key, group]) => (
+            <div key={key} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
               <div
-                key={p.playlist_id}
                 style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  padding: '6px 10px',
-                  borderRadius: 4,
-                  background: isSelected
-                    ? 'var(--bg-panel)'
-                    : isCollision
-                      ? 'var(--bg-panel-alt, rgba(245, 166, 35, 0.08))'
-                      : 'transparent',
-                  border: isSelected
-                    ? '1px solid var(--accent, #4a7afc)'
-                    : isCollision
-                      ? '1px solid var(--warn, #f5a623)'
-                      : '1px solid transparent',
-                  opacity: checkable && p.is_smart ? 0.55 : 1,
+                  fontSize: 11,
+                  fontWeight: 600,
+                  color: 'var(--text-dim)',
+                  textTransform: 'uppercase',
+                  letterSpacing: 0.5,
+                  padding: '6px 10px 2px',
                 }}
               >
-                {checkable && (
-                  <input
-                    type="checkbox"
-                    checked={isSelected}
-                    disabled={p.is_smart}
-                    onChange={() => onTogglePlaylist?.(p)}
-                    title={p.is_smart
-                      ? 'Smart playlists cannot be copied across backends (criteria differ).'
-                      : undefined}
-                  />
-                )}
-                <span style={{ flex: 1, fontSize: 12 }}>
-                  <strong>{p.name}</strong>
-                  {p.is_smart && (
-                    <span className="tag failed" style={{ fontSize: 10, marginLeft: 6 }}>smart</span>
-                  )}
-                  {isCollision && (
-                    <span
-                      className="tag"
-                      style={{ fontSize: 10, marginLeft: 6, background: 'var(--warn, #f5a623)', color: '#000' }}
-                      title="A source playlist with this name is queued for deploy. Existing dest playlist may collide."
-                    >
-                      name match
-                    </span>
-                  )}
-                </span>
-                <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
-                  {p.item_count} item{p.item_count === 1 ? '' : 's'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => void openDetail(p)}
-                  style={{ fontSize: 11, padding: '2px 6px' }}
-                  title="Show the items inside this playlist."
-                >
-                  View items
-                </button>
+                {group.label} ({group.items.length})
               </div>
-            );
-          })}
+              {group.items.map((p) => {
+                const isSelected = side === 'source' && (selectedPlaylistIds?.has(p.playlist_id) ?? false);
+                const isCollision = side === 'dest' && (collisionNames?.has(p.name) ?? false);
+                const checkable = side === 'source';
+                const showInspect = smartMode && side === 'source' && p.is_smart;
+                const filterExpanded = expandedFilterId === p.playlist_id;
+                const preview = previews.get(p.playlist_id);
+                const previewErr = previewErrors.get(p.playlist_id);
+                return (
+                  <div key={p.playlist_id} data-testid={`plmgmt-playlist-${p.playlist_id}`}>
+                    <div
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        padding: '6px 10px',
+                        borderRadius: 4,
+                        background: isSelected
+                          ? 'var(--bg-panel)'
+                          : isCollision
+                            ? 'var(--bg-panel-alt, rgba(245, 166, 35, 0.08))'
+                            : 'transparent',
+                        border: isSelected
+                          ? '1px solid var(--accent, #4a7afc)'
+                          : isCollision
+                            ? '1px solid var(--warn, #f5a623)'
+                            : '1px solid transparent',
+                      }}
+                    >
+                      {checkable && (
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => onTogglePlaylist?.(p)}
+                        />
+                      )}
+                      <span style={{ flex: 1, fontSize: 12 }}>
+                        <strong>{p.name}</strong>
+                        {p.is_smart && (
+                          <span className="tag failed" style={{ fontSize: 10, marginLeft: 6 }}>smart</span>
+                        )}
+                        {/* Per-row type chip when present; helps the
+                            operator distinguish video / photo playlists
+                            even when several libraries share a type. */}
+                        {p.playlist_type && (
+                          <span
+                            className="tag"
+                            style={{ fontSize: 10, marginLeft: 6, opacity: 0.7 }}
+                            title={`Playlist type: ${p.playlist_type}`}
+                          >
+                            {p.playlist_type}
+                          </span>
+                        )}
+                        {isCollision && (
+                          <span
+                            className="tag"
+                            style={{ fontSize: 10, marginLeft: 6, background: 'var(--warn, #f5a623)', color: '#000' }}
+                            title="A source playlist with this name is queued for deploy. Existing dest playlist may collide."
+                          >
+                            name match
+                          </span>
+                        )}
+                      </span>
+                      <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
+                        {p.item_count} item{p.item_count === 1 ? '' : 's'}
+                      </span>
+                      {showInspect && (
+                        <button
+                          type="button"
+                          onClick={() => toggleFilter(p.playlist_id)}
+                          style={{ fontSize: 11, padding: '2px 6px' }}
+                          title="Decode and show this smart playlist's filter."
+                        >
+                          {filterExpanded ? 'Hide filter' : 'Inspect filter'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void openDetail(p)}
+                        style={{ fontSize: 11, padding: '2px 6px' }}
+                        title="Show the items inside this playlist."
+                      >
+                        View items
+                      </button>
+                    </div>
+                    {showInspect && filterExpanded && (
+                      <div
+                        style={{
+                          margin: '4px 0 6px 28px',
+                          padding: 8,
+                          background: 'var(--bg-alt, rgba(127,127,127,0.08))',
+                          borderRadius: 4,
+                        }}
+                      >
+                        {previewLoading.has(p.playlist_id) && (
+                          <span className="help">Decoding filter…</span>
+                        )}
+                        {previewErr && (
+                          <div className="banner error" style={{ fontSize: 12 }}>{previewErr}</div>
+                        )}
+                        {preview && (
+                          <>
+                            <div style={{ fontSize: 12, marginBottom: 4 }}>
+                              <strong>{preview.filter.description}</strong>
+                            </div>
+                            <div style={{ fontSize: 11, color: 'var(--text-dim)', marginBottom: 6 }}>
+                              library: {preview.filter.library_name || '(unknown)'}
+                              {' '}({preview.filter.library_type || '?'})
+                            </div>
+                            {preview.filter.root ? (
+                              <SmartFilterTree node={preview.filter.root} />
+                            ) : (
+                              <span className="help">
+                                This smart playlist has no filter clauses.
+                              </span>
+                            )}
+                            {preview.filter.unresolved_source_ids.length > 0 && (
+                              <div style={{ color: 'var(--warn)', fontSize: 11, marginTop: 6 }}>
+                                {preview.filter.unresolved_source_ids.length}
+                                {' '}tag id(s) on the source had no name and may
+                                not migrate cleanly.
+                              </div>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
         </div>
         );
       })()}
 
       {/* Items detail modal for any playlist in this card. */}
       {detailFor && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.55)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 1000,
-          }}
-          onClick={closeDetail}
-        >
-          <div
-            className="panel"
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              maxWidth: 640,
-              width: 'calc(100% - 32px)',
-              maxHeight: 'calc(100vh - 32px)',
-              overflowY: 'auto',
-            }}
-          >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-              <h3 style={{ margin: 0 }}>{detailFor.name}</h3>
-              <button type="button" onClick={closeDetail}>Close</button>
-            </div>
-            <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>
-              {username} @ {serverLabel}
-            </div>
-            <PlaylistDetailView
-              detail={detail}
-              loading={detailLoading}
-              error={detailError}
-            />
+        <Modal onClose={closeDetail} align="center" width={640} maxHeight="calc(100vh - 32px)">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <h3 style={{ margin: 0 }}>{detailFor.name}</h3>
+            <button type="button" onClick={closeDetail}>Close</button>
           </div>
-        </div>
+          <div style={{ fontSize: 12, color: 'var(--text-dim)', marginBottom: 12 }}>
+            {username} @ {serverLabel}
+          </div>
+          <PlaylistDetailView
+            detail={detail}
+            loading={detailLoading}
+            error={detailError}
+          />
+        </Modal>
       )}
     </div>
   );

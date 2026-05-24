@@ -1,6 +1,5 @@
 """
-Playlist Management copy orchestrator (Plan[PLAYLIST-MANAGEMENT]-2026-05-16,
-section 3.6).
+Playlist Management copy orchestrator.
 
 Drives the per-playlist copy from source server / source user to
 destination server / destination user. Built on top of the
@@ -22,10 +21,12 @@ silently on errors; live failures bubble up.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from server import playlist_cache_db, server_registry
 from services.adapters import (
@@ -40,9 +41,34 @@ from services.tunables import (
     playlist_cache_max_age_seconds,
     playlist_cache_refresh_interval_seconds,
     playlist_cache_snapshot_threshold_seconds,
+    playlist_mgmt_batch_per_source_workers,
+    playlist_mgmt_fuzzy_ambiguous_behavior,
+    playlist_mgmt_item_resolve_workers,
     playlist_mgmt_plex_home_auth_mode,
     playlist_mgmt_same_user_behavior,
     strict_identity_resolution,
+)
+
+from services.playlist_item_resolver import resolve_item_to_dest
+from services.batch_runner import (
+    _per_source_semaphore_for,
+    _reset_per_source_semaphores_for_tests,
+    acquire_with_cancel,
+)
+
+
+# ── Re-exported from services.playlist_user_auth ─────────────────────────────
+# The user-resolution + per-user-auth cluster moved to its own module.
+# Re-exported here so this module's import surface is unchanged: external
+# code still does ``from services.playlist_copy import _find_user`` etc.
+from services.playlist_user_auth import (
+    _find_user,
+    _identity_kit,
+    _lookup_plex_home_token,  # noqa: F401
+    _obtain_per_user_token_via_pin,  # noqa: F401
+    _resolve_app_user_uuid_for_lookup,
+    _same_logical_user,
+    _user_context_for,
 )
 
 
@@ -102,6 +128,17 @@ class DestUserTokenMissing(PlaylistCopyError):
     http_status = 412
 
 
+class PlaylistCopyCancelled(PlaylistCopyError):
+    """Raised inside copy_playlist when the per-item cancel_event
+    fires mid-copy. Distinct from a generic failure so the batch
+    result counts cancellations separately from failures + skips.
+    The operator-set cancel_event is checked between phases; an item
+    already mid-write completes, since aborting would leave partial
+    state on the destination."""
+    code = "ITEM_CANCELLED"
+    http_status = 499  # client-closed-request convention
+
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 
@@ -120,1028 +157,20 @@ def _connect(server_id: str, *, on_fail: type) -> Any:
         raise on_fail(f"server {server_id!r} unreachable: {exc}") from exc
 
 
-def _user_context_for(
-    conn: Any,
-    user_spec: UserSpec,
-    *,
-    role: str = "source",
-    server_id: Optional[str] = None,
-) -> UserContext:
-    """Build a UserContext using the server's admin token + the target
-    user's backend_user_id by default.
-
-    When ``role='dest'`` AND the destination service_type is Plex AND
-    the end user set ``playlist_mgmt_plex_home_auth_mode='per_user_token'``,
-    the orchestrator instead looks up the user's saved Plex Home
-    token in ``managed_users.auth_token_enc`` and threads it through
-    so :class:`services.adapters.plex.PlexAdapter._server_for` can
-    create a per-user PlexServer instance for the write.
-
-    Missing-token behaviour is gated on the
-    ``strict_identity_resolution`` tunable (developer's identity-audit
-    follow-up):
-
-    * strict=True  -> refuse to write as someone else; raise
-      :class:`DestUserTokenMissing`. The UI surfaces the typed 412
-      with a pointer to the per-user-token save endpoint.
-    * strict=False -> silently fall back to the admin/owner context
-      for this copy. The new playlist lands under the owner instead
-      of under the Plex Home user, but the operation succeeds. The
-      Playlist Management dest picker uses the same gate to decide
-      whether to hide vs offer a user with no saved token.
-
-    Plex per-user-token writes are required when the end user wants
-    new playlists / collections / scrobbles to appear UNDER that
-    Plex Home user instead of under the owner; the owner_token
-    mode (default) creates everything under the admin account.
-
-    2026-05-17 (operator request — combined auth chain): the per-user
-    auth attempt now applies to BOTH ``role='source'`` and
-    ``role='dest'`` because Plex's admin token only sees the OWNER's
-    playlists; reading a managed user's playlists requires per-user
-    auth too. Resolution chain runs unconditionally for non-owner Plex
-    users:
-      1. Saved per-user token from ``managed_users.auth_token_enc``.
-      2. PIN-derived token via ``signInHomeUser`` when a Plex Home PIN
-         is stored on the row.
-      3. Admin/owner-token fallback (with logging) when neither works.
-
-    The ``playlist_mgmt_plex_home_auth_mode`` + ``strict_identity_resolution``
-    tunables together gate ONLY the dest-role admin fallback. Source
-    reads always fall back silently because admin can return *some*
-    data (the owner's view), and even if that view is empty for the
-    target user, an empty cache row is more useful than a hard error.
-    """
-    from services import playlist_cache_log as _audit  # local: keep import light
-
-    auth_token = conn.token
-    is_admin = True
-    is_plex = (conn.service_type or "plex").lower() == "plex"
-    # Owner detection 2026-05-17 (operator bug — managed user copying
-    # a playlist TO the Plex owner: orchestrator reported success but
-    # the playlist never appeared on the owner's account). Root cause:
-    # the prior gate only checked ``role == 'owner'``; if the resolved
-    # ``user_spec`` had ``is_admin=True`` but a non-owner role (cached
-    # row drift, identity-map walk landing on a managed-flavor row,
-    # etc.) the per-user auth chain ran and the create_playlist call
-    # got routed through a per-user PlexServer with the WRONG token —
-    # the write succeeded on that user's view but never showed up
-    # under the owner.
-    #
-    # Multi-signal gate (any one signal trips owner-mode):
-    #   1. ``user_spec.role == 'owner'`` — the explicit declaration.
-    #   2. ``user_spec.is_admin == True`` — the admin/owner flag from
-    #      both managed_users (kind='owner') and the live adapter's
-    #      ``list_users()``.
-    #   3. Positive match against the dest server's ``myPlexAccount``
-    #      email / username. Catches the rare case where neither of
-    #      the above signals fired but the target is provably the
-    #      Plex owner of THIS server (e.g. operator passed the owner's
-    #      email as ``dest_user_id`` and ``_find_user`` fell through
-    #      to a stale row).
-    #
-    # Plex Home + fan-out: the operator wants the owner ALWAYS routed
-    # through the admin token even when fan-out is on for other users.
-    # This gate is the single chokepoint that enforces it.
-    is_owner_target = (
-        (getattr(user_spec, "role", "") or "").lower() == "owner"
-        or bool(getattr(user_spec, "is_admin", False))
-        or _user_is_plex_owner(conn, user_spec)
-    )
-    if is_plex and is_owner_target and server_id:
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=user_spec.username,
-            step="admin_owner", outcome="used", role=role,
-            detail="target is Plex owner; admin token applied",
-        )
-
-    # Owner case: admin token IS the owner's token. No per-user lookup
-    # needed; bare admin auth returns the owner's view, which is the
-    # correct view of the owner's own data.
-    if is_plex and not is_owner_target and server_id:
-        # Step 1: try a saved per-user token.
-        per_user_token = _lookup_plex_home_token(server_id, user_spec.username)
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=user_spec.username,
-            step="saved_token",
-            outcome="hit" if per_user_token else "miss",
-            role=role,
-        )
-        # Step 2: try a PIN-derived token when no saved token exists.
-        if not per_user_token:
-            per_user_token = _obtain_per_user_token_via_pin(
-                conn, server_id, user_spec.username, role=role,
-            )
-        if per_user_token:
-            auth_token = per_user_token
-            is_admin = False
-        else:
-            # Step 3: admin fallback. Strict-mode gate applies for DEST
-            # writes — the operator may have configured the system to
-            # refuse writes that would land under the owner rather than
-            # the intended user. Source reads always fall back silently
-            # because we want at least the admin-visible view.
-            mode = (playlist_mgmt_plex_home_auth_mode() or "owner_token").lower()
-            if (
-                role == "dest"
-                and mode == "per_user_token"
-                and strict_identity_resolution()
-            ):
-                _audit.log_auth_chain_step(
-                    server_id=server_id, user_id=user_spec.username,
-                    step="admin_fallback", outcome="refused", role=role,
-                    detail="strict-mode dest + per_user_token",
-                )
-                raise DestUserTokenMissing(
-                    f"Per-user-token auth mode is enabled but no usable "
-                    f"per-user credentials are stored for user "
-                    f"{user_spec.username!r} on server {server_id!r}. "
-                    f"Save a Plex Home token via POST "
-                    f"/api/managed-users/{server_id}/{user_spec.username}/"
-                    f"plex-home-token, OR save a Plex Home PIN under "
-                    f"User Management."
-                )
-            _audit.log_auth_chain_step(
-                server_id=server_id, user_id=user_spec.username,
-                step="admin_fallback", outcome="used", role=role,
-                detail="no saved token, no usable PIN",
-            )
-            log.info(
-                "playlist_copy: per-user auth unavailable for user %r on "
-                "server %r (no saved token, no usable PIN); falling back "
-                "to admin/owner context. The admin token only sees the "
-                "owner's view, so this user's actual playlists / data "
-                "may not be visible. Save a Plex Home token or PIN to "
-                "unlock this user's data.",
-                user_spec.username, server_id,
-            )
-    # The Plex adapter's ``list_playlists`` does its own per-user
-    # filter via the username→local-SystemAccount-id map; UserContext
-    # just carries the (backend_user_id, username, token, is_admin)
-    # tuple. No need to nullify backend_user_id here.
-    return UserContext(
-        backend_user_id=user_spec.backend_user_id or "",
-        username=user_spec.username,
-        auth_token=auth_token,
-        is_admin=is_admin,
-    )
-
-
-def _same_logical_user(
-    server_id: str, a: UserSpec, b: UserSpec,
-) -> bool:
-    """Decide whether two UserSpecs refer to the same logical user on
-    ``server_id``. Used by ``copy_playlist`` to short-circuit a
-    source==destination copy as a no-op.
-
-    Priority chain:
-      1. app_user_uuid (canonical handle from managed_users.v12). The
-         strongest signal — survives backend_user_id / username drift.
-      2. backend_user_id exact (after normalising blank-vs-None).
-      3. Case-insensitive username (last-resort handle).
-
-    Each signal is checked only when BOTH sides have a non-empty value
-    for it; we never declare equality on "both unset" (that would
-    collapse all rows with an empty backend_user_id, e.g. owner rows
-    pre-share-state-refresh). Returns False when no signal could be
-    evaluated.
-    """
-    a_uuid: Optional[str] = None
-    b_uuid: Optional[str] = None
-    if server_id:
-        try:
-            a_uuid = _resolve_app_user_uuid_for_lookup(
-                server_id, a.backend_user_id or a.username,
-            )
-            b_uuid = _resolve_app_user_uuid_for_lookup(
-                server_id, b.backend_user_id or b.username,
-            )
-        except Exception:
-            a_uuid, b_uuid = None, None
-    if a_uuid and b_uuid:
-        return a_uuid == b_uuid
-    a_bid = (a.backend_user_id or "").strip()
-    b_bid = (b.backend_user_id or "").strip()
-    if a_bid and b_bid:
-        return a_bid == b_bid
-    a_name = (a.username or "").strip().lower()
-    b_name = (b.username or "").strip().lower()
-    if a_name and b_name:
-        return a_name == b_name
-    return False
-
-
-def _user_is_plex_owner(conn: Any, user_spec: UserSpec) -> bool:
-    """Positive identification of the Plex owner on ``conn``'s server.
-    Matches ``user_spec.username`` and ``user_spec.backend_user_id``
-    against ``myPlexAccount``'s email + username + id. Any match
-    returns True.
-
-    Used by :func:`_user_context_for` as a fallback owner signal when
-    neither ``role`` nor ``is_admin`` flag the user as owner — covers
-    stale managed_users rows + identity-map drift where the canonical
-    handle is correct but the role bookkeeping isn't.
-
-    Returns False silently on any error so callers can fall through
-    to the per-user chain rather than blocking on a transient
-    plex.tv lookup hiccup. Non-Plex backends always return False.
-    """
-    if (getattr(conn, "service_type", "plex") or "plex").lower() != "plex":
-        return False
-    username = (getattr(user_spec, "username", "") or "").strip().lower()
-    backend_id = (getattr(user_spec, "backend_user_id", "") or "").strip()
-    if not username and not backend_id:
-        return False
-    try:
-        adapter = getattr(conn, "adapter", None)
-        plex_server = getattr(adapter, "_server", None)
-        if plex_server is None:
-            return False
-        account = plex_server.myPlexAccount()
-        owner_email = (getattr(account, "email", "") or "").strip().lower()
-        owner_username = (getattr(account, "username", "") or "").strip().lower()
-        owner_id = str(getattr(account, "id", "") or "").strip()
-        if username and (username == owner_email or username == owner_username):
-            return True
-        if backend_id and owner_id and backend_id == owner_id:
-            return True
-    except Exception:
-        # Plex.tv hiccup, missing account, etc. The per-user chain
-        # below catches the dest_token_missing case; do NOT block here.
-        return False
-    return False
-
-
-def _lookup_plex_home_token(server_id: str, username: str) -> Optional[str]:
-    """Pull the Fernet-decrypted token off ``managed_users.auth_token_enc``
-    via :func:`server.media_db.get_managed_user_credential`. Returns
-    None on missing row, missing column, or decrypt failure (the
-    helper itself logs and returns None on bad ciphertext)."""
-    from server import media_db
-    try:
-        return media_db.get_managed_user_credential(
-            server_id, username, kind="auth_token",
-        )
-    except Exception:
-        log.exception(
-            "playlist_copy: per-user-token lookup failed for "
-            "(%s, %s); treating as missing.",
-            server_id, username,
-        )
-        return None
-
-
-def _obtain_per_user_token_via_pin(
-    conn: Any, server_id: str, username: str, *, role: str = "source",
-) -> Optional[str]:
-    """2026-05-17 (operator request, combined-auth chain): when a saved
-    per-user token isn't stored but a Plex Home PIN IS, sign in as the
-    home user with the PIN to obtain a fresh per-user token. Mirrors the
-    PIN-auth pattern already used by :func:`services.auth.get_home_users`
-    for snapshot/restore runs.
-
-    Returns the obtained token string on success; None when no PIN is
-    stored, no matching home-user object exists, plexapi's build doesn't
-    expose ``signInHomeUser`` / ``switchHomeUser``, or the sign-in fails.
-    Errors are caught and logged so callers can fall through to admin
-    auth or the strict-mode raise.
-
-    Doesn't persist the token. The caller can save it to
-    managed_users.auth_token_enc separately if they want it cached for
-    subsequent runs; we treat the obtained token as a one-shot.
-    """
-    from server import media_db
-    from services import playlist_cache_log as _audit
-    try:
-        stored_pin = media_db.get_managed_user_credential(
-            server_id, username, kind="plex_home_pin",
-        )
-    except Exception:
-        log.exception(
-            "playlist_copy: PIN lookup failed for (%s, %s).",
-            server_id, username,
-        )
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=username,
-            step="pin_token", outcome="miss", role=role,
-            detail="PIN lookup raised",
-        )
-        return None
-    if not stored_pin:
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=username,
-            step="pin_token", outcome="miss", role=role,
-            detail="no PIN stored",
-        )
-        return None
-    plex_server = getattr(getattr(conn, "adapter", None), "_server", None)
-    if plex_server is None:
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=username,
-            step="pin_token", outcome="miss", role=role,
-            detail="no adapter._server on conn",
-        )
-        return None
-    try:
-        account = plex_server.myPlexAccount()
-        # account.users() is the home-user roster. Match by case-insensitive
-        # title (Plex Home username).
-        target_user = None
-        for u in (account.users() or []):
-            if (getattr(u, "title", "") or "").lower() == username.lower():
-                target_user = u
-                break
-        if target_user is None:
-            log.info(
-                "playlist_copy: no matching home-user object for %r on "
-                "server %r; PIN-derived token unavailable.",
-                username, server_id,
-            )
-            _audit.log_auth_chain_step(
-                server_id=server_id, user_id=username,
-                step="pin_token", outcome="miss", role=role,
-                detail="no matching home-user object",
-            )
-            return None
-        switch_method = (
-            getattr(account, "signInHomeUser", None)
-            or getattr(account, "switchHomeUser", None)
-        )
-        if switch_method is None:
-            log.warning(
-                "playlist_copy: plexapi build does not expose a home-user "
-                "sign-in helper; PIN-derived token unavailable.",
-            )
-            _audit.log_auth_chain_step(
-                server_id=server_id, user_id=username,
-                step="pin_token", outcome="miss", role=role,
-                detail="plexapi exposes no signInHomeUser/switchHomeUser",
-            )
-            return None
-        try:
-            impersonated = switch_method(target_user, pin=stored_pin)
-        except TypeError:
-            # Positional pin signature on older plexapi builds.
-            impersonated = switch_method(target_user, stored_pin)
-        user_token = (
-            getattr(impersonated, "authToken", None)
-            or getattr(impersonated, "_token", None)
-        )
-        if not user_token:
-            log.warning(
-                "playlist_copy: PIN-authenticated account for %r exposed "
-                "no token; falling back.", username,
-            )
-            _audit.log_auth_chain_step(
-                server_id=server_id, user_id=username,
-                step="pin_token", outcome="miss", role=role,
-                detail="signInHomeUser returned no token",
-            )
-            return None
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=username,
-            step="pin_token", outcome="hit", role=role,
-        )
-        return str(user_token)
-    except Exception as exc:
-        log.exception(
-            "playlist_copy: PIN-based home-user sign-in failed for "
-            "(%s, %s); falling back to admin auth.",
-            server_id, username,
-        )
-        _audit.log_auth_chain_step(
-            server_id=server_id, user_id=username,
-            step="pin_token", outcome="miss", role=role,
-            detail=f"signInHomeUser raised: {type(exc).__name__}",
-        )
-        return None
-
-
-def _identity_kit(
-    server_id: str, user_spec: UserSpec, ctx: Optional["UserContext"] = None,
-) -> Dict[str, Any]:
-    """Resolve the identity / auth metadata that gets tagged onto each
-    playlist_cache row. Returns ``{app_user_uuid, auth_kind, role_flags}``.
-
-    2026-05-16 (end user request): the cache schema now carries these
-    columns so cache hits are robust against backend_user_id-vs-username
-    drift in ``user_id`` (the prior cache key). Callers pass the result
-    through to ``upsert_playlist`` / ``record_refresh``.
-
-    Fields:
-      * ``app_user_uuid`` — canonical handle from managed_users. ``None``
-        when the user has no managed_users row yet (live-only cold-start);
-        cache rows still get written, just without the uuid tag.
-      * ``auth_kind`` — ``'admin'`` when the orchestrator used the admin
-        / owner token (default + per_user_token fallback path), or
-        ``'per_user'`` when a Plex Home per-user token was used. ``None``
-        when no ctx was passed.
-      * ``role_flags`` — bitmask. bit 0 = is_admin, bit 1 = is_owner.
-        Captures J/E's dual-flag case where one user can be both.
-    """
-    from server import media_db
-    app_uuid: Optional[str] = None
-    try:
-        app_uuid = media_db.get_managed_user_app_uuid(
-            server_id, user_spec.username,
-        )
-    except Exception:
-        log.exception(
-            "playlist_copy._identity_kit: app_user_uuid lookup failed "
-            "for (%s, %s); cache row will be untagged.",
-            server_id, user_spec.username,
-        )
-    auth_kind: Optional[str] = None
-    if ctx is not None:
-        auth_kind = "admin" if ctx.is_admin else "per_user"
-    role_flags = 0
-    if bool(getattr(user_spec, "is_admin", False)):
-        role_flags |= 1
-    if (getattr(user_spec, "role", "") or "").lower() == "owner":
-        role_flags |= 2
-    return {
-        "app_user_uuid": app_uuid,
-        "auth_kind": auth_kind,
-        "role_flags": role_flags,
-    }
-
-
-def _managed_users_row(
-    server_id: str, needle: str,
-) -> Optional[Dict[str, Any]]:
-    """Resolve a managed_users row by a flexible ``needle`` (any of
-    ``app_user_uuid`` / ``backend_user_id`` / case-insensitive
-    ``username``).
-
-    Returns the raw row dict so callers can use whatever fields they
-    need: :func:`_managed_users_lookup` extracts a ``UserSpec``;
-    :func:`_resolve_app_user_uuid_for_lookup` pulls just the uuid for
-    cache key resolution.
-
-    Match order:
-      1. app_user_uuid exact (canonical, post-v12 stable identifier)
-      2. backend_user_id exact
-      3. case-insensitive username
-    """
-    from server import media_db
-    if not server_id or not needle:
-        return None
-    try:
-        rows = media_db.list_managed_users(
-            server_id, include_hidden=False,
-        ) or []
-    except Exception:
-        log.exception(
-            "playlist_copy._managed_users_row: list_managed_users "
-            "failed for server %r.",
-            server_id,
-        )
-        return None
-    n = needle.lower()
-    for r in rows:
-        if (r.get("app_user_uuid") or "") == needle:
-            return r
-    for r in rows:
-        if (r.get("backend_user_id") or "") == needle:
-            return r
-    for r in rows:
-        if (r.get("username") or "").lower() == n:
-            return r
-    return None
-
-
-def _managed_users_lookup(
-    server_id: str, needle: str,
-) -> Optional[UserSpec]:
-    """Resolve a user from the local ``managed_users`` table without
-    touching the live Plex / Jellyfin / Emby API.
-
-    2026-05-16 (end user request): the prior _find_user always called
-    ``adapter.list_users()`` live and matched on its result, which was
-    brittle when the owner's myPlexAccount lookup failed, Plex.tv was
-    rate-limiting, or the live ID-mapping had drifted. We already have
-    everything we need in managed_users; for user IDENTIFICATION trust
-    the local cache. Live calls only need to happen for the actual
-    playlist data fetch.
-
-    Returns a synthesized ``UserSpec`` when a row is found; ``None``
-    when no row matches (caller falls back to the live adapter)."""
-    chosen = _managed_users_row(server_id, needle)
-    if chosen is None:
-        return None
-    kind = (chosen.get("kind") or "managed").lower()
-    is_admin = kind == "owner"
-    return UserSpec(
-        backend_user_id=chosen.get("backend_user_id") or "",
-        username=chosen.get("username") or "",
-        display_name=chosen.get("display_name") or chosen.get("username") or "",
-        role="owner" if is_admin else "managed",
-        is_admin=is_admin,
-    )
-
-
-def _resolve_app_user_uuid_for_lookup(
-    server_id: str, user_id: str,
-) -> Optional[str]:
-    """Get the canonical ``app_user_uuid`` for a (server_id, user_id)
-    pair where ``user_id`` may be the canonical uuid itself, a
-    backend_user_id, or a username. Used by cache READ paths to look
-    up rows by uuid even when the caller passed a legacy identifier."""
-    row = _managed_users_row(server_id, user_id)
-    if row is None:
-        return None
-    return row.get("app_user_uuid")
-
-
-def _find_user(
-    adapter: MediaServerAdapter,
-    user_id: str,
-    *,
-    on_missing: type,
-    this_server_id: Optional[str] = None,
-    peer_server_id: Optional[str] = None,
-) -> UserSpec:
-    """Lookup a UserSpec.
-
-    Resolution order:
-
-      0. Local ``managed_users`` cache (when ``this_server_id`` is set).
-         Trusts the DB as the source of truth for user identification;
-         avoids brittle live ``adapter.list_users()`` calls. See
-         :func:`_managed_users_lookup` for the rationale.
-      1. Live adapter ``list_users()`` exact ``backend_user_id`` match.
-      2. Live adapter case-insensitive ``username`` match (legacy).
-      3. USER-MGMT-IDENTITY-AUDIT R-4: user_identity_map walk. When
-         ``this_server_id`` and ``peer_server_id`` are both provided,
-         interpret ``user_id`` as a handle on the PEER server and
-         look it up in identity_map; if a row links to a handle on
-         ``this_server_id``, retry the direct match using the
-         resolved handle.
-
-    Raises ``on_missing`` if every step fails.
-    """
-    needle = (user_id or "").strip()
-    if not needle:
-        raise on_missing("user_id is required")
-    # Step 0: local DB. Cheap, robust, and the end user's source of
-    # truth for who exists. Live adapter fallback below covers the
-    # legacy case where managed_users has not been populated yet
-    # (the route-level cold-start sync handles initial seeding).
-    if this_server_id:
-        cached = _managed_users_lookup(this_server_id, needle)
-        if cached is not None:
-            return cached
-    users = adapter.list_users() or []
-    for u in users:
-        if (u.backend_user_id or "") == needle:
-            return u
-    # Fallback: case-insensitive username match.
-    for u in users:
-        if (u.username or "").lower() == needle.lower():
-            return u
-    # USER-MGMT-IDENTITY-AUDIT R-4: walk identity_map for a peer-
-    # server -> this-server link when both server ids are known.
-    if this_server_id and peer_server_id:
-        try:
-            from server.media_db import get_identity_maps_for_user
-            for link in get_identity_maps_for_user(
-                peer_server_id, needle,
-            ) or []:
-                if link.get("other_server_id") != this_server_id:
-                    continue
-                resolved = (link.get("other_user_handle") or "").strip()
-                if not resolved:
-                    continue
-                for u in users:
-                    if (u.username or "").lower() == resolved.lower():
-                        return u
-        except Exception:  # pragma: no cover (defensive)
-            pass
-    raise on_missing(f"user {user_id!r} not found on destination server")
-
-
-# ── Public read API ─────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class _ListResult:
-    playlists: List[Dict[str, Any]]
-    from_cache: bool
-    fetched_at: float
-
-
-def list_user_playlists(
-    *,
-    server_id: str,
-    user_id: str,
-    force_refresh: bool = False,
-) -> _ListResult:
-    """List a user's playlists. Reads from cache when fresh enough
-    (``playlist_cache_refresh_interval_seconds`` tunable) unless the
-    caller forces a refresh. Cache failures fall through to live."""
-    if not server_id or not user_id:
-        return _ListResult(playlists=[], from_cache=False, fetched_at=time.time())
-
-    cache_on = playlist_cache_enabled()
-    if cache_on and not force_refresh:
-        try:
-            interval = playlist_cache_refresh_interval_seconds()
-            # Resolve the canonical app_user_uuid early so the cache
-            # lookup matches by uuid even when ``user_id`` here is an
-            # alias (backend_user_id vs username) that doesn't agree
-            # with what the bulk refresh stored. Falls back to the
-            # legacy user_id key when no uuid resolves.
-            app_uuid = _resolve_app_user_uuid_for_lookup(server_id, user_id)
-            marker = playlist_cache_db.get_refresh_marker(
-                server_id, user_id, app_user_uuid=app_uuid,
-            )
-            if marker and not marker.get("error"):
-                age = time.time() - float(marker["last_refreshed_at"])
-                if age <= float(interval):
-                    rows = playlist_cache_db.list_cached_playlists(
-                        server_id, user_id, app_user_uuid=app_uuid,
-                    )
-                    return _ListResult(
-                        playlists=rows,
-                        from_cache=True,
-                        fetched_at=float(marker["last_refreshed_at"]),
-                    )
-        except Exception:
-            log.exception(
-                "list_user_playlists cache read failed for (%s,%s); "
-                "falling through to live.",
-                server_id, user_id,
-            )
-
-    # Live fetch + cache write.
-    return _live_list_and_cache(server_id, user_id)
-
-
-def _live_list_and_cache(server_id: str, user_id: str) -> _ListResult:
-    """Connect to ``server_id``, list playlists for ``user_id`` via
-    the adapter, write the rosters to cache, return the result."""
-    start = time.perf_counter()
-    try:
-        conn = _connect(server_id, on_fail=SourceUnreachable)
-    except PlaylistCopyError as exc:
-        # Connection failed before we could resolve a user_spec. Try a
-        # best-effort uuid lookup so the error marker still carries the
-        # canonical identity tag; falls back to untagged when no row.
-        early_uuid = _resolve_app_user_uuid_for_lookup(server_id, user_id)
-        try:
-            playlist_cache_db.record_refresh(
-                server_id=server_id, user_id=user_id,
-                last_refresh_ms=int((time.perf_counter() - start) * 1000),
-                error=str(exc),
-                app_user_uuid=early_uuid,
-            )
-        except Exception:
-            pass
-        raise
-    adapter = conn.adapter
-    user_spec = _find_user(
-        adapter, user_id, on_missing=DestUserNotFound,
-        this_server_id=server_id,
-    )
-    # 2026-05-17 bug fix (operator report — combined auth chain
-    # appeared to have no effect): pass server_id through so the
-    # per-user auth chain inside _user_context_for activates. The
-    # prior bare call defaulted server_id=None which skipped the
-    # saved-token + PIN-sign-in steps entirely and silently fell
-    # back to admin auth (returning the admin's view, filtered to 0
-    # rows for managed users).
-    ctx = _user_context_for(conn, user_spec, server_id=server_id)
-    # Identity / auth tags written onto every cache row this call
-    # produces. Resolved once here so all per-playlist + the refresh
-    # marker stay in sync (the canonical uuid + auth kind + role flags
-    # let cache reads match by app_user_uuid regardless of which legacy
-    # user_id alias the caller passed in).
-    kit = _identity_kit(server_id, user_spec, ctx)
-    try:
-        specs: List[AdapterPlaylistSpec] = list(adapter.list_playlists(ctx) or [])
-    except Exception as exc:
-        try:
-            playlist_cache_db.record_refresh(
-                server_id=server_id, user_id=user_id,
-                last_refresh_ms=int((time.perf_counter() - start) * 1000),
-                error=f"list_playlists failed: {exc}",
-                **kit,
-            )
-        except Exception:
-            pass
-        raise SourceUnreachable(f"list_playlists failed: {exc}") from exc
-
-    out_rows: List[Dict[str, Any]] = []
-    cache_uid = user_spec.backend_user_id or user_id
-    cache_enabled = playlist_cache_enabled()
-    # 2026-05-17 (operator bug report — cross-user contamination):
-    # wipe every existing row for this user before writing the fresh
-    # set. Per-playlist upsert only overwrites matching playlist_ids,
-    # so without this delete, stale rows from a prior (incorrectly-
-    # tagged) refresh would survive forever. Matches both the legacy
-    # user_id key + the canonical app_user_uuid key so pre- and post-
-    # schema-v2 rows are both cleared.
-    if cache_enabled:
-        try:
-            playlist_cache_db.clear_user_cache(
-                server_id=server_id,
-                user_id=cache_uid,
-                app_user_uuid=kit.get("app_user_uuid"),
-            )
-        except Exception:
-            log.exception(
-                "playlist_cache clear_user_cache failed for (%s,%s); "
-                "stale rows may survive into the next read.",
-                server_id, cache_uid,
-            )
-    for spec in specs:
-        # Cache write per playlist; surface as the end user-facing
-        # row regardless of cache outcome.
-        items_for_cache = [
-            {
-                "title": ref.title,
-                "guids": list(ref.guids),
-                "type": "",
-            }
-            for ref in (spec.items or ())
-        ]
-        if cache_enabled:
-            try:
-                playlist_cache_db.upsert_playlist(
-                    server_id=server_id,
-                    user_id=cache_uid,
-                    playlist_id=spec.playlist_id,
-                    name=spec.name,
-                    is_smart=bool(spec.is_smart),
-                    items=items_for_cache,
-                    **kit,
-                )
-            except Exception:
-                log.exception(
-                    "playlist_cache upsert failed for (%s,%s,%s); continuing.",
-                    server_id, cache_uid, spec.playlist_id,
-                )
-        out_rows.append({
-            "playlist_id": spec.playlist_id,
-            "name": spec.name,
-            "is_smart": bool(spec.is_smart),
-            "item_count": len(spec.items or ()),
-            "fetched_at": time.time(),
-        })
-
-    refreshed_at = time.time()
-    if cache_enabled:
-        try:
-            playlist_cache_db.record_refresh(
-                server_id=server_id, user_id=cache_uid,
-                last_refreshed_at=refreshed_at,
-                last_refresh_ms=int((time.perf_counter() - start) * 1000),
-                error=None,
-                **kit,
-            )
-        except Exception:
-            log.exception(
-                "playlist_cache refresh marker write failed for (%s,%s); continuing.",
-                server_id, cache_uid,
-            )
-    return _ListResult(playlists=out_rows, from_cache=False, fetched_at=refreshed_at)
-
-
-def get_playlist_detail(
-    *,
-    server_id: str,
-    user_id: str,
-    playlist_id: str,
-    force_refresh: bool = False,
-) -> Dict[str, Any]:
-    """Return one playlist's items. Cache-aware in the same way as
-    :func:`list_user_playlists`. Returns a dict shape that maps
-    directly onto :class:`server.models.PlaylistDetail`."""
-    if not server_id or not user_id or not playlist_id:
-        raise PlaylistNotFound("server_id, user_id, playlist_id are all required")
-
-    cache_on = playlist_cache_enabled()
-    if cache_on and not force_refresh:
-        try:
-            interval = playlist_cache_refresh_interval_seconds()
-            app_uuid = _resolve_app_user_uuid_for_lookup(server_id, user_id)
-            marker = playlist_cache_db.get_refresh_marker(
-                server_id, user_id, app_user_uuid=app_uuid,
-            )
-            cached = playlist_cache_db.get_cached_playlist_items(
-                server_id, user_id, playlist_id,
-            )
-            if cached and marker and not marker.get("error"):
-                age = time.time() - float(marker["last_refreshed_at"])
-                if age <= float(interval):
-                    return {
-                        "playlist_id": playlist_id,
-                        "name": cached["name"],
-                        "is_smart": cached["is_smart"],
-                        "items": cached["items"],
-                        "fetched_at": float(cached["fetched_at"]),
-                        "from_cache": True,
-                    }
-        except Exception:
-            log.exception(
-                "get_playlist_detail cache read failed for (%s,%s,%s); "
-                "falling through to live.",
-                server_id, user_id, playlist_id,
-            )
-
-    # Live fetch.
-    conn = _connect(server_id, on_fail=SourceUnreachable)
-    adapter = conn.adapter
-    user_spec = _find_user(
-        adapter, user_id, on_missing=DestUserNotFound,
-        this_server_id=server_id,
-    )
-    # Pass server_id so the per-user auth chain (saved token → PIN
-    # sign-in → admin fallback) activates; without it the call
-    # short-circuits to admin auth.
-    ctx = _user_context_for(conn, user_spec, server_id=server_id)
-    cache_uid = user_spec.backend_user_id or user_id
-    kit = _identity_kit(server_id, user_spec, ctx)
-
-    # Resolve the playlist's name / is_smart flag via list_playlists
-    # (single source of truth on the adapter); items via the dedicated
-    # get_playlist_items helper.
-    name = ""
-    is_smart = False
-    try:
-        specs = list(adapter.list_playlists(ctx) or [])
-        match = next((s for s in specs if s.playlist_id == playlist_id), None)
-    except Exception as exc:
-        raise SourceUnreachable(f"list_playlists failed: {exc}") from exc
-    if match is None:
-        raise PlaylistNotFound(
-            f"playlist {playlist_id!r} not found for user {user_id!r}"
-        )
-    name = match.name
-    is_smart = bool(match.is_smart)
-
-    try:
-        items_tuple: Tuple[ItemRef, ...] = adapter.get_playlist_items(
-            playlist_id, user_context=ctx,
-        )
-    except Exception as exc:
-        raise SourceUnreachable(f"get_playlist_items failed: {exc}") from exc
-
-    items_out = [
-        {
-            "title": ref.title,
-            "guids": list(ref.guids),
-            "type": "",
-            "duration_ms": None,
-        }
-        for ref in (items_tuple or ())
-    ]
-
-    # Cache-write side effect.
-    if playlist_cache_enabled():
-        try:
-            playlist_cache_db.upsert_playlist(
-                server_id=server_id,
-                user_id=cache_uid,
-                playlist_id=playlist_id,
-                name=name,
-                is_smart=is_smart,
-                items=items_out,
-                **kit,
-            )
-        except Exception:
-            log.exception("playlist_cache upsert failed; continuing.")
-
-    return {
-        "playlist_id": playlist_id,
-        "name": name,
-        "is_smart": is_smart,
-        "items": items_out,
-        "fetched_at": time.time(),
-        "from_cache": False,
-    }
-
-
-# ── Public refresh API ──────────────────────────────────────────────────────
-
-
-def refresh_user_cache(
-    *,
-    server_id: str,
-    user_id: str,
-) -> Dict[str, Any]:
-    """Force a live re-fetch + cache rewrite for one user. Returns a
-    dict shape matching :class:`server.models.PlaylistCacheRefreshResult`."""
-    from services import playlist_cache_log
-    start = time.perf_counter()
-    try:
-        result = _live_list_and_cache(server_id, user_id)
-    except PlaylistCopyError as exc:
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        playlist_cache_log.log_user_refresh(
-            server_id=server_id, user_id=user_id, ok=False,
-            elapsed_ms=elapsed_ms, error=f"{exc.code}: {exc}",
-        )
-        return {
-            "server_id": server_id,
-            "user_id": user_id,
-            "refreshed_at": time.time(),
-            "playlists_count": 0,
-            "items_count": 0,
-            "duration_ms": elapsed_ms,
-            "error": f"{exc.code}: {exc}",
-        }
-    items_count = sum(int(r.get("item_count") or 0) for r in result.playlists)
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
-    playlist_cache_log.log_user_refresh(
-        server_id=server_id, user_id=user_id, ok=True,
-        elapsed_ms=elapsed_ms,
-        playlists=len(result.playlists), items=items_count,
-    )
-    return {
-        "server_id": server_id,
-        "user_id": user_id,
-        "refreshed_at": result.fetched_at,
-        "playlists_count": len(result.playlists),
-        "items_count": items_count,
-        "duration_ms": elapsed_ms,
-        "error": None,
-    }
-
-
-def refresh_server_cache(
-    *,
-    server_id: str,
-    source: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Force-refresh every user on ``server_id``. Returns a list of
-    :class:`PlaylistCacheRefreshResult`-shaped dicts (one per user)
-    plus a final aggregate row with ``user_id=None``.
-
-    ``source`` is an optional free-form tag for the audit log (e.g.
-    ``"servers-refresh"`` or ``"playlist-mgmt-panel"``) so the end user
-    can tell which UI surface triggered each entry."""
-    from services import playlist_cache_log
-    try:
-        conn = _connect(server_id, on_fail=SourceUnreachable)
-    except PlaylistCopyError as exc:
-        playlist_cache_log.log_bulk_refresh_end(
-            server_id=server_id, ok=0, errors=1, elapsed_s=0.0, source=source,
-        )
-        return [{
-            "server_id": server_id, "user_id": None,
-            "refreshed_at": time.time(),
-            "playlists_count": 0, "items_count": 0, "duration_ms": 0,
-            "error": f"{exc.code}: {exc}",
-        }]
-    try:
-        users = conn.adapter.list_users() or []
-    except Exception as exc:
-        playlist_cache_log.log_bulk_refresh_end(
-            server_id=server_id, ok=0, errors=1, elapsed_s=0.0, source=source,
-        )
-        return [{
-            "server_id": server_id, "user_id": None,
-            "refreshed_at": time.time(),
-            "playlists_count": 0, "items_count": 0, "duration_ms": 0,
-            "error": f"list_users failed: {exc}",
-        }]
-
-    playlist_cache_log.log_bulk_refresh_start(
-        server_id=server_id, user_count=len(users), source=source,
-    )
-    out: List[Dict[str, Any]] = []
-    total_playlists = 0
-    total_items = 0
-    error_count = 0
-    aggregate_start = time.perf_counter()
-    for user in users:
-        uid = user.backend_user_id or user.username
-        if not uid:
-            continue
-        row = refresh_user_cache(server_id=server_id, user_id=uid)
-        out.append(row)
-        total_playlists += int(row.get("playlists_count") or 0)
-        total_items += int(row.get("items_count") or 0)
-        if row.get("error"):
-            error_count += 1
-    elapsed_s = time.perf_counter() - aggregate_start
-    playlist_cache_log.log_bulk_refresh_end(
-        server_id=server_id,
-        ok=len(out) - error_count,
-        errors=error_count,
-        elapsed_s=elapsed_s,
-        source=source,
-    )
-    out.append({
-        "server_id": server_id, "user_id": None,
-        "refreshed_at": time.time(),
-        "playlists_count": total_playlists,
-        "items_count": total_items,
-        "duration_ms": int(elapsed_s * 1000),
-        "error": None,
-    })
-    return out
+# ── Re-exported from services.playlist_cache_api ─────────────────────────────
+# The cache-aware list / detail / refresh surface (plus the snapshot-path
+# freshness check) moved to its own module. Re-exported so external callers
+# (server/app.py, services/sync_worker.py,
+# services/playlist_cache_refresher.py) are unaffected.
+from services.playlist_cache_api import (
+    _ListResult,  # noqa: F401
+    _live_list_and_cache,  # noqa: F401
+    get_playlist_detail,
+    list_user_playlists,
+    refresh_server_cache,
+    refresh_user_cache,
+    snapshot_should_use_cache,  # noqa: F401
+)
 
 
 # ── Public copy API ────────────────────────────────────────────────────────
@@ -1156,6 +185,10 @@ def copy_playlist(
     dest_user_id: str,
     dest_playlist_name: Optional[str] = None,
     progress_cb: Optional[Any] = None,
+    cancel_event: Optional[threading.Event] = None,
+    on_existing: str = "create",
+    materialize_smart_as_static: bool = False,
+    logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """Copy one playlist from source -> destination.
 
@@ -1177,8 +210,25 @@ def copy_playlist(
     the same per-phase progress it shows for snapshot/restore/direct.
     Any callback exception is caught + swallowed so the copy itself
     never fails on observer plumbing.
+
+    ``logger`` overrides the module-level logger for this call.
+    Manual / operator-initiated copies (Playlist Management,
+    restore-mode playlists) leave this None so log records
+    propagate to ``plexmigrate`` and land in the active job's
+    runtime.log. The sync engine passes
+    :func:`services.sync_log.get_sync_logger` so its activity is
+    written to sync.log instead, never bleeding into a running
+    job's runtime.log.
     """
     started = time.perf_counter()
+    # ``log`` is the module-level logger; rebind it locally so the
+    # body uses the caller-supplied logger when provided. Existing
+    # code inside the function references ``log`` heavily; this is
+    # the smallest-touch way to honour the logger override without
+    # rewriting every call site below.
+    log = logger if logger is not None else logging.getLogger(
+        "plexmigrate.services.playlist_copy"
+    )
 
     def _emit(event: str, **fields: Any) -> None:
         if progress_cb is None:
@@ -1188,7 +238,19 @@ def copy_playlist(
         except Exception:
             log.exception("copy_playlist progress_cb raised on event %r", event)
 
+    def _check_cancel(phase: str) -> None:
+        """Cancellation checkpoint. cancel_event is set externally
+        (per-item Cancel button OR whole-batch Stop). Checked at phase
+        boundaries so an in-flight HTTP call isn't interrupted
+        mid-flight but no new work starts after the operator clicks
+        Cancel."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise PlaylistCopyCancelled(
+                f"Copy cancelled at phase {phase!r} by operator request."
+            )
+
     _emit("started")
+    _check_cancel("start")
 
     # 1. Connect both ends.
     src_conn = _connect(source_server_id, on_fail=SourceUnreachable)
@@ -1216,7 +278,7 @@ def copy_playlist(
         peer_server_id=source_server_id,
     )
 
-    # 2026-05-17 (operator request): same-user no-op short-circuit.
+    # Same-user no-op short-circuit.
     # When the resolved source + destination are the same (server,
     # user) pair, the copy would either no-op or silently produce a
     # duplicate-named playlist under the same account. Skip by default;
@@ -1259,42 +321,78 @@ def copy_playlist(
 
     src_ctx = _user_context_for(
         src_conn, src_user, role="source", server_id=source_server_id,
+        progress_cb=progress_cb,
     )
     dst_ctx = _user_context_for(
         dst_conn, dst_user, role="dest", server_id=dest_server_id,
+        progress_cb=progress_cb,
     )
     _emit(
         "users-resolved",
         source_username=src_user.username,
         dest_username=dst_user.username,
     )
+    _check_cancel("after_users_resolved")
 
     # 3. Read the source playlist's name + smart flag + items.
-    try:
-        src_specs = list(src_adapter.list_playlists(src_ctx) or [])
-    except Exception as exc:
-        raise SourceUnreachable(f"source list_playlists failed: {exc}") from exc
-    src_spec = next(
-        (s for s in src_specs if s.playlist_id == source_playlist_id),
-        None,
-    )
+    #
+    # The ``get_playlist`` adapter method fetches ONE playlist in a
+    # single round-trip and returns name + is_smart + items together.
+    # Preferred over the ``list_playlists`` + ``get_playlist_items``
+    # path, which eagerly fetches items for EVERY playlist the user
+    # has (hundreds of round-trips). Falls back to that slow two-walk
+    # path on adapters that don't implement ``get_playlist``.
+    src_spec: Optional[AdapterPlaylistSpec] = None
+    _get_playlist = getattr(src_adapter, "get_playlist", None)
+    if callable(_get_playlist):
+        try:
+            src_spec = _get_playlist(source_playlist_id, user_context=src_ctx)
+        except Exception as exc:
+            raise SourceUnreachable(
+                f"source get_playlist failed: {exc}"
+            ) from exc
+    if src_spec is None:
+        # Fallback: backends that haven't implemented get_playlist.
+        try:
+            src_specs = list(src_adapter.list_playlists(src_ctx) or [])
+        except Exception as exc:
+            raise SourceUnreachable(
+                f"source list_playlists failed: {exc}"
+            ) from exc
+        src_spec = next(
+            (s for s in src_specs if s.playlist_id == source_playlist_id),
+            None,
+        )
     if src_spec is None:
         raise PlaylistNotFound(
             f"playlist {source_playlist_id!r} not found for user "
             f"{source_user_id!r} on source server"
         )
-    if src_spec.is_smart:
+    if src_spec.is_smart and not materialize_smart_as_static:
         raise SmartPlaylistNotPortable(
             f"playlist {src_spec.name!r} is smart; criteria do not port "
             f"across backends"
         )
+    # When the caller asked to
+    # materialize a smart playlist as static (the destination is
+    # Jellyfin / Emby, which have no smart-playlist concept), fall
+    # through. ``src_spec.items`` is empty for a smart playlist, so
+    # the item block below fetches the current resolved members via
+    # ``get_playlist_items`` - a point-in-time static snapshot.
 
-    try:
-        src_items: Tuple[ItemRef, ...] = src_adapter.get_playlist_items(
-            source_playlist_id, user_context=src_ctx,
-        )
-    except Exception as exc:
-        raise SourceUnreachable(f"source get_playlist_items failed: {exc}") from exc
+    # Items: prefer the ones the get_playlist call already returned;
+    # otherwise fetch them now (fallback path only).
+    if src_spec.items:
+        src_items: Tuple[ItemRef, ...] = tuple(src_spec.items)
+    else:
+        try:
+            src_items = src_adapter.get_playlist_items(
+                source_playlist_id, user_context=src_ctx,
+            )
+        except Exception as exc:
+            raise SourceUnreachable(
+                f"source get_playlist_items failed: {exc}"
+            ) from exc
     _emit(
         "source-loaded",
         playlist_name=src_spec.name,
@@ -1304,7 +402,7 @@ def copy_playlist(
 
     # 4. Resolve each source item to a destination backend_item_id.
     #
-    # Resolution chain (2026-05-17 multi-tier):
+    # Resolution chain (multi-tier):
     #   1. Same-server passthrough — when src_server == dst_server, the
     #      source's ratingKey IS the dest's ratingKey. No live API call.
     #   2. GUID match — try every GUID the source carries against the
@@ -1326,87 +424,149 @@ def copy_playlist(
     )
     resolved_refs: List[ItemRef] = []
     skipped_no_match = 0
+    # CONSOLE-05: items whose resolution raised an exception and stayed
+    # unresolved - a real failure, distinct from a clean no-match skip.
+    resolve_failed = 0
     errors: List[str] = []
+    # CONSOLE-07: a non-owner destination context that fell back to the
+    # admin token writes the playlist under the OWNER, not the requested
+    # user. Surface that in the result so callers / UI do not report a
+    # clean success for a misdirected copy.
+    if dst_ctx.admin_fallback:
+        errors.append(
+            f"Destination user {dst_ctx.username!r}: per-user "
+            f"credentials unavailable - copied under the server "
+            f"owner's admin token, so the playlist lands under the "
+            f"OWNER, not {dst_ctx.username!r}."
+        )
     total_items = len(src_items)
-    # Emit a "resolving" progress event every PROGRESS_STEP items so
-    # the dashboard counter ticks without overwhelming the WS payload.
-    # 1 keeps small playlists (a few items) responsive; for large
-    # cross-server runs the per-item live calls dominate latency
-    # anyway, so emitting per-item is fine.
     PROGRESS_STEP = max(1, total_items // 50) if total_items > 0 else 1
-    items_processed = 0
-    for ref in src_items:
-        items_processed += 1
-        # Method 1: same-server passthrough.
-        if same_server:
-            if not ref.backend_item_id:
-                skipped_no_match += 1
-            else:
-                resolved_refs.append(ItemRef(
-                    backend_item_id=ref.backend_item_id,
-                    guids=tuple(ref.guids or ()),
-                    title=ref.title,
-                    file_path=ref.file_path,
-                ))
-            if items_processed % PROGRESS_STEP == 0:
-                _emit(
-                    "resolving",
-                    completed=items_processed,
-                    total=total_items,
-                    resolved=len(resolved_refs),
-                    skipped=skipped_no_match,
-                )
-            continue
-        # Cross-server: layered resolution. Track which methods were
-        # actually attempted (not just which were available) so the
-        # per-item miss message can list them honestly.
-        methods_tried: List[str] = []
-        dest_id: Optional[str] = None
-        guids = tuple(ref.guids or ())
-        # Method 2: GUID resolution.
-        if guids:
-            methods_tried.append("GUID")
+
+    # Each item's tier walk (GUID -> full-path -> path-tail -> fuzzy)
+    # is independent once the dest adapter's path-tail index is built.
+    # Run them through a ThreadPoolExecutor to overlap the Plex
+    # round-trips. Input order is preserved by
+    # writing to a pre-sized slot list, then concatenating the
+    # per-item ItemRef sub-lists at the end.
+    parallelism = max(1, int(playlist_mgmt_item_resolve_workers()))
+    if total_items < 2:
+        parallelism = 1
+
+    # Per-slot output: each input item produces 0 (miss) or 1+ refs
+    # (1 for unique match, N when fuzzy 'all' policy expanded).
+    slot_refs: List[List[ItemRef]] = [list() for _ in range(total_items)]
+    counters_lock = threading.Lock()
+    progress_state = {"completed": 0, "resolved": 0, "skipped": 0}
+
+    def _resolve_one(idx: int, ref: ItemRef) -> None:
+        """Per-item resolution worker. Delegates the tier walk to
+        :func:`resolve_item_to_dest` and applies the neutral result
+        to the shared slot list + thread-safe counters."""
+        # CONSOLE-04: per-item silent drop when the cancel event
+        # fires during the resolution phase. This is asymmetric with
+        # the phase-boundary _check_cancel (which raises
+        # PlaylistCopyCancelled) - the silent drop is by design so
+        # the resolver pool drains promptly without a per-item raise.
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        result = resolve_item_to_dest(
+            dst_adapter, ref,
+            same_server=same_server,
+            fuzzy_ambiguous_behavior=playlist_mgmt_fuzzy_ambiguous_behavior(),
+            logger=log,
+        )
+        if result.errors:
+            with counters_lock:
+                errors.extend(result.errors)
+        if not result.dest_refs:
+            # Empty dest_refs -> a clean no-match miss, or a
+            # tier-raised failure. CONSOLE-05: distinguish the two
+            # in the counters so items_failed stays accurate.
+            _bump_progress(
+                failed=result.tier_raised,
+                skipped=not result.tier_raised,
+            )
+            return
+        slot_refs[idx].extend(result.dest_refs)
+        _bump_progress(resolved=True, count=len(result.dest_refs))
+        if result.tier_hit and progress_cb is not None:
             try:
-                dest_id = dst_adapter.resolve_by_guids(guids)
-            except Exception as exc:
-                errors.append(f"resolve {ref.title!r} via GUID: {exc}")
-                dest_id = None
-        # Method 3: path-tail fallback (last N components, default 3).
-        if not dest_id and ref.file_path:
-            _resolver = getattr(dst_adapter, "resolve_by_path_tail", None)
-            if callable(_resolver):
-                methods_tried.append("path-tail")
-                try:
-                    dest_id = _resolver(ref.file_path)
-                except Exception as exc:
-                    errors.append(
-                        f"resolve {ref.title!r} via path-tail: {exc}",
-                    )
-                    dest_id = None
-        if not dest_id:
-            methods_label = (
-                ", ".join(methods_tried) if methods_tried
-                else "none (item has no GUIDs or file_path)"
-            )
-            errors.append(
-                f"{ref.title!r}: no destination match — tried {methods_label}"
-            )
-            skipped_no_match += 1
-            continue
-        resolved_refs.append(ItemRef(
-            backend_item_id=dest_id,
-            guids=guids,
-            title=ref.title,
-            file_path=ref.file_path,
-        ))
-        if items_processed % PROGRESS_STEP == 0:
+                progress_cb({
+                    "event": "tier-hit",
+                    "tier": result.tier_hit,
+                    "title": ref.title,
+                    "expanded": (
+                        len(result.dest_refs)
+                        if len(result.dest_refs) > 1 else 1
+                    ),
+                })
+            except Exception:
+                log.exception("tier-hit progress emit failed")
+
+    def _bump_progress(
+        *,
+        resolved: bool = False,
+        skipped: bool = False,
+        failed: bool = False,
+        count: int = 1,
+    ) -> None:
+        """Thread-safe progress counter update + emit on
+        PROGRESS_STEP boundaries. Called by each _resolve_one
+        worker as items finish."""
+        nonlocal skipped_no_match, resolve_failed
+        with counters_lock:
+            progress_state["completed"] += 1
+            if resolved:
+                progress_state["resolved"] += count
+            if skipped:
+                progress_state["skipped"] += 1
+                skipped_no_match += 1
+            if failed:
+                # CONSOLE-05: shown in the progress bar's skipped total
+                # (the item did not resolve) but tracked separately so
+                # the result dict's items_failed is accurate.
+                progress_state["skipped"] += 1
+                resolve_failed += 1
+            completed = progress_state["completed"]
+            resolved_total = progress_state["resolved"]
+            skipped_total = progress_state["skipped"]
+        if completed % PROGRESS_STEP == 0 or completed == total_items:
             _emit(
                 "resolving",
-                completed=items_processed,
+                completed=completed,
                 total=total_items,
-                resolved=len(resolved_refs),
-                skipped=skipped_no_match,
+                resolved=resolved_total,
+                skipped=skipped_total,
             )
+
+    if parallelism == 1 or total_items <= 1:
+        for idx, ref in enumerate(src_items):
+            _resolve_one(idx, ref)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=parallelism,
+            thread_name_prefix="pl-resolve",
+        ) as pool:
+            futures = [
+                pool.submit(_resolve_one, idx, ref)
+                for idx, ref in enumerate(src_items)
+            ]
+            # Drain futures so any exceptions surface (defensive —
+            # _resolve_one catches its own + records the error in the
+            # shared errors list, so this should be quick).
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    fut.result()
+                except Exception:
+                    log.exception(
+                        "pl-resolve worker raised unexpectedly; "
+                        "the item's miss should still be recorded.",
+                    )
+
+    # Flatten the pre-sized slots into the final resolved_refs list,
+    # preserving input order.
+    for slot in slot_refs:
+        resolved_refs.extend(slot)
 
     # Final post-loop tick so the dashboard sees the end state even
     # when the last item didn't land on a PROGRESS_STEP boundary.
@@ -1425,18 +585,158 @@ def copy_playlist(
             "new_playlist_id": None,
             "items_written": 0,
             "items_skipped_no_match": skipped_no_match,
-            "items_failed": 0,
+            "items_failed": resolve_failed,
             "errors": errors or [
                 "No source items resolved on the destination server (zero GUID matches)."
             ],
             "elapsed_seconds": time.perf_counter() - started,
         }
 
-    # 5. Create the destination playlist using the destination user's
-    # context so it appears under their user on the destination.
+    # 5. Land the playlist on the destination. ``on_existing`` chooses
+    # the policy when a playlist with the same name already lives on
+    # the destination under the same user:
+    #
+    #   * "create" (default) — always call create_playlist. May produce
+    #     duplicate-named playlists. Preserves historical behaviour for
+    #     the manual Playlist Management + restore paths that built
+    #     against this function before merge mode existed.
+    #   * "merge" — used by the sync engine. Looks up an existing
+    #     playlist with the same case-insensitive name, dedups
+    #     resolved_refs against its current items by backend_item_id,
+    #     and appends only the missing entries via add_to_playlist.
+    #     Returns the existing playlist_id so the caller can record
+    #     the persistent identity.
+    #   * "skip" — same lookup as merge, but on hit returns success
+    #     without touching the dest. Useful for "only fire on first
+    #     run, never replay" semantics.
     name = (dest_playlist_name or src_spec.name or "").strip()
     if not name:
         name = "Untitled"
+    on_existing_norm = (on_existing or "create").strip().lower()
+    if on_existing_norm not in ("create", "merge", "skip"):
+        on_existing_norm = "create"
+
+    existing_pl = None
+    if on_existing_norm in ("merge", "skip"):
+        try:
+            dst_playlists = dst_adapter.list_playlists(dst_ctx)
+        except Exception as exc:
+            log.warning(
+                "copy_playlist: list_playlists for %s lookup failed; "
+                "falling through to create: %s",
+                on_existing_norm, exc,
+            )
+            dst_playlists = []
+        target_lc = name.lower()
+        for pl in dst_playlists:
+            if (pl.name or "").strip().lower() == target_lc:
+                existing_pl = pl
+                break
+
+    # Last cancel-checkpoint BEFORE the destination write fires.
+    # Per Plan section 8a Q5: in-flight items mid-write don't abort
+    # (would leave partial state); they complete normally. The
+    # check here is the last chance to drop the work before any
+    # write side-effect lands.
+
+    if existing_pl is not None and on_existing_norm == "skip":
+        # Operator-requested no-op. Report success so the caller's
+        # cycle accounting marks this as resolved, not failed.
+        _emit("done", items_written=0, items_skipped_no_match=skipped_no_match)
+        return {
+            "success":                  True,
+            "new_playlist_id":          existing_pl.playlist_id or None,
+            "items_written":            0,
+            "items_already_present":    len(resolved_refs),
+            "items_skipped_no_match":   skipped_no_match,
+            "items_failed":             resolve_failed,
+            "errors":                   errors,
+            "merged_into_existing":     True,
+            "existing_playlist_name":   existing_pl.name,
+            "skipped_create":           True,
+            "elapsed_seconds":          time.perf_counter() - started,
+        }
+
+    if existing_pl is not None and on_existing_norm == "merge":
+        # Pull the existing playlist's items so we can dedup new
+        # resolved_refs against what's already on the destination.
+        # Dedup key is the destination-side backend_item_id (rating
+        # key on Plex, GUID on Jellyfin / Emby). Items in
+        # resolved_refs without a backend_item_id (resolver shouldn't
+        # produce these, but defensive) are appended unconditionally.
+        try:
+            existing_items = dst_adapter.get_playlist_items(
+                existing_pl.playlist_id, user_context=dst_ctx,
+            )
+        except Exception as exc:
+            raise DestWriteFailed(
+                f"get_playlist_items({existing_pl.playlist_id!r}) "
+                f"failed during merge: {exc}"
+            ) from exc
+        existing_keys = {
+            str(it.backend_item_id) for it in (existing_items or [])
+            if getattr(it, "backend_item_id", None)
+        }
+        new_refs: List[ItemRef] = []
+        already_present = 0
+        for r in resolved_refs:
+            key = str(getattr(r, "backend_item_id", "") or "")
+            if key and key in existing_keys:
+                already_present += 1
+                continue
+            new_refs.append(r)
+
+        if not new_refs:
+            # Source and destination already agree; nothing to write.
+            _emit(
+                "done", items_written=0,
+                items_skipped_no_match=skipped_no_match,
+            )
+            return {
+                "success":                  True,
+                "new_playlist_id":          existing_pl.playlist_id or None,
+                "items_written":            0,
+                "items_already_present":    already_present,
+                "items_skipped_no_match":   skipped_no_match,
+                "items_failed":             resolve_failed,
+                "errors":                   errors,
+                "merged_into_existing":     True,
+                "existing_playlist_name":   existing_pl.name,
+                "elapsed_seconds":          time.perf_counter() - started,
+            }
+
+        _check_cancel("before_write")
+        _emit("writing", name=name, resolved_count=len(new_refs))
+        try:
+            added = dst_adapter.add_to_playlist(
+                existing_pl.playlist_id, new_refs,
+                user_context=dst_ctx,
+            )
+        except Exception as exc:
+            raise DestWriteFailed(
+                f"add_to_playlist({existing_pl.playlist_id!r}) "
+                f"failed during merge: {exc}"
+            ) from exc
+        added_int = int(added or 0)
+        _emit(
+            "done", items_written=added_int,
+            items_skipped_no_match=skipped_no_match,
+        )
+        return {
+            "success":                  True,
+            "new_playlist_id":          existing_pl.playlist_id or None,
+            "items_written":            added_int,
+            "items_already_present":    already_present,
+            "items_skipped_no_match":   skipped_no_match,
+            "items_failed":             resolve_failed,
+            "errors":                   errors,
+            "merged_into_existing":     True,
+            "existing_playlist_name":   existing_pl.name,
+            "elapsed_seconds":          time.perf_counter() - started,
+        }
+
+    # Default path: create a fresh playlist on the destination.
+    _check_cancel("before_write")
     _emit("writing", name=name, resolved_count=len(resolved_refs))
     try:
         new_id = dst_adapter.create_playlist(name, resolved_refs, user_context=dst_ctx)
@@ -1450,36 +750,422 @@ def copy_playlist(
     )
 
     return {
-        "success": True,
-        "new_playlist_id": new_id or None,
-        "items_written": len(resolved_refs),
-        "items_skipped_no_match": skipped_no_match,
-        "items_failed": 0,
-        "errors": errors,
-        "elapsed_seconds": time.perf_counter() - started,
+        "success":                  True,
+        "new_playlist_id":          new_id or None,
+        "items_written":            len(resolved_refs),
+        "items_skipped_no_match":   skipped_no_match,
+        "items_failed":             resolve_failed,
+        "errors":                   errors,
+        "merged_into_existing":     False,
+        "elapsed_seconds":          time.perf_counter() - started,
     }
 
 
-# ── Cache freshness helper (for snapshot path integration) ──────────────────
+# ── Batch copy ───────────────────────────────────────────────────────────────
 
 
-def snapshot_should_use_cache(
-    server_id: str,
-    user_id: str,
-) -> bool:
-    """Return True if the snapshot path should consult the playlist
-    cache instead of hitting the live API. Reads
-    ``playlist_cache_snapshot_threshold_seconds`` and short-circuits to
-    False when the cache is disabled or the marker is stale / errored.
+def copy_playlist_batch(
+    items: List[Dict[str, Any]],
+    *,
+    parallelism: int = 8,
+    stop_event: Optional[threading.Event] = None,
+    per_item_cancel_events: Optional[Dict[int, threading.Event]] = None,
+    progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Run N playlist copies in parallel via ThreadPoolExecutor.
 
-    Lives here (not in ``playlist_cache_db``) because the threshold +
-    enabled check are tunable-side concerns, not DB-side concerns."""
-    if not playlist_cache_enabled():
-        return False
-    try:
-        threshold = playlist_cache_snapshot_threshold_seconds()
-    except Exception:
-        return False
-    return playlist_cache_db.is_fresh(
-        server_id, user_id, threshold_seconds=float(threshold),
+    Contract:
+
+    * ``items`` is a list of dicts, each carrying the kwargs that
+      :func:`copy_playlist` accepts (``source_server_id``,
+      ``source_user_id``, ``source_playlist_id``, ``dest_server_id``,
+      ``dest_user_id``, ``dest_playlist_name``).
+    * ``parallelism`` caps the worker pool size (operator-tunable;
+      caller supplies the resolved value from the per-submit override
+      or ``playlist_mgmt_batch_workers``).
+    * ``stop_event`` is the whole-batch Stop signal — when set, the
+      helper drains pending items without starting them; in-flight
+      items respect their own per-item cancel_event.
+    * ``per_item_cancel_events`` maps item INDEX (0-based) to its own
+      cancel_event. The per-item Cancel button on the active-deploys
+      panel sets the matching event; the worker for that item checks
+      it between phases (see ``copy_playlist``'s ``_check_cancel``).
+      Missing index = no cancel possible for that item (treated as
+      "not cancelled").
+    * ``progress_cb`` receives structured per-item progress events
+      decorated with the item's ``index`` so the caller can correlate
+      with the original batch positions.
+
+    Returns ``{total, succeeded, failed, skipped, cancelled,
+    elapsed_seconds, results: [...]}``. The ``results`` list is
+    1:1 with the input ``items`` and ordered by original index;
+    each entry mirrors :func:`copy_playlist`'s return shape plus
+    a per-item ``index`` field and an ``error_code`` when the item
+    failed (one of the PlaylistCopyError ``code`` values).
+
+    Per-item failures DO NOT abort the batch; the result row carries
+    the typed error code and the batch continues."""
+    started = time.perf_counter()
+    total = len(items)
+
+    if total == 0:
+        return {
+            "total": 0, "succeeded": 0, "failed": 0,
+            "skipped": 0, "cancelled": 0,
+            "elapsed_seconds": 0.0, "results": [],
+        }
+
+    # Pre-size results so per-item slots maintain input ordering
+    # regardless of which thread finishes first.
+    results: List[Optional[Dict[str, Any]]] = [None] * total
+
+    def _batch_emit(event: str, **fields: Any) -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb({"event": event, **fields})
+        except Exception:
+            log.exception(
+                "copy_playlist_batch progress_cb raised on event %r", event,
+            )
+
+    _batch_emit("batch-started", total=total, parallelism=parallelism)
+
+    def _per_item_emit_factory(
+        index: int, item_for_thread: Dict[str, Any],
+    ) -> Callable[[Dict[str, Any]], None]:
+        """Wrap the per-item progress events with the batch index so
+        the caller can correlate to the original input slot. Also
+        updates the dashboard's per-thread CurrentItem phase as the
+        inner copy progresses, so the Currently Processing panel
+        shows live phase transitions."""
+        # Map copy_playlist event names to a short phase label for
+        # the dashboard's CurrentItem row.
+        _PHASE_FOR_EVENT = {
+            "started": "starting",
+            "auth-chain": "authenticating",
+            "users-resolved": "resolving users",
+            "source-loaded": "reading source",
+            "resolving": "resolving items",
+            "writing": "writing to destination",
+            "done": "done",
+        }
+        # Stash details for the dashboard CurrentItem row.
+        _src_sid = str(item_for_thread.get("source_server_id") or "")
+        _src_pid = str(item_for_thread.get("source_playlist_id") or "")
+
+        def _per_item(ev: Dict[str, Any]) -> None:
+            try:
+                if progress_cb is not None:
+                    progress_cb({**ev, "index": index})
+            except Exception:
+                log.exception(
+                    "copy_playlist_batch per-item progress emit failed "
+                    "for index %d", index,
+                )
+            # Update the per-thread dashboard row as we move
+            # through phases. Best-effort; failures don't affect the
+            # copy.
+            phase = _PHASE_FOR_EVENT.get(str(ev.get("event") or ""))
+            if not phase:
+                return
+            # Use the playlist NAME if the event surfaced it (e.g.
+            # 'source-loaded' carries playlist_name); otherwise fall
+            # back to the id we captured at item start.
+            title = ev.get("playlist_name") or _src_pid or "(playlist)"
+            try:
+                from services import state as _state
+                d = _state.get_dashboard()
+                if d is not None:
+                    d.set_current_item(
+                        library=_src_sid or "(source server)",
+                        item_type="playlist",
+                        title=str(title),
+                        phase=phase,
+                    )
+            except Exception:
+                log.exception(
+                    "copy_playlist_batch dashboard phase update failed",
+                )
+        return _per_item
+
+    def _run_one(index: int, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute one copy_playlist; return its result dict
+        decorated with the batch index. Per-item structured errors
+        land here as ``{success: False, error_code: <code>}`` rather
+        than bubbling out — the batch never aborts on one bad item."""
+        per_item_evt = (
+            per_item_cancel_events.get(index)
+            if per_item_cancel_events is not None else None
+        )
+        # If the whole-batch stop_event is set BEFORE we start this
+        # item, drop it as cancelled. The cancel_event check inside
+        # copy_playlist handles mid-flight cases; this is the pre-
+        # start gate.
+        if stop_event is not None and stop_event.is_set():
+            return {
+                "index": index,
+                "success": False,
+                "cancelled": True,
+                "error_code": PlaylistCopyCancelled.code,
+                "errors": ["Batch stop was requested before this item started."],
+                "items_written": 0,
+                "items_skipped_no_match": 0,
+                "items_failed": 0,
+                "elapsed_seconds": 0.0,
+                "new_playlist_id": None,
+            }
+        # Bridge the per-item event into copy_playlist; ALSO wire the
+        # whole-batch stop_event so a global Stop short-circuits any
+        # in-flight item (matching the operator's "Cancel All"
+        # semantic from Q5).
+        bridged_evt: Optional[threading.Event] = None
+        if per_item_evt is not None and stop_event is not None:
+            # Both supplied — bridge into a single event the inner
+            # copy_playlist checks. Cheap one-shot daemon thread
+            # forwards the global stop into the per-item event when
+            # it fires.
+            bridged_evt = per_item_evt
+            def _forward_global_stop() -> None:
+                stop_event.wait()
+                bridged_evt.set()
+            threading.Thread(
+                target=_forward_global_stop, daemon=True,
+            ).start()
+        else:
+            bridged_evt = per_item_evt if per_item_evt is not None else stop_event
+
+        # Per-source backpressure (Plan section 8a Q7): at most N
+        # in-flight copy_playlist calls per source server, regardless of
+        # total batch parallelism. Acquire the source-keyed semaphore
+        # AFTER the pre-start cancel gate (cheap) and BEFORE
+        # copy_playlist starts any work. While waiting on the semaphore
+        # we still respect the cancel events with a short-timeout poll
+        # so the operator's Stop / per-item Cancel doesn't block on a
+        # busy source.
+        source_server_id = str(item.get("source_server_id") or "")
+        sem = _per_source_semaphore_for(source_server_id)
+        if not acquire_with_cancel(sem, (stop_event, per_item_evt)):
+            return {
+                "index": index, "success": False, "cancelled": True,
+                "error_code": PlaylistCopyCancelled.code,
+                "errors": [
+                    "Cancelled while waiting for a per-source slot."
+                ],
+                "items_written": 0, "items_skipped_no_match": 0,
+                "items_failed": 0, "elapsed_seconds": 0.0,
+                "new_playlist_id": None,
+            }
+        # ── Light up the dashboard "Currently Processing"
+        # panel for the duration of this item. set_current_item is
+        # keyed by threading.get_ident(), and since each batch worker
+        # runs in its own thread (from the ThreadPoolExecutor), each
+        # in-flight item gets its own row on the panel. clear_current_item
+        # in the finally block below removes it once the item finishes.
+        try:
+            from services import state as _state
+            _dash = _state.get_dashboard()
+        except Exception:
+            _dash = None
+        if _dash is not None:
+            try:
+                _dash.set_current_item(
+                    library=source_server_id or "(source server)",
+                    item_type="playlist",
+                    title=str(item.get("source_playlist_id") or "(playlist)"),
+                    phase="starting",
+                )
+            except Exception:
+                log.exception(
+                    "playlist_copy_batch: set_current_item failed at start",
+                )
+        # Fire a per-item "started" event AFTER the semaphore acquire
+        # so the dashboard activity feed shows when each item actually
+        # leaves the source-throttle queue and begins work. Without
+        # this, operators see only completions and assume the batch is
+        # running sequentially when it's actually being throttled by
+        # the per-source semaphore.
+        _batch_emit_started = progress_cb
+        if _batch_emit_started is not None:
+            try:
+                _batch_emit_started({
+                    "event": "batch-item-running",
+                    "index": index,
+                    "source_server_id": source_server_id,
+                    "source_user_id": str(item.get("source_user_id") or ""),
+                    "source_playlist_id": str(item.get("source_playlist_id") or ""),
+                    "dest_server_id": str(item.get("dest_server_id") or ""),
+                    "dest_user_id": str(item.get("dest_user_id") or ""),
+                })
+            except Exception:
+                log.exception(
+                    "copy_playlist_batch batch-item-running emit failed "
+                    "for index %d", index,
+                )
+        try:
+            result = copy_playlist(
+                source_server_id=source_server_id,
+                source_user_id=str(item.get("source_user_id") or ""),
+                source_playlist_id=str(item.get("source_playlist_id") or ""),
+                dest_server_id=str(item.get("dest_server_id") or ""),
+                dest_user_id=str(item.get("dest_user_id") or ""),
+                dest_playlist_name=item.get("dest_playlist_name"),
+                progress_cb=_per_item_emit_factory(index, item),
+                cancel_event=bridged_evt,
+            )
+            decorated = dict(result)
+            decorated["index"] = index
+            # Mark cancelled-status explicitly when the inner copy
+            # short-circuited via PlaylistCopyCancelled (it raises
+            # there; we shouldn't see it here, but defensive).
+            if not decorated.get("cancelled"):
+                decorated["cancelled"] = False
+            decorated["error_code"] = None
+            return decorated
+        except PlaylistCopyCancelled as exc:
+            return {
+                "index": index,
+                "success": False,
+                "cancelled": True,
+                "error_code": exc.code,
+                "errors": [str(exc)],
+                "items_written": 0,
+                "items_skipped_no_match": 0,
+                "items_failed": 0,
+                "elapsed_seconds": 0.0,
+                "new_playlist_id": None,
+            }
+        except PlaylistCopyError as exc:
+            # Typed structured error (smart-playlist, dest-not-found,
+            # token-missing, etc.) — record the code + message and
+            # let the batch continue.
+            return {
+                "index": index,
+                "success": False,
+                "cancelled": False,
+                "error_code": exc.code,
+                "errors": [f"{exc.code}: {exc}"],
+                "items_written": 0,
+                "items_skipped_no_match": 0,
+                "items_failed": 0,
+                "elapsed_seconds": 0.0,
+                "new_playlist_id": None,
+            }
+        except Exception as exc:
+            # Unexpected exception — log + record as a generic
+            # failure so the batch keeps going. The operator's
+            # forensic trail (run-level log) still has the full
+            # traceback.
+            log.exception(
+                "copy_playlist_batch: item index %d raised an unexpected "
+                "exception; recording as failed and continuing.",
+                index,
+            )
+            return {
+                "index": index,
+                "success": False,
+                "cancelled": False,
+                "error_code": "PLAYLIST_COPY_FAILED",
+                "errors": [f"unexpected: {exc}"],
+                "items_written": 0,
+                "items_skipped_no_match": 0,
+                "items_failed": 0,
+                "elapsed_seconds": 0.0,
+                "new_playlist_id": None,
+            }
+        finally:
+            # Always release the per-source slot, even when the item
+            # raises or returns early. Without this a single permanent
+            # source failure would leak the semaphore depth and
+            # deadlock subsequent batches against the same source.
+            sem.release()
+            # Clear the dashboard's per-thread current_item so
+            # the Currently Processing panel drops this row when the
+            # item finishes. Best-effort; never blocks return.
+            if _dash is not None:
+                try:
+                    _dash.clear_current_item()
+                except Exception:
+                    log.exception(
+                        "playlist_copy_batch: clear_current_item failed",
+                    )
+
+    parallelism = max(1, int(parallelism))
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=parallelism,
+        thread_name_prefix="pl-batch",
+    ) as pool:
+        future_to_index = {
+            pool.submit(_run_one, idx, item): idx
+            for idx, item in enumerate(items)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                row = future.result()
+            except Exception as exc:
+                # _run_one catches its own exceptions; this branch is
+                # a defensive belt for executor-internal failures.
+                log.exception(
+                    "copy_playlist_batch: future for index %d raised "
+                    "unexpectedly; recording as failed.", idx,
+                )
+                row = {
+                    "index": idx, "success": False, "cancelled": False,
+                    "error_code": "PLAYLIST_COPY_FAILED",
+                    "errors": [f"executor: {exc}"],
+                    "items_written": 0, "items_skipped_no_match": 0,
+                    "items_failed": 0, "elapsed_seconds": 0.0,
+                    "new_playlist_id": None,
+                }
+            results[idx] = row
+            # Surface the first error message + items_written/skipped to
+            # the progress callback so the dashboard activity feed can
+            # render rich per-item context (Plan section 8a follow-up:
+            # operator reported "all 16 failed with no detail").
+            _batch_emit(
+                "batch-item-done",
+                index=idx,
+                success=bool(row.get("success")),
+                cancelled=bool(row.get("cancelled")),
+                error_code=row.get("error_code"),
+                error_message=((row.get("errors") or [None])[0]),
+                items_written=int(row.get("items_written") or 0),
+                items_skipped_no_match=int(row.get("items_skipped_no_match") or 0),
+                items_failed=int(row.get("items_failed") or 0),
+            )
+
+    # Tally outcomes. ``skipped`` covers the same-user no-op +
+    # SmartPlaylistNotPortable paths (both surface as success=True
+    # with a skipped flag from copy_playlist).
+    succeeded = sum(
+        1 for r in results
+        if r and r.get("success") and not r.get("skipped") and not r.get("cancelled")
     )
+    skipped = sum(
+        1 for r in results
+        if r and (r.get("skipped") or r.get("error_code") == "SMART_PLAYLIST_NOT_PORTABLE")
+    )
+    cancelled = sum(1 for r in results if r and r.get("cancelled"))
+    failed = sum(
+        1 for r in results
+        if r and not r.get("success") and not r.get("cancelled")
+        and r.get("error_code") != "SMART_PLAYLIST_NOT_PORTABLE"
+    )
+
+    elapsed = time.perf_counter() - started
+    _batch_emit(
+        "batch-done", total=total, succeeded=succeeded,
+        failed=failed, skipped=skipped, cancelled=cancelled,
+        elapsed_seconds=elapsed,
+    )
+
+    return {
+        "total": total,
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": skipped,
+        "cancelled": cancelled,
+        "elapsed_seconds": elapsed,
+        "results": [r if r is not None else {} for r in results],
+    }

@@ -1,8 +1,7 @@
 // Active-deploys panel for Playlist Management.
 //
-// 2026-05-17 (end user request): Deploy on the Playlist Management
-// surface now submits each copy as a job to the existing JobQueue.
-// This panel tracks those jobs:
+// Deploy on the Playlist Management surface submits each copy as a
+// job to the existing JobQueue. This panel tracks those jobs:
 //   * Polls /api/playlist-mgmt/copy-jobs every 2s while at least one
 //     job is queued / running. Stops polling when everything is in a
 //     terminal state, then resumes on the next Deploy.
@@ -25,7 +24,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
-import type { PlaylistCopyIn, PlaylistCopyJob } from '../api';
+import { errorText } from '../utils/format';
+import { pausableInterval } from '../utils/pausableInterval';
+import type {
+  PlaylistCopyIn,
+  PlaylistCopyJob,
+  PlaylistCopyBatchItemResult,
+} from '../api';
 
 const POLL_INTERVAL_MS = 2000;
 const DISMISSED_KEY = 'playlistMgmt.dismissedJobIds';
@@ -112,7 +117,7 @@ export function ActiveDeploysPanel({ submissionTick, labels, onCloneDeploy }: Pr
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [dismissed, setDismissed] = useState<Set<string>>(() => loadDismissed());
-  const pollTimerRef = useRef<number | null>(null);
+  const pollTimerRef = useRef<(() => void) | null>(null);
 
   const fetchJobs = useCallback(async () => {
     try {
@@ -120,7 +125,7 @@ export function ActiveDeploysPanel({ submissionTick, labels, onCloneDeploy }: Pr
       setJobs(r.jobs || []);
       setError(null);
     } catch (e) {
-      setError(String(e instanceof Error ? e.message : e));
+      setError(errorText(e));
     }
   }, []);
 
@@ -153,18 +158,18 @@ export function ActiveDeploysPanel({ submissionTick, labels, onCloneDeploy }: Pr
   useEffect(() => {
     if (!hasActive) {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
       return;
     }
     if (pollTimerRef.current !== null) return;
-    pollTimerRef.current = window.setInterval(() => {
+    pollTimerRef.current = pausableInterval(() => {
       void fetchJobs();
     }, POLL_INTERVAL_MS);
     return () => {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
     };
@@ -259,13 +264,22 @@ export function ActiveDeploysPanel({ submissionTick, labels, onCloneDeploy }: Pr
       )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         {visible.map((j) => (
-          <DeployRow
-            key={j.job_id}
-            job={j}
-            labels={labels}
-            onDismiss={() => dismissOne(j.job_id)}
-            onClone={() => onCloneDeploy(buildCloneBody(j.params))}
-          />
+          j.mode === 'playlist_copy_batch' ? (
+            <BatchDeployRow
+              key={j.job_id}
+              job={j}
+              onDismiss={() => dismissOne(j.job_id)}
+              onRefresh={() => void refresh()}
+            />
+          ) : (
+            <DeployRow
+              key={j.job_id}
+              job={j}
+              labels={labels}
+              onDismiss={() => dismissOne(j.job_id)}
+              onClone={() => onCloneDeploy(buildCloneBody(j.params))}
+            />
+          )
         ))}
       </div>
     </div>
@@ -423,6 +437,231 @@ function DeployRow({ job, labels, onDismiss, onClone }: DeployRowProps) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+
+// ── Batch deploy row ──
+//
+// Renders a single playlist_copy_batch JobRecord. Collapsed header
+// shows total/succeeded/failed/cancelled/skipped tallies; expandable
+// per-item drill-down lists every result row with its index, status,
+// and a Cancel button for items that haven't reached a terminal state
+// yet (only meaningful while the job is running). Collapsed-by-default
+// and expandable to inspect individual misses.
+
+interface BatchRowProps {
+  job: PlaylistCopyJob;
+  onDismiss: () => void;
+  onRefresh: () => void;
+}
+
+function BatchDeployRow({ job, onDismiss, onRefresh }: BatchRowProps) {
+  const [drilldownOpen, setDrilldownOpen] = useState(false);
+  // Item indices the operator clicked Cancel on but the server hasn't
+  // yet reflected as terminal — kept in component state so the button
+  // disables visually until the next /copy-jobs poll picks up the
+  // updated state from the per-item drill-down.
+  const [cancelInFlight, setCancelInFlight] = useState<Set<number>>(new Set());
+  const tone = stateLabel(job.state);
+  const terminal = isTerminal(job.state);
+  const batch = job.batch ?? null;
+  const label = batch?.label || job.params.label || '(batch)';
+  const elapsed = job.finished_at && job.started_at
+    ? job.finished_at - job.started_at
+    : (batch?.elapsed_seconds ?? null);
+
+  const cancelItem = async (index: number) => {
+    if (cancelInFlight.has(index)) return;
+    setCancelInFlight((prev) => new Set(prev).add(index));
+    try {
+      await api.cancelPlaylistBatchItem(job.job_id, index);
+      onRefresh();
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('cancelPlaylistBatchItem failed', { jobId: job.job_id, index, e });
+      // Drop the in-flight flag so the operator can retry.
+      setCancelInFlight((prev) => {
+        const n = new Set(prev);
+        n.delete(index);
+        return n;
+      });
+    }
+  };
+
+  return (
+    <div
+      style={{
+        padding: 10,
+        border: `1px solid ${tone.color}`,
+        borderRadius: 4,
+        background: terminal ? 'transparent' : 'rgba(74, 122, 252, 0.06)',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8 }}>
+        <div style={{ flex: 1 }}>
+          <strong style={{ color: tone.color, fontSize: 13 }}>{tone.label}</strong>
+          <span style={{ marginLeft: 8, fontSize: 13 }}>
+            <strong>Batch:</strong> {label}
+            <span style={{ color: 'var(--text-dim)', fontSize: 11, marginLeft: 6 }}>
+              ({batch ? `${batch.total} item(s), parallelism=${batch.parallelism}` : 'pending…'})
+            </span>
+          </span>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {terminal && (
+            <button
+              type="button"
+              onClick={onDismiss}
+              style={{ fontSize: 11 }}
+              title="Hide this row from the panel. Server history is unaffected."
+            >
+              Dismiss
+            </button>
+          )}
+        </div>
+      </div>
+      {elapsed !== null && (
+        <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-dim)' }}>
+          Elapsed {elapsed.toFixed(1)}s
+        </div>
+      )}
+      {batch && (
+        <div style={{ marginTop: 6, fontSize: 12, display: 'flex', gap: 14, flexWrap: 'wrap' }}>
+          <span>
+            Succeeded: <strong style={{ color: 'var(--success, #16a34a)' }}>{batch.succeeded}</strong>
+          </span>
+          <span>
+            Failed:{' '}
+            <strong style={{ color: batch.failed > 0 ? 'var(--bad, #ef4444)' : undefined }}>
+              {batch.failed}
+            </strong>
+          </span>
+          <span>
+            Skipped: <strong>{batch.skipped}</strong>
+          </span>
+          <span>
+            Cancelled:{' '}
+            <strong style={{ color: batch.cancelled > 0 ? 'var(--warn, #f5a623)' : undefined }}>
+              {batch.cancelled}
+            </strong>
+          </span>
+          <span style={{ color: 'var(--text-dim)' }}>
+            Total: {batch.total}
+          </span>
+        </div>
+      )}
+      {job.error && (
+        <div style={{ marginTop: 6, fontSize: 12, color: 'var(--warn, #f5a623)' }}>
+          {job.error}
+        </div>
+      )}
+      {batch && batch.results.length > 0 && (
+        <div style={{ marginTop: 6 }}>
+          <button
+            type="button"
+            onClick={() => setDrilldownOpen((open) => !open)}
+            style={{ fontSize: 11 }}
+            title="Show per-item drill-down: status + per-item Cancel buttons."
+          >
+            {drilldownOpen ? 'Hide' : 'Show'} per-item drill-down ({batch.results.length})
+          </button>
+          {drilldownOpen && (
+            <BatchItemList
+              items={batch.results}
+              jobIsRunning={!terminal}
+              cancelInFlight={cancelInFlight}
+              onCancelItem={(idx) => void cancelItem(idx)}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+interface BatchItemListProps {
+  items: PlaylistCopyBatchItemResult[];
+  jobIsRunning: boolean;
+  cancelInFlight: Set<number>;
+  onCancelItem: (index: number) => void;
+}
+
+function BatchItemList({ items, jobIsRunning, cancelInFlight, onCancelItem }: BatchItemListProps) {
+  return (
+    <div
+      style={{
+        marginTop: 6,
+        maxHeight: 280,
+        overflowY: 'auto',
+        border: '1px solid rgba(128,128,128,0.2)',
+        borderRadius: 3,
+        padding: 4,
+      }}
+    >
+      {items.map((r) => {
+        const statusLabel =
+          r.cancelled ? 'Cancelled'
+          : r.error_code ? r.error_code
+          : r.skipped ? 'Skipped'
+          : r.success ? 'OK'
+          : 'Pending';
+        const statusColor =
+          r.cancelled ? 'var(--warn, #f5a623)'
+          : r.error_code ? 'var(--bad, #ef4444)'
+          : r.skipped ? 'var(--text-dim)'
+          : r.success ? 'var(--success, #16a34a)'
+          : 'var(--text-dim)';
+        // A row is "done" (no Cancel button) when its result row carries
+        // success=true, cancelled=true, skipped=true, or any error_code.
+        // While the job is running, items that haven't yet started OR
+        // that are mid-flight are eligible for cancel.
+        const itemDone = r.success || r.cancelled || r.skipped || !!r.error_code;
+        const showCancel = jobIsRunning && !itemDone;
+        return (
+          <div
+            key={r.index}
+            style={{
+              display: 'flex',
+              gap: 8,
+              fontSize: 11,
+              padding: '2px 4px',
+              borderBottom: '1px dotted rgba(128,128,128,0.15)',
+              alignItems: 'baseline',
+            }}
+          >
+            <span style={{ color: 'var(--text-dim)', minWidth: 28 }}>#{r.index}</span>
+            <span style={{ color: statusColor, minWidth: 90, fontWeight: 600 }}>
+              {statusLabel}
+            </span>
+            <span style={{ flex: 1 }}>
+              {r.success && !r.skipped && !r.cancelled && (
+                <>
+                  written {r.items_written}
+                  {r.items_skipped_no_match > 0 ? <>, missed {r.items_skipped_no_match}</> : null}
+                </>
+              )}
+              {r.skip_reason && <em style={{ color: 'var(--text-dim)' }}>{r.skip_reason}</em>}
+              {r.errors && r.errors.length > 0 && (
+                <span style={{ color: 'var(--bad, #ef4444)' }}>{r.errors[0]}</span>
+              )}
+            </span>
+            {showCancel && (
+              <button
+                type="button"
+                disabled={cancelInFlight.has(r.index)}
+                onClick={() => onCancelItem(r.index)}
+                style={{ fontSize: 10, padding: '0 4px' }}
+                title="Cancel this item only; the rest of the batch continues."
+              >
+                {cancelInFlight.has(r.index) ? 'Cancelling…' : 'Cancel'}
+              </button>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

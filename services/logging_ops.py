@@ -1,5 +1,5 @@
 """
-Logging setup and result recording for PlexMigrate.
+Logging setup and result recording for Hestia-MediaManager.
 
 Contains setup_logging() (builds all file and console handlers), the
 thread-safe _record_success() / _record_failure() accumulators, and the
@@ -246,6 +246,11 @@ def setup_logging(
     for _lg_name in ("plexmigrate", "plexmigrate.media"):
         _lg = logging.getLogger(_lg_name)
         for _h in _lg.handlers[:]:
+            # Persistent app-log handler (installed at app startup;
+            # spans every job lifetime). Skip it during the per-run
+            # detach so the unified app log keeps receiving records.
+            if getattr(_h, "_pm_app_log", False):
+                continue
             h_dest = getattr(_h, "_pm_destination", "")
             if h_dest != current_dest:
                 continue
@@ -619,7 +624,7 @@ def write_troubleshoot_log(log_dir: str) -> None:
     tpath = log_path / "troubleshoot.log"
 
     with open(tpath, "w", encoding="utf-8") as f:
-        f.write(f"PlexMigrate Troubleshooting Log - {_tz_now()}\n")
+        f.write(f"Hestia-MediaManager Troubleshooting Log - {_tz_now()}\n")
         f.write("=" * 60 + "\n\n")
 
         for cat_key, items in state._failure_categories.items():
@@ -674,7 +679,7 @@ def write_unresolved_log(log_dir: str) -> None:
 
     with open(upath, "w", encoding="utf-8") as f:
         f.write(
-            "This file lists every item that PlexMigrate could not automatically match on the\n"
+            "This file lists every item that Hestia-MediaManager could not automatically match on the\n"
             "target server after trying all available methods (GUID lookup, file path lookup,\n"
             "and title search). Use this as a checklist to manually restore these items in Plex.\n"
             "Items are listed one per line in the format:\n"

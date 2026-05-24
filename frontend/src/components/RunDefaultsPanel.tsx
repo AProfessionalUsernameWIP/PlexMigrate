@@ -1,10 +1,9 @@
 // Servers ▸ Run Defaults sub-tab.
 //
-// Houses the per-run defaults moved out of Settings ▸ General Settings
-// in Phase 2 of the Settings/Servers reorg. These describe HOW
-// snapshots and direct transfers operate against Plex (paths, worker
-// counts, snapshot defaults, transfer resolver tiers, global snapshot
-// retention ceiling).
+// Houses the per-run defaults that describe HOW snapshots and direct
+// transfers operate against Plex (paths, worker counts, snapshot
+// defaults, transfer resolver tiers, global snapshot retention
+// ceiling).
 //
 // Per-server overrides for snapshot defaults + retention live one tab
 // over on Servers ▸ Advanced Settings; the resolution chain is
@@ -16,6 +15,15 @@ import { RestoreModeSelector, RestoreMode, MergeWatchStrategy } from './RestoreM
 import { InfoTip } from './InfoTip';
 
 type WrStrategy = 'smart' | 'force_bulk' | 'force_server_side';
+
+// Clamp a number <input>'s onChange value as the end user types so a
+// transient NaN (empty field) or out-of-range entry never lands in
+// state. ``fallback`` is the documented default substituted for a
+// non-numeric value; the result is floored and bounded to [min, max].
+function clampInt(raw: number, min: number, max: number, fallback: number): number {
+  const n = Number.isFinite(raw) ? Math.floor(raw) : fallback;
+  return Math.max(min, Math.min(max, n));
+}
 
 export function RunDefaultsPanel() {
   const [view, setView] = useState<SettingsView | null>(null);
@@ -39,29 +47,29 @@ export function RunDefaultsPanel() {
   const [allowFilepathFallback, setAllowFilepathFallback] = useState<boolean>(true);
   const [allowFuzzyFallback, setAllowFuzzyFallback] = useState<boolean>(false);
 
-  // v0.13.x: Restore-side defaults (Merge / Replace + auto-capture
-  // safety belt). Bottom of the resolution chain - the per-job form
-  // (Run Job + Schedules) wins, per-server overrides on Advanced
-  // Settings come next, then these.
+  // Restore-side defaults (Merge / Replace + auto-capture safety
+  // belt). Bottom of the resolution chain - the per-job form (Run Job
+  // + Schedules) wins, per-server overrides on Advanced Settings come
+  // next, then these.
   const [restoreMode, setRestoreMode] = useState<RestoreMode>('merge');
   const [autoCaptureBeforeReplace, setAutoCaptureBeforeReplace] = useState<boolean>(true);
   const [mergeWatchStrategy, setMergeWatchStrategy] = useState<MergeWatchStrategy>('higher');
-  // v0.13.x: concurrency tunables. Two orthogonal axes:
+  // Concurrency tunables. Two orthogonal axes:
   //   - restoreLibraryWorkers: libraries-within-one-restore parallelism.
-  //     Default 3 preserves today's hardcoded cap; lower to 1 if Plex
-  //     rate-limits multi-library API bursts.
+  //     Default 3 caps the libraries-per-restore fan-out; lower to 1 if
+  //     Plex rate-limits multi-library API bursts.
   //   - fanOutDestinationWorkers: destinations-within-one-fan-out
-  //     parallelism. Default 0 = no cap (today's behavior - one thread
-  //     per destination). Set to 1 to serialise destinations.
+  //     parallelism. Default 0 = no cap (one thread per destination).
+  //     Set to 1 to serialise destinations.
   const [restoreLibraryWorkers, setRestoreLibraryWorkers] = useState<number>(3);
   const [fanOutDestinationWorkers, setFanOutDestinationWorkers] = useState<number>(0);
   // Snapshot library concurrency. 0 = inherit the Worker threads
-  // value above (today's behavior, preserved on upgrade).
+  // value above.
   const [snapshotLibraryWorkers, setSnapshotLibraryWorkers] = useState<number>(0);
 
-  // Feature 2: snapshot integrity validation toggles. Two flags so
-  // post-capture and pre-restore behave independently. Defaults per
-  // D4 / D5: after-capture ON, before-restore OFF.
+  // Snapshot integrity validation toggles. Two flags so post-capture
+  // and pre-restore behave independently. Defaults: after-capture ON,
+  // before-restore OFF.
   const [validateAfterCapture, setValidateAfterCapture] = useState<boolean>(true);
   const [validateBeforeRestore, setValidateBeforeRestore] = useState<boolean>(false);
 
@@ -205,12 +213,12 @@ export function RunDefaultsPanel() {
               <InfoTip topicId="worker-threads" />
             </span>
             <span className="help">Default value for <code>--workers</code>.</span>
-            <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(Number(e.target.value))} />
+            <input type="number" min={1} max={128} value={workers} onChange={(e) => setWorkers(clampInt(Number(e.target.value), 1, 128, 16))} />
           </label>
           <label className="field">
             <span className="label">Scrobble workers</span>
             <span className="help">Default value for <code>--scrobble-workers</code>.</span>
-            <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(Number(e.target.value))} />
+            <input type="number" min={1} max={64} value={scrobbleWorkers} onChange={(e) => setScrobbleWorkers(clampInt(Number(e.target.value), 1, 64, 8))} />
           </label>
         </div>
         <label className="switch">
@@ -364,11 +372,11 @@ export function RunDefaultsPanel() {
         />
       </div>
 
-      {/* v0.13.x: Concurrency tunables. Two orthogonal axes that let
-          the end user pull back from default parallelism when Plex
-          rate-limits the multi-library / multi-destination API bursts.
-          Both default to today's behavior so an unchanged install is a
-          no-op. */}
+      {/* Concurrency tunables. Two orthogonal axes that let the end
+          user pull back from default parallelism when Plex rate-limits
+          the multi-library / multi-destination API bursts. Both
+          defaults preserve the standard parallelism, so an unchanged
+          install is a no-op. */}
       <div className="panel">
         <h2>Concurrency</h2>
         <div className="banner info" style={{ fontSize: 12, marginBottom: 12 }}>
@@ -391,7 +399,7 @@ export function RunDefaultsPanel() {
             min={0}
             max={16}
             value={snapshotLibraryWorkers}
-            onChange={(e) => setSnapshotLibraryWorkers(Number(e.target.value))}
+            onChange={(e) => setSnapshotLibraryWorkers(clampInt(Number(e.target.value), 0, 16, 0))}
           />
         </label>
         <label className="field">
@@ -407,7 +415,7 @@ export function RunDefaultsPanel() {
             min={1}
             max={16}
             value={restoreLibraryWorkers}
-            onChange={(e) => setRestoreLibraryWorkers(Number(e.target.value))}
+            onChange={(e) => setRestoreLibraryWorkers(clampInt(Number(e.target.value), 1, 16, 3))}
           />
         </label>
         <label className="field">
@@ -423,7 +431,7 @@ export function RunDefaultsPanel() {
             min={0}
             max={32}
             value={fanOutDestinationWorkers}
-            onChange={(e) => setFanOutDestinationWorkers(Number(e.target.value))}
+            onChange={(e) => setFanOutDestinationWorkers(clampInt(Number(e.target.value), 0, 32, 0))}
           />
         </label>
       </div>
@@ -478,7 +486,7 @@ export function RunDefaultsPanel() {
             type="number"
             min={1}
             value={globalRetention}
-            onChange={(e) => setGlobalRetention(Number(e.target.value))}
+            onChange={(e) => setGlobalRetention(clampInt(Number(e.target.value), 1, Number.MAX_SAFE_INTEGER, 30))}
           />
         </label>
       </div>

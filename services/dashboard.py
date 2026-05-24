@@ -1,20 +1,16 @@
 """
-Dashboard UI, keyboard handling, and progress utilities for PlexMigrate.
+Dashboard state model and rendering utilities for Hestia-MediaManager.
 
-Contains DashboardState (the thread-safe state model), _build_dashboard
-(the Rich Panel renderer), _keyboard_thread (raw key capture), and helpers
-used by both the snapshot and import pipelines.
+Contains DashboardState (the thread-safe state model the WebSocket
+layer broadcasts), _build_dashboard (the Rich Panel renderer), and
+helpers used by both the snapshot and import pipelines.
 """
 
 import contextlib
 import contextvars
 import logging
-import os
-import subprocess
-import sys
 import threading
 import time
-import webbrowser
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,18 +18,10 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeRemainingColumn,
-)
 from rich.text import Text
 
 import services.state as state
-from services.state import VERSION, PLEX_PORT, console
+from services.state import VERSION, console
 
 
 # ── Dashboard Data Classes ────────────────────────────────────────────────────
@@ -118,44 +106,33 @@ _http_lib_var: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 
-# ── ETA tunable shims ────────────────────────────────────────────────
-#
-# Late-bound reads of the four ETA Danger tunables. Wrapped here so
-# the dashboard module never raises on import if services.tunables is
-# unavailable (avoids a circular-import surprise in tests that swap
-# the data dir); each shim falls through to the hardcoded baseline
-# instead.
+# Per-job network attribution.
+# Workers running inside a JobRecord set this to rec.job_id at job
+# start so every HTTP response captured by the auth.py hook tags the
+# entry with the job that fired it. The Network panel then offers a
+# "filter by job" surface so operators can audit exactly which
+# requests fired during a given batch.
+_http_job_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "plexmigrate_http_job_id",
+    default="",
+)
 
-def _eta_wallclock_floor_fraction() -> float:
+
+@contextlib.contextmanager
+def job_http_context(job_id: str):
+    """Set :data:`_http_job_id_var` to ``job_id`` for the duration of
+    the ``with`` block, then restore the prior value on exit. Used by
+    job workers (snapshot / restore / direct / playlist_copy_batch)
+    to seed the context so every HTTP call inside gets attributed to
+    the right job. Empty job_id is a no-op."""
+    if not job_id:
+        yield
+        return
+    token = _http_job_id_var.set(str(job_id))
     try:
-        from services import tunables
-        return float(tunables.eta_wallclock_floor_fraction())
-    except Exception:
-        return 0.15
-
-
-def _eta_calibration_ratio_bounds() -> tuple:
-    try:
-        from services import tunables
-        return tunables.eta_calibration_ratio_bounds()
-    except Exception:
-        return (0.25, 4.0)
-
-
-def _eta_calibration_blend_threshold() -> float:
-    try:
-        from services import tunables
-        return float(tunables.eta_calibration_blend_threshold())
-    except Exception:
-        return 0.25
-
-
-def _eta_calibration_deflation_strength() -> float:
-    try:
-        from services import tunables
-        return float(tunables.eta_calibration_deflation_strength())
-    except Exception:
-        return 0.5
+        yield
+    finally:
+        _http_job_id_var.reset(token)
 
 
 def submit_with_context(executor, fn: Callable, *args, **kwargs):
@@ -284,47 +261,10 @@ class DashboardState:
             "playlists": [],
             "collections": [],
         }
-        # Timing engine state (discover-don't-predict model). There is
-        # no pre-run estimate: ``rolling_etr_seconds`` is the single
-        # headline value, populated only once the rolling tracker has
-        # enough real throughput samples to project from. ``None``
-        # means "still measuring" - the frontend renders that as
-        # "Calculating...".
-        self.rolling_etr_seconds: Optional[float] = None
-        # Gap-B of the post-cutover review: the new ETA training
-        # engine pre-computes a whole-job prediction at run start.
-        # While ``rolling_etr_seconds`` warms up (first ~3 samples),
-        # the dashboard frame surfaces ``predicted_etr_seconds`` as a
-        # fallback so the end user never sees "Calculating..." for
-        # ~10 seconds at the top of every run. Once the live tracker
-        # has data, it takes precedence (live observations beat any
-        # pre-run guess).
-        # ``predicted_total_seconds`` is the engine's whole-job
-        # estimate captured at start; ``predicted_etr_seconds`` is
-        # the same value minus elapsed wall-clock so the field
-        # decays as the run progresses.
-        self._predicted_total_seconds: Optional[float] = None
-        self._predicted_start_at: Optional[float] = None
-        self.predicted_etr_seconds: Optional[float] = None
-        # Source tag carried on the frame so the UI can label which
-        # estimate it is rendering. "live" = rolling tracker;
-        # "predicted" = ETA engine fallback; None = no estimate yet.
-        self.etr_source: Optional[str] = None
-        # Per-batch trackers - populated dynamically as the engine
-        # encounters new leaf types. Each entry exposes the tracker's
-        # current state (total, completed, etr_seconds) to the frame
-        # serialiser without holding the tracker object itself.
+        # Per-batch progress counters keyed by batch label ("watch",
+        # "rating", "playlist", "collection"). Each entry is a plain
+        # {total, completed} dict that drives the Process List bars.
         self.batch_etrs: Dict[str, Dict[str, Any]] = {}
-        # Total-run rolling tracker. ``None`` until init_etr_tracker
-        # is called at job start. Lives behind the lock; the
-        # ``rolling_etr_seconds`` mirror above is what the frame
-        # serialiser actually reads.
-        self._etr_tracker: Optional["Any"] = None
-        # Per-batch trackers keyed by batch label ("watch", "rating",
-        # "playlist", "collection"). Each one is an independent
-        # :class:`services.timing.ETRTracker`. Populated lazily via
-        # ``add_batch_total`` / ``tick_batch``.
-        self._batch_trackers: Dict[str, "Any"] = {}
         # Per-worker-thread phase clocks. Indexed by threading
         # ident. ``phase_started_at`` is the unix timestamp the
         # current phase entered; the frontend computes phase age =
@@ -534,297 +474,46 @@ class DashboardState:
         with self._lock:
             self.unresolved += 1
 
-    # ── Timing engine plumbing (discover-don't-predict) ─────────────
+    # Process List progress counters. The pre-run predictor and the
+    # live ETR tracker were retired; init_etr_tracker / add_run_total
+    # / tick_etr survive as no-ops so the engine call sites keep
+    # working untouched. The per-batch counters below are the only
+    # remaining live timing plumbing.
 
     def init_etr_tracker(self) -> None:
-        """
-        Create the rolling-window tracker for the total run. Called
-        at job start with a total of zero - the engine grows the
-        total via ``add_run_total`` as it discovers real work, and
-        ``tick_etr`` feeds completion samples. The smoothed seconds
-        value is published into ``rolling_etr_seconds`` so the frame
-        surfaces it; it stays ``None`` ("Calculating...") until the
-        tracker has enough samples to project.
-        """
-        # Late import to keep dashboard.py free of any test-time
-        # dependency on the timing module.
-        from services.timing import ETRTracker
-        with self._lock:
-            self._etr_tracker = ETRTracker()
-            self.rolling_etr_seconds = None
-            self.etr_source = None
-
-    def set_predicted_total(self, total_seconds: Optional[float]) -> None:
-        """
-        Stash the pre-run ETA engine's whole-job prediction so the
-        dashboard frame can surface it as a fallback while
-        ``rolling_etr_seconds`` is still warming up.
-
-        Gap-B of the post-cutover review. Called from
-        :mod:`server.jobs` right after :meth:`init_etr_tracker` at
-        run start, with the result of
-        :meth:`services.eta_training.ETATrainer.predict_for_job`.
-        ``None`` is acceptable (the engine has no data, or the
-        prediction failed) - the dashboard falls back to the existing
-        "Calculating..." copy in that case.
-        """
-        with self._lock:
-            if total_seconds is None or total_seconds <= 0:
-                self._predicted_total_seconds = None
-                self._predicted_start_at = None
-                self.predicted_etr_seconds = None
-                return
-            self._predicted_total_seconds = float(total_seconds)
-            self._predicted_start_at = time.time()
-            self.predicted_etr_seconds = float(total_seconds)
-            # When a predicted total is in play, the dashboard
-            # always surfaces the predicted (engine-anchored) ETR -
-            # the live tracker is reserved for the per-batch
-            # Process List rows. Set the source tag unconditionally
-            # so the badge matches what the end user is reading,
-            # regardless of any prior rolling-tracker state.
-            self.etr_source = "predicted"
-
-    def _is_finishing_for_display(self) -> bool:
-        """Backend-computed gate for the frontend's 'Almost done' copy.
-
-        Returns True when:
-          * the post-engine finalize phase is active, OR
-          * the run's cumulative library completion fraction is past
-            the end user-tunable ``eta_almost_done_progress_threshold``
-            (default 0.85, exposed under the Danger tab).
-
-        Centralising this gate on the backend prevents the original
-        2026-05-16 bug where a low-seconds reading was sufficient to
-        claim "Almost done" - now real progress evidence is required.
-        """
-        if self.finalizing:
-            return True
-        # Sum across the per-library progress counters. ``self.libraries``
-        # is keyed by library name; each value carries .total + .completed.
-        try:
-            total = 0
-            completed = 0
-            for lib in self.libraries.values():
-                total += int(getattr(lib, "total", 0) or 0)
-                completed += int(getattr(lib, "completed", 0) or 0)
-        except Exception:
-            return False
-        if total <= 0:
-            return False
-        try:
-            from services import tunables
-            threshold = float(tunables.eta_almost_done_progress_threshold())
-        except Exception:
-            threshold = 0.85
-        return (completed / total) >= threshold
-
-    def _refresh_predicted_etr(self) -> None:
-        """
-        Compute the headline ETA using the engine-anchored progress
-        model (chosen 2026-05-16 to replace the original linear decay).
-
-        Math::
-
-            remaining_frac = (total - completed) / total
-            expected_elapsed = predicted_total * (completed / total)
-            observed_ratio = clamp(elapsed / expected_elapsed, 0.25, 4.0)
-            blend_weight = min(1.0, completed_frac * 4.0)
-            calibration = 1.0 + (observed_ratio - 1.0) * blend_weight
-            etr = predicted_total * remaining_frac * calibration
-
-        Why this shape:
-          * **No per-object rate samples** -> no per-tick oscillation.
-            The math depends on cumulative ``total`` / ``completed``
-            counters, which only ever advance.
-          * **Anchored to a learned baseline** so it shows something
-            meaningful at tick 0 (end user never sees "Calculating...").
-          * **Self-calibrates from the run's own pace** so a server
-            that has gotten 2x faster since the weights were learned
-            sees the ETA halve instead of staying wrong.
-          * **Blend weight ramps up with completion** so the first
-            few percent (small expected_elapsed -> huge observed_ratio)
-            do not throw the ETA off; full calibration only kicks in
-            at ~25% complete.
-          * **Observed-ratio clamp [0.25, 4.0]** prevents a single
-            slow-start phase from blowing up the ETA. A 4x slowdown
-            is the most we will reflect; beyond that the end user's
-            mental model is "this is broken anyway."
-
-        Falls back to the prior linear-decay behaviour only when the
-        engine has no progress counters to anchor on
-        (``_etr_tracker.total == 0``), which happens for ~1 second at
-        run start before the engine has discovered any libraries.
-        """
-        if self._predicted_total_seconds is None:
-            return
-        if self._predicted_start_at is None:
-            return
-
-        total = 0
-        completed = 0
-        if self._etr_tracker is not None:
-            try:
-                total = int(self._etr_tracker.total)
-                completed = int(self._etr_tracker.completed)
-            except Exception:
-                total = 0
-                completed = 0
-
-        # Pre-discovery / no progress yet: show predicted_total
-        # decayed by wall clock so the end user still sees something
-        # counting down. Floor at ``eta_wallclock_floor_fraction``
-        # of the original prediction so a too-small cold-start guess
-        # does not drop to 0 (which would surface as "Almost done" on
-        # a 6-minute run after just 70 seconds; observed bug
-        # 2026-05-16). Once the engine discovers real work and
-        # total > 0, the anchored branch below takes over with a
-        # calibrated estimate that can grow past the original
-        # prediction if the run is slower than expected.
-        if total <= 0:
-            elapsed = max(0.0, time.time() - self._predicted_start_at)
-            decayed = self._predicted_total_seconds - elapsed
-            floor_frac = _eta_wallclock_floor_fraction()
-            floor = self._predicted_total_seconds * floor_frac
-            self.predicted_etr_seconds = max(floor, decayed)
-            return
-
-        # Run finishing: completed >= total. Floor at 0; the ETR
-        # tracker also reports done.
-        if completed >= total:
-            self.predicted_etr_seconds = 0.0
-            return
-
-        completed_frac = float(completed) / float(total)
-        remaining_frac = 1.0 - completed_frac
-
-        # Calibration blends from neutral (1.0) toward the observed
-        # actual_vs_expected ratio as the run completes more of its
-        # work. Early ticks have noisy timing; late ticks are
-        # representative. Both the clamp range and the blend
-        # threshold are end user-tunable under the Danger tab.
-        elapsed = max(0.0, time.time() - self._predicted_start_at)
-        expected_elapsed = self._predicted_total_seconds * completed_frac
-        ratio_min, ratio_max = _eta_calibration_ratio_bounds()
-        blend_threshold = _eta_calibration_blend_threshold()
-        if expected_elapsed <= 0.0:
-            observed_ratio = 1.0
-        else:
-            observed_ratio = elapsed / expected_elapsed
-            # Asymmetric: full credit on the slowdown side (the run is
-            # genuinely behind the prediction; end user deserves to
-            # see the displayed ETA grow). Diminishing-return credit
-            # on the speedup side because item-completion outruns
-            # time-completion early in a snapshot - lightweight
-            # metrics (collections, playlists) finish first and bump
-            # completed_frac way faster than they consume wall-clock.
-            # Without this damping, observed_ratio crashes toward
-            # ratio_min in the first 20% and the displayed ETA halves
-            # against end user expectation.
-            if observed_ratio < 1.0:
-                strength = _eta_calibration_deflation_strength()
-                observed_ratio = 1.0 - (1.0 - observed_ratio) * strength
-            if observed_ratio < ratio_min:
-                observed_ratio = ratio_min
-            elif observed_ratio > ratio_max:
-                observed_ratio = ratio_max
-
-        # blend_weight: at completed_frac=0 we trust the prediction
-        # (weight=0); at completed_frac>=blend_threshold we trust the
-        # run's pace (weight=1.0). Linear ramp between.
-        blend_weight = min(1.0, completed_frac / blend_threshold)
-        calibration = 1.0 + (observed_ratio - 1.0) * blend_weight
-
-        anchored = self._predicted_total_seconds * remaining_frac * calibration
-        self.predicted_etr_seconds = max(0.0, anchored)
+        """Retired ETR plumbing; retained as a no-op."""
 
     def add_run_total(self, n: int) -> None:
-        """
-        Grow the total-run tracker's total by ``n``. The discover-
-        don't-predict entry point - called by each engine phase as it
-        enumerates its real work. No-op when the tracker hasn't been
-        initialised.
-        """
-        if n <= 0:
-            return
-        with self._lock:
-            t = self._etr_tracker
-            if t is not None:
-                t.grow_total(n)
+        """Retired ETR plumbing; retained as a no-op."""
 
     def tick_etr(self, n: int = 1) -> None:
-        """
-        Advance the rolling tracker by ``n`` items and republish the
-        smoothed ETR. No-op when the tracker hasn't been initialised
-        (callers should call ``init_etr_tracker`` at job start; safe
-        to call regardless so engine code doesn't have to gate every
-        site).
-        """
-        if n <= 0:
-            return
-        with self._lock:
-            t = self._etr_tracker
-            if t is None:
-                return
-            t.tick(n)
-            self.rolling_etr_seconds = t.etr_seconds
-            # Gap-B: the source tag flips to "live" only when the
-            # tracker has a meaningful projection AND we have not
-            # selected the predicted-anchored path. Note that
-            # raw_etr_seconds now returns None (not 0) when total<=0
-            # or completed>total, so this branch no longer fires on
-            # the "false done" condition that produced the 2026-05-16
-            # bug.
-            if t.etr_seconds is not None and self._predicted_total_seconds is None:
-                self.etr_source = "live"
+        """Retired ETR plumbing; retained as a no-op."""
 
     def add_batch_total(self, kind: str, n: int) -> None:
         """
-        Grow one batch's total by ``n``. The discover-don't-predict
-        entry point for per-batch trackers - called by each engine
-        phase as it enumerates the real count of work for that batch
-        (e.g. ``snapshot_ratings`` finding 751 rated items registers
-        751 under "rating"). Lazily creates the batch tracker on first
-        call. Also refreshes the ``batch_etrs`` frame entry so the
-        Process List bar gets a real denominator immediately.
+        Grow one batch total by ``n`` - the discover-as-you-go entry
+        point for the Process List bars. Each engine phase calls this
+        as it enumerates the real count of work for the batch.
+        Lazily creates the batch entry on first call.
         """
         if not kind or n <= 0:
             return
-        from services.timing import ETRTracker
         with self._lock:
-            t = self._batch_trackers.get(kind)
-            if t is None:
-                t = ETRTracker()
-                self._batch_trackers[kind] = t
-            t.grow_total(n)
-            self.batch_etrs[kind] = {
-                "total": t.total,
-                "completed": t.completed,
-                "etr_seconds": t.etr_seconds,
-            }
+            entry = self.batch_etrs.setdefault(
+                kind, {"total": 0, "completed": 0})
+            entry["total"] = int(entry["total"]) + int(n)
 
     def tick_batch(self, kind: str, n: int = 1) -> None:
         """
-        Advance one batch's rolling tracker by ``n`` completed items
-        and refresh the ``batch_etrs`` frame entry. Lazily creates the
-        batch tracker if ``add_batch_total`` hasn't run yet (a tick
-        before any total is registered just means the bar shows
-        progress with a zero denominator until a phase enumerates).
+        Advance one batch completed count by ``n``. Lazily creates
+        the batch entry if add_batch_total has not run yet.
         """
         if not kind or n <= 0:
             return
-        from services.timing import ETRTracker
         with self._lock:
-            t = self._batch_trackers.get(kind)
-            if t is None:
-                t = ETRTracker()
-                self._batch_trackers[kind] = t
-            t.tick(n)
-            self.batch_etrs[kind] = {
-                "total": t.total,
-                "completed": t.completed,
-                "etr_seconds": t.etr_seconds,
-            }
+            entry = self.batch_etrs.setdefault(
+                kind, {"total": 0, "completed": 0})
+            entry["completed"] = int(entry["completed"]) + int(n)
 
     # ── Per-container import summary (Rule 4) ───────────────────────
 
@@ -891,25 +580,21 @@ class DashboardState:
         # work cuts across movie / episode / track libraries; we use
         # the generic "watch" key so the end user sees one batch row
         # for the watch-history workstream regardless of library type.
-        self.tick_etr(n)
         self.tick_batch("watch", n)
 
     def inc_playlist(self, n: int = 1) -> None:
         with self._lock:
             self.playlist_count += n
-        self.tick_etr(n)
         self.tick_batch("playlist", n)
 
     def inc_collection(self, n: int = 1) -> None:
         with self._lock:
             self.collection_count += n
-        self.tick_etr(n)
         self.tick_batch("collection", n)
 
     def inc_rating(self, n: int = 1) -> None:
         with self._lock:
             self.rating_count += n
-        self.tick_etr(n)
         self.tick_batch("rating", n)
 
     # ── Currently-processing items ───────────────────────────────────
@@ -1094,9 +779,6 @@ class DashboardState:
         """Returns a JSON-like dict copy of the current state for rendering."""
         now = time.time()
         with self._lock:
-            # Gap-B: refresh the predicted-ETR decay each frame so the
-            # number visibly counts down without a separate timer.
-            self._refresh_predicted_etr()
             return {
                 "libraries": [
                     {
@@ -1161,33 +843,8 @@ class DashboardState:
                     }
                     for ci in self.current_items.values()
                 ],
-                # Timing engine value (discover-don't-predict). The
-                # single headline ETR, populated only once the rolling
-                # tracker has real throughput samples; ``None`` until
-                # then (frontend renders "Calculating..." UNLESS
-                # predicted_etr_seconds is set, see below).
-                # Per-batch ETRs feed the Process List panel.
-                "rolling_etr_seconds": self.rolling_etr_seconds,
-                # Gap-B of the post-cutover review: the new ETA
-                # training engine's pre-run prediction. Decays from
-                # ``predicted_total`` toward 0 as the run progresses
-                # (recomputed once per frame from elapsed wall-clock).
-                # The frontend prefers rolling_etr_seconds when set;
-                # falls back to predicted_etr_seconds while the live
-                # tracker is still warming up.
-                "predicted_etr_seconds": self.predicted_etr_seconds,
-                # Source tag: "live" when rolling_etr_seconds is the
-                # rendered value, "predicted" when predicted_etr_seconds
-                # is the fallback, None when neither has data yet.
-                "etr_source": self.etr_source,
-                # Bugfix 2026-05-16: surface a single backend-computed
-                # "is the run actually near the end?" flag so the
-                # frontend can gate the "Almost done" copy on real
-                # evidence rather than just a low-seconds reading.
-                # True when the post-engine finalize phase is active
-                # OR when the engine's progress counter is past the
-                # end user-tunable ``eta_almost_done_progress_threshold``.
-                "is_finishing": self._is_finishing_for_display(),
+                # Per-batch progress for the Process List panel;
+                # each value is a {total, completed} pair.
                 "batch_etrs": {k: dict(v) for k, v in self.batch_etrs.items()},
                 "threads": dict(self._threads),
                 "paused": self.paused,
@@ -1245,16 +902,22 @@ def _aggregate_http_series(
     window_seconds: int = 60,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Collapse the rolling 500-entry response deque into the wire shape
-    the Network panel renders: per-library buckets, one per second
-    over the last ``window_seconds``, each bucket carrying
+    Collapse the rolling response deque into the wire shape the
+    Network panel renders: per-library buckets, one per second over
+    the last ``window_seconds`` (default 60s), each bucket carrying
     ``{t, rps, avg_ms}``.
 
+    CONSOLE-16: the source ``_http_recent`` deque is time-windowed —
+    it holds the last 60 seconds of entries, with a hard ceiling of
+    100 000 entries as a safety net against pathological traffic
+    rates. This aggregation only consumes entries newer than
+    ``now - window_seconds``; older ones are skipped.
+
     Keeps the WS payload small (60 buckets × ~K libraries instead of
-    500 raw events) and predictable in size regardless of traffic
-    volume. Always returns the cumulative ``"__all__"`` series so the
-    frontend can render the default cumulative view without a library
-    selection.
+    every raw event in the window) and predictable in size regardless
+    of traffic volume. Always returns the cumulative ``"__all__"``
+    series so the frontend can render the default cumulative view
+    without a library selection.
     """
     cutoff = now - window_seconds
     # buckets[lib][second_index] = (count, total_elapsed_ms)
@@ -1347,69 +1010,6 @@ def _fmt_duration(seconds: float) -> str:
     return f"{m}:{sc:02d}"
 
 
-def _check_terminal_size() -> bool:
-    """
-    Returns True if the terminal is too small for the full dashboard.
-
-    The threshold is 80 columns × 22 rows - below that we fall back to the
-    simple Rich Progress bars used in v0.4.0. Also returns True when stdout
-    is not a TTY (piped output), since Live mode doesn't make sense there.
-    """
-    if not sys.stdout.isatty():
-        return True
-    try:
-        cols, rows = os.get_terminal_size()
-        return cols < 80 or rows < 22
-    except OSError:
-        return True
-
-
-def _open_log_folder(log_dir: str) -> None:
-    """Opens the log directory in the OS file manager (best-effort, silent on failure)."""
-    try:
-        target = os.path.abspath(log_dir)
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", target])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", target])
-        else:
-            subprocess.Popen(["xdg-open", target])
-    except Exception:
-        pass
-
-
-def _open_plex_server() -> None:
-    """Opens the connected Plex server in the default browser, auto-logged in via token."""
-    try:
-        base = (state._plex_base_url or f"http://localhost:{PLEX_PORT}").rstrip("/")
-        if state._plex_token:
-            url = f"{base}/web/index.html?X-Plex-Token={state._plex_token}"
-        else:
-            url = base
-        webbrowser.open(url)
-    except Exception:
-        pass
-
-
-def _make_progress() -> Progress:
-    """
-    Builds the Rich Progress instance used for all snapshot and import bars.
-
-    Layout per row:
-        [spinner] [library name, 25 chars] [bar, 22 wide] [N/M] [phase label, 22 chars] [ETA]
-    """
-    return Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description:<25}"),
-        BarColumn(bar_width=22),
-        MofNCompleteColumn(),
-        TextColumn("[dim]{task.fields[phase]:<22}"),
-        TimeRemainingColumn(),
-        console=console,
-        refresh_per_second=8,
-    )
-
-
 # ── Dashboard Rendering ───────────────────────────────────────────────────────
 
 _ACTION_COLORS: Dict[str, str] = {
@@ -1477,7 +1077,7 @@ def _build_dashboard(snap: Dict[str, Any], mode: str = "IMPORT") -> Panel:
 
     # ── Header ─────────────────────────────────────────────────────────────────
     body.append(
-        f" PlexMigrate v{VERSION}  ·  {mode}  ·  {now_str}  ·  Elapsed {elapsed_str}{paused_tag}\n",
+        f" Hestia-MediaManager v{VERSION}  ·  {mode}  ·  {now_str}  ·  Elapsed {elapsed_str}{paused_tag}\n",
         style="bold",
     )
 
@@ -1573,91 +1173,26 @@ def _build_dashboard(snap: Dict[str, Any], mode: str = "IMPORT") -> Panel:
 
 # ── Keyboard Input Handling ───────────────────────────────────────────────────
 
-def _handle_key(
-    key: str,
-    log_dir: str,
-    logger: Any,
-    stop_event: threading.Event,
-) -> None:
-    """
-    Dispatches a single keypress to the appropriate action.
-
-    Key bindings:
-        Q - cancel queued work and exit cleanly after running tasks finish
-        V - toggle RichHandler console log level between INFO and DEBUG
-        P - pause/resume all worker threads at their next checkpoint
-        L - open the log directory in the OS file manager
-        S - open the connected Plex server in the default web browser
-        R - force an immediate dashboard refresh
-    """
-    k = key.lower()
-    if k == "q":
-        stop_event.set()
-        if state.get_dashboard():
-            state.get_dashboard().push_activity("phase", "-", "Stopping (finishing current tasks)…")
-    elif k == "v":
-        if state._console_handler is not None:
-            if state._console_handler.level == logging.DEBUG:
-                state._console_handler.setLevel(logging.INFO)
-                logger.info("Verbose console logging disabled")
-            else:
-                state._console_handler.setLevel(logging.DEBUG)
-                logger.info("Verbose console logging enabled")
-    elif k == "p":
-        if state.get_dashboard() is not None:
-            state.get_dashboard().toggle_pause()
-    elif k == "l":
-        _open_log_folder(log_dir)
-    elif k == "s":
-        _open_plex_server()
-    elif k == "r":
-        if state._live_instance is not None:
-            state._live_instance.refresh()
-
-
 def _keyboard_thread(
     log_dir: str,
     logger: Any,
     stop_event: threading.Event,
 ) -> None:
     """
-    Background daemon thread that reads keyboard input without blocking the main thread.
+    Daemon thread spawned once per engine run. It registers the run's
+    ``stop_event`` on ``state._active_stop_event`` so the server's
+    ``/api/job/stop`` endpoint (via ``server.runtime_patches.signal_stop``
+    / ``signal_hard_stop``) can flip the flag, then blocks until the run
+    ends or a stop is signalled and clears the registration on exit.
 
-    Windows path:
-        Uses msvcrt.kbhit() to check for input and msvcrt.getwch() to read one
-        wide character without echoing it to the terminal.
-
-    Unix/macOS path:
-        Sets the terminal to raw mode (tty.setraw) so characters arrive without
-        waiting for Enter, then uses select() with a 50 ms timeout to avoid
-        busy-waiting. The original terminal settings are restored in the finally
-        block even if the thread is killed by an exception.
+    ``log_dir`` and ``logger`` are accepted for call-site compatibility
+    with ``run_snapshot`` / ``run_restore`` but are unused.
     """
+    state._active_stop_event = stop_event
     try:
-        if sys.platform == "win32":
-            import msvcrt
-            while not stop_event.is_set():
-                if msvcrt.kbhit():
-                    ch = msvcrt.getwch()
-                    _handle_key(ch, log_dir, logger, stop_event)
-                time.sleep(0.05)
-        else:
-            import tty
-            import termios
-            import select as _select
-            fd = sys.stdin.fileno()
-            old_settings = termios.tcgetattr(fd)
-            try:
-                tty.setraw(fd)
-                while not stop_event.is_set():
-                    r, _, _ = _select.select([sys.stdin], [], [], 0.05)
-                    if r:
-                        ch = sys.stdin.read(1)
-                        _handle_key(ch, log_dir, logger, stop_event)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    except Exception:
-        pass
+        stop_event.wait()
+    finally:
+        state._active_stop_event = None
 
 
 # ── Action Type and Progress Helpers ─────────────────────────────────────────
@@ -1683,14 +1218,7 @@ def _action_type_from_record(record: Dict) -> str:
 
 
 def _advance_lib(lib_name: str) -> None:
-    """
-    Advances the progress display for lib_name by one step.
-
-    Works in both dashboard mode (_dashboard) and small-terminal fallback mode
-    (_live_progress), so import functions only need to call this once instead of
-    duplicating the if/elif logic at every progress-advance site.
-    """
+    """Advance the dashboard's per-library progress for ``lib_name`` by
+    one step. No-op when no DashboardState is active."""
     if state.get_dashboard():
         state.get_dashboard().advance_library(lib_name)
-    elif state._live_progress:
-        state._live_progress.update(state._lib_task_ids.get(lib_name), advance=1)

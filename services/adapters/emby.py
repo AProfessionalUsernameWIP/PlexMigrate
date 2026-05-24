@@ -4,7 +4,7 @@ EmbyAdapter: Emby Server implementation of
 
 Emby and Jellyfin share a common ancestor (Emby's pre-3.6 codebase
 that Jellyfin forked from) and consequently share most of the REST
-API surface. The differences relevant to PlexMigrate are:
+API surface. The differences relevant to Hestia-MediaManager are:
 
 1. **Authorization scheme name.** Emby uses
    ``Authorization: Emby UserId=..., Token=..., Client=..., ...``;
@@ -67,34 +67,30 @@ class EmbyAdapter(JellyfinAdapter):
         *,
         owner_user_id: Optional[str] = None,
         machine_id: Optional[str] = None,
+        server_uid: Optional[str] = None,
     ) -> None:
-        # Bypass JellyfinAdapter.__init__'s session creation by
-        # manually setting attributes then re-instantiating the
-        # credentials + session with Emby's scheme. The parent class
-        # builds the session in its own __init__ with the Jellyfin
-        # scheme; we replace it here. Equivalent to calling super()
-        # but cleaner: AuthCredentials.backend is the single
-        # divergence point.
-        self._base_url = base_url.rstrip("/")
-        self._admin_token = admin_token
-        self._owner_user_id = (owner_user_id or "").strip()
-        self._machine_id_cached = (machine_id or "").strip()
+        super().__init__(
+            base_url,
+            admin_token,
+            owner_user_id=owner_user_id,
+            machine_id=machine_id,
+            server_uid=server_uid,
+        )
+        # Emby diverges from the Jellyfin base in ways the parent
+        # __init__ does not cover: Emby carries ``UserId`` in the
+        # Authorization header (Jellyfin does not), so rebuild the
+        # credentials + session with the owner id. Emby also accepts a
+        # UserId-free ``X-Emby-Token`` header, set here so
+        # construction-time calls work before server_identity()
+        # resolves the owner. See
+        # https://dev.emby.media/doc/restapi/User-Authentication.html
         self._creds = AuthCredentials(
             backend=self._auth_scheme,
             token=admin_token,
             user_id=self._owner_user_id or None,
         )
         self._session = make_session(self._creds)
-        # Emby-specific: also set the X-Emby-Token header. The
-        # Authorization: Emby header REQUIRES ``UserId`` for some
-        # endpoints, but at construction time we don't have the
-        # owner_user_id yet (it's resolved by server_identity()
-        # later). X-Emby-Token is the auth path that doesn't need
-        # UserId, so we set both - the server accepts whichever it
-        # prefers. See https://dev.emby.media/doc/restapi/User-Authentication.html
-        # for the dual-header contract.
         self._session.headers["X-Emby-Token"] = admin_token
-        self._identity_cache = None
 
     def server_identity(self):
         """Emby override: after resolving owner_user_id, rebuild the

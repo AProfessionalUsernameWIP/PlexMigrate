@@ -1,10 +1,8 @@
-# PlexMigrate backend container.
+# Hestia-MediaManager backend container.
 #
 # Runs the FastAPI server defined in server/app.py under uvicorn.
-# The engine code (services/) and the CLI driver (plexmigrate.py)
-# are copied in unchanged - the same image can be used to run the
-# CLI from inside the container if needed (docker compose exec
-# backend python plexmigrate.py ...).
+# The engine code (services/) and the server layer (server/) are the
+# only application code in the image. The web UI is the sole interface.
 
 FROM python:3.11-slim
 
@@ -20,8 +18,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Engine, CLI driver, server layer.
-COPY plexmigrate.py ./
+# Engine + server layer.
 COPY services/ ./services/
 COPY server/ ./server/
 

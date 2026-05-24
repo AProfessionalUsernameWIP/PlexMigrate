@@ -1,21 +1,20 @@
 // The Networking tab - process-lifetime, server-keyed HTTP telemetry
-// for every registered server (v0.12.0).
+// for every registered server.
 //
 // Why a dedicated tab?
 // --------------------
-// Pre-v0.12.0, the network charts lived inline on the Dashboard panel
-// as part of the per-job DashboardState. That made them disappear in
-// two valid scenarios:
+// Network telemetry tied to a per-job DashboardState would disappear
+// in two valid scenarios:
 //
 //   * Idle: no job → no DashboardState → no network surface, even
 //     though the registered servers are still reachable and pingable.
 //   * Fan-out: every destination has its own DashboardState; there's
-//     no single "the" dashboard to embed network details on, so the
-//     fan-out layout omitted the panel entirely.
+//     no single "the" dashboard to embed network details on, so a
+//     fan-out layout would omit the panel entirely.
 //
 // The Networking tab reads from the process-lifetime collector keyed
 // by URL host. It stays correct in every UI state - idle, single-job,
-// fan-out - because telemetry no longer rides on the per-job
+// fan-out - because telemetry does not ride on the per-job
 // abstraction. One card per registered server, each with rolling 60s
 // RPS / latency, window + cumulative status histograms, and the
 // rate-limit feed for 429s and 503s.
@@ -23,7 +22,10 @@
 // The Dashboard's inline NetworkPanel is unchanged for single-dest
 // jobs; this tab is an addition, not a replacement.
 
-import { DashboardFrame, ServerNetworkState } from '../api';
+import { useCallback, useEffect, useState } from 'react';
+import { api, DashboardFrame, ServerNetworkState } from '../api';
+import { errorText } from '../utils/format';
+import { pausableInterval } from '../utils/pausableInterval';
 
 interface Props {
   snapshot: DashboardFrame | null;
@@ -33,13 +35,16 @@ export function NetworkingPanel({ snapshot }: Props) {
   const servers = snapshot?.servers_network ?? [];
   if (servers.length === 0) {
     return (
-      <div className="panel">
-        <h2>Networking</h2>
-        <div className="empty">
-          No registered servers yet. Add one from the <strong>Servers</strong> tab and
-          the per-server live telemetry will appear here automatically.
+      <>
+        <div className="panel">
+          <h2>Networking</h2>
+          <div className="empty">
+            No registered servers yet. Add one from the <strong>Servers</strong> tab and
+            the per-server live telemetry will appear here automatically.
+          </div>
         </div>
-      </div>
+        <RecentRequestsPanel />
+      </>
     );
   }
   return (
@@ -57,7 +62,184 @@ export function NetworkingPanel({ snapshot }: Props) {
       {servers.map((s) => (
         <ServerNetworkCard key={s.server_id || s.host} snap={s} />
       ))}
+      <RecentRequestsPanel />
     </>
+  );
+}
+
+
+// ── Recent requests ──
+//
+// Per-request HTTP timeline. The shared session response hook in
+// services.auth captures every Plex API call's URL + method + status
+// + elapsed_ms + host + job_id and pushes them onto a ring buffer
+// (5000 entries process-lifetime). This panel polls
+// /api/network/recent-requests every 3s while visible so the operator
+// can see the actual requests fired during direct / fan-out / batch
+// runs. Includes filters for job_id + host so a busy timeline can be
+// narrowed to one specific run.
+
+interface RecentRequest {
+  timestamp: number;
+  host: string;
+  method: string;
+  url: string;
+  status_code: number;
+  elapsed_ms: number;
+  job_id: string | null;
+}
+
+function RecentRequestsPanel() {
+  const [requests, setRequests] = useState<RecentRequest[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [hostFilter, setHostFilter] = useState('');
+  const [jobIdFilter, setJobIdFilter] = useState('');
+  const [autoRefresh, setAutoRefresh] = useState(true);
+
+  const fetchRequests = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      const r = await api.listRecentNetworkRequests({
+        limit: 500,
+        jobId: jobIdFilter.trim() || undefined,
+        host: hostFilter.trim() || undefined,
+      });
+      setRequests(r.requests || []);
+      setError(null);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [hostFilter, jobIdFilter]);
+
+  useEffect(() => {
+    void fetchRequests();
+  }, [fetchRequests]);
+
+  useEffect(() => {
+    if (!autoRefresh) return;
+    return pausableInterval(() => { void fetchRequests(); }, 3000);
+  }, [autoRefresh, fetchRequests]);
+
+  return (
+    <div className="panel" style={{ marginTop: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+        <h2 style={{ margin: 0 }}>
+          Recent requests
+          <span style={{ color: 'var(--text-dim)', fontSize: 12, fontWeight: 400, marginLeft: 8 }}>
+            {requests.length} entries (newest first)
+          </span>
+        </h2>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline' }}>
+          <label style={{ fontSize: 12 }}>
+            Filter by host:
+            <input
+              type="text"
+              value={hostFilter}
+              onChange={(e) => setHostFilter(e.target.value)}
+              placeholder="plex.local:32400"
+              style={{ marginLeft: 4, width: 160, fontSize: 11 }}
+            />
+          </label>
+          <label style={{ fontSize: 12 }}>
+            Filter by job_id:
+            <input
+              type="text"
+              value={jobIdFilter}
+              onChange={(e) => setJobIdFilter(e.target.value)}
+              placeholder="(job UUID)"
+              style={{ marginLeft: 4, width: 260, fontSize: 11 }}
+            />
+          </label>
+          <label style={{ fontSize: 12 }}>
+            <input
+              type="checkbox"
+              checked={autoRefresh}
+              onChange={(e) => setAutoRefresh(e.target.checked)}
+            />
+            {' '}Auto-refresh (3s)
+          </label>
+          <button
+            type="button"
+            onClick={() => void fetchRequests()}
+            disabled={refreshing}
+            style={{ fontSize: 11 }}
+          >
+            {refreshing ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
+      </div>
+      <p style={{ color: 'var(--text-dim)', fontSize: 12, marginTop: 6 }}>
+        Per-request HTTP timeline captured by the shared session response hook.
+        Tags include the originating job ID so you can correlate a request to a
+        specific snapshot / restore / direct transfer / playlist batch.
+      </p>
+      {error && (
+        <div className="banner error" style={{ fontSize: 12, marginBottom: 8 }}>
+          Could not load requests: {error}
+        </div>
+      )}
+      {requests.length === 0 ? (
+        <div className="empty" style={{ fontSize: 12 }}>
+          No requests captured yet. Run a job to populate the timeline.
+        </div>
+      ) : (
+        <div style={{ maxHeight: 420, overflowY: 'auto', border: '1px solid rgba(128,128,128,0.2)', borderRadius: 3 }}>
+          <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
+            <thead style={{ position: 'sticky', top: 0, background: 'var(--bg, #1a1a1a)' }}>
+              <tr>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>When</th>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>Method</th>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>Status</th>
+                <th style={{ textAlign: 'right', padding: '4px 8px' }}>ms</th>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>Host</th>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>URL</th>
+                <th style={{ textAlign: 'left', padding: '4px 8px' }}>Job</th>
+              </tr>
+            </thead>
+            <tbody>
+              {requests.map((r, i) => {
+                const statusColor =
+                  r.status_code >= 500 ? 'var(--bad, #ef4444)'
+                  : r.status_code >= 400 ? 'var(--warn, #f5a623)'
+                  : r.status_code >= 300 ? 'var(--text-dim)'
+                  : 'var(--success, #16a34a)';
+                const elapsedColor =
+                  r.elapsed_ms > 2000 ? 'var(--bad, #ef4444)'
+                  : r.elapsed_ms > 500 ? 'var(--warn, #f5a623)'
+                  : undefined;
+                const when = new Date(r.timestamp * 1000).toLocaleTimeString();
+                return (
+                  <tr
+                    key={`${r.timestamp}-${i}`}
+                    style={{ borderBottom: '1px dotted rgba(128,128,128,0.15)' }}
+                  >
+                    <td style={{ padding: '2px 8px', whiteSpace: 'nowrap' }}>{when}</td>
+                    <td style={{ padding: '2px 8px', fontFamily: 'monospace' }}>{r.method}</td>
+                    <td style={{ padding: '2px 8px', color: statusColor, fontWeight: 600 }}>{r.status_code}</td>
+                    <td style={{ padding: '2px 8px', textAlign: 'right', color: elapsedColor }}>{r.elapsed_ms.toFixed(0)}</td>
+                    <td style={{ padding: '2px 8px', fontFamily: 'monospace' }}>{r.host}</td>
+                    <td style={{ padding: '2px 8px', fontFamily: 'monospace', wordBreak: 'break-all' }}>
+                      {/* Truncate by code point (Array.from splits on
+                          full code points) so a surrogate pair is never
+                          cut in half. */}
+                      {Array.from(r.url).length > 100
+                        ? Array.from(r.url).slice(0, 100).join('') + '…'
+                        : r.url}
+                    </td>
+                    <td style={{ padding: '2px 8px', fontFamily: 'monospace', color: r.job_id ? undefined : 'var(--text-dim)' }}>
+                      {r.job_id ? r.job_id.slice(0, 8) : '-'}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
 

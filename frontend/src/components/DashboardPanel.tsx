@@ -4,74 +4,101 @@
 //   * Thread pool summary (categorised counts)
 //   * Run stats (completed / skipped / failed / unresolved)
 //   * Match resolution stats (GUID / filepath / suffix / fuzzy)
-//   * Per-library progress bars with ETA
+//   * Per-library progress bars
 //   * Activity feed (last several events, colour-coded)
-//   * Job state badge with elapsed + ETA
+//   * Job state badge with elapsed
+//
+// No ETA columns anywhere on the dashboard. An ETA would have to be
+// anchored on a step-count denominator that isn't work-time-uniform
+// (snapshot owner-phase steps complete in seconds; per-user fan-out
+// steps take minutes per user), so extrapolation flips libraries to
+// "Done" prematurely.
 //
 // Reads only from props - no fetch logic here. The App owns the WS
 // subscription and pushes the snapshot down.
 
-import { type ReactNode, Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactNode, Fragment, createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityEntry, ContainerResult, CurrentItem, DashboardState, FanOutDestState, JobPayload, LibraryProgress, LogFile, DashboardFrame, api } from '../api';
 import { LogTailer } from './LogTailer';
 import { NetworkPanel } from './NetworkPanel';
 import { InfoTip } from './InfoTip';
+import { useConfirm } from './ConfirmModal';
 import { usePermission } from '../hooks/usePermission';
+import { useNowTick } from '../hooks/useNowTick';
+import { pausableInterval } from '../utils/pausableInterval';
 
 interface Props {
   snapshot: DashboardFrame | null;
-  // v0.9.3: connection state from App so the empty-state panel can
+  // Connection state from App so the empty-state panel can
   // distinguish "still connecting" from "connected, no job running".
   connState?: 'connecting' | 'connected' | 'disconnected';
-  // PR-8 - which job's sub-tab is active. ``null`` defaults to the
-  // running job. Selection is owned by App.tsx so the sub-tab strip
-  // sits at the same visual layer as Run Job / Servers / Settings
-  // strips. Single-job snapshots ignore this prop entirely.
+  // Which job's sub-tab is active. ``null`` defaults to the running
+  // job. Selection is owned by App.tsx so the sub-tab strip sits at
+  // the same visual layer as Run Job / Servers / Settings strips.
+  // Single-job snapshots ignore this prop entirely.
   selectedJobId?: string | null;
 }
+
+// DashboardPanel-scoped config that deep-tree sub-components read. The
+// values come from settings and live in DashboardPanel state, so a
+// settings change re-renders every consumer; a module-level ``let``
+// would mutate silently without re-rendering. Defaults match the
+// backend tunable defaults.
+interface DashboardConfig {
+  etrColorMultiplier: number;
+  restorationSummaryMaxItems: number;
+}
+
+const DashboardConfigContext = createContext<DashboardConfig>({
+  etrColorMultiplier: 1.0,
+  restorationSummaryMaxItems: 10,
+});
 
 export function DashboardPanel({
   snapshot,
   connState = 'connected',
   selectedJobId = null,
 }: Props) {
-  // Re-render every second so the elapsed-time strings tick even when
-  // no new snapshot has arrived (e.g. job idle but page still open).
-  const [, force] = useState(0);
-  useEffect(() => {
-    const t = window.setInterval(() => force((x) => x + 1), 1000);
-    return () => window.clearInterval(t);
-  }, []);
-
-  // Phase 4: pull the end user-set ETR colour multiplier from settings
-  // on mount and stash it in the module-level value the per-phase
-  // stall thresholds read. A change via Settings ▸ General takes
-  // effect on the next DashboardPanel mount.
+  // The per-phase stall thresholds scale by an end user-set ETR
+  // colour multiplier, and the Restoration Summary panel caps its
+  // row count by a tunable. Both are component state surfaced to the
+  // deep-tree consumers via DashboardConfigContext, so a settings
+  // change re-renders them. A change via Settings takes effect on the
+  // next DashboardPanel mount.
+  const [etrColorMultiplier, setEtrColorMultiplier] = useState(1.0);
+  const [restorationSummaryMaxItems, setRestorationSummaryMaxItems] = useState(10);
   useEffect(() => {
     api.getSettings()
       .then((s) => {
         const m = (s as { etr_color_multiplier?: number }).etr_color_multiplier;
-        if (typeof m === 'number' && Number.isFinite(m)) setEtrColorMultiplier(m);
-        // 2026-05-17 (end user request): restore summary row cap.
-        // Tunable lives in settings.tunables.restoration_summary_panel_max_items.
+        // Clamp to the [0.5, 2.0] window the backend tunable enforces.
+        if (typeof m === 'number' && Number.isFinite(m)) {
+          setEtrColorMultiplier(Math.min(2.0, Math.max(0.5, m)));
+        }
+        // Restoration Summary row cap, from
+        // settings.tunables.restoration_summary_panel_max_items.
         const raw = (s as unknown as Record<string, unknown>).tunables;
         const tn = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
         const cap = tn['restoration_summary_panel_max_items'];
         if (typeof cap === 'number' && Number.isFinite(cap)) {
-          setRestorationSummaryMaxItems(cap);
+          setRestorationSummaryMaxItems(Math.min(200, Math.max(1, Math.trunc(cap))));
         }
       })
-      .catch(() => { /* non-fatal - keep the default 1.0 */ });
+      .catch(() => { /* non-fatal - keep the defaults */ });
   }, []);
+  const dashboardConfig = useMemo<DashboardConfig>(
+    () => ({ etrColorMultiplier, restorationSummaryMaxItems }),
+    [etrColorMultiplier, restorationSummaryMaxItems],
+  );
 
   const dash = snapshot?.dashboard ?? null;
   const job = snapshot?.job ?? null;
   const fanOut = snapshot?.fan_out ?? null;
   const jobs = snapshot?.jobs ?? [];
 
-  // PR-8 - multi-job selection. When two or more jobs are active /
-  // queued the parent (App.tsx) renders a sub-tab strip and threads
-  // the selected job id down via ``selectedJobId``. If the end user
+  // Multi-job selection. When two or more jobs are active / queued
+  // the parent (App.tsx) renders a sub-tab strip and threads the
+  // selected job id down via ``selectedJobId``. If the end user
   // hasn't picked one yet (or the prior pick has fallen off the list)
   // we default to the running job. If the end user selected a queued
   // job we render the lightweight QueuedJobPanel - there's no
@@ -90,17 +117,17 @@ export function DashboardPanel({
     // running record - that's identical to the single-job case below.
   }
 
-  // Unified shell (Tier 3): JobHeader renders exactly ONCE here, for
-  // every job type, then the body is routed to one of two components:
+  // Unified shell: JobHeader renders exactly ONCE here, for every job
+  // type, then the body is routed to one of two components:
   //   * FanOutBody    - the per-destination sub-tab layout (>1 dest)
   //   * DashboardBody - the single-job section list (snapshot /
   //     restore / direct; each fan-out destination sub-tab also
   //     reuses DashboardBody internally).
-  // Before this, JobHeader was rendered inside BOTH DashboardBody and
-  // FanOutSubTabs - which double-rendered it on every fan-out
-  // per-destination tab. One render site, one source of truth.
+  // JobHeader has one render site here so it is never double-rendered
+  // on a fan-out per-destination tab. One render site, one source of
+  // truth.
   return (
-    <>
+    <DashboardConfigContext.Provider value={dashboardConfig}>
       <JobHeader job={job} dash={dash} />
       {fanOut && fanOut.length > 1 ? (
         <FanOutBody job={job} fanOut={fanOut} connState={connState} frame={snapshot} />
@@ -116,15 +143,15 @@ export function DashboardPanel({
           logRunOverride={null}
         />
       )}
-    </>
+    </DashboardConfigContext.Provider>
   );
 }
 
-// PR-8 - placeholder rendered when the end user clicks a queued
-// job's sub-tab. We don't have a DashboardState for a job that
-// hasn't started yet, so show the end user the queue position and
-// the job's submitted scope so they can still inspect it without
-// having to wait for the worker to pick it up.
+// Placeholder rendered when the end user clicks a queued job's
+// sub-tab. We don't have a DashboardState for a job that hasn't
+// started yet, so show the end user the queue position and the
+// job's submitted scope so they can still inspect it without having
+// to wait for the worker to pick it up.
 function QueuedJobPanel({ job, queuePosition }: { job: JobPayload; queuePosition: number }) {
   const params = (job.params as Record<string, unknown>) ?? {};
   const libs = Array.isArray(params.libraries) ? (params.libraries as unknown[]).map(String) : [];
@@ -133,6 +160,10 @@ function QueuedJobPanel({ job, queuePosition }: { job: JobPayload; queuePosition
   const dests = Array.isArray(params.dest_server_names)
     ? (params.dest_server_names as unknown[]).map(String)
     : (typeof params.dest_server_name === 'string' ? [params.dest_server_name] : []);
+  // The "source" of a restore is a snapshot file, not a server, so
+  // the input_files block is labelled "Snapshot used" and the
+  // destination block is "Restoring to".
+  const isRestore = job.mode === 'restore';
   return (
     <div className="panel">
       <h2 style={{ marginTop: 0 }}>
@@ -146,12 +177,27 @@ function QueuedJobPanel({ job, queuePosition }: { job: JobPayload; queuePosition
         currently-running job (and any earlier queued jobs) finish.
       </SectionHint>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 16, fontSize: 14, marginTop: 6 }}>
-        {src && (
-          <div><span className="label">Source:</span> <strong>{src}</strong></div>
+        {isRestore ? (
+          inputFiles.length > 0 && (
+            <div>
+              <span className="label">Snapshot used:</span>{' '}
+              <strong>
+                {inputFiles.length} export file{inputFiles.length === 1 ? '' : 's'}
+              </strong>
+            </div>
+          )
+        ) : (
+          src && (
+            <div><span className="label">Source:</span> <strong>{src}</strong></div>
+          )
         )}
         {dests.length > 0 && (
           <div>
-            <span className="label">{dests.length > 1 ? 'Destinations:' : 'Destination:'}</span>{' '}
+            <span className="label">
+              {isRestore
+                ? (dests.length > 1 ? 'Restoring to:' : 'Restoring to:')
+                : (dests.length > 1 ? 'Destinations:' : 'Destination:')}
+            </span>{' '}
             <strong>{dests.join(', ')}</strong>
           </div>
         )}
@@ -160,7 +206,7 @@ function QueuedJobPanel({ job, queuePosition }: { job: JobPayload; queuePosition
             <span className="label">Libraries:</span> {libs.join(', ')}
           </div>
         )}
-        {inputFiles.length > 0 && (
+        {!isRestore && inputFiles.length > 0 && (
           <div>
             <span className="label">Export files:</span> {inputFiles.length}
           </div>
@@ -170,10 +216,10 @@ function QueuedJobPanel({ job, queuePosition }: { job: JobPayload; queuePosition
   );
 }
 
-// PR-4 / Phase E + Tier 2 standardization - the per-snapshot panel
-// body. JobHeader is NO LONGER rendered here; the unified shell in
-// DashboardPanel owns it. This component is purely the ordered
-// section list plus the empty / connecting / job-starting placeholder.
+// The per-snapshot panel body. JobHeader is not rendered here; the
+// unified shell in DashboardPanel owns it. This component is purely
+// the ordered section list plus the empty / connecting /
+// job-starting placeholder.
 //
 // ``logRunOverride`` lets the fan-out per-destination sub-tab point
 // the inline log tail at the destination's own run_log_dir rather
@@ -209,7 +255,7 @@ const DASHBOARD_SECTIONS: {
   // restore-only: the per-container restoration summary.
   { key: 'container', modes: ['restore'], render: (c) => <ContainerSummary dash={c.dash} job={c.job} /> },
   { key: 'batch', modes: 'all', render: (c) => <BatchEtrPanel dash={c.dash} /> },
-  { key: 'libraries', modes: 'all', render: (c) => <LibraryList libs={c.dash.libraries} now={Date.now() / 1000} job={c.job} /> },
+  { key: 'libraries', modes: 'all', render: (c) => <LibraryList libs={c.dash.libraries} job={c.job} /> },
   { key: 'threadpool', modes: 'all', render: (c) => <ThreadPool dash={c.dash} /> },
   { key: 'current', modes: 'all', render: (c) => <CurrentlyProcessing items={c.dash.current_items ?? []} /> },
   { key: 'activity', modes: 'all', render: (c) => <ActivityFeed entries={c.dash.activity} /> },
@@ -249,6 +295,29 @@ function DashboardBody({
     <>
       {dash ? (
         <>
+          {/* Surface dash.finalizing prominently. After every library
+              shows "Library complete" the engine still has to close
+              logs, finalize the run dir, write the snapshot .db file,
+              and run the mirror writethrough - all of which can take
+              10-60s on a large run. Without this banner the dashboard
+              goes silent and the operator reasonably wonders whether
+              the job hung. The label is set by server/jobs.py at each
+              finalize step ("closing run logs" -> "writing snapshot
+              to database" -> "writing mirror"). */}
+          {dash.finalizing && (
+            <div
+              className="banner info"
+              style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}
+              role="status"
+            >
+              <span className="spinner" aria-hidden="true" />
+              <strong>Finalizing run:</strong>
+              <span>{dash.finalizing}…</span>
+              <span style={{ marginLeft: 'auto', fontSize: 12, opacity: 0.7 }}>
+                Run is not hung — libraries are complete; the engine is writing artifacts.
+              </span>
+            </div>
+          )}
           {DASHBOARD_SECTIONS
             .filter((s) => sectionVisible(s.modes, mode))
             .map((s) => (
@@ -288,7 +357,7 @@ function DashboardBody({
                 );
               }
               return (
-                <div className="empty">No job is running. Start one from the <strong>Run Job</strong> tab.</div>
+                <div className="empty" data-testid="dashboard-no-active-jobs">No job is running. Start one from the <strong>Run Job</strong> tab.</div>
               );
             })()
           )}
@@ -299,7 +368,7 @@ function DashboardBody({
   );
 }
 
-// Step 6: yellow review banner. Only fires during direct-transfer runs
+// Yellow review banner. Only fires during direct-transfer runs
 // where Tier 3 (fuzzy title matching) actually produced a match - the
 // gate ships OFF by default, so a non-zero count means the end user
 // explicitly opted in via Settings → Transfer Resolution and we want
@@ -335,7 +404,7 @@ function FuzzyTierWarning({
   );
 }
 
-// Rule 4: per-container restoration summary. Renders a table of every
+// Per-container restoration summary. Renders a table of every
 // playlist + collection touched by the active import (or the just-
 // completed import) showing "restored / total" plus an expandable
 // "X items unavailable" breakdown. Hidden entirely on snapshot /
@@ -379,13 +448,14 @@ function ContainerSummaryTable({
   rows: ContainerResult[];
 }) {
   const memberWord = kind === 'Playlists' ? 'items' : 'members';
-  // 2026-05-17 (end user request): cap on-screen rows + scroll the rest
-  // so the Restoration Summary panel doesn't unbounded-grow on libraries
-  // with hundreds of playlists. Cap source is the
-  // ``restoration_summary_panel_max_items`` tunable (default 10).
+  // Cap on-screen rows + scroll the rest so the Restoration Summary
+  // panel doesn't unbounded-grow on libraries with hundreds of
+  // playlists. Cap source is the
+  // ``restoration_summary_panel_max_items`` tunable (default 10),
+  // surfaced through DashboardConfigContext so a change re-renders.
   // Approx row height is ~32px; we set maxHeight at cap × row + header
   // padding so the cap value × row height bounds the visible window.
-  const cap = getRestorationSummaryMaxItems();
+  const cap = useContext(DashboardConfigContext).restorationSummaryMaxItems;
   const scrollable = rows.length > cap;
   const APPROX_ROW_HEIGHT = 32;
   const maxHeightPx = scrollable ? cap * APPROX_ROW_HEIGHT + 4 : undefined;
@@ -514,7 +584,7 @@ function ContainerSummaryRow({
   );
 }
 
-// ── Dashboard live-log tail (v0.9.4) ──────────────────────────────────────────
+// ── Dashboard live-log tail ───────────────────────────────────────────────────
 // Embedded under the JobHeader so users can tail any log file from the
 // current run without switching to the Logs tab. The file dropdown
 // shows everything in the run dir (runtime.log, errors.log, media.log,
@@ -530,10 +600,10 @@ function DashboardLogTail({
   logRunOverride = null,
 }: {
   job: JobPayload | null;
-  // PR-4 / Phase E - fan-out per-destination sub-tabs pass their own
-  // log dir basename here so the tail attaches to that destination's
-  // run directory instead of the parent job's. ``null`` = use the
-  // job's run_log_dir (single-destination behaviour).
+  // Fan-out per-destination sub-tabs pass their own log dir basename
+  // here so the tail attaches to that destination's run directory
+  // instead of the parent job's. ``null`` = use the job's
+  // run_log_dir (single-destination behaviour).
   logRunOverride?: string | null;
 }) {
   const [files, setFiles] = useState<LogFile[]>([]);
@@ -583,8 +653,8 @@ function DashboardLogTail({
     load();
     // Stop refreshing once the job is done - the file set is final.
     if (!jobIsLive) return () => { cancelled = true; };
-    const tick = window.setInterval(load, 5000);
-    return () => { cancelled = true; window.clearInterval(tick); };
+    const stop = pausableInterval(load, 5000);
+    return () => { cancelled = true; stop(); };
   }, [runName, jobIsLive]);
 
   // Default selection: prefer runtime.log if present; otherwise first
@@ -652,9 +722,7 @@ function DashboardLogTail({
   );
 }
 
-// ── Fan-out layout (v0.10.0) ──────────────────────────────────────────────────
-//
-// ── Fan-out sub-tab system (PR-4 / Phase E) ──────────────────────────────────
+// ── Fan-out sub-tab system ────────────────────────────────────────────────────
 //
 // When the WS payload carries more than one destination, the Dashboard
 // tab grows a row of nested sub-tabs:
@@ -678,8 +746,8 @@ type FanOutTabKey = string;  // dest_name | "__overview__" | "__logs__"
 // FanOutBody - the per-destination sub-tab layout. Parallel to
 // DashboardBody (the single-job body); the unified shell in
 // DashboardPanel picks one or the other and renders JobHeader above
-// whichever it picks. (Formerly FanOutSubTabs, which rendered its own
-// JobHeader - that double-rendered the header on every per-dest tab.)
+// whichever it picks. JobHeader is rendered by the shell, not here,
+// so it is never double-rendered on a per-dest tab.
 function FanOutBody({
   job,
   fanOut,
@@ -822,8 +890,7 @@ function FanOutPerDest({
   );
 }
 
-// Compact, read-only status table - one row per destination. The
-// columns match the clp.md / Phase E spec.
+// Compact, read-only status table - one row per destination.
 function FanOutOverview({
   job,
   fanOut,
@@ -870,12 +937,17 @@ function FanOutOverview({
         <h2>Per-destination status</h2>
         <table className="list" style={{ width: '100%' }}>
           <thead>
+            {/* No ETA column. An ETA would be inconsistent across
+                job phases - it would mark "done" and flip the bar
+                green at ~71% because the underlying estimator
+                anchors on a different step count than the visible
+                progress. Progress + last log line carry the
+                load instead. */}
             <tr>
               <th>Server</th>
               <th>Status</th>
               <th>Current library</th>
               <th>Progress</th>
-              <th>ETA</th>
               <th>Last log line</th>
               <th>Avg latency</th>
             </tr>
@@ -887,7 +959,6 @@ function FanOutOverview({
               const totalCompleted = (dash?.libraries ?? []).reduce((a, l) => a + l.completed, 0);
               const totalTotal = (dash?.libraries ?? []).reduce((a, l) => a + l.total, 0);
               const pct = totalTotal > 0 ? Math.round((totalCompleted / totalTotal) * 100) : 0;
-              const eta = activeLib ? computeETA(activeLib, Date.now() / 1000) : (d.state === 'completed' ? '-' : '-');
               const lastLog = dash?.activity?.[dash.activity.length - 1];
               const lastLogText = lastLog
                 ? `${lastLog.timestamp} ${lastLog.action_type.toUpperCase()} ${lastLog.title}`
@@ -904,7 +975,6 @@ function FanOutOverview({
                   </td>
                   <td>{activeLib?.name || '-'}</td>
                   <td>{totalTotal > 0 ? `${pct}%` : '-'}</td>
-                  <td>{eta}</td>
                   <td style={{ maxWidth: 320, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {lastLogText}
                   </td>
@@ -919,15 +989,14 @@ function FanOutOverview({
   );
 }
 
-// Unified Logs sub-tab. PR-8 - bubbles are now multi-select and act as
-// a client-side filter on top of a merged log view that pulls each
+// Unified Logs sub-tab. Bubbles are multi-select and act as a
+// client-side filter on top of a merged log view that pulls each
 // destination's runtime.log, tags every line with its server, and
 // orders chronologically. All bubbles default-on. Toggling a bubble
 // off hides that server's lines without affecting the merge.
 //
-// "Underlying tailer unchanged" per clp.md / PR-8: the existing
-// ``LogTailer`` component is not modified. The merge happens inside
-// a new ``FanOutMergedLogTailer`` that owns its own polling for
+// The ``LogTailer`` component is not modified. The merge happens
+// inside ``FanOutMergedLogTailer``, which owns its own polling for
 // multiple files - the per-file fetch mechanism (``api.readLogFile``)
 // is the same primitive ``LogTailer`` uses.
 function FanOutUnifiedLogs({
@@ -1064,7 +1133,7 @@ function isJobLive(job: JobPayload | null): boolean {
   return job.state === 'queued' || job.state === 'running' || job.state === 'stopping';
 }
 
-// PR-8 - multi-source merged log viewer for the fan-out Unified Logs
+// Multi-source merged log viewer for the fan-out Unified Logs
 // sub-tab. Polls each destination's ``runtime.log`` in parallel via
 // the same ``api.readLogFile`` primitive ``LogTailer`` uses, merges
 // the line streams by their leading ``[YYYY-MM-DD HH:MM:SS]`` prefix,
@@ -1145,10 +1214,10 @@ function FanOutMergedLogTailer({
     };
     tick();
     if (!jobIsLive) return () => { cancelled = true; };
-    const id = window.setInterval(tick, TAIL_POLL_MS);
+    const stop = pausableInterval(tick, TAIL_POLL_MS);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      stop();
     };
   }, [sourcesSig, jobIsLive, sources]);
 
@@ -1290,20 +1359,79 @@ function deriveEndpoints(job: JobPayload | null) {
   const inputFiles = Array.isArray(params['input_files'])
     ? (params['input_files'] as unknown[]).filter((x) => typeof x === 'string').length
     : 0;
+  // Restore-from-snapshot path. ``snapshot_id`` is the registered
+  // snapshot's stable id; the dashboard looks the row up via
+  // api.listSnapshots() so the restore line can show "Snapshot from
+  // <server>" with the captured-at date underneath.
+  //
+  // The submit handler in server/app.py pops ``snapshot_id`` off the
+  // request body and re-stamps it as ``_imported_from_snapshot_id``
+  // before queueing the run record (line ~2641 in app.py). Both keys
+  // are checked here so the lookup resolves regardless of which
+  // submit path queued the run.
+  const snapshotId =
+    typeof params['snapshot_id'] === 'string'
+      ? params['snapshot_id']
+      : typeof params['_imported_from_snapshot_id'] === 'string'
+        ? params['_imported_from_snapshot_id']
+        : undefined;
   const isFanOut = destServersList.length > 1;
-  return { sourceServer, destServer, destServersList, inputFiles, isFanOut };
+  return { sourceServer, destServer, destServersList, inputFiles, snapshotId, isFanOut };
 }
 
-// Tier 1: the source / destination line under the job title. ONE
-// component for all four job shapes - replaces the inline if/else
-// ladder that used to live in JobHeader:
+// The source / destination line under the job title. ONE component
+// for all four job shapes:
 //   snapshot -> "Source: X"
-//   restore  -> "Destination: Y · N export file(s)"
+//   restore  -> "Snapshot used: N file(s) -> Restoring to: Y"
 //   direct   -> "Source: X -> Destination: Y"
 //   fan-out  -> "Source: X -> Destinations (N): Y, Z, ..."
+//
+// The "source" of a restore is a snapshot file, not a server, so the
+// restore shape surfaces "Snapshot used" + the export file count
+// rather than a "Destination · N export files" rendering.
 function JobEndpoints({ job }: { job: JobPayload | null }) {
-  const { sourceServer, destServer, destServersList, inputFiles, isFanOut } =
+  const { sourceServer, destServer, destServersList, inputFiles, snapshotId, isFanOut } =
     deriveEndpoints(job);
+  // Look up the source snapshot's metadata so the restore line can
+  // show "Snapshot from <server>" + captured-at date rather than an
+  // "N export file(s)" count. Fetches once when the snapshot_id
+  // changes (per current-job switch).
+  const [snapshotMeta, setSnapshotMeta] = useState<
+    {
+      server_name: string;
+      captured_at: number;
+      snapshot_name: string;
+      file_path: string;
+      libraries: string[];
+    } | null
+  >(null);
+  useEffect(() => {
+    if (!snapshotId) {
+      setSnapshotMeta(null);
+      return;
+    }
+    let cancelled = false;
+    api.listSnapshots()
+      .then((r) => {
+        if (cancelled) return;
+        const match = (r.snapshots || []).find((s) => s.id === snapshotId);
+        if (match) {
+          setSnapshotMeta({
+            server_name: match.server_name,
+            captured_at: match.captured_at,
+            snapshot_name: match.snapshot_name,
+            file_path: match.file_path,
+            libraries: Array.isArray(match.libraries) ? match.libraries : [],
+          });
+        } else {
+          setSnapshotMeta(null);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSnapshotMeta(null);
+      });
+    return () => { cancelled = true; };
+  }, [snapshotId]);
   if (!sourceServer && !destServer && !isFanOut) return null;
   return (
     <div style={{ marginTop: 8, fontSize: 13, color: 'var(--text-dim)' }}>
@@ -1329,6 +1457,55 @@ function JobEndpoints({ job }: { job: JobPayload | null }) {
           <span style={{ margin: '0 8px' }}>→</span>
           <span>Destination: <strong style={{ color: 'var(--text)' }}>{destServer}</strong></span>
         </>
+      ) : job?.mode === 'restore' ? (
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: '0 8px' }}>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <span style={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 6 }}>
+              <span>Snapshot from:</span>
+              <strong
+                style={{ color: 'var(--text)' }}
+                title={
+                  snapshotMeta
+                    ? `${snapshotMeta.snapshot_name}\n${snapshotMeta.file_path}\ncaptured ${new Date(snapshotMeta.captured_at * 1000).toLocaleString()}`
+                    : (inputFiles > 0 ? `${inputFiles} export file${inputFiles === 1 ? '' : 's'} on disk` : '')
+                }
+              >
+                {snapshotMeta?.server_name
+                  ?? (inputFiles > 0
+                    ? `${inputFiles} export file${inputFiles === 1 ? '' : 's'}`
+                    : '(none specified)')}
+              </strong>
+              {/* Library badges: surface the libraries captured in the
+                  snapshot so the operator can confirm scope at a glance.
+                  Renders inline next to the server name. */}
+              {snapshotMeta?.libraries && snapshotMeta.libraries.length > 0 && (
+                snapshotMeta.libraries.map((lib) => (
+                  <span
+                    key={lib}
+                    className="tag phase"
+                    style={{ fontSize: 10, color: 'var(--text)' }}
+                    title={`Library captured in this snapshot: ${lib}`}
+                  >
+                    {lib}
+                  </span>
+                ))
+              )}
+            </span>
+            {snapshotMeta?.captured_at && (
+              <span style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>
+                captured {new Date(snapshotMeta.captured_at * 1000).toLocaleString()}
+              </span>
+            )}
+          </div>
+          {destServer && (
+            <>
+              <span style={{ alignSelf: 'center' }}>→</span>
+              <span style={{ alignSelf: 'center' }}>
+                Restoring to: <strong style={{ color: 'var(--text)' }}>{destServer}</strong>
+              </span>
+            </>
+          )}
+        </div>
       ) : sourceServer ? (
         <span>Source: <strong style={{ color: 'var(--text)' }}>{sourceServer}</strong></span>
       ) : (
@@ -1345,70 +1522,51 @@ function JobEndpoints({ job }: { job: JobPayload | null }) {
   );
 }
 
+// Self-ticking elapsed-time display. Renders secondsToHMS(ref - start)
+// and, while the job is still in flight (endSec === null), re-renders
+// only itself once a second. Isolating the tick in this leaf keeps the
+// live elapsed counter from re-rendering the whole dashboard panel.
+function ElapsedClock({ startSec, endSec }: { startSec: number; endSec: number | null }) {
+  useNowTick(1000, endSec === null);
+  const ref = endSec ?? Date.now() / 1000;
+  return <>{secondsToHMS(ref - startSec)}</>;
+}
+
 function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState | null }) {
-  // v0.9.7: detect "run is over" so elapsed freezes at the final
-  // duration instead of climbing while the post-finish snapshot is
-  // retained on-screen, and ETA returns to '-' (extrapolating a
-  // remaining time after the run finished is meaningless).
+  // Detect "run is over" so elapsed freezes at the final duration
+  // instead of climbing while the post-finish snapshot is retained
+  // on-screen, and ETA returns to '-' (extrapolating a remaining
+  // time after the run finished is meaningless).
   const runIsOver = !!job && (
     job.state === 'completed' ||
     job.state === 'completed_with_errors' ||
     job.state === 'failed' ||
     job.state === 'cancelled'
   );
-  // ``nowSec`` is the time-reference the elapsed counter uses. When
-  // the run is over and ``finished_at`` is known, freeze it to that
-  // value so the displayed elapsed equals the actual run duration.
-  // While the run is in flight (running / stopping / queued), use
-  // the live wallclock. (The ETA no longer derives from this; it
-  // reads the backend's rolling tracker directly.)
-  const nowSec = runIsOver && job?.finished_at
-    ? job.finished_at
-    : Date.now() / 1000;
-  const elapsed = dash ? secondsToHMS(nowSec - dash.start_time) : '-';
-  // v0.9.2 fix for "Current Job shows 0/N and no ETA" bugs.
-  // Both totalCount and completedCount now read from
+  // Both totalCount and completedCount read from
   // ``dash.libraries[].{total,completed}`` - the exact same fields
-  // the Libraries section below already reads correctly. The previous
-  // build read completedCount from ``dash.completed/skipped/failed``,
-  // which are the engine's resolution-pipeline counters (incremented
-  // by _record_success/_record_failure on matched items). Those are a
+  // the Libraries section below reads. They must NOT read
+  // completedCount from ``dash.completed/skipped/failed``, which are
+  // the engine's resolution-pipeline counters (incremented by
+  // _record_success/_record_failure on matched items): those are a
   // different concept from per-library progress (advanced by
-  // advance_library at phase boundaries), so the header always lagged
-  // behind the per-library rows. With both summands now from the same
-  // source, the ETA formula below also starts producing a value
-  // because completedCount > 0 lifts pct above the 2% threshold.
+  // advance_library at phase boundaries) and would make the header
+  // lag behind the per-library rows. With both summands from the
+  // same source, the header progress stays in step with the
+  // per-library table.
   const totalCount = dash ? dash.libraries.reduce((acc, l) => acc + l.total, 0) : 0;
   const completedCount = dash ? dash.libraries.reduce((acc, l) => acc + l.completed, 0) : 0;
   const pct = totalCount > 0 ? completedCount / totalCount : 0;
-  // ── Top-level ETA: engine-anchored progress (chosen 2026-05-16) ──
+  // ── Top-level ETA ──
   //
-  // The headline ETR is the engine-anchored progress estimate from
-  // ``dash.predicted_etr_seconds``. The math is:
-  //
-  //   etr = predicted_total * remaining_frac * calibration
-  //
-  // where ``predicted_total`` comes from cross-run learned timings,
-  // ``remaining_frac`` is (total - completed) / total, and
-  // ``calibration`` self-corrects mid-run by comparing observed
-  // elapsed vs expected elapsed. This replaces the previous per-tick
-  // rate-based projection that drifted between high and low as the
-  // engine moved through phases of heterogeneous throughput.
-  //
-  // ``dash.rolling_etr_seconds`` (the legacy live tracker) is kept
-  // for the per-batch Process List rows where its per-phase view is
-  // useful; it's no longer the headline number.
-  //
-  // The dashboard's "Estimated remaining" row used to surface the
-  // backend's predicted_etr_seconds / rolling_etr_seconds anchored
-  // estimate. Removed by end user request: the Run Job form's
-  // pre-submit prediction is the only ETA shown to the end user now.
-  // Maintaining a live-updating remaining-time number during the run
-  // was too noisy to be useful - completion fraction is item-weighted,
-  // not work-time-weighted, so a quick early phase cratered the
+  // The dashboard shows no live "Estimated remaining" row. The Run
+  // Job form's pre-submit prediction is the only ETA shown to the
+  // end user. A live-updating remaining-time number during the run
+  // is too noisy to be useful - completion fraction is item-weighted,
+  // not work-time-weighted, so a quick early phase craters the
   // displayed value. The backend still computes predicted_etr_seconds
   // and surfaces it on the wire for any consumer that wants it (logs,
-  // future telemetry, etc.); the dashboard just stops displaying it.
+  // future telemetry, etc.); the dashboard just does not display it.
 
   // Source / destination endpoints come from the job params dict.
   // ``deriveEndpoints`` is the single source of truth, shared with
@@ -1420,13 +1578,12 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
     ? (isFanOut ? 'FAN-OUT' : job.mode.toUpperCase())
     : '';
 
-  // v0.9.6 Feature 1  header context.
+  // Header context.
   const queuedLibs = extractQueuedLibraries(job);
   // Active libraries are derived from the dashboard's per-library
-  // statuses (Q1 of the design pass: no separate ``current_library``
-  // field  multiple libraries can be active at once under
-  // ``lib_pool`` concurrency, and the libraries[] array already
-  // models that).
+  // statuses: there is no separate ``current_library`` field because
+  // multiple libraries can be active at once under ``lib_pool``
+  // concurrency, and the libraries[] array already models that.
   const activeLibs = dash ? dash.libraries.filter((l) => l.status === 'active').map((l) => l.name) : [];
   // Current user is the raw identifier from the engine. The display
   // name lookup is purely a rendering concern  backend logs and
@@ -1436,29 +1593,34 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
     ? (dash?.user_display_names?.[rawCurrentUser] || rawCurrentUser)
     : null;
 
+  const confirm = useConfirm();
   const onStop = async () => {
     // Stop now (a) signals the running job to halt at the next
     // item-level checkpoint and (b) clears every queued job. Both are
     // hard to undo (a half-finished run, a wiped queue), so confirm.
-    const ok = window.confirm(
-      'Stop will halt the running job at the next safe checkpoint ' +
-      'and remove every queued job. The running job ends as ' +
-      'Cancelled; anything captured so far is kept.\n\n' +
-      'Continue?'
-    );
+    const ok = await confirm({
+      body:
+        'Stop will halt the running job at the next safe checkpoint ' +
+        'and remove every queued job. The running job ends as ' +
+        'Cancelled; anything captured so far is kept.\n\n' +
+        'Continue?',
+      danger: true,
+    });
     if (!ok) return;
     try { await api.stopJob(false); } catch { /* surface elsewhere */ }
   };
   const onHardStop = async () => {
-    // v0.12.1  confirm because this is a destructive operation
-    // (in-flight items become failures) and there's no undo.
-    const ok = window.confirm(
-      'Hard stop will tear down the HTTP session to the Plex server immediately ' +
-      'and clear every queued job. Any items currently being processed will be ' +
-      'recorded as failures in this run\'s logs. Use this only when the regular ' +
-      'Stop has been pending too long.\n\n' +
-      'Continue?'
-    );
+    // Confirm because this is a destructive operation (in-flight
+    // items become failures) and there's no undo.
+    const ok = await confirm({
+      body:
+        'Hard stop will tear down the HTTP session to the Plex server immediately ' +
+        'and clear every queued job. Any items currently being processed will be ' +
+        'recorded as failures in this run\'s logs. Use this only when the regular ' +
+        'Stop has been pending too long.\n\n' +
+        'Continue?',
+      danger: true,
+    });
     if (!ok) return;
     try { await api.stopJob(true); } catch { /* surface elsewhere */ }
   };
@@ -1469,9 +1631,9 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
   // the next library boundary  see services/snapshotter.py ::
   // snapshot_watch_history's stop_event checkpoint.
   //
-  // PR-A4 - Stop / Hard Stop are gated on ``jobs.stop``. Viewer and
-  // end user have no Stop permission; their buttons render disabled
-  // so the layout stays consistent across roles. The backend
+  // Stop / Hard Stop are gated on ``jobs.stop``. Viewer and end user
+  // have no Stop permission; their buttons render disabled so the
+  // layout stays consistent across roles. The backend
   // (``require_role('manager')`` on /api/job/stop) is the
   // authoritative gate - this is UX-only.
   const canStopJobs = usePermission('jobs.stop');
@@ -1499,12 +1661,12 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
         </div>
         <div className="col">
           <div className="kv">
-            {/* Timing-spec section 1.1 - Start / End time stamps. The
-                ``started_at`` field is set by the worker thread at the
-                moment the engine actually begins; ``finished_at`` is
-                stamped on terminal states (completed / failed /
-                cancelled). Both are unix seconds on the wire and
-                rendered in the end user's local timezone here. */}
+            {/* Start / End time stamps. The ``started_at`` field is
+                set by the worker thread at the moment the engine
+                actually begins; ``finished_at`` is stamped on
+                terminal states (completed / failed / cancelled).
+                Both are unix seconds on the wire and rendered in the
+                end user's local timezone here. */}
             <div className="k">Start time</div>
             <div className="v">{formatAbsoluteTimestamp(job?.started_at ?? null)}</div>
             <div className="k">End time</div>
@@ -1513,7 +1675,7 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
                 ? formatAbsoluteTimestamp(job?.finished_at ?? null)
                 : <span style={{ color: 'var(--text-dim)' }}>--:--:--</span>}
             </div>
-            <div className="k">Elapsed</div><div className="v">{elapsed}</div>
+            <div className="k">Elapsed</div><div className="v">{dash ? <ElapsedClock startSec={dash.start_time} endSec={runIsOver && job?.finished_at ? job.finished_at : null} /> : '-'}</div>
             {/* "steps", not "items": totalCount/completedCount sum each
                 library's gather-phase count (4 owner data-type gathers +
                 one per home user), advanced at phase boundaries by
@@ -1524,11 +1686,11 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
             <div className="v" title="Gather-phase steps completed across all libraries (4 data-type gathers + one per home user, per library) - not a media-item count.">
               {completedCount.toLocaleString()} / {totalCount.toLocaleString()} steps ({(pct * 100).toFixed(1)}%)
             </div>
-            {/* v0.9.6 Feature 1: queued libraries (from job params),
-                currently-active libraries (derived from per-library
-                status), and current user (raw id resolved through
-                the cached display-name map). Each row is hidden
-                entirely when it has nothing to show. */}
+            {/* Queued libraries (from job params), currently-active
+                libraries (derived from per-library status), and
+                current user (raw id resolved through the cached
+                display-name map). Each row is hidden entirely when
+                it has nothing to show. */}
             {queuedLibs.length > 0 && (<>
               <div className="k">Libraries queued</div>
               <div className="v">
@@ -1568,10 +1730,10 @@ function JobHeader({ job, dash }: { job: JobPayload | null; dash: DashboardState
           }}
         >
           <button className="danger" disabled={stopDisabled} onClick={onStop}>{stopLabel}</button>
-          {/* v0.12.1  Hard Stop. Sits directly under the soft Stop
-              so it's discoverable when the soft Stop is hung but
-              isn't the default click target. Smaller / dimmer to
-              telegraph "this is the escalation, not the normal action". */}
+          {/* Hard Stop. Sits directly under the soft Stop so it's
+              discoverable when the soft Stop is hung but isn't the
+              default click target. Smaller / dimmer to telegraph
+              "this is the escalation, not the normal action". */}
           <button
             className="danger"
             disabled={hardStopDisabled}
@@ -1594,8 +1756,8 @@ function JobBadge({ state }: { state: JobPayload['state'] }) {
     running: 'phase',
     stopping: 'unresolved',
     completed: 'done',
-    // v0.13.x: amber chip for partial-success - distinct from the
-    // green ``done`` chip and the red ``error`` chip. Uses the same
+    // Amber chip for partial-success - distinct from the green
+    // ``done`` chip and the red ``error`` chip. Uses the same
     // ``unresolved`` class the stopping state uses (amber/yellow).
     completed_with_errors: 'unresolved',
     failed: 'error',
@@ -1610,7 +1772,7 @@ function JobBadge({ state }: { state: JobPayload['state'] }) {
   return <span className={`tag ${map[state]}`}>{label}</span>;
 }
 
-// ── Run coverage (v0.9.3) ─────────────────────────────────────────────────────
+// ── Run coverage ──────────────────────────────────────────────────────────────
 // "How big is this run?"  counts the run's *scope* (users covered,
 // items being touched per category) rather than the per-disposition
 // counters in RunStats. The fields come from DashboardState's
@@ -1633,12 +1795,17 @@ function RunCoverage({ dash }: { dash: DashboardState }) {
   );
 }
 
-// ── Currently Processing (v0.9.3) ─────────────────────────────────────────────
+// ── Currently Processing ──────────────────────────────────────────────────────
 // One row per active worker thread, showing exactly what each worker
 // is doing right now. Updated at the 4 Hz WS tick  transient items
 // flash by but multi-second items stay long enough to read.
 
 function CurrentlyProcessing({ items }: { items: CurrentItem[] }) {
+  const { etrColorMultiplier } = useContext(DashboardConfigContext);
+  // Self-tick once a second so each row's phase-age + stall colour
+  // stay live. Scoped to this component so the rest of the dashboard
+  // doesn't re-render on the tick; only runs while items are in flight.
+  useNowTick(1000, items.length > 0);
   // Cap visible rows; very large worker pools (32+) would otherwise
   // push the rest of the dashboard off-screen.
   const MAX_ROWS = 10;
@@ -1663,12 +1830,12 @@ function CurrentlyProcessing({ items }: { items: CurrentItem[] }) {
             </tr>
           </thead>
           <tbody>
-            {visible.map((ci, i) => {
+            {visible.map((ci) => {
               const phaseAge = ci.phase_started_at
                 ? Math.max(0, now - ci.phase_started_at)
                 : null;
               const health = phaseAge !== null && ci.phase
-                ? getPhaseHealth(ci.phase, phaseAge)
+                ? getPhaseHealth(ci.phase, phaseAge, etrColorMultiplier)
                 : 'normal';
               const phaseClass = health === 'normal'
                 ? `tag ${PHASE_TAG[ci.phase ?? ''] ?? 'phase'}`
@@ -1679,7 +1846,8 @@ function CurrentlyProcessing({ items }: { items: CurrentItem[] }) {
                   ? 'var(--warn, #d97706)'
                   : 'var(--text-dim)';
               return (
-                <tr key={i}>
+                // FECORE-11: stable composite key derived from the row's own fields
+                <tr key={`${ci.library}|${ci.title}|${ci.started_at}`}>
                   <td style={{ color: 'var(--text-dim)' }}>{ci.library}</td>
                   <td className="mono">{ci.type}</td>
                   <td>
@@ -1708,8 +1876,8 @@ function CurrentlyProcessing({ items }: { items: CurrentItem[] }) {
   );
 }
 
-// Spec Section 4.3 - per-phase stall thresholds. Normal phase
-// durations vary by orders of magnitude (a rating write is fast, an
+// Per-phase stall thresholds. Normal phase durations vary by orders
+// of magnitude (a rating write is fast, an
 // indexing pass on a big music library can legitimately take 90s),
 // so the colour escalation has to be per-phase rather than a single
 // global threshold.
@@ -1723,45 +1891,13 @@ const STALL_THRESHOLDS: Record<string, { amber: number; red: number }> = {
   merging:    { amber: 30,  red: 60  },
 };
 
-// Phase-4 ETR colour multiplier. Module-level so any component (the
-// top-level DashboardPanel does it via useEffect on mount) can set
-// it once after reading settings.etr_color_multiplier. Clamped to
-// the same [0.5, 2.0] window the backend tunable accessor enforces.
-let _etrColorMultiplier = 1.0;
-
-export function setEtrColorMultiplier(value: number): void {
-  if (!Number.isFinite(value)) return;
-  if (value < 0.5) _etrColorMultiplier = 0.5;
-  else if (value > 2.0) _etrColorMultiplier = 2.0;
-  else _etrColorMultiplier = value;
-}
-
-// 2026-05-17 (end user request): cap how many rows the Restoration
-// Summary panel renders before scrolling kicks in. Mirrors the activity
-// feed's "show N, scroll the rest" pattern so a restore against a
-// library with hundreds of playlists / collections doesn't blow up the
-// dashboard's vertical real estate. Reads
-// ``settings.tunables.restoration_summary_panel_max_items`` (end user-
-// tunable). Clamped to [1, 200] to defend against typo'd values.
-let _restorationSummaryMaxItems = 10;
-
-export function setRestorationSummaryMaxItems(value: number): void {
-  if (!Number.isFinite(value)) return;
-  const v = Math.trunc(value);
-  if (v < 1) _restorationSummaryMaxItems = 1;
-  else if (v > 200) _restorationSummaryMaxItems = 200;
-  else _restorationSummaryMaxItems = v;
-}
-
-export function getRestorationSummaryMaxItems(): number {
-  return _restorationSummaryMaxItems;
-}
-
-function getPhaseHealth(phase: string, ageSeconds: number): 'normal' | 'amber' | 'red' {
+function getPhaseHealth(
+  phase: string, ageSeconds: number, multiplier: number,
+): 'normal' | 'amber' | 'red' {
   const base = STALL_THRESHOLDS[phase] ?? { amber: 60, red: 120 };
   const t = {
-    amber: base.amber * _etrColorMultiplier,
-    red: base.red * _etrColorMultiplier,
+    amber: base.amber * multiplier,
+    red: base.red * multiplier,
   };
   if (ageSeconds >= t.red) return 'red';
   if (ageSeconds >= t.amber) return 'amber';
@@ -1795,17 +1931,17 @@ function RunStats({ dash }: { dash: DashboardState }) {
         <Stat label="Completed" value={dash.completed} variant="good" />
         <Stat label="Skipped"   value={dash.skipped} />
         <Stat label="Failed"    value={dash.failed} variant="bad" />
-        {/* Tier 1: "Unresolved" intentionally lives ONLY in Match
-            Resolution now - it's a resolution-tier outcome (restore /
-            direct), not a universal pipeline count. A snapshot has no
-            "unresolved" concept, and Match Resolution is hidden on
-            snapshot runs, so the count simply doesn't surface there. */}
+        {/* "Unresolved" intentionally lives ONLY in Match Resolution
+            - it's a resolution-tier outcome (restore / direct), not
+            a universal pipeline count. A snapshot has no "unresolved"
+            concept, and Match Resolution is hidden on snapshot runs,
+            so the count simply doesn't surface there. */}
       </div>
     </div>
   );
 }
 
-// ── Per-batch ETR (spec Section 2.2) ──────────────────────────────────────────
+// ── Per-batch ETR ─────────────────────────────────────────────────────────────
 //
 // One row per leaf-type the engine has reported on. Each batch has its
 // own independent rolling tracker on the backend, so the values here
@@ -1937,11 +2073,10 @@ function ThreadPool({ dash }: { dash: DashboardState }) {
       {entries.length > 0 ? (
         <div>
           {entries.map(([lbl, n]) => (
-            // v0.9.2: render the category label + count followed by a
+            // Render the category label + count followed by a
             // plain-English description so a user unfamiliar with the
             // pipeline stages can tell what each group of threads is
-            // currently doing. The pill itself still flows inline
-            // (existing layout); only the text inside it grew.
+            // currently doing. The pill flows inline.
             <span key={lbl} className="thread-pill" title={THREAD_DESCRIPTIONS[lbl] ?? ''}>
               <span className="thread-pill-label">{lbl} × {n}</span>
               {THREAD_DESCRIPTIONS[lbl] && (
@@ -1968,9 +2103,9 @@ const THREAD_LABELS: Record<string, string> = {
   snapshot: 'Capturing snapshot',
 };
 
-// v0.9.2: plain-English descriptions for each thread category.
-// Keyed by the *display label* produced by THREAD_LABELS above so
-// the lookup in the JSX uses the same string the user sees.
+// Plain-English descriptions for each thread category. Keyed by the
+// *display label* produced by THREAD_LABELS above so the lookup in
+// the JSX uses the same string the user sees.
 const THREAD_DESCRIPTIONS: Record<string, string> = {
   'Watched':     'Reading or writing TV / movie view counts and resume positions',
   'Play Count':  'Reading or writing music track play counts',
@@ -1992,23 +2127,23 @@ const THREAD_DESCRIPTIONS: Record<string, string> = {
 // instead of a bare "12/16" the operator has to puzzle out.
 const SNAPSHOT_OWNER_PHASES = 4;
 
-function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number; job: JobPayload | null }) {
-  // v0.13.x lightweight stop-state: when the operator stops the run,
+function LibraryList({ libs, job }: { libs: LibraryProgress[]; job: JobPayload | null }) {
+  // Lightweight stop-state: when the operator stops the run,
   // libraries that didn't reach 100% read "Stopped" (red) instead of a
   // misleading percentage; libraries that never started read "Skipped"
   // (neutral); libraries that genuinely completed BEFORE the stop stay
   // green. job.state === 'cancelled' is the canonical signal - same one
   // the job status badge already uses.
   const jobStopped = job?.state === 'cancelled';
-  // v0.13.x "Steps" column: the per-library count is 4 owner-phase
-  // gathers + N user gathers in snapshot / direct-transfer mode. The
-  // breakdown is meaningful only on those modes; restore counts items
-  // and the cell falls back to the legacy "completed / total" shape.
+  // "Steps" column: the per-library count is 4 owner-phase gathers +
+  // N user gathers in snapshot / direct-transfer mode. The breakdown
+  // is meaningful only on those modes; restore counts items and the
+  // cell falls back to the "completed / total" shape.
   const stepsModeBreakdown = job?.mode === 'snapshot' || job?.mode === 'direct';
   return (
     <div className="panel">
       <h2>Libraries</h2>
-      <SectionHint>Per-library progress with step counts, current phase, and an ETA.</SectionHint>
+      <SectionHint>Per-library progress with step counts and current phase.</SectionHint>
       {libs.length === 0 ? (
         <div className="empty">No libraries in this run.</div>
       ) : (
@@ -2017,8 +2152,8 @@ function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number;
             <tr>
               <th style={{ width: '20%' }}>Library</th>
               <th style={{ width: '36%' }}>Progress</th>
-              {/* v0.13.x: "Items" -> "Steps" with a formula tooltip.
-                  Each per-library step is either one of the four
+              {/* "Steps" column with a formula tooltip. Each
+                  per-library step is either one of the four
                   owner-phase gathers (watch history / ratings /
                   playlists / collections) or one managed-user gather,
                   so "8/16" on a snapshot run means "8 of (4 owner
@@ -2038,15 +2173,18 @@ function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number;
                   Restore: one step per item resolved or applied.
                 </InfoTip>
               </th>
+              {/* No ETA column in the per-library table. An ETA
+                  would be anchored on a different step-count
+                  denominator than the progress bar, which would flip
+                  libraries to "Done" while the visible progress was
+                  still ~71% and turn the bar green prematurely. */}
               <th style={{ width: '18%' }}>Phase</th>
-              <th style={{ width: '10%' }}>ETA</th>
             </tr>
           </thead>
           <tbody>
             {libs.map((lib) => {
               const total = lib.total || 1;
               const pct = total > 0 ? lib.completed / total : 0;
-              const eta = computeETA(lib, now);
               // Stop-state classification for each row. Order matters:
               // an explicit engine-side error always wins; otherwise a
               // partially-complete library on a cancelled job reads
@@ -2062,7 +2200,6 @@ function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number;
                 : stoppedShort
                   ? 'Stopped'
                   : `${(pct * 100).toFixed(0)}%`;
-              const etaText = stoppedShort || neverStarted ? '-' : eta;
               // Two-axis cell content for snapshot / direct: derive
               // phases vs user-tasks from the engine's "4 + N" total
               // (snapshotter.py :: snapshot_library). Owner phases fill
@@ -2087,7 +2224,6 @@ function LibraryList({ libs, now, job }: { libs: LibraryProgress[]; now: number;
                   </td>
                   <td className="num">{stepsCell}</td>
                   <td>{lib.phase || '-'}</td>
-                  <td className="mono">{etaText}</td>
                 </tr>
               );
             })}
@@ -2103,17 +2239,6 @@ function StatusDot({ status }: { status: LibraryProgress['status'] }) {
   return cls ? <span className={`dot ${cls}`} style={{ marginLeft: 6 }} /> : null;
 }
 
-function computeETA(lib: LibraryProgress, now: number): string {
-  if (lib.status === 'done') return 'Done';
-  if (lib.status === 'error') return 'Error';
-  if (lib.status === 'queued') return 'Queued';
-  if (lib.start_time <= 0) return 'starting…';
-  const elapsed = now - lib.start_time;
-  const pct = lib.total > 0 ? lib.completed / lib.total : 0;
-  if (pct <= 0.02 || elapsed <= 0) return 'starting…';
-  return secondsToHMS((elapsed / pct) * (1 - pct));
-}
-
 // ── Activity feed ─────────────────────────────────────────────────────────────
 
 function ActivityFeed({ entries }: { entries: ActivityEntry[] }) {
@@ -2127,8 +2252,9 @@ function ActivityFeed({ entries }: { entries: ActivityEntry[] }) {
         <div className="empty">No events yet.</div>
       ) : (
         <div className="feed">
-          {ordered.map((e, i) => (
-            <div className="row" key={i}>
+          {ordered.map((e) => (
+            // FECORE-11: stable composite key derived from the entry's own fields
+            <div className="row" key={`${e.timestamp}|${e.action_type}|${e.library}|${e.title}`}>
               <span style={{ color: 'var(--text-dim)' }}>{e.timestamp}</span>
               <span className={`tag ${TAG_FOR_ACTION[e.action_type] ?? 'phase'}`}>
                 {LABEL_FOR_ACTION[e.action_type] ?? e.action_type.toUpperCase()}
@@ -2173,13 +2299,13 @@ const LABEL_FOR_ACTION: Record<string, string> = {
 
 // ── Tiny shared helpers ───────────────────────────────────────────────────────
 
-// v0.9.6 Feature 1: pull the libraries-queued list straight from the
-// job params. The backend already broadcasts ``job.params.libraries``
-// for every job mode (snapshot, import, direct), so no new WS field is
-// needed. ``import`` mode submits ``input_files`` instead  no
-// per-library names available from the form. An empty list also
-// covers the legitimate "all libraries on the server" shorthand the
-// engine accepts.
+// Pull the libraries-queued list straight from the job params. The
+// backend broadcasts ``job.params.libraries`` for every job mode
+// (snapshot, import, direct), so no new WS field is needed.
+// ``import`` mode submits ``input_files`` instead  no per-library
+// names available from the form. An empty list also covers the
+// legitimate "all libraries on the server" shorthand the engine
+// accepts.
 export function extractQueuedLibraries(job: JobPayload | null): string[] {
   if (!job) return [];
   const raw = (job.params as Record<string, unknown>)?.libraries;

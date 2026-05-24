@@ -44,6 +44,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import random
 import re
 import subprocess
 import sys
@@ -398,7 +399,9 @@ def _generate_run_id() -> str:
     """ISO-ish timestamp with a 4-digit jitter so two runs in the
     same second don't collide. The file naming uses this directly,
     so the result must be filename-safe on every OS."""
-    return time.strftime("%Y-%m-%d_%H-%M-%S")
+    # CONSOLE-14: append the documented 4-digit jitter. The underscore
+    # separator + zero-padded digits keep the result filename-safe.
+    return f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{random.randint(0, 9999):04d}"
 
 
 # ── junitxml parsing ────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 """
-Multi-server registry for PlexMigrate v0.9.0.
+Multi-server registry for Hestia-MediaManager v0.9.0.
 
 Replaces the single ``plex_url`` + ``plex_token`` fields that lived in
 ``settings.json`` with a *list* of registered Plex servers. Each entry
@@ -36,7 +36,7 @@ single-server mode.
 
 Threading note
 --------------
-Several PlexMigrate threads can read and write this file:
+Several Hestia-MediaManager threads can read and write this file:
 - The request handler when the user adds / renames / deletes a server.
 - The "test connection" handler when the user clicks the refresh icon.
 - The job worker reading the registry to resolve a name at run start.
@@ -101,7 +101,7 @@ def _registry_path() -> Path:
 _REG_LOCK = threading.Lock()
 
 
-# ── Server-UID format (Plan[SERVER-UID-IDENTITY]-2026-05-16) ─────────────────
+# ── Server-UID format ────────────────────────────────────────────────────────
 #
 # Every server row carries a stable per-row identifier assigned at
 # add_server time and bound to the row for life. Format:
@@ -262,7 +262,7 @@ def migrate_server_ids_add_backend_prefix() -> Dict[str, int]:
             "to their server until the operator re-registers."
         )
 
-    # playlist_cache.db reference rewrite (Plan[PLAYLIST-MANAGEMENT]).
+    # playlist_cache.db reference rewrite.
     # Best-effort: if the cache DB has never been initialised on this
     # boot, importing + calling its rewrite helper is still safe (it
     # raises RuntimeError; we catch and log, no migration impact).
@@ -291,12 +291,12 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     "name": "",
     "url": "",
     "token": "",
-    # PR-Backends: per-row backend discriminator. Rows registered
+    # Per-row backend discriminator. Rows registered
     # before this feature shipped omit it; readers default to "plex".
     # New rows declare their backend at add_server() time and the
     # value is one of {"plex", "jellyfin", "emby"}.
     "service_type": "plex",
-    # Auto-fallback-token state (2026-05-15). When the end user's
+    # Auto-fallback-token state. When the end user's
     # typed token returns 401 at Add Server time but an existing
     # registered server's token DID connect, we store the working
     # token under ``token`` (so the engine just works) and stash the
@@ -318,7 +318,7 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     "last_checked_at": 0.0,           # UNIX timestamp of last connection attempt.
     "last_libraries": [],             # Cached library list ({name,type,key,count}).
     "owner_name": "",                 # myPlexUsername at last successful connect.
-    # v0.10.0: identity captured from the Plex server itself so we can
+    # Identity captured from the Plex server itself so we can
     # detect a URL/token mismatch (end user typed the right URL but
     # used a token for a different server). ``machine_identifier`` is
     # the stable UUID-shaped ID Plex assigns to each install - distinct
@@ -327,24 +327,24 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     # its own friendly name (set inside Plex's own settings).
     "machine_identifier": "",
     "friendly_name": "",
-    # v0.14 - Plex Media Server software version (e.g. "1.32.5.7349").
+    # Plex Media Server software version (e.g. "1.32.5.7349").
     # Captured at probe / refresh time from plexapi's ``PlexServer.version``
     # attribute. Used by the frontend to gate features that require a
     # minimum Plex version (currently: Fast Collection Detection
-    # requires ≥1.32 because it relies on the ``librarySectionUserID``
+    # requires >=1.32 because it relies on the ``librarySectionUserID``
     # attribute Plex didn't ship until then). Empty string when the
     # row was added before this field landed or hasn't been refreshed.
     "plex_version": "",
-    # v0.9.1: response time in milliseconds for the last lightweight
+    # Response time in milliseconds for the last lightweight
     # ping. ``None`` if no ping has succeeded yet. Used by the Servers
     # tab live indicator and the JobForm server selector chips.
     "last_response_ms": None,
 
-    # v0.9.5: marker indicating ``token`` is a Fernet ciphertext string.
+    # Marker indicating ``token`` is a Fernet ciphertext string.
     # Rows missing this marker (or with it set to False) are treated as
     # legacy plaintext on the next ``_load_raw`` and migrated in place.
     "_encrypted": False,
-    # v0.9.6 Feature 3: end user-chosen friendly names for users on
+    # End user-chosen friendly names for users on
     # this server. Keys: raw Plex identifier - owner's email for the
     # owner, managed user's username for managed users. Values: a
     # free-form display string. Empty dict on rows that have never
@@ -368,6 +368,14 @@ _DEFAULT_SERVER: Dict[str, Any] = {
     "playlist_count": None,
     "collection_count": None,
     "counts_refreshed_at": None,
+    # Per-server opt-in for the auto-tombstone sweeper. When False
+    # (default),
+    # the sweeper still PROBES users on this server (provided the
+    # global tunable is on) and writes signals, but never converts
+    # signals into tombstones. When True AND the matching
+    # per-trigger toggle is on, N consecutive failures auto-tombstone
+    # the user. Reversible from the User Management panel.
+    "auto_tombstone_inactive_users_enabled": False,
 }
 
 
@@ -413,34 +421,87 @@ def _count_via_size_zero(server: Any, section_key: Any, libtype_num: int) -> int
 def _fetch_leaf_counts(server: Any, sec: Any) -> Dict[str, int]:
     """
     Best-effort cheap leaf-count for one library section. Returns the
-    empty dict when the section type has no relevant leaf level (e.g.
-    movie libraries) or when the count call fails.
+    empty dict when the section type has no relevant leaf level or
+    when the count call fails.
 
-    The only leaf counts we capture are:
+    Per-libtype counts captured:
 
-      * Show libraries -> episode count.
-      * Artist libraries -> track count.
+      * Show libraries -> seasons + episodes.
+      * Artist libraries -> albums + tracks.
+      * Movie libraries -> movies-in-collections (best-effort).
 
-    Seasons / albums are intentionally skipped: they aren't the unit
-    of restore work and gathering them would add round-trips for no
-    benefit. These counts feed the Library Catalogue display and give
-    the end user a sense of scale; they are not used to predict run
-    time (the timing engine is discover-don't-predict).
+    All use Plex's ``X-Plex-Container-Size=0`` trick so each
+    additional count is one extra HTTP round-trip with no body
+    payload. These counts feed the Library Catalogue display + the
+    Run Job library-mapping panel; they are not used to predict
+    run time (the timing engine is discover-don't-predict).
+
+    Seasons + albums are surfaced in the per-run library mapping
+    editor so the cost-of-move is visible at a glance ("I'm about to
+    map a library with 45 seasons / 312 episodes" reads more
+    concretely than "12 shows"). Counted here so every downstream
+    consumer (Library Catalogue, sides endpoint, mapping panel) sees
+    the same richer counts.
     """
     try:
         libtype = sec.type
     except Exception:
         return {}
+    out: Dict[str, int] = {}
     try:
         if libtype == "show":
-            n = _count_via_size_zero(server, sec.key, _PLEX_LIBTYPE["episode"])
-            return {"episodes": n} if n else {}
-        if libtype == "artist":
-            n = _count_via_size_zero(server, sec.key, _PLEX_LIBTYPE["track"])
-            return {"tracks": n} if n else {}
+            try:
+                n_eps = _count_via_size_zero(server, sec.key, _PLEX_LIBTYPE["episode"])
+                if n_eps:
+                    out["episodes"] = n_eps
+            except Exception:
+                pass
+            try:
+                n_seasons = _count_via_size_zero(server, sec.key, _PLEX_LIBTYPE["season"])
+                if n_seasons:
+                    out["seasons"] = n_seasons
+            except Exception:
+                pass
+        elif libtype == "artist":
+            try:
+                n_tracks = _count_via_size_zero(server, sec.key, _PLEX_LIBTYPE["track"])
+                if n_tracks:
+                    out["tracks"] = n_tracks
+            except Exception:
+                pass
+            try:
+                n_albums = _count_via_size_zero(server, sec.key, _PLEX_LIBTYPE["album"])
+                if n_albums:
+                    out["albums"] = n_albums
+            except Exception:
+                pass
+        elif libtype == "movie":
+            # Movies-in-collection: count of distinct movies that
+            # belong to at least one collection. Plex doesn't expose
+            # this as a single number; the cheapest path is per-
+            # collection size summed. ``totalSize`` on
+            # /library/sections/<k>/collections gives collection
+            # count; iterating each collection's child count would
+            # be an N-call walk that scales with collection count.
+            # Best-effort: capture only collection_count for now and
+            # let the UI display "M collections" alongside the movie
+            # total. Detailed per-collection membership is left as a
+            # follow-up to avoid blowing up the cheap "Refresh
+            # libraries" path.
+            try:
+                url = (
+                    f"/library/sections/{sec.key}/collections"
+                    f"?X-Plex-Container-Size=0&X-Plex-Container-Start=0"
+                )
+                data = server.query(url)
+                n_colls = int(data.attrib.get("totalSize", 0))
+                if n_colls:
+                    out["collections"] = n_colls
+            except Exception:
+                pass
     except Exception:
         return {}
-    return {}
+    return out
 
 
 def _fetch_server_level_counts(server: Any, sections: Any) -> Tuple[Optional[int], Optional[int]]:
@@ -515,7 +576,7 @@ def safe_server_name(name: str) -> str:
 
 def backend_aware_slug(name: str, service_type: str) -> str:
     """
-    PR-Backends. Always returns ``"<safe-name>-<service_type>"``.
+    Always returns ``"<safe-name>-<service_type>"``.
 
     The friendly name is unique per ``(name, service_type)`` (an
     end user can have "Jade.TV" Plex + "Jade.TV" Emby). Artifact
@@ -523,11 +584,8 @@ def backend_aware_slug(name: str, service_type: str) -> str:
     that composite identity or a cascade delete leaks across backends.
 
     No backward-compat exemption for Plex - the slug uniformly carries
-    the backend even for Plex servers. Pre-PR-Backends artifacts that
-    live under the bare ``safe_server_name`` slug are migrated to
-    ``<slug>-plex`` by :func:`migrate_legacy_plex_artifact_slugs` at
-    boot time. After that one-time rename, every artifact path on
-    disk is unambiguous.
+    the backend even for Plex servers. Every artifact path the engine
+    writes carries the suffix on disk.
 
     Always use this helper - not ``safe_server_name`` directly - when
     computing paths or cascade filters for engine-produced artifacts.
@@ -703,8 +761,8 @@ def get_server_by_name(
     case-sensitive contract matches how schedules and CLI flags pass
     server names around - "Plex1" and "plex1" are different servers.
 
-    PR-Backends: the registry now allows duplicate friendly names
-    across backends ("Jade.TV" Plex + "Jade.TV" Emby). When
+    The registry allows duplicate friendly names across backends
+    ("Jade.TV" Plex + "Jade.TV" Emby). When
     ``service_type`` is supplied, only rows matching BOTH name and
     backend are returned. When omitted, the first row matching by
     name wins (legacy behaviour - safe for installs with no duplicate
@@ -1020,7 +1078,7 @@ def _diagnose_http_probe(
         # Spell out the most-common-cause case explicitly. "Connection
         # refused" / Errno 111 means TCP itself was refused at the
         # destination - the server isn't listening, the port's wrong,
-        # or PlexMigrate's container can't route to the host. The
+        # or Hestia-MediaManager's container can't route to the host. The
         # generic ConnectionError otherwise covers DNS failures, name
         # resolution issues, etc.
         exc_str = str(exc)
@@ -1031,11 +1089,11 @@ def _diagnose_http_probe(
         ):
             return "unreachable", (
                 f"Connection refused at {url_stripped}. Nothing is "
-                f"listening on that port from PlexMigrate's host / "
+                f"listening on that port from Hestia-MediaManager's host / "
                 f"container. Common causes: (1) the {label} "
                 f"server isn't running, (2) it's bound to a different "
                 f"interface (check the server's Dashboard -> Networking "
-                f"settings), (3) PlexMigrate runs in Docker and the "
+                f"settings), (3) Hestia-MediaManager runs in Docker and the "
                 f"target IP isn't reachable from the container (try "
                 f"`host.docker.internal:<port>` or switch the container "
                 f"to host networking), or (4) the port is wrong."
@@ -1226,7 +1284,7 @@ def probe_unsaved(
     token: str,
     logger: logging.Logger,
     *,
-    timeout: float = 8.0,
+    timeout: Optional[float] = None,
     service_type: str = "plex",
 ) -> Dict[str, Any]:
     """
@@ -1251,7 +1309,7 @@ def probe_unsaved(
       * ``owner_name`` - the connected account / token's owner.
       * ``libraries`` - current catalogue with item counts.
 
-    PR-Backends: ``service_type`` selects which probe path runs.
+    ``service_type`` selects which probe path runs.
     Plex (default) goes through the existing plexapi-based probe;
     Jellyfin / Emby go through the HTTP adapter's ``ping`` +
     ``server_identity`` + ``list_libraries`` surface.
@@ -1260,6 +1318,12 @@ def probe_unsaved(
     and ``detail`` so the frontend can render a useful message.
     Re-raises only for programmer errors (bad arguments).
     """
+    # ``timeout=None`` resolves from the ``server_probe_timeout_seconds``
+    # tunable so the "Test Connection" probe budget is operator-tunable.
+    # An explicit caller-supplied timeout still wins.
+    if timeout is None:
+        from services import tunables
+        timeout = float(tunables.server_probe_timeout())
     service_type = (service_type or "plex").lower()
     if service_type in ("jellyfin", "emby"):
         return _probe_http_backend(
@@ -1304,7 +1368,7 @@ def probe_unsaved(
         # case especially gets the right UX treatment.
         status, detail = classify_connection_error(exc)
 
-        # Auto-fallback (2026-05-15): when a 401 fires on a NEW server
+        # Auto-fallback: when a 401 fires on a NEW server
         # whose token may not yet have propagated to Plex.tv's auth
         # layer, try the end user's existing tokens. Each registered
         # server stores a Plex.tv account token that's effectively
@@ -1440,14 +1504,13 @@ def add_server(
     Raises ValueError if the name is already taken or any required
     field is empty.
 
-    v0.10.0 - connection check on save. Before persisting the new row
+    Connection check on save. Before persisting the new row
     we probe the URL+token via :func:`probe_unsaved`. Two failure
     cases raise:
 
       1. The probe fails (server unreachable, token rejected). The
          end user gets the concrete failure message and the registry
-         stays clean - no "ghost row" left from a failed test like
-         pre-v0.10.0 used to do.
+         stays clean - no "ghost row" left behind from a failed test.
 
       2. The probe succeeds but the server's ``machine_identifier``
          is already registered under a different friendly name. This
@@ -1462,7 +1525,7 @@ def add_server(
     Servers tab paints with real data immediately - no second
     round-trip needed.
 
-    Auto-fallback path (2026-05-15): when
+    Auto-fallback path: when
     ``use_fallback_from_server_id`` is set, the end user has accepted
     the offered fallback token. The flow is:
 
@@ -1555,7 +1618,7 @@ def add_server(
 
     with _REG_LOCK:
         rows = _load_raw()
-        # PR-Backends: friendly-name uniqueness is scoped to
+        # Friendly-name uniqueness is scoped to
         # (name + service_type) rather than name alone. An end user's
         # "Jade.TV" Plex server and their "Jade.TV" Emby server are
         # different physical things, and the end user wants the same
@@ -1580,7 +1643,7 @@ def add_server(
         # probe didn't surface one (very old Plex builds, or some
         # plexapi failure path) - in that case we let the end user
         # proceed; the friendly-name uniqueness check above is the
-        # only guard left, same as pre-v0.10.0 behaviour.
+        # only guard left.
         if machine_id:
             for r in rows:
                 if r.get("machine_identifier") and r["machine_identifier"] == machine_id:
@@ -1669,11 +1732,10 @@ def update_server(server_id: str, *, name: Optional[str] = None, url: Optional[s
                     f"exists. Same name across different backends is "
                     f"allowed; the same name twice within one backend is not."
                 )
-            # PR-Backends rename-vs-schedule fix (Path A from
-            # Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md): propagate
-            # the rename into every schedule that references the old
-            # name + same backend. Scoped by backend so a Plex rename
-            # doesn't touch a same-named Jellyfin / Emby schedule.
+            # Propagate the rename into every schedule that
+            # references the old name + same backend. Scoped by
+            # backend so a Plex rename doesn't touch a same-named
+            # Jellyfin / Emby schedule.
             old_name = target.get("name") or ""
             new_name = name.strip()
             target["name"] = new_name
@@ -1758,7 +1820,7 @@ def cascade_preview(server_id: str) -> Optional[Dict[str, Any]]:
 
     name = row.get("name") or ""
     service_type = (row.get("service_type") or "plex").lower()
-    # PR-Backends: preview uses the backend-aware slug + filters
+    # Preview uses the backend-aware slug + filters
     # schedules by (name + service_type) so the displayed counts
     # match what a real cascade delete would actually touch.
     slug = backend_aware_slug(name, service_type)
@@ -1944,7 +2006,7 @@ def remove_server(server_id: str) -> Optional[Dict[str, Any]]:
             return None
         name = target.get("name") or ""
         target_service = (target.get("service_type") or "plex").lower()
-        # PR-Backends: the slug for cascade artifact lookups is
+        # The slug for cascade artifact lookups is
         # backend-aware so deleting "Jade.TV" Emby doesn't touch
         # "Jade.TV" Plex artifacts (which live under "Jade-TV-plex").
         slug = backend_aware_slug(name, target_service)
@@ -1983,122 +2045,6 @@ def remove_server(server_id: str) -> Optional[Dict[str, Any]]:
         "log_dirs_failed": len(log_errors),
         "errors": errors,
     }
-
-
-def migrate_legacy_plex_artifact_slugs() -> Dict[str, int]:
-    """
-    One-time boot migration. PR-Backends made artifact slugs uniformly
-    ``<safe-name>-<service_type>``; pre-migration Plex artifacts live
-    under bare ``<safe-name>`` and would otherwise be unreachable from
-    the new code paths (orphan log directories, orphan snapshot files).
-
-    Walks the on-disk roots used by ``log_browser`` (``log_dir``) and
-    ``snapshot_browser`` (``output_dir``). For each registered Plex
-    server, renames any directory / file whose name matches the
-    server's bare slug to the ``-plex`` suffixed form. Idempotent:
-    when ``<slug>-plex`` already exists, the bare directory is left
-    in place (end user can review and merge manually if needed) and
-    we record the conflict in the return summary.
-
-    Best-effort. Each rename failure is logged + reported in the
-    return summary but doesn't block the rest of the sweep. Safe to
-    call at every boot - after the first successful run there's
-    nothing to migrate.
-
-    Returns ``{"renamed_log_dirs": int, "renamed_exports": int,
-    "skipped_existing": int, "errors": list[str]}``.
-    """
-    from pathlib import Path as _Path
-    from server.persistence import load_settings as _load_settings
-
-    summary = {
-        "renamed_log_dirs": 0,
-        "renamed_exports": 0,
-        "skipped_existing": 0,
-        "errors": [],
-    }
-
-    # Build {bare_slug: new_slug} for every registered Plex row.
-    plex_renames: Dict[str, str] = {}
-    for row in list_servers(include_tokens=False):
-        if (row.get("service_type") or "plex").lower() != "plex":
-            continue
-        bare = safe_server_name(row.get("name") or "")
-        new = backend_aware_slug(row.get("name") or "", "plex")
-        if bare and new and bare != new:
-            plex_renames[bare] = new
-
-    if not plex_renames:
-        return summary
-
-    settings = _load_settings()
-
-    def _try_rename(src: _Path, dest: _Path, kind: str) -> bool:
-        if dest.exists():
-            summary["skipped_existing"] += 1
-            log.info(
-                "migrate_legacy_plex_artifact_slugs: target %s already "
-                "exists, leaving %s in place for manual review.",
-                dest, src,
-            )
-            return False
-        try:
-            src.rename(dest)
-            return True
-        except OSError as exc:
-            summary["errors"].append(
-                f"{kind} rename {src} -> {dest}: {exc}"
-            )
-            log.warning(
-                "migrate_legacy_plex_artifact_slugs: %s rename failed (%s): %s",
-                kind, src, exc,
-            )
-            return False
-
-    # Log directories.
-    log_root = _Path(settings.get("log_dir") or "./plex_logs")
-    if log_root.exists():
-        for child in log_root.iterdir():
-            if not child.is_dir():
-                continue
-            # log dirs are typically ``<slug>_<timestamp>`` so split
-            # on the first underscore. Bare slugs containing
-            # underscores are still matched because we compare the
-            # prefix to the registered slug exactly.
-            stem = child.name
-            for bare, new in plex_renames.items():
-                if stem == bare or stem.startswith(bare + "_") or stem.startswith(bare + "-"):
-                    new_name = new + stem[len(bare):]
-                    if _try_rename(child, child.parent / new_name, "log_dir"):
-                        summary["renamed_log_dirs"] += 1
-                    break
-
-    # Snapshot exports.
-    output_root = _Path(settings.get("output_dir") or "./snapshots")
-    if output_root.exists():
-        for child in output_root.iterdir():
-            if not child.is_file():
-                continue
-            # Export filenames typically embed the slug as a prefix
-            # followed by ``_<timestamp>.plexexport.json``. Match on
-            # the same prefix rule as log dirs.
-            stem = child.name
-            for bare, new in plex_renames.items():
-                if stem.startswith(bare + "_") or stem.startswith(bare + "-"):
-                    new_name = new + stem[len(bare):]
-                    if _try_rename(child, child.parent / new_name, "export"):
-                        summary["renamed_exports"] += 1
-                    break
-
-    if summary["renamed_log_dirs"] or summary["renamed_exports"]:
-        log.info(
-            "migrate_legacy_plex_artifact_slugs: renamed %d log dirs + "
-            "%d exports to backend-suffixed slugs (%d skipped due to "
-            "pre-existing target, %d errors).",
-            summary["renamed_log_dirs"], summary["renamed_exports"],
-            summary["skipped_existing"], len(summary["errors"]),
-        )
-    return summary
 
 
 def remove_server_by_name(name: str) -> Optional[Dict[str, Any]]:
@@ -2227,12 +2173,12 @@ def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
 
         return {"users": users, "error": sys_error}
 
-    # v0.9.7 fix: tokens on disk are Fernet ciphertexts (encryption at
-    # rest, see server/secrets.py). The pre-fix code passed the raw
-    # row["token"] straight to ``connect_to_server`` - Plex received
-    # ciphertext as the auth token and rejected it, surfacing as a
+    # Tokens on disk are Fernet ciphertexts (encryption at rest, see
+    # server/secrets.py) and must be decrypted before use. Passing
+    # the raw row["token"] straight to ``connect_to_server`` sends
+    # ciphertext as the auth token; Plex rejects it, surfacing as a
     # 502 in the Servers tab's Users panel. Decrypting at the point
-    # of use brings this consumer in line with every other
+    # of use keeps this consumer in line with every other
     # token-touching path (connect_registered_server, test_connection,
     # ping_server, _run_direct).
     try:
@@ -2255,26 +2201,36 @@ def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
     # the SystemAccount entry for the owner uses the *username*, not
     # the email - and the dashboard's ``current_user`` keys on email
     # for the owner role.
-    owner_email = ""
-    owner_username = ""
+    # Owner identifier derivation + the per-SystemAccount skip check
+    # both live in the shared helper in
+    # ``services.plex_owner_identity`` so this surface and
+    # PlexAdapter.list_users stay in lockstep.
+    from services.plex_owner_identity import (
+        derive_owner_identifiers,
+        dedupe_owner_against_managed,
+        is_owner_system_account,
+    )
+    owner_ids = {"email": "", "username": "", "account_id": "", "email_local": ""}
     try:
         account = server.myPlexAccount()
-        owner_email = (getattr(account, "email", "") or "").strip()
-        owner_username = (getattr(account, "username", "") or "").strip()
+        owner_ids = derive_owner_identifiers(account)
     except Exception as e:
         logger.debug(f"myPlexAccount unavailable for {row.get('name')!r}: {e}")
 
-    if owner_email:
+    if owner_ids["email"]:
         users.append({
             "kind": "owner",
-            "plex_id": owner_email,
-            "raw_name": owner_email,
-            "display_name": display_names.get(owner_email, ""),
+            "plex_id": owner_ids["email"],
+            "raw_name": owner_ids["email"],
+            "display_name": display_names.get(owner_ids["email"], ""),
         })
 
-    # Managed users - read systemAccounts(); skip the entry whose
-    # ``name`` matches the owner's username (that's the owner himself
-    # appearing in the local accounts list, already represented above).
+    # Managed users - read systemAccounts(); skip the entry that IS
+    # the owner so we don't append them a second time as a managed
+    # user. The shared helper covers id==1 + username match + three
+    # additional signals (Plex.tv accountID, email full match, email
+    # local-part match) so an operator-renamed owner SystemAccount
+    # whose id != 1 no longer leaks through.
     sys_error = None
     try:
         sys_accts = server.systemAccounts() or []
@@ -2287,22 +2243,13 @@ def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
         name = (getattr(acct, "name", "") or "").strip()
         if not name:
             continue
-        # v0.9.7 Item 7: harden owner detection. The original check
-        # matched SystemAccount.name against the Plex.tv username
-        # from myPlexAccount, but those identifiers can legitimately
-        # differ (server stores "Plex Owner" or a handle while
-        # Plex.tv stores an email). Without the id==1 fallback the
-        # owner can show up twice - once as kind="owner" (from
-        # myPlexAccount.email) and once as kind="managed" (from
-        # the SystemAccounts row that didn't match). SystemAccount
-        # id 1 is Plex's conventional server-owner local id.
-        try:
-            local_id = int(getattr(acct, "id", 0) or 0)
-        except (TypeError, ValueError):
-            local_id = 0
-        if local_id == 1:
-            continue
-        if owner_username and name == owner_username:
+        if is_owner_system_account(
+            acct,
+            owner_email=owner_ids["email"],
+            owner_username=owner_ids["username"],
+            owner_account_id=owner_ids["account_id"],
+            owner_email_local=owner_ids["email_local"],
+        ):
             continue
         users.append({
             "kind": "managed",
@@ -2310,6 +2257,17 @@ def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
             "raw_name": name,
             "display_name": display_names.get(name, ""),
         })
+
+    # Defensive last-pass dedup: collapse any kind="managed" rows
+    # whose identifier matches the owner's identifier set. Belt-and-
+    # braces against display-name shapes the per-account skip didn't
+    # recognise; the owner row stays in its original position.
+    users = dedupe_owner_against_managed(
+        users,
+        owner_email=owner_ids["email"],
+        owner_email_local=owner_ids["email_local"],
+        owner_username=owner_ids["username"],
+    )
 
     return {"users": users, "error": sys_error}
 
@@ -2350,6 +2308,49 @@ def set_user_display_name(
     return get_server_by_id(server_id, include_token=False)
 
 
+def update_server_settings(
+    server_id: str,
+    patch: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Merge ``patch`` into the registry row identified by ``server_id``
+    and persist. Returns the redacted server row after the write,
+    or ``None`` when no row matched.
+
+    Generic per-server-settings update: callers pass a dict of keys
+    to merge (no nested-merge logic; top-level keys overwrite). The
+    flat-dict layout in ``_DEFAULT_SERVER`` is what makes this work
+    cleanly - there's no schema migration; missing keys default to
+    their ``_DEFAULT_SERVER`` value on read.
+
+    Used by:
+      - services.user_activity_sweeper: stamps
+        ``user_activity_last_sweep_at`` +
+        ``user_activity_last_sweep_summary`` after each per-server
+        sweep cycle.
+      - the new auto_tombstone toggle wiring on the server editor.
+
+    Caller is responsible for validating the patch's values; this
+    helper does not enforce key allow-lists because the set of
+    legal per-server keys is the whole ``_DEFAULT_SERVER`` keyspace
+    plus anything the engine writes (sweep cursor etc.).
+    """
+    if not server_id:
+        return None
+    sid = str(server_id).strip()
+    if not sid:
+        return None
+    with _REG_LOCK:
+        rows = _load_raw()
+        target = next((r for r in rows if r.get("id") == sid), None)
+        if target is None:
+            return None
+        for k, v in (patch or {}).items():
+            target[k] = v
+        _save_raw(rows)
+    return get_server_by_id(sid, include_token=False)
+
+
 # ── Engine integration ──────────────────────────────────────────────────────
 
 
@@ -2357,12 +2358,12 @@ def set_user_display_name(
 class ServerConnection:
     """Result of :func:`connect_registered_server`.
 
-    Replaces the legacy ``(PlexServer, row)`` tuple. Carries the
-    connected ``server`` instance (today always a ``plexapi.PlexServer``;
-    a Jellyfin / Emby HTTP client when PR-Backends ships), a backend-
-    agnostic ``adapter`` implementing :class:`services.adapters.MediaServerAdapter`,
-    and the raw registry ``row`` for callers that still need the
-    persisted metadata (url, token, owner_name, last_status, etc.).
+    Carries the connected ``server`` instance (a ``plexapi.PlexServer``
+    for Plex, a Jellyfin / Emby HTTP client for those backends), a
+    backend-agnostic ``adapter`` implementing
+    :class:`services.adapters.MediaServerAdapter`, and the raw
+    registry ``row`` for callers that still need the persisted
+    metadata (url, token, owner_name, last_status, etc.).
 
     All 8 production callers and 3 test mocks updated in the same PR
     that introduced the dataclass; no transitional tuple-unpacking
@@ -2374,6 +2375,100 @@ class ServerConnection:
     url: str                             # convenience accessor; mirrors row['url']
     token: str                           # plaintext, in-memory only; mirrors decrypt_server_token(row)
     service_type: str = "plex"           # mirrors row.get('service_type', 'plex')
+
+
+# Persistent-adapter cache, so a batch doesn't pay the 32s
+# path-index walk every time: cache the constructed
+# MediaServerAdapter + the live server handle per server_id.
+# Subsequent batches against the same server reuse the cached
+# instance, so its on-instance caches (path indexes, per-artist
+# track maps, library-of-truth, GUID blacklist, sections cache)
+# survive across submissions.
+#
+# The cache fingerprint includes the row's URL and a hash of the
+# decrypted token so a config change (rotated token / moved URL)
+# invalidates the cache on next connect.
+
+_ADAPTER_CACHE: Dict[
+    str,
+    Dict[str, Any],  # {"adapter", "server", "url", "token_hash", "service_type"}
+] = {}
+_ADAPTER_CACHE_LOCK = threading.Lock()
+
+
+def _adapter_cache_fingerprint(url: str, plain_token: str) -> str:
+    """Stable fingerprint so we invalidate when URL or token rotates.
+    Token is hashed (sha256) before storage so the cache never holds
+    plaintext credentials."""
+    import hashlib
+    h = hashlib.sha256(plain_token.encode("utf-8", errors="ignore")).hexdigest()
+    return f"{url}|{h[:16]}"
+
+
+def _get_cached_adapter(
+    server_id: str, url: str, plain_token: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the cached adapter+server bundle for this server_id,
+    or None when:
+    - never cached
+    - URL or token fingerprint changed (config rotated)
+    Caller is responsible for falling through to a fresh build on miss."""
+    if not server_id:
+        return None
+    fp = _adapter_cache_fingerprint(url, plain_token)
+    with _ADAPTER_CACHE_LOCK:
+        cached = _ADAPTER_CACHE.get(server_id)
+        if cached is None:
+            return None
+        cached_fp = (
+            f"{cached.get('url', '')}|{cached.get('token_hash', '')}"
+        )
+        if cached_fp != fp:
+            # Fingerprint drift; drop and rebuild.
+            _ADAPTER_CACHE.pop(server_id, None)
+            return None
+        return cached
+
+
+def _set_cached_adapter(
+    server_id: str,
+    *,
+    adapter: Any,
+    server: Any,
+    url: str,
+    plain_token: str,
+    service_type: str,
+) -> None:
+    """Publish a built adapter to the cache. First write wins under
+    racing concurrent connects."""
+    if not server_id:
+        return
+    import hashlib
+    token_hash = hashlib.sha256(
+        plain_token.encode("utf-8", errors="ignore"),
+    ).hexdigest()[:16]
+    with _ADAPTER_CACHE_LOCK:
+        if server_id not in _ADAPTER_CACHE:
+            _ADAPTER_CACHE[server_id] = {
+                "adapter": adapter,
+                "server": server,
+                "url": url,
+                "token_hash": token_hash,
+                "service_type": service_type,
+            }
+
+
+def invalidate_adapter_cache(server_id: Optional[str] = None) -> int:
+    """Drop the cached adapter(s). ``server_id=None`` clears every
+    entry (used by tests + on global config change). Returns the
+    count evicted. Operators can call this after a server token
+    rotation to force re-build on next connect."""
+    with _ADAPTER_CACHE_LOCK:
+        if server_id is None:
+            n = len(_ADAPTER_CACHE)
+            _ADAPTER_CACHE.clear()
+            return n
+        return 1 if _ADAPTER_CACHE.pop(server_id, None) else 0
 
 
 def connect_registered_server(
@@ -2414,13 +2509,52 @@ def connect_registered_server(
     service_type = (row.get("service_type") or "plex").lower()
     now = time.time()
 
-    # PR-Backends: dispatch on service_type. Plex still goes through
+    # Adapter cache. If we've already built a PlexAdapter for this
+    # (server_id, url, token) fingerprint, reuse it so its
+    # on-instance caches (path index, per-artist cache, sections
+    # cache, library-of-truth, GUID blacklist) survive across
+    # submissions. Subsequent batches against the same dest drop to
+    # ~3 seconds from ~35 seconds.
+    cached_bundle = _get_cached_adapter(
+        str(row.get("id") or ""), row["url"], plain_token,
+    )
+    if cached_bundle is not None:
+        server = cached_bundle["server"]
+        adapter = cached_bundle["adapter"]
+        owner = row.get("owner_name") or ""
+        # Still record an "ok" status timestamp on the row so the
+        # registry's "last_checked_at" field stays current (the
+        # cached adapter doesn't ping; the cache is implicit liveness
+        # because a stale adapter would have failed on its first use
+        # and a token rotation would have flipped the fingerprint).
+        _record_status(row["id"], status="ok", detail="", checked_at=now, owner=owner)
+        row["last_status"] = "ok"
+        row["last_checked_at"] = now
+        return ServerConnection(
+            server=server,
+            row=row,
+            adapter=adapter,
+            url=row["url"],
+            token=plain_token,
+            service_type=service_type,
+        )
+
+    # Dispatch on service_type. Plex goes through
     # the existing plexapi-based connect path so all engine internals
     # (the engine call sites still use ``connection.server``) keep
     # working. Jellyfin / Emby instantiate the HTTP adapter directly
     # and probe via ``server_identity()``.
     if service_type == "plex":
         server, owner = _connect_plex(row, plain_token, logger, now)
+        # Stamp the app registry UID onto the plexapi server object
+        # so the resolver and PlexAdapter.MirrorResolveMixin both key
+        # the server mirror on the app UID
+        # (server_registry.make_server_id()) rather than the
+        # backend-native machineIdentifier.
+        try:
+            server._pmig_server_uid = str(row.get("id") or "")
+        except Exception:
+            pass
         from services.adapters.plex import PlexAdapter
         adapter = PlexAdapter(
             server,
@@ -2446,6 +2580,15 @@ def connect_registered_server(
     row["last_status"] = "ok"
     row["last_checked_at"] = now
     row["owner_name"] = owner
+
+    # Publish to the adapter cache so subsequent connects reuse this
+    # instance + its on-instance caches.
+    _set_cached_adapter(
+        str(row.get("id") or ""),
+        adapter=adapter, server=server,
+        url=row["url"], plain_token=plain_token,
+        service_type=service_type,
+    )
 
     return ServerConnection(
         server=server,
@@ -2522,17 +2665,23 @@ def _connect_http_backend(
     # Late imports to avoid circular dependency: adapter modules
     # import services.guid_translator which is safe; the registry
     # itself never imports the adapters at module load.
+    # Hand the adapter the app registry UID so MirrorResolveMixin
+    # keys the server mirror on the same backend-neutral id the sync
+    # endpoint uses.
+    _server_uid = str(row.get("id") or "")
     if service_type == "jellyfin":
         from services.adapters.jellyfin import JellyfinAdapter
         adapter = JellyfinAdapter(
             row["url"], plain_token,
             machine_id=row.get("machine_identifier"),
+            server_uid=_server_uid,
         )
     else:
         from services.adapters.emby import EmbyAdapter
         adapter = EmbyAdapter(
             row["url"], plain_token,
             machine_id=row.get("machine_identifier"),
+            server_uid=_server_uid,
         )
 
     try:
@@ -2626,7 +2775,7 @@ def test_connection(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
     failure is recorded into the row instead so the frontend can
     render a useful tooltip.
 
-    PR-Backends: dispatch on ``row['service_type']``. Plex uses the
+    Dispatch on ``row['service_type']``. Plex uses the
     existing plexapi handshake; Jellyfin / Emby delegate to
     :func:`probe_unsaved` (which is already multi-backend) and
     transcribe the probe result into the registry row.
@@ -2712,9 +2861,35 @@ def refresh_libraries(server_id: str, logger: logging.Logger) -> List[Dict[str, 
     return row.get("last_libraries", []) or []
 
 
+def get_cached_libraries(server_id: str) -> List[Dict[str, Any]]:
+    """Return the registry's last-known library list for a server
+    WITHOUT re-probing the live API.
+
+    Probing live via :func:`refresh_libraries` (which calls
+    :func:`test_connection`) does a full Plex / Emby / Jellyfin
+    handshake + per-library item count probe (3-15 seconds depending
+    on backend + library size). The Run Job form's DataToMigratePanel
+    hits this endpoint on every source-server change, so a live probe
+    each time makes the panel slow to load.
+
+    This cached path returns the already-stored ``last_libraries``
+    row instantly. The Run Job form uses it by default; an explicit
+    refresh button (or ``?refresh=1`` query) still triggers the
+    full probe when the operator wants a live re-read.
+
+    Empty list when the server has never been probed (the registry
+    row's ``last_libraries`` is initialised to ``[]``). 404 raised
+    for an unknown server_id so the endpoint can distinguish "not
+    yet probed" from "wrong id."""
+    row = get_server_by_id(server_id, include_token=False)
+    if row is None:
+        raise ValueError(f"No server with id {server_id!r}")
+    return row.get("last_libraries", []) or []
+
+
 # ── Lightweight ping (v0.9.1) ────────────────────────────────────────────────
 
-def ping_server(server_id: str, *, timeout: float = 3.0) -> Dict[str, Any]:
+def ping_server(server_id: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
     """
     Probe a registered server's reachability without enumerating its
     libraries - much cheaper than :func:`test_connection`. Used by the
@@ -2738,6 +2913,13 @@ def ping_server(server_id: str, *, timeout: float = 3.0) -> Dict[str, Any]:
     # in environments that only use the CRUD bits.
     import requests
 
+    # ``timeout=None`` resolves from the ``server_ping_timeout_seconds``
+    # tunable so the 30-second status-poll budget is operator-tunable.
+    # An explicit caller-supplied timeout still wins.
+    if timeout is None:
+        from services import tunables
+        timeout = float(tunables.server_ping_timeout())
+
     row = get_server_by_id(server_id)
     if row is None:
         return {"ok": False, "response_ms": 0.0, "status": "unknown",
@@ -2758,7 +2940,7 @@ def ping_server(server_id: str, *, timeout: float = 3.0) -> Dict[str, Any]:
         return {"ok": False, "response_ms": 0.0, "status": "auth_error",
                 "detail": str(exc)}
 
-    # PR-Backends: dispatch on service_type for the cheap reachability
+    # Dispatch on service_type for the cheap reachability
     # probe. Plex uses ``/identity`` (token-gated); Jellyfin / Emby
     # use ``/System/Info/Public`` (public, no auth) which is the
     # canonical "is the server alive" check on both. Per-backend
@@ -2807,7 +2989,7 @@ def ping_server(server_id: str, *, timeout: float = 3.0) -> Dict[str, Any]:
         response_ms=elapsed_ms,
     )
 
-    # v0.12.0 - feed the process-lifetime network collector so the
+    # Feed the process-lifetime network collector so the
     # Networking tab has live "is this server reachable and how fast"
     # data even when no job is running. The collector ages entries
     # over a 60 s window so a 30 s ping cadence keeps the chart fresh.
@@ -2850,10 +3032,10 @@ def _record_status(server_id: str, *, status: str, detail: str, checked_at: floa
     measures library enumeration time, not raw ping) pass ``None``
     to leave the previous value in place.
 
-    v0.10.0: ``machine_identifier`` and ``friendly_name`` are
-    captured on every successful connect so the UI can warn when the
-    URL+token a user typed connects to a different physical server
-    than the one they intended to register / refresh.
+    ``machine_identifier`` and ``friendly_name`` are captured on
+    every successful connect so the UI can warn when the URL+token a
+    user typed connects to a different physical server than the one
+    they intended to register / refresh.
     """
     with _REG_LOCK:
         rows = _load_raw()

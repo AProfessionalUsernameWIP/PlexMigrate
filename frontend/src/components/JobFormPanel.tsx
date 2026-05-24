@@ -1,4 +1,4 @@
-// Job submission form (v0.9.0).
+// Job submission form.
 //
 // Three modes:
 //   * Snapshot   pick source server, pick libraries, write JSON files.
@@ -9,14 +9,16 @@
 //               intermediate file. Source and destination must
 //               be different.
 //
-// Every CLI flag from plexmigrate.py has a clearly labelled form
+// Every engine job parameter has a clearly labelled form
 // control. The form does not submit the Plex URL or token directly
 //  those live in the registry the user manages from the Servers tab.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, ExportArchive, LibraryDescriptor, PingResult, ServerManagedUser, ServerUser, ServerView, DashboardFrame, Snapshot, EtaPrediction, EtaTrainingServerStatus } from '../api';
+import { api, ExportArchive, LeafCounts, LibraryDescriptor, PingResult, ServerManagedUser, ServerUser, ServerView, DashboardFrame, Snapshot } from '../api';
 import { BackendType, backendCounts, serversForBackend } from './BackendTabStrip';
+import { useBackendTint, type BackendTint } from '../contexts/BackendTintContext';
 import { serverSupportsFastCollections } from '../utils/plexVersion';
+import { pausableInterval } from '../utils/pausableInterval';
 import { RestoreModeSelector, RestoreMode, MergeWatchStrategy } from './RestoreModeSelector';
 import { ReplaceConfirmModal } from './ReplaceConfirmModal';
 import { InfoTip } from './InfoTip';
@@ -39,6 +41,7 @@ import type { Mode } from './ModeAndServersPanel';
 import { LibrariesPanel } from './LibrariesPanel';
 import { DataToMigratePanel } from './DataToMigratePanel';
 import { JobConfigBody } from './JobConfigBody';
+import { RunJobLibraryMappingPanel } from './RunJobLibraryMappingPanel';
 import type { JobConfigOwner } from './JobConfigOwner';
 import { PerRunSettingsPanel } from './PerRunSettingsPanel';
 import type {
@@ -49,16 +52,16 @@ import type {
   MixedMediaCollisionHandling,
 } from './PerRunSettingsPanel';
 
-// v0.9.1: live status indicator polling cadence for the server pickers.
+// Live status indicator polling cadence for the server pickers.
 const PING_INTERVAL_MS = 30_000;
 
 
-// PR-11 - the user picker reads from the local managed_users DB
-// instead of hitting the live Plex API on every job-form visit.
-// Shape adapter: DB rows carry ``username`` and ``kind`` directly;
-// the picker UI was originally built against the live API's
-// ``ServerUser`` shape with ``plex_id`` / ``raw_name``. Translating
-// here keeps the downstream render code unchanged.
+// The user picker reads from the local managed_users DB instead of
+// hitting the live Plex API on every job-form visit. Shape adapter:
+// DB rows carry ``username`` and ``kind`` directly; the picker UI
+// expects the live API's ``ServerUser`` shape with ``plex_id`` /
+// ``raw_name``. Translating here keeps the downstream render code
+// working against one shape.
 function dbUserToPickerUser(u: ServerManagedUser): ServerUser {
   return {
     kind: u.kind,
@@ -69,11 +72,11 @@ function dbUserToPickerUser(u: ServerManagedUser): ServerUser {
 }
 
 // Fetch DB-backed users for one server with a one-shot cold-start
-// recovery: if the DB has no rows yet (the end user just installed
-// PR-11 without re-testing their existing servers), fire a single
-// sync and re-fetch. Failures swallow into an empty list - the
-// downstream effect surfaces a single combined error if multiple
-// servers fail.
+// recovery: if the DB has no rows yet (the user hasn't re-tested
+// their existing servers since the managed_users cache was added),
+// fire a single sync and re-fetch. Failures swallow into an empty
+// list - the downstream effect surfaces a single combined error if
+// multiple servers fail.
 async function fetchPickerUsers(serverId: string): Promise<ServerUser[]> {
   let res = await api.listServerManagedUsers(serverId);
   if (res.users.length === 0) {
@@ -87,7 +90,7 @@ async function fetchPickerUsers(serverId: string): Promise<ServerUser[]> {
       // server in the Servers tab.
     }
   }
-  // 2026-05-15 share-state filter. The local managed_users cache may
+  // Share-state filter. The local managed_users cache may
   // still carry rows for users the end user un-shared on Plex.tv;
   // the engine drops them at run-time but they shouldn't be selectable
   // here either. Owners are always kept (admin token covers them
@@ -104,9 +107,9 @@ interface Props {
 export function JobFormPanel({ snapshot }: Props) {
   const [mode, setMode] = useState<Mode>('snapshot');
 
-  // Workflow selector (2026-05-16). Adds a backend-class layer above
-  // the mode tabs so end users explicitly pick which kind of job
-  // they're running:
+  // Workflow selector. Adds a backend-class layer above the mode
+  // tabs so end users explicitly pick which kind of job they're
+  // running:
   //
   //   * 'plex' / 'jellyfin' / 'emby' = same-backend workflow. The
   //     server pickers below are filtered to servers of that backend
@@ -120,29 +123,25 @@ export function JobFormPanel({ snapshot }: Props) {
   // servers (Plex-only install sees zero UX change). When 2+ backend
   // types exist, the Cross-platform tab also becomes available.
   //
-  // Engine support: Plex<->Plex works today. Jellyfin<->Jellyfin and
-  // Emby<->Emby require developer's PR-Backends engine call-site
-  // migration. Cross-platform requires PR-CrossPolish (Phase 2 of
-  // Plan[MULTI-BACKEND]-2026-05-15.md). Tabs are visible regardless;
+  // Tabs are visible for every backend regardless of engine support;
   // the Submit button below is gated for workflows whose backend
   // support isn't ready, with a banner explaining why.
   const [workflowMode, setWorkflowMode] = useState<WorkflowMode>('plex');
 
   // Registry-aware server selection.
-  // v0.10.0  destinations are now a Set so direct-transfer and import
-  // jobs can target multiple servers in one job (fan-out). Membership
-  // is order-insensitive; the rendered picker is a multi-select grid.
-  // The source is still a single string  fan-out is one source many
+  // Destinations are a Set so direct-transfer and import jobs can
+  // target multiple servers in one job (fan-out). Membership is
+  // order-insensitive; the rendered picker is a multi-select grid.
+  // The source is a single string - fan-out is one source many
   // destinations, never the reverse.
   const [servers, setServers] = useState<ServerView[]>([]);
-  // 2026-05-16: this state holds the registry's stable server id,
-  // not the friendly name. The same friendly name can exist across
-  // backends (Plex "Jade.TV" and Emby "Jade.TV" are different
-  // servers); keying on id is the only way to identify the server
-  // unambiguously. The variable names below preserve the historical
-  // "Name" suffix because the API field is still ``source_server_name``
-  // pending developer's PR-Backends id-aware schedule changes - until
-  // then we convert id -> name at submit time only.
+  // This state holds the registry's stable server id, not the
+  // friendly name. The same friendly name can exist across backends
+  // (Plex "Jade.TV" and Emby "Jade.TV" are different servers);
+  // keying on id is the only way to identify the server
+  // unambiguously. The variable names below keep the "Name" suffix
+  // because the API field is ``source_server_name``; we convert
+  // id -> name at submit time only.
   const [sourceServerName, setSourceServerName] = useState<string>('');
   const [destServerNames, setDestServerNames] = useState<Set<string>>(new Set());
 
@@ -183,10 +182,10 @@ export function JobFormPanel({ snapshot }: Props) {
     return serversForBackend(servers, workflowMode);
   }, [servers, workflowMode]);
 
-  // 2026-05-16 Set Backend simplification: source / dest backend are
-  // now derived from the actually-picked source / destination
-  // server's service_type, NOT from a separate chip state. The
-  // backend tabs above filter both pickers' available lists; the
+  // Source / dest backend are derived from the actually-picked
+  // source / destination server's service_type, NOT from a separate
+  // chip state. The backend tabs above filter both pickers'
+  // available lists; the
   // cross-platform tab unlocks an "open selection" mode where the
   // end user can pick servers from any backend and the actual
   // cross-backend-ness comes from the picker choice.
@@ -225,20 +224,37 @@ export function JobFormPanel({ snapshot }: Props) {
     return false;
   }, [sourceServerName, destServerNames, servers]);
 
-  // Plan[RUN-JOB-UI] work item 3: D-RATE mode. End user's per-job
-  // rating-mapping policy in the cross-backend sub-card. Default
+  // Publish the chameleon backend tint based on the current source +
+  // destination picks. Cross-backend routes (source and dest differ)
+  // publish 'mixed' so the "you're running across backends" warning
+  // signal carries into the chrome too. Same-backend routes publish
+  // the source backend so the Run button + selection highlights take
+  // on that backend's identity. This is the JobFormPanel-equivalent
+  // of BackendTabStrip's tint hook (Run Job doesn't render a strip
+  // because the picker selection is the source of truth here).
+  const jobFormTint: BackendTint = useMemo(() => {
+    if (sourceServerName && destServerNames.size > 0 && isCrossBackend) return 'mixed';
+    if (sourceBackend === 'plex' || sourceBackend === 'jellyfin' || sourceBackend === 'emby') {
+      return sourceBackend;
+    }
+    return null;
+  }, [sourceServerName, destServerNames, isCrossBackend, sourceBackend]);
+  useBackendTint(jobFormTint);
+
+  // D-RATE mode. End user's per-job rating-mapping policy in the
+  // cross-backend sub-card. Default
   // matches the backend (favorite_threshold=5.0); 'tunable' lets the
   // end user pick their own threshold; 'numeric_only' uses the 11.0
   // sentinel to disable IsFavorite writes entirely.
   const [rateMode, setRateMode] = useState<RateMode>('default');
   const [rateThreshold, setRateThreshold] = useState<string>('5.0');
 
-  // Plan[RUN-JOB-UI] work item 4: per-user fan-out toggle. Default
-  // ON matches the backend's include_managed_users=True kwarg.
+  // Per-user fan-out toggle. Default ON matches the backend's
+  // include_managed_users=True kwarg.
   const [includeManagedUsers, setIncludeManagedUsers] = useState<boolean>(true);
 
-  // Plan[RUN-JOB-UI] work item 2 (D-OWNER, PR-4): end user-confirmed
-  // user-creation spec list. Empty until the modal is approved.
+  // D-OWNER end user-confirmed user-creation spec list. Empty until
+  // the modal is approved.
   type UserCreateSpec = {
     source_user_handle: string;
     target_username: string;
@@ -249,17 +265,15 @@ export function JobFormPanel({ snapshot }: Props) {
   const [userCreateModalOpen, setUserCreateModalOpen] = useState<boolean>(false);
   const [userCreateConfirmed, setUserCreateConfirmed] = useState<boolean>(false);
 
-  // Phase D (2026-05-16): the boolean cross-backend Submit gate has
-  // been removed. Cross-backend submission is now driven by the
-  // CrossPlatformPreflightModal's verdict instead: the preflight
-  // endpoint computes per-destination decisions, and the modal locks
-  // Submit only when a row has a blocking verdict the end user hasn't
+  // Cross-backend submission is driven by the
+  // CrossPlatformPreflightModal's verdict: the preflight endpoint
+  // computes per-destination decisions, and the modal locks Submit
+  // only when a row has a blocking verdict the end user hasn't
   // resolved. Same-backend routes skip the modal entirely (verdict=ok).
   //
-  // The pre-Phase-D ``workflowEngineReady`` boolean is kept here for
-  // any non-preflight readiness checks that may want it in the future;
-  // it returns true unconditionally now so the gate that used to read
-  // it is a no-op.
+  // ``workflowEngineReady`` is a constant true, kept as a hook for
+  // any non-preflight readiness check that may want it in the future;
+  // the gate that reads it is a no-op.
   const workflowEngineReady = true;
   // First-time-enablement notice for Jellyfin / Emby. The engine is
   // implemented and contract-tested, but this is the first release
@@ -318,7 +332,7 @@ export function JobFormPanel({ snapshot }: Props) {
   // Kept separate from ``servers`` so a ping refresh doesn't trigger
   // the library-fetch effect (which depends on ``servers``).
   const [pings, setPings] = useState<Record<string, PingResult>>({});
-  const pollTimerRef = useRef<number | null>(null);
+  const pollTimerRef = useRef<(() => void) | null>(null);
 
   // Library picker (snapshot + direct).
   const [libraries, setLibraries] = useState<LibraryDescriptor[]>([]);
@@ -328,9 +342,9 @@ export function JobFormPanel({ snapshot }: Props) {
   // Export file picker (import only).
   const [snapshots, setExports] = useState<ExportArchive[]>([]);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
-  // Restore source toggle. Defaults to 'snapshot' (registered .db) since
-  // that's the post-PR-13 storage shape; legacy JSON archives still work
-  // via the 'file' option.
+  // Restore source toggle. Defaults to 'snapshot' (registered .db),
+  // the current storage shape; legacy JSON archives still work via
+  // the 'file' option.
   const [restoreSource, setRestoreSource] = useState<'snapshot' | 'file'>('snapshot');
   const [registeredSnapshots, setRegisteredSnapshots] = useState<Snapshot[]>([]);
   const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | null>(null);
@@ -349,23 +363,113 @@ export function JobFormPanel({ snapshot }: Props) {
   const [fastCollectionDetection, setFastCollectionDetection] = useState(false);
   const [skipPlaylistPrebuild, setSkipPlaylistPrebuild] = useState(false);
 
-  // v0.13.x Restore mode (Merge / Replace). Shared between the
-  // ``restore`` and ``direct`` operations - both end up in the same
-  // engine path. Defaults to ``merge`` (the safe, additive, current
-  // behaviour); Replace is opt-in and gated by the typed-confirmation
-  // modal below.
+  // Restore mode (Merge / Replace). Shared between the ``restore``
+  // and ``direct`` operations - both end up in the same engine
+  // path. Defaults to ``merge`` (the safe, additive behaviour);
+  // Replace is opt-in and gated by the typed-confirmation modal
+  // below.
   const [restoreMode, setRestoreMode] = useState<RestoreMode>('merge');
   const [autoCaptureBeforeReplace, setAutoCaptureBeforeReplace] = useState(true);
-  // v0.13.x: Merge-mode sub-toggle for the watch-count math. Defaults
-  // to "higher" (the legacy idempotent behaviour) so existing job
-  // submissions are wire-identical until the end user opts into the
+  // Merge-mode sub-toggle for the watch-count math. Defaults to
+  // "higher" (the idempotent behaviour); the end user opts into the
   // additive variant.
   const [mergeWatchStrategy, setMergeWatchStrategy] = useState<MergeWatchStrategy>('higher');
+
+  // Per-run override that bypasses the saved library mapping table.
+  // Default false (mappings apply). When true, the engine falls back
+  // to exact-name matching between source + destination libraries.
+  // The checkbox is surfaced as a first-class control next to Submit
+  // (Replace mode users see the explicit cross-backend safety belt
+  // as a banner instead).
+  const [ignoreLibraryMapping, setIgnoreLibraryMapping] = useState<boolean>(false);
+
+  // Per-run library mapping override map. Keys are source library
+  // names; values are destination library names (empty string for
+  // explicit per-run skip). Edits here NEVER touch the shared
+  // library_mappings table - they only travel with this one job
+  // submission. The engine reads the map BEFORE the saved table, so
+  // an entry here is the highest-precedence routing decision short
+  // of the ignore_library_mapping flag.
+  const [libraryMappingOverrides, setLibraryMappingOverrides] = useState<Record<string, string>>({});
+
+  // Per-library counts read from the selected snapshot's .db file.
+  // Populated when source is a snapshot so the Run Job > Library
+  // Mapping panel renders rich counts (movies / shows / seasons /
+  // episodes / tracks / etc.) for the source side, matching the
+  // destination side. Null until fetched; empty array when the
+  // snapshot file is missing.
+  //
+  // media_type_counts is the authoritative per-libtype breakdown -
+  // Plex stores 'artist', 'album', and 'track' as separate items,
+  // all in server_items. Counting server_items rows without
+  // splitting by media_type gives a misleading union (e.g. "12,005
+  // artists" for a library with 1,100 artists + 7,400 tracks). The
+  // split is carried through to leaf_counts so the renderer puts
+  // each count on the right line.
+  const [snapshotLibraryCounts, setSnapshotLibraryCounts] = useState<Record<string, {
+    section_type: string;
+    item_count: number;
+    media_type_counts: Record<string, number>;
+    hierarchy_counts: Record<string, number>;
+    watch_events: number;
+    ratings: number;
+    playlists: number;
+    collections: number;
+  }> | null>(null);
+
+  useEffect(() => {
+    if (mode !== 'restore' || restoreSource !== 'snapshot' || !selectedSnapshotId) {
+      setSnapshotLibraryCounts(null);
+      return;
+    }
+    let cancelled = false;
+    api.snapshotLibraryCounts(selectedSnapshotId).then(
+      (r) => {
+        if (cancelled) return;
+        const idx: Record<string, {
+          section_type: string; item_count: number;
+          media_type_counts: Record<string, number>;
+          hierarchy_counts: Record<string, number>;
+          watch_events: number; ratings: number;
+          playlists: number; collections: number;
+        }> = {};
+        for (const lib of r.libraries || []) {
+          idx[lib.section_title] = {
+            section_type: lib.section_type,
+            item_count: lib.item_count,
+            media_type_counts: lib.media_type_counts || {},
+            hierarchy_counts: lib.hierarchy_counts || {},
+            watch_events: lib.watch_events,
+            ratings: lib.ratings,
+            playlists: lib.playlists,
+            collections: lib.collections,
+          };
+        }
+        setSnapshotLibraryCounts(idx);
+      },
+      () => { if (!cancelled) setSnapshotLibraryCounts(null); },
+    );
+    return () => { cancelled = true; };
+  }, [mode, restoreSource, selectedSnapshotId]);
+
+  // Preflight result from POST /api/library-mapping/preflight.
+  // Fetched whenever (source, dest, libs, mode, ignore_mapping)
+  // changes so the operator sees the warning before Submit.
+  const [mappingPreflight, setMappingPreflight] = useState<{
+    same_server: boolean;
+    cross_backend_replace_refusal: string | null;
+    library_warnings: Array<{
+      library: string;
+      status: 'unmapped' | 'operator_skip' | 'auto_unconfirmed' | 'per_run_route' | 'per_run_skip';
+      detail: string;
+    }>;
+    any_unmapped: boolean;
+  } | null>(null);
   // Gate for the typed-REPLACE modal. Submit() flips it true when the
   // end user hits Submit with mode=replace; the modal's onConfirm
   // calls ``submitConfirmed()`` which actually fires the API request.
   const [replaceModalOpen, setReplaceModalOpen] = useState(false);
-  // PR-12: PIN preflight modal state. Filled by ``submit()`` from the
+  // PIN preflight modal state. Filled by ``submit()`` from the
   // ``/api/job/preflight-pin-check`` response; ``pinPreflightAck`` is
   // set when the end user clicks Continue anyway and is stamped onto
   // the next ``api.submit*`` payload via ``stampPreflight``.
@@ -373,28 +477,27 @@ export function JobFormPanel({ snapshot }: Props) {
   const [pinPreflightAtRisk, setPinPreflightAtRisk] = useState<string[]>([]);
   const [pinPreflightAck, setPinPreflightAck] = useState(false);
 
-  // Phase C: cross-platform preflight state. The modal opens between
+  // Cross-platform preflight state. The modal opens between
   // PinPreflight and ReplaceConfirm when the route is cross-backend
   // AND the backend's aggregate verdict is not 'ok'. On Continue, the
   // end user's per-destination decisions go into the submit payload
-  // as ``cross_platform_resolutions`` (read by developer's engine-side
-  // enforcement at write time).
+  // as ``cross_platform_resolutions``, read by engine-side
+  // enforcement at write time.
   const [cppOpen, setCppOpen] = useState(false);
   const [cppResponse, setCppResponse] = useState<PreflightResponse | null>(null);
   const [cppAcks, setCppAcks] = useState<Record<string, CrossPlatformPreflightAck>>({});
-  // PR-3 / Phase D - four-flag data-type filter. Replaces the two old
-  // skip_* checkboxes (skip_collections / skip_playlists). Applies to
-  // every job mode (snapshot / import / direct) so the end user can
-  // pick exactly which data types to migrate.
-  // 2026-05-16: the four include_* booleans below are no longer
-  // surfaced as standalone checkboxes. The per-library
-  // LibraryMetricsMatrix is the end user's only metric control. The
-  // booleans are kept (a) so existing submit payload code still
-  // populates ``include_watch_history`` etc., (b) so the
-  // ``atLeastOneType`` validation continues to gate Submit, and
-  // (c) so preflight / saved-settings paths that set them still
-  // work. A useEffect below derives them from libraryMetrics on
-  // every change so the matrix stays the source of truth.
+  // Four-flag data-type filter. Applies to every job mode (snapshot
+  // / import / direct) so the end user can pick exactly which data
+  // types to migrate.
+  //
+  // The four include_* booleans below are not surfaced as standalone
+  // checkboxes. The per-library LibraryMetricsMatrix is the end
+  // user's only metric control. The booleans are kept (a) so submit
+  // payload code populates ``include_watch_history`` etc., (b) so
+  // the ``atLeastOneType`` validation gates Submit, and (c) so
+  // preflight / saved-settings paths that set them still work. A
+  // useEffect below derives them from libraryMetrics on every
+  // change so the matrix stays the source of truth.
   const [includeWatchHistory, setIncludeWatchHistory] = useState(true);
   const [includeRatings, setIncludeRatings] = useState(true);
   const [includePlaylists, setIncludePlaylists] = useState(true);
@@ -445,12 +548,12 @@ export function JobFormPanel({ snapshot }: Props) {
   const [remapOld, setRemapOld] = useState('');
   const [remapNew, setRemapNew] = useState('');
 
-  // v0.9.6 Feature 4: per-side managed-user lists for direct transfer.
-  // Loaded in parallel as soon as both source + destination are
-  // chosen. ``null`` = not loaded yet for that side; an array (even
-  // empty) means the fetch completed. ``sourceUsers === null ||
-  // destUsers === null`` gates the Users section's rendering so it
-  // doesn't flash an empty intersection during the fetch window.
+  // Per-side managed-user lists for direct transfer. Loaded in
+  // parallel as soon as both source + destination are chosen.
+  // ``null`` = not loaded yet for that side; an array (even empty)
+  // means the fetch completed. ``sourceUsers === null || destUsers
+  // === null`` gates the Users section's rendering so it doesn't
+  // flash an empty intersection during the fetch window.
   const [sourceUsers, setSourceUsers] = useState<ServerUser[] | null>(null);
   const [destUsers, setDestUsers] = useState<ServerUser[] | null>(null);
   const [usersError, setUsersError] = useState<string | null>(null);
@@ -460,17 +563,16 @@ export function JobFormPanel({ snapshot }: Props) {
   // server selection changes.
   const [includedUsers, setIncludedUsers] = useState<Set<string>>(new Set());
 
-  // Phase A (admin-management plan follow-up): user filter criteria
-  // narrow the user-selection grid by attributes like stored
-  // PIN/token + cross-server presence. The UserFilterPanel below
-  // pushes the matching plex_id set back here.
+  // User filter criteria narrow the user-selection grid by
+  // attributes like stored PIN/token + cross-server presence. The
+  // UserFilterPanel below pushes the matching plex_id set back here.
   const [userFilteredIds, setUserFilteredIds] = useState<Set<string>>(new Set());
   const [userFilterCriteria, setUserFilterCriteria] = useState<UserFilterCriteria>(EMPTY_FILTER);
 
-  // Plan[RUN-JOB-UI] PR-4: source users not present on the
-  // destination, used as the D-OWNER modal's proposed list. Case-
-  // insensitive match on the username; missing-on-destination =
-  // "this user needs to be created."
+  // Source users not present on the destination, used as the
+  // D-OWNER modal's proposed list. Case-insensitive match on the
+  // username; missing-on-destination = "this user needs to be
+  // created."
   const proposedUserCreates = useMemo<ProposedUser[]>(() => {
     if (!isCrossBackend) return [];
     if (sourceUsers === null || destUsers === null) return [];
@@ -492,41 +594,68 @@ export function JobFormPanel({ snapshot }: Props) {
   }, [isCrossBackend, sourceUsers, destUsers]);
   const userFilterActive = (Object.values(userFilterCriteria) as boolean[]).some(Boolean);
 
-  // Phase C (admin-management plan follow-up, 2026-05-15): per-library
-  // metric override map. When the end user fills any cell here, the
-  // submit path sends ``library_metrics`` and the backend's engine
-  // applies it per library. When the matrix is empty, the four
-  // global include_* flags above are sent and the backend's
-  // validator expands them into library_metrics at parse time.
+  // FECORE-04: when the attribute filter is active, the picker is fed
+  // a narrowed list (sourceUsers ∩ userFilteredIds), but includedUsers
+  // is the set actually submitted as user_filter. Prune includedUsers
+  // down to ids the filter still admits so filtered-out users can't
+  // linger in the submitted selection while invisible in the picker.
+  // When the filter is inactive, leave includedUsers untouched.
+  useEffect(() => {
+    if (!userFilterActive) return;
+    setIncludedUsers((prev) => {
+      const pruned = new Set<string>();
+      for (const id of prev) {
+        if (userFilteredIds.has(id)) pruned.add(id);
+      }
+      if (pruned.size === prev.size) return prev;
+      return pruned;
+    });
+  }, [userFilterActive, userFilteredIds]);
+
+  // Per-library metric override map. When the end user fills any
+  // cell here, the submit path sends ``library_metrics`` and the
+  // backend's engine applies it per library. When the matrix is
+  // empty, the four global include_* flags above are sent and the
+  // backend's validator expands them into library_metrics at parse
+  // time.
   const [libraryMetrics, setLibraryMetrics] = useState<LibraryMetricsMap | null>(null);
 
-  // 2026-05-16: the four global include_* flags are now derived from
-  // libraryMetrics. Whenever the end user toggles a cell in the
-  // matrix, this effect re-computes whether each metric is on for
-  // ANY library and stamps the corresponding global. Submit logic
-  // continues to send both ``include_*`` AND ``library_metrics``
-  // (backend uses library_metrics as authoritative; the globals are
-  // a back-compat fallback). When libraryMetrics is null / empty
-  // (end user hasn't touched the matrix), we leave the globals alone
-  // so the existing defaults / preflight paths keep working.
+  // The four global include_* flags are derived from libraryMetrics.
+  // Whenever the end user toggles a cell in the matrix, this effect
+  // re-computes whether each metric is on for ANY visible library
+  // and stamps the corresponding global. Submit logic sends both
+  // ``include_*`` AND ``library_metrics`` (backend uses
+  // library_metrics as authoritative; the globals are a fallback
+  // AND drive the atLeastOneType submit gate banner).
+  //
+  // The some()-checks must walk the full ``libraries`` list, not
+  // just Object.values(libraryMetrics): libraries the user hasn't
+  // touched have no entry but default to all-on per the matrix's
+  // contract (and render that way). Treat missing rows as ALL_ON so
+  // the globals match what the user actually sees in the matrix.
   useEffect(() => {
-    if (!libraryMetrics) return;
-    const rows = Object.values(libraryMetrics);
-    if (rows.length === 0) return;
+    if (!libraryMetrics || libraries.length === 0) return;
+    const ALL_ON: LibraryMetricsRow = {
+      watch_history: true,
+      ratings: true,
+      playlists: true,
+      collections: true,
+    };
+    const rows = libraries.map((lib) => libraryMetrics[lib.name] ?? ALL_ON);
     setIncludeWatchHistory(rows.some((r) => r.watch_history));
     setIncludeRatings(rows.some((r) => r.ratings));
     setIncludePlaylists(rows.some((r) => r.playlists));
     setIncludeCollections(rows.some((r) => r.collections));
-  }, [libraryMetrics]);
+  }, [libraryMetrics, libraries]);
 
-  // 2026-05-16: selectedLibs is auto-synced from libraryMetrics now
-  // that the Libraries checkbox panel has been removed. A library is
-  // "selected" if (a) it has no entry in libraryMetrics (default
-  // all-on per LibraryMetricsMatrix's fallback behaviour) OR (b) it
-  // has an entry with at least one true flag. Excluding a library is
-  // done by clicking its row "none" button in the matrix - that
-  // zeroes the entry and the library drops out of selectedLibs on
-  // the next tick.
+  // selectedLibs is auto-synced from libraryMetrics (there is no
+  // separate Libraries checkbox panel). A library is "selected" if
+  // (a) it has no entry in libraryMetrics (default all-on per
+  // LibraryMetricsMatrix's fallback behaviour) OR (b) it has an
+  // entry with at least one true flag. Excluding a library is done
+  // by clicking its row "none" button in the matrix - that zeroes
+  // the entry and the library drops out of selectedLibs on the next
+  // tick.
   useEffect(() => {
     if (libraries.length === 0) return;
     const next = new Set<string>();
@@ -547,15 +676,6 @@ export function JobFormPanel({ snapshot }: Props) {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitOk, setSubmitOk] = useState<string | null>(null);
-
-  // Plan[ETA-TRAINING] PR-E: adaptive ETA preview. The block renders
-  // just above the submit button and updates 350ms after any
-  // relevant input changes. The trainer is happy to answer with
-  // tier-5 defaults on a brand-new install, so the preview shows
-  // useful copy from the very first form load.
-  const [etaPrediction, setEtaPrediction] = useState<EtaPrediction | null>(null);
-  const [etaLoading, setEtaLoading] = useState(false);
-  const [trainingStatus, setTrainingStatus] = useState<EtaTrainingServerStatus | null>(null);
 
   // v0.13 form-layout refactor: the Run-Job form is now grouped into
   // three sections - Mode & Servers (always visible) → Scope (always
@@ -581,9 +701,9 @@ export function JobFormPanel({ snapshot }: Props) {
   // ``''`` means "inherit" (no override sent to backend).
   const [watchRatingsStrategy, setWatchRatingsStrategy] = useState<WatchRatingsStrategy>('');
 
-  // Mixed-media playlist per-run overrides (Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16).
-  // All five default to '' (inherit) so the backend uses the global
-  // tunable. Owner-builder converts '' to null at submit time.
+  // Mixed-media playlist per-run overrides. All five default to ''
+  // (inherit) so the backend uses the global tunable. Owner-builder
+  // converts '' to null at submit time.
   const [mixedMediaBehavior, setMixedMediaBehavior] = useState<MixedMediaBehavior>('');
   const [mixedMediaDominanceThreshold, setMixedMediaDominanceThreshold] = useState('');
   const [mixedMediaVideoRouting, setMixedMediaVideoRouting] = useState<MixedMediaVideoRouting>('');
@@ -591,12 +711,10 @@ export function JobFormPanel({ snapshot }: Props) {
   const [mixedMediaCollisionHandling, setMixedMediaCollisionHandling] = useState<MixedMediaCollisionHandling>('');
 
   // Load registered servers on mount.
-  // v0.9.1 change: do NOT pre-select source/destination. The previous
-  // code auto-selected the first registered server, which is exactly
-  // the failure mode the user reported  operations silently used a
-  // server the user never picked. The new flow forces the user to
-  // make a deliberate selection (and the gated lower panels make this
-  // visible).
+  // Do NOT pre-select source/destination. Auto-selecting the first
+  // registered server lets operations silently run against a server
+  // the user never picked; forcing a deliberate selection (and the
+  // gated lower panels) makes the choice visible.
   useEffect(() => {
     setServersError(null);
     api.listServers()
@@ -606,14 +724,14 @@ export function JobFormPanel({ snapshot }: Props) {
       .catch((e) => setServersError(String(e)));
   }, []);
 
-  // v0.9.1: poll each registered server's status every 30 s so the
-  // dots in the source/destination selectors stay current. Pings are
+  // Poll each registered server's status every 30 s so the dots in
+  // the source/destination selectors stay current. Pings are
   // independent and cheap (single HTTP GET against /identity), so we
   // run them all in parallel each tick.
   useEffect(() => {
     if (servers.length === 0) {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
       return;
@@ -630,11 +748,11 @@ export function JobFormPanel({ snapshot }: Props) {
       await Promise.allSettled(tasks);
     };
     pingAll();
-    if (pollTimerRef.current !== null) window.clearInterval(pollTimerRef.current);
-    pollTimerRef.current = window.setInterval(pingAll, PING_INTERVAL_MS);
+    if (pollTimerRef.current !== null) pollTimerRef.current();
+    pollTimerRef.current = pausableInterval(pingAll, PING_INTERVAL_MS);
     return () => {
       if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current();
         pollTimerRef.current = null;
       }
     };
@@ -652,27 +770,31 @@ export function JobFormPanel({ snapshot }: Props) {
       setLibraries([]);
       return;
     }
+    // FECORE-13: cancellation guard so a stale listServerLibraries
+    // response can't clobber a newer one on rapid server switching.
+    let cancelled = false;
     setLibrariesError(null);
     api.listServerLibraries(srv.id)
-      .then((libs) => setLibraries(libs))
-      .catch((e) => setLibrariesError(String(e)));
+      .then((libs) => { if (!cancelled) setLibraries(libs); })
+      .catch((e) => { if (!cancelled) setLibrariesError(String(e)); });
+    return () => { cancelled = true; };
   }, [sourceServerName, mode, servers]);
 
   // Load existing snapshot files when import mode is active.
-  // PR-13: the registry-backed listSnapshots() shape isn't compatible
-  // with the JSON-file-picker UI here (snapshots are now ``.db``
+  // The registry-backed listSnapshots() shape isn't compatible with
+  // the JSON-file-picker UI here (registered snapshots are ``.db``
   // files; the end user can't ingest them directly through this
-  // picker until the importer learns to read DB snapshots). For now
-  // the picker lists the legacy ``.plexexport.json`` archives moved
-  // to ``snapshots/legacy/`` by the PR-13 migration - those remain
-  // ingestible by the existing JSON-based importer.
+  // picker until the importer learns to read DB snapshots). The
+  // picker lists the legacy ``.plexexport.json`` archives under
+  // ``snapshots/legacy/`` - those remain ingestible by the existing
+  // JSON-based importer.
   useEffect(() => {
     if (mode !== 'restore') return;
     api.listLegacySnapshots().then(setExports).catch(() => setExports([]));
     // Registered snapshots from snapshots.db - the primary import
-    // source post-PR-13. The importer reads JSON; the route handler
-    // for /api/job/import-from-snapshot materialises the sidecar
-    // before forwarding, so the engine path stays unchanged.
+    // source. The importer reads JSON; the route handler for
+    // /api/job/import-from-snapshot materialises the sidecar before
+    // forwarding, so the engine path stays unchanged.
     setSnapshotsLoadError(null);
     api.listSnapshots()
       .then((r) => setRegisteredSnapshots(r.snapshots))
@@ -707,6 +829,58 @@ export function JobFormPanel({ snapshot }: Props) {
   // the end user already changed stay changed unless the new server
   // has an explicit override for them. Resolution order documented
   // in dbschema.md - this implements step (2) for ad-hoc jobs.
+  // Fire the library-mapping preflight whenever the inputs that
+  // affect it change. The endpoint short-circuits to a "no warnings"
+  // reply for same-server jobs + snapshot mode (snapshot doesn't
+  // write to a destination, so mappings don't apply). Throttled by
+  // React's effect dependency check; no debouncing needed because
+  // the inputs only change on operator action.
+  useEffect(() => {
+    // Snapshot mode never writes to a destination; no mapping needed.
+    if (mode === 'snapshot') {
+      setMappingPreflight(null);
+      return;
+    }
+    // Derive the effective source server id per mode. For
+    // restore-from-snapshot the source is the snapshot's captured
+    // server_id (the source server may be offline); direct +
+    // restore-from-file use the form's source picker.
+    const effectiveSourceId =
+      mode === 'restore' && _selectedSnapshot
+        ? _selectedSnapshot.server_id
+        : sourceServerName;
+    // Single destination check covers the most common direct +
+    // restore cases. Fan-out runs check each destination separately
+    // server-side, but the form gate uses just the first.
+    if (!effectiveSourceId || destServerNames.size === 0) {
+      setMappingPreflight(null);
+      return;
+    }
+    const firstDest = Array.from(destServerNames)[0];
+    const libs = Array.from(selectedLibs);
+    if (libs.length === 0) {
+      setMappingPreflight(null);
+      return;
+    }
+    let cancelled = false;
+    api.libraryMappingPreflight({
+      source_server_id: effectiveSourceId,
+      dest_server_id: firstDest,
+      library_names: libs,
+      mode: restoreMode,
+      ignore_library_mapping: ignoreLibraryMapping,
+      library_mapping_overrides: libraryMappingOverrides,
+    }).then(
+      (r) => { if (!cancelled) setMappingPreflight(r); },
+      () => { if (!cancelled) setMappingPreflight(null); },
+    );
+    return () => { cancelled = true; };
+  }, [
+    mode, sourceServerName, destServerNames, selectedLibs,
+    restoreMode, ignoreLibraryMapping, libraryMappingOverrides,
+    _selectedSnapshot,
+  ]);
+
   useEffect(() => {
     if (mode !== 'snapshot' && mode !== 'direct') return;
     if (!sourceServerName) return;
@@ -778,108 +952,15 @@ export function JobFormPanel({ snapshot }: Props) {
     }
   }, [selectedSnapshotId, registeredSnapshots, mode, restoreSource]);
 
-  // Plan[ETA-TRAINING] PR-E: adaptive ETA preview. Debounced 350ms so
-  // typing in workers or toggling metric checkboxes does not fire a
-  // round trip on every keystroke. The cold-start path (no learned
-  // weights yet) still returns a useful tier-5 estimate so the
-  // preview is informative from the very first run.
-  useEffect(() => {
-    // Snapshot mode uses the source server's learned timings;
-    // restore / direct also key on the source for the gather work
-    // (the engine timings live on the gather side, not the apply
-    // side). Skip the prediction when no server is picked yet.
-    const srv = servers.find((s) => s.id === sourceServerName);
-    if (!srv) {
-      setEtaPrediction(null);
-      return;
-    }
-    // Use leaf count where Plex reports it: a TV library's "874 shows"
-    // tells the predictor nothing useful when the engine processes
-    // episodes; same for artist libraries that work on tracks. Fall
-    // back to the top-level count for movie libraries (1:1) or when
-    // leaf counts are absent on an older registry row.
-    const leafCountFor = (L: { type: string; count: number; leaf_counts?: { episodes?: number; tracks?: number } }): number | null => {
-      if (L.type === 'show' && typeof L.leaf_counts?.episodes === 'number') {
-        return L.leaf_counts.episodes;
-      }
-      if (L.type === 'artist' && typeof L.leaf_counts?.tracks === 'number') {
-        return L.leaf_counts.tracks;
-      }
-      return typeof L.count === 'number' ? L.count : null;
-    };
-    const selectedLibList = libraries
-      .filter((L) => selectedLibs.has(L.name))
-      .map((L) => ({
-        name: L.name,
-        library_type: L.type || '',
-        items_count: leafCountFor(L),
-      }));
-    if (selectedLibList.length === 0) {
-      setEtaPrediction(null);
-      return;
-    }
-    const body = {
-      mode,
-      source_server_id: srv.id,
-      libraries: selectedLibList,
-      metrics_enabled: {
-        watch_history: includeWatchHistory,
-        ratings: includeRatings,
-        playlists: includePlaylists,
-        collections: includeCollections,
-      },
-      user_count: Math.max(1, includedUsers.size || 1),
-      workers: Math.max(1, parseInt(workers || '16', 10) || 16),
-      bulk_strategy: (watchRatingsStrategy || 'smart') as 'smart' | 'force_bulk' | 'force_server_side',
-    };
-    setEtaLoading(true);
-    const t = window.setTimeout(() => {
-      api.predictEta(body)
-        .then((p) => setEtaPrediction(p))
-        .catch(() => setEtaPrediction(null))
-        .finally(() => setEtaLoading(false));
-    }, 350);
-    return () => {
-      window.clearTimeout(t);
-      setEtaLoading(false);
-    };
-  }, [
-    mode, sourceServerName, servers, libraries, selectedLibs,
-    includeWatchHistory, includeRatings, includePlaylists, includeCollections,
-    includedUsers, workers, watchRatingsStrategy,
-  ]);
-
-  // Training-status fetch: refreshes when the source server changes
-  // AND when the prediction completes (a fresh job-end would have
-  // updated samples, though that lands via the run-completion path
-  // not this form). Light enough to fetch on every prediction tick.
-  useEffect(() => {
-    const srv = servers.find((s) => s.id === sourceServerName);
-    if (!srv) {
-      setTrainingStatus(null);
-      return;
-    }
-    let cancelled = false;
-    api.etaTrainingStatus(srv.id)
-      .then((res) => {
-        if (cancelled) return;
-        const match = (res.by_server || []).find((s) => s.server_id === srv.id);
-        setTrainingStatus(match || null);
-      })
-      .catch(() => {
-        if (!cancelled) setTrainingStatus(null);
-      });
-    return () => { cancelled = true; };
-  }, [sourceServerName, servers, etaPrediction]);
-
-  // v0.9.6 Feature 4: load users from BOTH servers in direct mode so
-  // the form can compute the transferable intersection. Reset state
-  // on every selection change so we never show a stale list. The
+  // Load users from BOTH servers in direct mode so the form can
+  // compute the transferable intersection. Reset state on every
+  // selection change so we never show a stale list. The
   // includedUsers default ("all checked") is set once after the
   // fetch resolves so the end user only needs to *un*check to
-  // exclude  matching the spec.
-  // v0.10.0  destinations are a set, so the per-user transferable
-  // intersection now spans the source plus *every* selected
+  // exclude.
+  //
+  // Destinations are a set, so the per-user transferable
+  // intersection spans the source plus *every* selected
   // destination. A managed user must exist on every side to be
   // included; missing on any one destination drops them from the
   // default-checked set. The owner is treated the same way.
@@ -921,17 +1002,22 @@ export function JobFormPanel({ snapshot }: Props) {
     if (!sourceServerName || destServerNames.size === 0) return;
     if (destServerNames.has(sourceServerName)) return;
     const src = servers.find((s) => s.id === sourceServerName);
+    // destServerNames contains server IDs despite the misleading
+    // "Names" suffix (the state setter is wired through
+    // setDestServerIds in JobConfigBody). Look them up by id, not
+    // ``s.name``: a name lookup returns undefined, which leaves
+    // ``dsts`` empty, early-returns, and the user picker never
+    // populates.
     const dsts = Array.from(destServerNames)
-      .map((n) => servers.find((s) => s.name === n))
+      .map((id) => servers.find((s) => s.id === id))
       .filter((s): s is ServerView => !!s);
     if (!src || dsts.length === 0) return;
     let cancelled = false;
-    // PR-11 - the user picker reads from the local managed_users DB
-    // (no live Plex round-trip during job setup). ``fetchPickerUsers``
-    // handles the cold-DB case by firing a one-shot sync and re-
-    // fetching, so a server whose table was never warmed paints the
-    // picker without forcing the end user to visit User Management
-    // first.
+    // The user picker reads from the local managed_users DB (no live
+    // Plex round-trip during job setup). ``fetchPickerUsers`` handles
+    // the cold-DB case by firing a one-shot sync and re-fetching, so
+    // a server whose table was never warmed paints the picker without
+    // forcing the end user to visit User Management first.
     Promise.allSettled([
       fetchPickerUsers(src.id),
       ...dsts.map((d) => fetchPickerUsers(d.id)),
@@ -972,9 +1058,9 @@ export function JobFormPanel({ snapshot }: Props) {
     return () => { cancelled = true; };
   }, [mode, sourceServerName, destNamesKey, servers]);
 
-  // v0.14 - Restore mode user picker. Loads the snapshot's user list
-  // (from snapshot_users in the .db) plus every destination's user
-  // list, intersects them, and exposes the result through the same
+  // Restore mode user picker. Loads the snapshot's user list (from
+  // snapshot_users in the .db) plus every destination's user list,
+  // intersects them, and exposes the result through the same
   // ``sourceUsers`` / ``destUsers`` state the rest of the form reads.
   //
   // Owner-row normalisation: the snapshot stores the owner with
@@ -997,8 +1083,12 @@ export function JobFormPanel({ snapshot }: Props) {
     if (restoreSource !== 'snapshot') return;
     if (!selectedSnapshotId) return;
     if (destServerNames.size === 0) return;
+    // destServerNames carries server IDs (see comment in the
+    // direct-mode effect above). Look them up by id, not ``s.name``:
+    // a name lookup leaves ``dsts`` empty and the restore-mode user
+    // picker never appears.
     const dsts = Array.from(destServerNames)
-      .map((n) => servers.find((s) => s.name === n))
+      .map((id) => servers.find((s) => s.id === id))
       .filter((s): s is ServerView => !!s);
     if (dsts.length === 0) return;
     let cancelled = false;
@@ -1009,12 +1099,12 @@ export function JobFormPanel({ snapshot }: Props) {
     // result types straight.
     const snapPromise = Promise.allSettled([api.listSnapshotUsers(selectedSnapshotId)]);
     const destPromise = Promise.allSettled(dsts.map((d) => fetchPickerUsers(d.id)));
-    // Restore-mode parity (2026-05-17 operator request): also fetch
-    // managed_users for every destination so the default "checked"
-    // set excludes users who can't actually be impersonated on every
-    // destination. Owner is always defaulted in (admin token). Users
-    // without credentials remain VISIBLE in the picker (unchecked) so
-    // the end user can still pick them and supply credentials later.
+    // Restore-mode parity: also fetch managed_users for every
+    // destination so the default "checked" set excludes users who
+    // can't actually be impersonated on every destination. Owner is
+    // always defaulted in (admin token). Users without credentials
+    // remain VISIBLE in the picker (unchecked) so the end user can
+    // still pick them and supply credentials later.
     const muPromise = Promise.allSettled(
       dsts.map((d) => api.listServerManagedUsers(d.id, true)),
     );
@@ -1098,26 +1188,26 @@ export function JobFormPanel({ snapshot }: Props) {
   //   - submitConfirmed() is what the modal's onConfirm calls (and
   //     what snapshot/Merge submissions flow through directly). It
   //     does the actual API work.
-  // PR-12: stamp the end user's preflight acknowledgement onto a
-  // submission payload. No-op if the end user did not see the modal.
-  // Captured as a closure so each ``api.submit*`` call site only
-  // needs ``stampPreflight(payload)`` right before it fires.
+  // Stamp the end user's preflight acknowledgement onto a submission
+  // payload. No-op if the end user did not see the modal. Captured
+  // as a closure so each ``api.submit*`` call site only needs
+  // ``stampPreflight(payload)`` right before it fires.
   const stampPreflight = (payload: Record<string, unknown>) => {
     if (pinPreflightAck) {
       payload.pin_preflight_acknowledged = true;
       payload.pin_preflight_at_risk = pinPreflightAtRisk;
     }
-    // Phase C: bundle the end user's cross-platform preflight
-    // decisions when the modal was shown + Continue was clicked.
-    // Backend reads this at submit time (developer step 6 wires
-    // engine-side enforcement). Same key the schedule row uses.
+    // Bundle the end user's cross-platform preflight decisions when
+    // the modal was shown + Continue was clicked. Backend reads this
+    // at submit time for engine-side enforcement. Same key the
+    // schedule row uses.
     if (Object.keys(cppAcks).length > 0) {
       payload.cross_platform_resolutions = cppAcks;
     }
   };
 
-  // Phase C: cross-platform preflight gate. Run between PinPreflight
-  // and ReplaceConfirm. When the route is cross-backend, fire the
+  // Cross-platform preflight gate. Run between PinPreflight and
+  // ReplaceConfirm. When the route is cross-backend, fire the
   // backend's preflight and let the verdict drive the modal/Submit
   // relationship:
   //   * verdict='ok' -> fall through to the Replace modal / submit
@@ -1131,12 +1221,12 @@ export function JobFormPanel({ snapshot }: Props) {
       await replaceOrSubmit();
       return;
     }
-    // Build a preflight body that matches developer's
-    // CrossPlatformPreflightJobIn shape. Today supports
-    // snapshot_id / input_files + destinations; direct-transfer
-    // preflight is a v2 follow-up (developer spec).
+    // Build a preflight body that matches the backend's
+    // CrossPlatformPreflightJobIn shape. Supports snapshot_id /
+    // input_files + destinations; direct-transfer preflight is a v2
+    // follow-up.
     const body: Record<string, unknown> = {
-      // 2026-05-16 (developer Emby fix): id-keyed destinations.
+      // id-keyed destinations.
       dest_server_ids: Array.from(destServerNames),
       dest_server_names: _idsToNames(destServerNames),
     };
@@ -1176,11 +1266,9 @@ export function JobFormPanel({ snapshot }: Props) {
     }
   };
 
-  // PR-12: the post-preflight continuation. Replicates the prior
-  // ``submit()`` body so the Replace modal still pops at the right
+  // Post-preflight continuation. Pops the Replace modal at the right
   // moment when the preflight is clear (or after Continue anyway).
-  // Renamed to ``replaceOrSubmit`` for clarity; ``afterPreflight``
-  // kept as an alias for back-compat with existing call sites.
+  // ``afterPreflight`` is an alias kept for existing call sites.
   const replaceOrSubmit = async () => {
     if ((mode === 'restore' || mode === 'direct') && restoreMode === 'replace') {
       setSubmitError(null);
@@ -1199,9 +1287,9 @@ export function JobFormPanel({ snapshot }: Props) {
   };
 
   const submit = async () => {
-    // Plan[RUN-JOB-UI] D-OWNER intercept: when a cross-backend route
-    // would create users on the destination AND the end user hasn't
-    // already confirmed the modal, open it now and bail. The modal's
+    // D-OWNER intercept: when a cross-backend route would create
+    // users on the destination AND the end user hasn't already
+    // confirmed the modal, open it now and bail. The modal's
     // onConfirm flips userCreateConfirmed true and re-fires submit().
     if (
       isCrossBackend
@@ -1212,13 +1300,13 @@ export function JobFormPanel({ snapshot }: Props) {
       return;
     }
 
-    // PR-12: ask the backend whether any in-scope managed user is
+    // Ask the backend whether any in-scope managed user is
     // PIN-protected with no credentials on file. ``restore`` mode
     // always returns ``checked: false`` so this naturally skips the
     // modal for file-mediated runs. Preflight network failure is
     // soft: we proceed without the modal rather than blocking the
     // submit (the engine still falls back to admin-token
-    // impersonation, same as before PR-12 landed).
+    // impersonation).
     let atRisk: string[] = [];
     try {
       const r = await api.preflightPinCheck({
@@ -1245,9 +1333,9 @@ export function JobFormPanel({ snapshot }: Props) {
     await afterPreflight();
   };
 
-  // Plan[MIXED-MEDIA-PLAYLISTS]-2026-05-16: mutate the payload to add
-  // the 5 mixed-media override fields. Empty strings (the "inherit"
-  // sentinel) are omitted so the backend uses the global tunable.
+  // Mutate the payload to add the 5 mixed-media override fields.
+  // Empty strings (the "inherit" sentinel) are omitted so the
+  // backend uses the global tunable.
   const stampMixedMedia = (payload: Record<string, unknown>) => {
     if (mixedMediaBehavior) payload.mixed_media_behavior = mixedMediaBehavior;
     if (mixedMediaDominanceThreshold) {
@@ -1267,10 +1355,9 @@ export function JobFormPanel({ snapshot }: Props) {
       if (mode === 'snapshot') {
         if (!sourceServerName) throw new Error('Pick a source server first.');
         const payload: Record<string, unknown> = {
-          // 2026-05-16 (developer Emby fix): send the stable server id;
-          // backend prefers it over the friendly name. Name is kept
-          // for back-compat with any legacy code paths that still
-          // route by name.
+          // Send the stable server id; backend prefers it over the
+          // friendly name. Name is sent too for any legacy code
+          // paths that still route by name.
           source_server_id: sourceServerName,
           source_server_name: _idToName(sourceServerName),
           libraries: Array.from(selectedLibs),
@@ -1282,27 +1369,25 @@ export function JobFormPanel({ snapshot }: Props) {
         payload.verbose = verbose;
         if (fastCollectionDetection) payload.fast_collection_detection = true;
         if (skipPlaylistPrebuild) payload.skip_playlist_prebuild = true;
-        // PR-3 / Phase D - four-flag data-type filter. Always sent so
-        // the server has an explicit value rather than relying on a
-        // model default. Defaults are all true so this is a no-op
-        // when the end user hasn't unchecked anything.
+        // Four-flag data-type filter. Always sent so the server has
+        // an explicit value rather than relying on a model default.
+        // Defaults are all true so this is a no-op when the end user
+        // hasn't unchecked anything.
         payload.include_watch_history = includeWatchHistory;
         payload.include_ratings = includeRatings;
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
-        // Phase C (admin-management follow-up, 2026-05-15): when the
-        // end user filled in any per-library cell, send the explicit
-        // per-library map instead of letting the backend expand the
-        // global flags. The backend treats library_metrics as the
-        // source of truth when set.
+        // When the end user filled in any per-library cell, send the
+        // explicit per-library map instead of letting the backend
+        // expand the global flags. The backend treats
+        // library_metrics as the source of truth when set.
         if (libraryMetrics && Object.keys(libraryMetrics).length > 0) {
           payload.library_metrics = libraryMetrics;
         }
         payload.prebuild_json_sidecar = prebuildJsonSidecar;
-        // Plan[RUN-JOB-UI] work item 4: per-user fan-out toggle.
-        // Snapshot mode only cares about this (no destination
-        // writes). Default ON; explicit OFF tells the engine to
-        // skip the managed-user gather pass.
+        // Per-user fan-out toggle. Snapshot mode only cares about
+        // this (no destination writes). Default ON; explicit OFF
+        // tells the engine to skip the managed-user gather pass.
         payload.include_managed_users = includeManagedUsers;
         // Per-job watch+ratings strategy override (top of resolution
         // chain). Empty string means "inherit" → omit field so backend
@@ -1327,7 +1412,7 @@ export function JobFormPanel({ snapshot }: Props) {
         if (destServerNames.size === 0) throw new Error('Pick at least one destination server first.');
         const destList = _idsToNames(destServerNames);
         const payload: Record<string, unknown> = {
-          // 2026-05-16 (developer Emby fix): id-keyed destinations.
+          // id-keyed destinations.
           dest_server_ids: Array.from(destServerNames),
           dest_server_names: destList,
           strict_match: strictMatch,
@@ -1336,6 +1421,18 @@ export function JobFormPanel({ snapshot }: Props) {
           auto_capture_before_replace: autoCaptureBeforeReplace,
           confirm_replace: restoreMode === 'replace',
           merge_watch_strategy: mergeWatchStrategy,
+          // Per-run bypass for the saved mapping table. Default
+          // false so the mapping table is always consulted; flipping
+          // the checkbox makes the engine fall back to exact-name
+          // match only.
+          ignore_library_mapping: ignoreLibraryMapping,
+          // Per-run library name overrides. Omitted entirely when no
+          // entries are set so the engine sees None and goes
+          // straight to the saved table consult. When entries ARE
+          // set, the engine reads them BEFORE the saved table.
+          ...(Object.keys(libraryMappingOverrides).length > 0
+            ? { library_mapping_overrides: libraryMappingOverrides }
+            : {}),
         };
         if (workers) payload.workers = Number(workers);
         if (scrobbleWorkers) payload.scrobble_workers = Number(scrobbleWorkers);
@@ -1349,17 +1446,16 @@ export function JobFormPanel({ snapshot }: Props) {
         payload.include_ratings = includeRatings;
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
-        // Phase C (admin-management follow-up, 2026-05-15): when the
-        // end user filled in any per-library cell, send the explicit
-        // per-library map. Engine override at restore_export_file
-        // honours it per-library.
+        // When the end user filled in any per-library cell, send the
+        // explicit per-library map. Engine override at
+        // restore_export_file honours it per-library.
         if (libraryMetrics && Object.keys(libraryMetrics).length > 0) {
           payload.library_metrics = libraryMetrics;
         }
-        // Plan[RUN-JOB-UI] cross-backend payload additions on the
-        // restore path. include_managed_users always sent; the other
-        // two are gated on cross-backend routes where they actually
-        // apply (the backend ignores them on same-backend routes).
+        // Cross-backend payload additions on the restore path.
+        // include_managed_users always sent; the other two are gated
+        // on cross-backend routes where they actually apply (the
+        // backend ignores them on same-backend routes).
         payload.include_managed_users = includeManagedUsers;
         if (isCrossBackend) {
           if (rateMode === 'tunable') {
@@ -1373,12 +1469,12 @@ export function JobFormPanel({ snapshot }: Props) {
             payload.user_create_specs = userCreateSpecs;
           }
         }
-        // v0.14 - per-restore user filter. Only applicable to the
+        // Per-restore user filter. Only applicable to the
         // snapshot-based restore path (file-based restore doesn't
         // surface a user picker yet - would require parsing the
         // file). Send the explicit list when the end user picked a
         // subset; omit entirely when every intersectable user is
-        // selected (= historical "all users" default at the backend).
+        // selected (= "all users" default at the backend).
         if (
           restoreSource === 'snapshot'
           && sourceUsers !== null
@@ -1418,7 +1514,7 @@ export function JobFormPanel({ snapshot }: Props) {
         }
         const destList = _idsToNames(destServerNames);
         const payload: Record<string, unknown> = {
-          // 2026-05-16 (developer Emby fix): id-keyed source + destinations.
+          // id-keyed source + destinations.
           source_server_id: sourceServerName,
           source_server_name: _idToName(sourceServerName),
           dest_server_ids: Array.from(destServerNames),
@@ -1429,6 +1525,18 @@ export function JobFormPanel({ snapshot }: Props) {
           auto_capture_before_replace: autoCaptureBeforeReplace,
           confirm_replace: restoreMode === 'replace',
           merge_watch_strategy: mergeWatchStrategy,
+          // Per-run bypass for the saved mapping table. Default
+          // false so the mapping table is always consulted; flipping
+          // the checkbox makes the engine fall back to exact-name
+          // match only.
+          ignore_library_mapping: ignoreLibraryMapping,
+          // Per-run library name overrides. Omitted entirely when no
+          // entries are set so the engine sees None and goes
+          // straight to the saved table consult. When entries ARE
+          // set, the engine reads them BEFORE the saved table.
+          ...(Object.keys(libraryMappingOverrides).length > 0
+            ? { library_mapping_overrides: libraryMappingOverrides }
+            : {}),
         };
         if (workers) payload.workers = Number(workers);
         if (scrobbleWorkers) payload.scrobble_workers = Number(scrobbleWorkers);
@@ -1439,20 +1547,19 @@ export function JobFormPanel({ snapshot }: Props) {
           payload.remap_old = remapOld;
           payload.remap_new = remapNew;
         }
-        // PR-3 / Phase D - four-flag data-type filter on direct too.
+        // Four-flag data-type filter on direct too.
         payload.include_watch_history = includeWatchHistory;
         payload.include_ratings = includeRatings;
         payload.include_playlists = includePlaylists;
         payload.include_collections = includeCollections;
-        // Phase C (admin-management follow-up, 2026-05-15): per-library
-        // metric map. _transfer_one_library applies the override at the
-        // top so every downstream gather path sees the per-library
-        // include_* booleans.
+        // Per-library metric map. _transfer_one_library applies the
+        // override at the top so every downstream gather path sees
+        // the per-library include_* booleans.
         if (libraryMetrics && Object.keys(libraryMetrics).length > 0) {
           payload.library_metrics = libraryMetrics;
         }
-        // Plan[RUN-JOB-UI] cross-backend payload additions on the
-        // direct-transfer path. Same shape as on the restore path.
+        // Cross-backend payload additions on the direct-transfer
+        // path. Same shape as on the restore path.
         payload.include_managed_users = includeManagedUsers;
         if (isCrossBackend) {
           if (rateMode === 'tunable') {
@@ -1466,13 +1573,13 @@ export function JobFormPanel({ snapshot }: Props) {
           }
         }
         if (watchRatingsStrategy) payload.watch_ratings_filter_strategy = watchRatingsStrategy;
-        // v0.9.6 Feature 4 / v0.9.7 Item 7: send ``user_filter``
-        // whenever the Users section rendered AND at least one
-        // transferable entry exists (owner OR managed). If both
-        // servers report no users we omit the field so the
-        // backend's "None = include all" default applies. Owner is
-        // included in the intersection check now  unchecking the
-        // owner is how the end user skips library-level data.
+        // Send ``user_filter`` whenever the Users section rendered
+        // AND at least one transferable entry exists (owner OR
+        // managed). If both servers report no users we omit the
+        // field so the backend's "None = include all" default
+        // applies. Owner is included in the intersection check;
+        // unchecking the owner is how the end user skips
+        // library-level data.
         if (sourceUsers !== null && destUsers !== null) {
           const dstIds = new Set(destUsers.map((u) => u.plex_id));
           const hasIntersection = sourceUsers.some((u) => dstIds.has(u.plex_id));
@@ -1493,7 +1600,7 @@ export function JobFormPanel({ snapshot }: Props) {
       setSubmitError(String(e));
     } finally {
       setSubmitting(false);
-      // PR-12: clear the ack so the next Run click triggers a fresh
+      // Clear the ack so the next Run click triggers a fresh
       // preflight check. Without this, a re-submit after a failure
       // would silently re-use the prior acknowledgement.
       setPinPreflightAck(false);
@@ -1520,10 +1627,10 @@ export function JobFormPanel({ snapshot }: Props) {
     });
   };
 
-  // Phase E (2026-05-16): build the JobConfigOwner from local
-  // state + derived values. JobConfigBody renders the shared panel
-  // stack from this owner; both Run Job and Schedules build their
-  // own owner of the same shape.
+  // Build the JobConfigOwner from local state + derived values.
+  // JobConfigBody renders the shared panel stack from this owner;
+  // both Run Job and Schedules build their own owner of the same
+  // shape.
   const _serversReady = serversReady(mode, sourceServerName, destServerNames);
   const owner: JobConfigOwner = {
     idScope: 'job',
@@ -1594,6 +1701,7 @@ export function JobFormPanel({ snapshot }: Props) {
       <h2>Restore source</h2>
       <div className="row-buttons" style={{ marginBottom: 12 }}>
         <button
+          data-testid="job-restore-source-snapshot"
           type="button"
           className={restoreSource === 'snapshot' ? 'primary' : ''}
           onClick={() => setRestoreSource('snapshot')}
@@ -1601,6 +1709,7 @@ export function JobFormPanel({ snapshot }: Props) {
           From registered snapshot
         </button>
         <button
+          data-testid="job-restore-source-file"
           type="button"
           className={restoreSource === 'file' ? 'primary' : ''}
           onClick={() => setRestoreSource('file')}
@@ -1696,15 +1805,112 @@ export function JobFormPanel({ snapshot }: Props) {
       <JobConfigBody
         owner={owner}
         restoreSourceSlot={restoreSourceSlot}
+        libraryMappingSlot={
+          /* Per-run library mapping editor. JobConfigBody renders
+              this between DataToMigratePanel and PerRunSettingsPanel
+              - same cluster as "what's leaving / where's it going".
+              Collapsed by default; expands to a two-column
+              click-to-link editor (mirrors Server Syncing >
+              Library Mapping's UX) that writes pairs to LOCAL
+              STATE only (never persists to the shared mapping
+              table).
+
+              Source-side data is derived per mode:
+                * restore-from-snapshot: snapshot.server_id +
+                  snapshot.libraries (the snapshot's captured
+                  library list - the source server may be offline
+                  and we wouldn't be able to query it live)
+                * direct: sourceServerName + the form's live
+                  libraries list (already loaded by the form's
+                  per-mode effect) */
+          <RunJobLibraryMappingPanel
+            enabled={mode === 'restore' || mode === 'direct'}
+            sourceServerId={
+              mode === 'restore' && _selectedSnapshot
+                ? _selectedSnapshot.server_id
+                : sourceServerName
+            }
+            destServerIds={Array.from(destServerNames)}
+            selectedLibraryNames={Array.from(selectedLibs)}
+            sourceLibraries={
+              mode === 'restore' && _selectedSnapshot
+                ? (_selectedSnapshot.libraries || []).map((n) => {
+                    // Enrich each snapshot library with
+                    // counts pulled from the snapshot.db join
+                    // (server_items + items). Two count families are
+                    // used:
+                    //   media_type_counts -> COUNT of leaf rows by
+                    //     items.media_type (track, episode, movie ...)
+                    //   hierarchy_counts  -> COUNT(DISTINCT ...) over
+                    //     the hierarchy columns (artist, show_title,
+                    //     show_title+season_index, album). This is
+                    //     what makes "number of artists" / "number of
+                    //     series" accurate even though the snapshot
+                    //     only stores leaf rows.
+                    // Note: these counts reflect WHAT THE SNAPSHOT
+                    // CAPTURED, not the live library's current state.
+                    // A snapshot that captured only watched tracks
+                    // reports tracks=N + artists=(distinct artists of
+                    // those tracks) rather than the library total.
+                    // That's correct behaviour for the panel's job
+                    // ("show me what's available to move"); the copy
+                    // below in the panel surfaces a reminder so
+                    // operators don't read smaller counts as a bug.
+                    const ct = snapshotLibraryCounts?.[n];
+                    if (!ct) {
+                      return { name: n, type: '', key: n, count: 0 };
+                    }
+                    const t = (ct.section_type || '').toLowerCase();
+                    const mt = ct.media_type_counts || {};
+                    const hc = ct.hierarchy_counts || {};
+                    const leaf: LeafCounts = {};
+                    let topCount = ct.item_count;
+                    if (t === 'show') {
+                      // top-level unit is the series; seasons and
+                      // episodes drop to leaf rows.
+                      topCount = hc.series || mt.show || ct.item_count;
+                      if (hc.seasons) leaf.seasons = hc.seasons;
+                      if (mt.episode) leaf.episodes = mt.episode;
+                    } else if (t === 'artist') {
+                      // top-level unit is the artist; albums and
+                      // tracks drop to leaf rows.
+                      topCount = hc.artists || mt.artist || ct.item_count;
+                      if (hc.albums) leaf.albums = hc.albums;
+                      if (mt.track) leaf.tracks = mt.track;
+                    } else if (t === 'movie') {
+                      topCount = mt.movie || ct.item_count;
+                      if (ct.collections > 0) {
+                        leaf.collections = ct.collections;
+                      }
+                    }
+                    if (ct.playlists > 0) leaf.playlists = ct.playlists;
+                    return {
+                      name: n,
+                      type: ct.section_type,
+                      key: n,
+                      count: topCount,
+                      leaf_counts: leaf,
+                    };
+                  })
+                : libraries
+            }
+            ignoreLibraryMapping={ignoreLibraryMapping}
+            onIgnoreLibraryMappingChange={setIgnoreLibraryMapping}
+            libraryMappingOverrides={libraryMappingOverrides}
+            onLibraryMappingOverridesChange={setLibraryMappingOverrides}
+            mappingPreflight={mappingPreflight}
+            restoreMode={restoreMode}
+            sourceIsSnapshot={mode === 'restore' && restoreSource === 'snapshot'}
+          />
+        }
       />
 
-      {/* Phase E placeholder fieldset: kept for compatibility with the
-          existing Submit-button block below, which the JobConfigBody
-          extraction left outside the shared body. The disabled
-          attribute lines up with owner.serversReady; visual greying
-          happens via inline style. After this block closes, the
-          remaining JSX (sum-mode warning, ETA preview, Submit row)
-          renders. */}
+      {/* Placeholder fieldset wrapping the Submit-button block,
+          which lives in this page's wrapper rather than the shared
+          JobConfigBody. The disabled attribute lines up with
+          owner.serversReady; visual greying happens via inline
+          style. After this block closes, the remaining JSX
+          (sum-mode warning, Submit row) renders. */}
       <fieldset
         className="job-form-gate"
         disabled={!_serversReady}
@@ -1715,162 +1921,32 @@ export function JobFormPanel({ snapshot }: Props) {
         }}
       >
 
-      {/* Plan[ETA-TRAINING] PR-E: adaptive ETA preview. Renders the
-            current job's learned-from-history estimate (or a tier-5
-            default on a fresh install). Per-library breakdown is
-            revealed in a small details disclosure so the surface
-            stays compact; the end user can drill in when one library
-            dominates the runtime. */}
-      {etaPrediction !== null && etaPrediction.per_library.length > 0 && (
-        <div className="panel" style={{ fontSize: 13 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 12 }}>
-            <div>
-              <span style={{ color: 'var(--text-dim)' }}>Estimated runtime: </span>
-              <strong>{etaPrediction.display}</strong>
-              {(() => {
-                const mult = etaPrediction.latency_multiplier ?? 1.0;
-                if (Math.abs(mult - 1.0) <= 0.02) return null;
-                const color = mult > 1.0 ? 'var(--warning, #d97706)' : 'var(--success, #16a34a)';
-                const label = mult > 1.0 ? 'Inflated for current latency' : 'Reduced for current latency';
-                return (
-                  <span
-                    style={{ marginLeft: 8, fontSize: 11, color }}
-                    title={`${label}: ${mult.toFixed(2)}× vs trained-time ping`}
-                  >
-                    {mult.toFixed(2)}× latency
-                  </span>
-                );
-              })()}
-              {etaLoading && (
-                <span style={{ marginLeft: 8, color: 'var(--text-dim)', fontSize: 11 }}>
-                  updating…
-                </span>
-              )}
-            </div>
-            <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>
-              {etaPrediction.samples > 0
-                ? `Based on ${etaPrediction.samples} prior sample${etaPrediction.samples === 1 ? '' : 's'} (tier ${etaPrediction.tier})`
-                : 'No history yet; using built-in default'}
-            </div>
-          </div>
-          {etaPrediction.per_library.length > 1 && (
-            <details style={{ marginTop: 8 }}>
-              <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-dim)' }}>
-                Per-library breakdown
-              </summary>
-              <table className="list" style={{ width: '100%', fontSize: 12, marginTop: 6 }}>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: 'left' }}>Library</th>
-                    <th style={{ textAlign: 'left' }}>Type</th>
-                    <th style={{ textAlign: 'right' }}>Items</th>
-                    <th style={{ textAlign: 'right' }}>Estimate</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {etaPrediction.per_library.map((lib) => {
-                    const mult = lib.latency_multiplier ?? 1.0;
-                    // Show the multiplier annotation only when it
-                    // materially differs from 1.0; a near-identical
-                    // ping doesn't deserve UI noise.
-                    const showMult = Math.abs(mult - 1.0) > 0.02;
-                    const multColor = mult > 1.0 ? 'var(--warning, #d97706)' : 'var(--success, #16a34a)';
-                    return (
-                      <tr key={lib.name}>
-                        <td style={{ fontWeight: 600 }}>{lib.name}</td>
-                        <td>{lib.library_type || '-'}</td>
-                        <td style={{ textAlign: 'right' }}>
-                          {lib.items_count != null ? lib.items_count.toLocaleString() : '-'}
-                        </td>
-                        <td style={{ textAlign: 'right' }}>
-                          {lib.display}
-                          {showMult && (
-                            <span
-                              style={{ marginLeft: 6, fontSize: 11, color: multColor }}
-                              title={`Latency offset: current ping is ${mult > 1.0 ? 'worse' : 'better'} than training-time average`}
-                            >
-                              {mult.toFixed(2)}×
-                            </span>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </details>
-          )}
-          {trainingStatus && trainingStatus.summary.total_buckets > 0 && (
-            <details style={{ marginTop: 6 }}>
-              <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-dim)' }}>
-                Training progress: {trainingStatus.summary.tier_one_count} tier-1
-                / {trainingStatus.summary.anchor_count} anchor
-                / {trainingStatus.summary.total_buckets} total buckets
-                (need {trainingStatus.summary.min_samples_for_tier_one}+ samples for confident bands)
-              </summary>
-              <table className="list" style={{ width: '100%', fontSize: 12, marginTop: 6 }}>
-                <thead>
-                  <tr>
-                    <th style={{ textAlign: 'left' }}>Label</th>
-                    <th style={{ textAlign: 'left' }}>Type</th>
-                    <th style={{ textAlign: 'left' }}>Strategy</th>
-                    <th style={{ textAlign: 'right' }}>Samples</th>
-                    <th style={{ textAlign: 'left' }}>Status</th>
-                    <th style={{ textAlign: 'right' }}>Ping</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {trainingStatus.buckets.map((b, i) => {
-                    let status = 'untrained';
-                    let color = 'var(--text-dim)';
-                    if (b.tier_one_ready) {
-                      status = 'tier 1';
-                      color = 'var(--success, #16a34a)';
-                    } else if (b.anchor_ready) {
-                      status = 'anchor';
-                      color = 'var(--warning, #d97706)';
-                    }
-                    return (
-                      <tr key={`${b.label}-${b.library_type}-${b.bulk_strategy}-${i}`}>
-                        <td>{b.label}</td>
-                        <td>{b.library_type || '-'}</td>
-                        <td>{b.bulk_strategy || '-'}</td>
-                        <td style={{ textAlign: 'right' }}>{b.samples}</td>
-                        <td style={{ color }}>{status}</td>
-                        <td style={{ textAlign: 'right' }}>
-                          {b.ping_ema_ms != null ? `${b.ping_ema_ms.toFixed(0)} ms` : '-'}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </details>
-          )}
-        </div>
-      )}
-
       <div className="panel">
         <div className="row-buttons">
           <button
+            data-testid="job-submit"
             className="primary"
             disabled={
               submitting
               || servers.length === 0
               || !atLeastOneType
-              // Phase A: when user filters are active and produce
-              // zero matching users, refuse to submit per end user
-              // policy (the engine would have nothing to do for
-              // managed-user content, which is rarely intended).
-              || (userFilterActive && userFilteredIds.size === 0)
-              // Phase D (2026-05-16): the boolean cross-backend gate
-              // has been removed. Cross-backend Submit is now
-              // verdict-driven by the CrossPlatformPreflightModal.
-              // The line below is kept as a no-op (workflowEngineReady
-              // is always true) so the disabled-expression structure
-              // stays intact in case a future readiness check
-              // re-enters here.
+              // FECORE-01: when a user filter is active, gate on the
+              // SUBMITTED set (includedUsers), not userFilteredIds (the
+              // attribute-match set). The two diverge once the operator
+              // unchecks users, and the job submits includedUsers - so
+              // an empty included set with a filter active means the
+              // engine has nothing to do for managed-user content.
+              || (userFilterActive && includedUsers.size === 0)
+              // Cross-backend Submit is verdict-driven by the
+              // CrossPlatformPreflightModal. The line below is a
+              // no-op (workflowEngineReady is always true), kept so
+              // the disabled-expression structure stays intact in
+              // case a future readiness check re-enters here.
               || !workflowEngineReady
+              // Refuse cross-backend Replace pre-submit when the
+              // server-side guard would refuse it too. Same error
+              // copy renders in the banner above.
+              || Boolean(mappingPreflight?.cross_backend_replace_refusal)
             }
             onClick={submit}
           >
@@ -1903,7 +1979,7 @@ export function JobFormPanel({ snapshot }: Props) {
         }}
       />
 
-      {/* PR-12: PIN preflight warning. Sits between submit() and the
+      {/* PIN preflight warning. Sits between submit() and the
           Replace modal / submitConfirmed() so the end user confirms
           before any commit. Cancel aborts; Continue anyway stamps the
           ack on the next payload and proceeds to ``afterPreflight``. */}
@@ -1921,11 +1997,11 @@ export function JobFormPanel({ snapshot }: Props) {
         }}
       />
 
-      {/* Phase C: cross-platform preflight modal. Opens between
-          PinPreflight and ReplaceConfirm when the actively-picked
-          source / destination backends differ AND the backend's
-          preflight returns aggregate_verdict !== 'ok'. End user
-          decisions persist into the submit payload via stampPreflight
+      {/* Cross-platform preflight modal. Opens between PinPreflight
+          and ReplaceConfirm when the actively-picked source /
+          destination backends differ AND the backend's preflight
+          returns aggregate_verdict !== 'ok'. End user decisions
+          persist into the submit payload via stampPreflight
           (cross_platform_resolutions field). */}
       <CrossPlatformPreflightModal
         open={cppOpen}
@@ -1944,14 +2020,14 @@ export function JobFormPanel({ snapshot }: Props) {
         }}
       />
 
-      {/* Plan[RUN-JOB-UI] PR-4: D-OWNER user-creation modal. Opens
-          from two paths: (a) the end user clicks "Review users to
-          create" in the cross-backend sub-card; (b) Submit fires
-          while a cross-backend route has proposed users to create
-          and the end user has not yet confirmed. onConfirm saves
-          the spec list, marks userCreateConfirmed, then immediately
-          re-fires submit() so the deferred submit completes without
-          a second click. */}
+      {/* D-OWNER user-creation modal. Opens from two paths: (a) the
+          end user clicks "Review users to create" in the
+          cross-backend sub-card; (b) Submit fires while a
+          cross-backend route has proposed users to create and the
+          end user has not yet confirmed. onConfirm saves the spec
+          list, marks userCreateConfirmed, then immediately re-fires
+          submit() so the deferred submit completes without a second
+          click. */}
       <UserCreationModal
         open={userCreateModalOpen}
         proposed={proposedUserCreates}
@@ -1989,8 +2065,8 @@ function serversReady(mode: Mode, src: string, dsts: Set<string>): boolean {
 }
 
 /**
- * v0.9.7 follow-up: build a readable short-form label for an export
- * file in the import picker. Prefers ``{library}  {source_server}
+ * Build a readable short-form label for an export file in the
+ * import picker. Prefers ``{library}  {source_server}
  * (short date)`` when both library and source_server are populated;
  * falls back to whatever's available without the dashes / parens so
  * older exports (no source_server, no captured_at) still render
@@ -2042,9 +2118,3 @@ function destLibraryNames(servers: ServerView[], destIds: Set<string>): Set<stri
   }
   return out;
 }
-
-// SnapshotPicker moved to ./SnapshotPicker.tsx (2026-05-16 extraction).
-
-// ServerPicker moved to ./ServerPicker.tsx (2026-05-16 extraction).
-
-// DirectUsersPanel moved to ./DirectUsersPanel.tsx (2026-05-16 extraction).

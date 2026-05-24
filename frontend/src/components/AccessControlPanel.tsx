@@ -75,17 +75,22 @@ export function AccessControlPanel() {
   // username changes.
   useEffect(() => {
     if (!selectedUsername) return;
+    // FEUI-10: cancellation guard so an out-of-order getUserPermissions
+    // response can't overwrite newer state on rapid user switching.
+    let cancelled = false;
     setLoading(true);
     setError(null);
     setOk(null);
     api.getUserPermissions(selectedUsername)
       .then((r) => {
+        if (cancelled) return;
         setData(r);
         setExtra(new Set(r.extra));
         setRevoked(new Set(r.revoked));
       })
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
+      .catch((e) => { if (!cancelled) setError(String(e)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [selectedUsername]);
 
   const baselineSet = useMemo(
@@ -179,6 +184,21 @@ export function AccessControlPanel() {
         extra: Array.from(extra),
         revoked: Array.from(revoked),
       });
+      // Defense-in-depth only: the backend is authoritative for the
+      // root_admin "immune to revokes" carve-out. If the response for a
+      // root_admin row comes back without that flag (or with effective
+      // missing some baseline permission), surface a console.warn so a
+      // resolver regression is noticed - but do NOT block the update.
+      if (
+        result.role === 'root_admin' &&
+        !result.root_admin_immune_to_revokes
+      ) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[AccessControl] root_admin response missing the immune-to-revokes carve-out; ' +
+            'the backend should always return it for this role.',
+        );
+      }
       setData(result);
       setExtra(new Set(result.extra));
       setRevoked(new Set(result.revoked));
@@ -205,7 +225,7 @@ export function AccessControlPanel() {
   return (
     <>
       {error && <div className="banner error">{error}</div>}
-      {ok && <div className="banner good">{ok}</div>}
+      {ok && <div className="banner good" data-testid="perms-save-ok">{ok}</div>}
 
       <div className="banner info" style={{ fontSize: 13 }}>
         <strong>Root admin only.</strong> Grant or revoke individual permissions on top
@@ -233,6 +253,7 @@ export function AccessControlPanel() {
                   key={u.username}
                   type="button"
                   onClick={() => setSelectedUsername(u.username)}
+                  data-testid={`perms-user-row-${u.username}`}
                   style={{
                     display: 'block',
                     width: '100%',
@@ -298,6 +319,7 @@ export function AccessControlPanel() {
                         <tr
                           key={p}
                           onClick={() => toggle(p)}
+                          data-testid={`perms-toggle-${p}`}
                           style={{ cursor: 'pointer' }}
                         >
                           <td>
@@ -344,7 +366,12 @@ export function AccessControlPanel() {
 
                 <div className="row-buttons" style={{ marginTop: 16 }}>
                   <button onClick={reset} disabled={!hasChanges || saving}>Reset</button>
-                  <button className="primary" onClick={() => void save()} disabled={!hasChanges || saving}>
+                  <button
+                    className="primary"
+                    onClick={() => void save()}
+                    disabled={!hasChanges || saving}
+                    data-testid="perms-save"
+                  >
                     {saving ? 'Saving…' : 'Save permissions'}
                   </button>
                 </div>

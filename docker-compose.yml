@@ -1,4 +1,4 @@
-# PlexMigrate v0.8.0  docker compose orchestration.
+# Hestia-MediaManager v0.8.0  docker compose orchestration.
 #
 # `docker compose up --build` brings up two services on a shared
 # bridge network:

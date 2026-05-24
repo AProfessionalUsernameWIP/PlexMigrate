@@ -222,12 +222,12 @@ def start_walk_background(
     Reserve a walk slot and run the walk in a daemon thread, so an
     on-demand HTTP trigger returns immediately.
 
-    M11: a library walk on a large server takes minutes. Running it
-    inline (``PlexServer(...)`` connect + ``run_walk_once``) blocked a
-    uvicorn worker for the whole duration, and concurrent triggers
-    could exhaust the worker pool. The Plex connect happens inside the
-    background thread too; a connect failure marks the walk row
-    ``failed`` rather than 502-ing the request.
+    A library walk on a large server takes minutes, so it must not run
+    inline: an inline ``PlexServer(...)`` connect + ``run_walk_once``
+    would block a uvicorn worker for the whole duration, and concurrent
+    triggers could exhaust the worker pool. The Plex connect happens
+    inside the background thread too; a connect failure marks the walk
+    row ``failed`` rather than 502-ing the request.
 
     Returns ``{walk_id, started}`` right away - the caller polls
     ``GET /library-walk`` (``is_walk_running`` + ``list_library_walks``)
@@ -293,6 +293,10 @@ class LibraryWalkScheduler:
     def __init__(self) -> None:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Per-server connect-failure counter. An instance attribute,
+        # not a class attribute, so separate scheduler instances (and
+        # test instances) never share this mutable state.
+        self._connect_failure_counts: Dict[str, int] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -351,6 +355,13 @@ class LibraryWalkScheduler:
             if self._stop_event.wait(interval):
                 return
 
+    # Per-server connect-failure counter. After
+    # CONNECT_FAILURE_QUIET_TICKS consecutive connect failures we
+    # downgrade the warning to debug-level so a stale-token server
+    # doesn't pollute the app log every tick. Counter resets on the
+    # next successful connect.
+    CONNECT_FAILURE_QUIET_TICKS: int = 3
+
     def _tick(self) -> None:
         from server import server_registry
         try:
@@ -363,6 +374,23 @@ class LibraryWalkScheduler:
         for srv in servers or []:
             server_id = srv.get("id")
             if not server_id:
+                continue
+            # Skip Emby / Jellyfin servers entirely for now. The
+            # current walk pipeline is Plex-only (plexapi PlexServer +
+            # XML library walk); on Emby/Jellyfin it parses XML against
+            # the JSON response and crashes with "mismatched tag".
+            # Re-enabling these backends requires a real adapter-based
+            # walk that iterates each library via the existing
+            # MediaServerAdapter.iter_items API. The walk is the only
+            # feature that drives last_seen_at, and Plex is the only
+            # backend where Prune Missing Items is wired today.
+            service_type = (srv.get("service_type") or "plex").lower()
+            if service_type != "plex":
+                log.debug(
+                    "LibraryWalkScheduler: skipping %r (service_type=%s); "
+                    "walk pipeline is Plex-only today.",
+                    server_id, service_type,
+                )
                 continue
             # Skip if the last walk for this server finished more
             # recently than the interval - prevents a server boot
@@ -377,11 +405,39 @@ class LibraryWalkScheduler:
             try:
                 plex = PlexServer(url, token, timeout=120)
             except Exception as exc:
-                log.warning(
-                    "LibraryWalkScheduler: cannot connect to %r (%s); skipping walk.",
-                    server_id, exc,
-                )
+                # Quiet down after repeat failures so a stale-token
+                # server doesn't fire a WARNING line on every tick
+                # (warning each tick would mean 7 servers x 24
+                # ticks/day x warn-each = 168 lines/day of dead noise).
+                fails = self._connect_failure_counts.get(server_id, 0) + 1
+                self._connect_failure_counts[server_id] = fails
+                if fails == 1:
+                    log.warning(
+                        "LibraryWalkScheduler: cannot connect to %r (%s); "
+                        "skipping walk. Further failures for this server "
+                        "will be downgraded to DEBUG until a successful "
+                        "connect resets the counter.",
+                        server_id, exc,
+                    )
+                elif fails <= self.CONNECT_FAILURE_QUIET_TICKS:
+                    log.info(
+                        "LibraryWalkScheduler: still cannot connect to %r "
+                        "(failure #%d); skipping walk.",
+                        server_id, fails,
+                    )
+                else:
+                    log.debug(
+                        "LibraryWalkScheduler: cannot connect to %r "
+                        "(failure #%d); skipping walk.",
+                        server_id, fails,
+                    )
                 continue
+            # Successful connect resets the failure counter.
+            if self._connect_failure_counts.pop(server_id, 0):
+                log.info(
+                    "LibraryWalkScheduler: connect to %r recovered; "
+                    "resuming walks.", server_id,
+                )
             try:
                 run_walk_once(server_id=server_id, plex=plex)
             except Exception:

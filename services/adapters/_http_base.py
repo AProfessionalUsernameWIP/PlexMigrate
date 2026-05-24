@@ -24,12 +24,10 @@ What lives here
   helper + a paginated GET helper. Both adapters will subclass
   ``MediaServerAdapter`` and mix this in for the boilerplate.
 
-[BREAKING] from roadmapplan4.md Part 13: that document proposed
-``httpx>=0.27`` as a new dependency for these adapters. Per end user
-decision D-HTTPX in Plan[MULTI-BACKEND]-2026-05-15.md section 11.5,
-we reuse ``requests`` + the existing retry adapter instead. Trade-off
-accepted: one fewer external dependency; inherit the existing
-telemetry / pool / retry plumbing uniformly across all adapters.
+These adapters use ``requests`` + the existing retry adapter rather
+than adding ``httpx`` as a new dependency: one fewer external
+dependency, and the telemetry / pool / retry plumbing stays uniform
+across all adapters.
 """
 
 from __future__ import annotations
@@ -91,19 +89,43 @@ class AuthCredentials:
     device: str = _DEVICE_NAME
     version: str = "1.0"
 
-    def authorization_header(self) -> str:
+    def authorization_header(self, *, user_id_override: Optional[str] = None) -> str:
         """Build the ``Authorization`` header value for this credential.
 
         Pairs are emitted in the order Plex / Jellyfin / Emby clients
         conventionally use. Order isn't required by spec but matches
         what server-side parsers have been observed to log most
-        predictably."""
+        predictably.
+
+        ``user_id_override`` lets a single call swap the
+        Authorization's ``UserId="..."`` to a target user without
+        rebuilding the session. The fix scenario: an admin token
+        impersonates a managed user via ``/Users/{target_uid}/Items``,
+        but Emby contextualises ``UserData`` (PlayCount, Rating,
+        IsFavorite) against the Authorization header's UserId rather
+        than the URL path's. Result pre-fix: every per-user iter_items
+        walk returned items with view_count=0 even when the target
+        user had played plenty. Per-call override gives the request
+        the target user's UserId in the header so Emby fills UserData
+        correctly. The session's default UserId stays the admin's
+        (for endpoints that genuinely need admin scope)."""
         scheme = "MediaBrowser" if self.backend == "jellyfin" else "Emby"
         parts = []
-        if self.backend == "emby" and self.user_id:
-            parts.append(f'UserId="{self.user_id}"')
+        effective_user_id = user_id_override if user_id_override is not None else self.user_id
+        if self.backend == "emby" and effective_user_id:
+            parts.append(f'UserId="{effective_user_id}"')
+        # Omit the ``Token`` field entirely when we don't
+        # have one yet (pre-authentication call to AuthenticateByName).
+        # Some Emby builds reject ``Token=""`` outright at the
+        # auth-header pre-flight check (before the actual credentials
+        # are validated), surfacing as a 401 with no body. Sending the
+        # field only when we have a real token matches the Emby /
+        # Jellyfin community-recommended shape for the
+        # MediaBrowser-style header and is back-compat for every
+        # subsequent authenticated request.
+        if self.token:
+            parts.append(f'Token="{self.token}"')
         parts.extend([
-            f'Token="{self.token}"',
             f'Client="{self.client}"',
             f'Device="{self.device}"',
             f'DeviceId="{self.device_id}"',
@@ -190,12 +212,23 @@ class HttpMediaAdapterMixin:
         *,
         params: Optional[Dict[str, Any]] = None,
         timeout: float = 30.0,
+        extra_headers: Optional[Dict[str, Optional[str]]] = None,
     ) -> Any:
         """GET ``path`` and return the parsed JSON body. Raises
         ``requests.HTTPError`` on non-2xx. Caller handles fail-soft
-        semantics where applicable."""
+        semantics where applicable.
+
+        ``extra_headers`` merges into the session headers for this
+        single request (per-call wins on collisions). A value of
+        ``None`` STRIPS that header from the final request even if
+        it's set in the session's default headers; per requests'
+        ``merge_setting`` behavior in ``sessions.py``, None values
+        get filtered out after the merge. Used by per-user
+        iter_items to strip the admin Authorization header while
+        keeping X-Emby-Token scoped to the target user."""
         resp = self._session.get(
             self._url(path), params=params or {}, timeout=timeout,
+            headers=extra_headers or None,
         )
         resp.raise_for_status()
         return resp.json()
@@ -242,17 +275,22 @@ class HttpMediaAdapterMixin:
         page_size: Optional[int] = None,
         items_key: str = "Items",
         total_key: str = "TotalRecordCount",
+        extra_headers: Optional[Dict[str, Optional[str]]] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Walk a paginated Jellyfin / Emby list endpoint and yield each
         item dict. Stops when ``StartIndex + len(page) >= TotalRecordCount``
-        or when an empty page comes back."""
+        or when an empty page comes back.
+
+        ``extra_headers`` is forwarded to every paginated request so a
+        per-user iter_items walk can keep the same target-user
+        Authorization across page boundaries."""
         params = dict(params or {})
         size = page_size or self._default_page_size
         start = 0
         while True:
             params["StartIndex"] = start
             params["Limit"] = size
-            payload = self._get_json(path, params=params)
+            payload = self._get_json(path, params=params, extra_headers=extra_headers)
             if not isinstance(payload, dict):
                 # Some endpoints return a bare list when there's no
                 # pagination envelope; surface those directly.

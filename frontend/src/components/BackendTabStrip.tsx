@@ -1,6 +1,3 @@
-// Phase A of the backend-filter UI restructure
-// (see Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md).
-//
 // Shared component that renders a top-level "Plex / Jellyfin / Emby"
 // tab strip above an existing per-server selector. Surfaces that
 // adopt it become two-tier:
@@ -8,7 +5,7 @@
 //   [ Plex ] [ Jellyfin ] [ Emby ]          <- backend tier (this)
 //   [ Server A ] [ Server B ] ...           <- per-server tier (caller)
 //
-// Behaviour rules pinned in the audit Finding:
+// Behaviour rules:
 //
 // * ``hideWhenSingleBackend`` defaults true. A Plex-only install
 //   never sees this strip - the existing UX stays unchanged for
@@ -27,10 +24,21 @@
 // ``service_type`` discriminator enum uses everywhere else.
 
 import { ServerView } from '../api';
+import { useBackendTint } from '../contexts/BackendTintContext';
 
 
 export type BackendType = 'plex' | 'jellyfin' | 'emby';
 
+
+/** A non-backend mode tab rendered after the backend group, mirroring
+ * Run Job's Cross-platform tab. Used by Playlist Transfer for its
+ * "Smart Playlist" mode. */
+export interface ExtraModeTab {
+  id: string;
+  label: string;
+  title?: string;
+  disabled?: boolean;
+}
 
 export interface BackendTabStripProps {
   /** All registered servers across every backend. The strip
@@ -50,6 +58,15 @@ export interface BackendTabStripProps {
   hideWhenSingleBackend?: boolean;
   /** Margin override; defaults to a small bottom margin. */
   style?: React.CSSProperties;
+  /** Optional non-backend mode tabs rendered after the backend tabs,
+   * visually separated. When any extra tab is supplied the strip
+   * always renders (an extra mode such as Smart Playlist must stay
+   * reachable on a single-backend install). */
+  extraTabs?: ExtraModeTab[];
+  /** Id of the lit extra tab. When set, no backend tab shows active. */
+  activeExtraTab?: string | null;
+  /** Called when an extra mode tab is clicked. */
+  onExtraTabSelect?: (id: string) => void;
 }
 
 
@@ -95,14 +112,34 @@ export function BackendTabStrip({
   onChange,
   hideWhenSingleBackend = true,
   style,
+  extraTabs,
+  activeExtraTab,
+  onExtraTabSelect,
 }: BackendTabStripProps) {
   const counts = backendCounts(servers);
   const populatedBackends = BACKEND_ORDER.filter((b) => counts[b] > 0);
+  const hasExtraTabs = !!extraTabs && extraTabs.length > 0;
+
+  // Surface the current backend selection to the Hearth backend-tint
+  // system. When this strip is visible the user is explicitly picking
+  // a backend, so we publish that choice. When the strip is hidden
+  // (single-backend install) we fall through to the only populated
+  // backend so the tint still tracks what they're working with.
+  // Mixed-strip surfaces (e.g. Recent Runtimes with hideWhenSingleBackend
+  // disabled while user has multiple backends) keep emitting the
+  // active backend; "mixed" tint is reserved for surfaces that
+  // explicitly visualize multiple backends at once.
+  const effectiveTint = populatedBackends.length === 0
+    ? null
+    : (populatedBackends.length === 1 ? populatedBackends[0] : activeBackend);
+  useBackendTint(effectiveTint);
 
   // Hide-when-single rule. Doesn't fire when zero backends are
   // populated either (empty install) - rendering an all-disabled
-  // strip would be visual noise.
-  if (hideWhenSingleBackend && populatedBackends.length <= 1) {
+  // strip would be visual noise. Suppressed entirely when extra
+  // mode tabs are present: those must stay reachable even on a
+  // single-backend install (Smart Playlist mode is the case).
+  if (hideWhenSingleBackend && populatedBackends.length <= 1 && !hasExtraTabs) {
     return null;
   }
 
@@ -115,7 +152,9 @@ export function BackendTabStrip({
     >
       {BACKEND_ORDER.map((b) => {
         const count = counts[b];
-        const isActive = activeBackend === b;
+        // An active extra tab (e.g. Smart Playlist) owns the strip;
+        // no backend tab is lit while it is selected.
+        const isActive = activeBackend === b && !activeExtraTab;
         const isDisabled = count === 0;
         const baseLabel = `${BACKEND_LABEL[b]} (${count})`;
         const title = isDisabled
@@ -133,6 +172,28 @@ export function BackendTabStrip({
             onClick={() => onChange(b)}
           >
             {baseLabel}
+          </button>
+        );
+      })}
+      {/* Extra mode tabs (e.g. Smart Playlist), separated from the
+          backend group the same way Run Job offsets Cross-platform. */}
+      {(extraTabs || []).map((tab, i) => {
+        const isActive = activeExtraTab === tab.id;
+        return (
+          <button
+            key={tab.id}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            disabled={tab.disabled}
+            title={tab.title}
+            className={isActive ? 'active' : ''}
+            onClick={() => onExtraTabSelect?.(tab.id)}
+            style={i === 0
+              ? { marginLeft: 12, borderLeft: '1px solid var(--border, #444)', paddingLeft: 16 }
+              : undefined}
+          >
+            {tab.label}
           </button>
         );
       })}

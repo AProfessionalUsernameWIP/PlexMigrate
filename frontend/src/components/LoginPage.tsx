@@ -39,12 +39,12 @@ export function LoginPage({ onLogin }: Props) {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">PlexMigrate</div>
+        <div className="brand"><span className="wordmark-badge">HM²</span><span className="wordmark-text">Hestia-MediaManager</span></div>
       </header>
       <main className="main" style={{ display: 'flex', justifyContent: 'center', paddingTop: 40 }}>
         <form className="panel" style={{ width: 380, maxWidth: '90vw' }} onSubmit={submit}>
           <h2>Sign in</h2>
-          {error && <div className="banner error">{error}</div>}
+          {error && <div className="banner error" data-testid="login-error">{error}</div>}
           <label className="field">
             <span className="label">Username</span>
             <input
@@ -53,6 +53,7 @@ export function LoginPage({ onLogin }: Props) {
               autoComplete="username"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
+              data-testid="login-username"
             />
           </label>
           <label className="field">
@@ -62,6 +63,7 @@ export function LoginPage({ onLogin }: Props) {
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              data-testid="login-password"
             />
           </label>
           <span className="help" style={{ marginTop: 4, fontSize: 12, color: 'var(--text-dim)' }}>
@@ -73,6 +75,7 @@ export function LoginPage({ onLogin }: Props) {
               type="submit"
               className="primary"
               disabled={busy || !username.trim() || !password}
+              data-testid="login-submit"
             >
               {busy ? 'Signing in…' : 'Sign in'}
             </button>

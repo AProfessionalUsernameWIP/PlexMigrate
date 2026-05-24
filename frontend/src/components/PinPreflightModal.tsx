@@ -1,4 +1,4 @@
-// PR-12 preflight modal.
+// PIN preflight modal.
 //
 // The Run Job form shows this modal between the end user's "Run"
 // click and the actual job submission when the backend's preflight
@@ -16,6 +16,8 @@
 //
 // "Cancel" aborts the submit; the end user can fix things (save the
 // missing PINs under Servers - User Management) and try again.
+
+import { Modal } from './Modal';
 
 interface Props {
   open: boolean;
@@ -35,31 +37,7 @@ export function PinPreflightModal({
   if (!open) return null;
 
   return (
-    <div
-      onClick={onCancel}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        padding: 20,
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: 'var(--panel, #131826)',
-          border: '1px solid var(--warn, #d97706)',
-          borderRadius: 8,
-          maxWidth: 560,
-          width: '100%',
-          padding: 20,
-          boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-        }}
-      >
+    <Modal onClose={onCancel} align="center" width={560} tone="warn">
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 10 }}>
           <span style={{ fontSize: 22, color: 'var(--warn, #d97706)' }}>!</span>
           <h2 style={{ margin: 0, fontSize: 16 }}>PIN-protected users detected</h2>
@@ -112,7 +90,6 @@ export function PinPreflightModal({
             Continue anyway
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

@@ -9,7 +9,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, LibraryDescriptor, Schedule, ServerTime, ServerUser, ServerView } from '../api';
 import { usePermission } from '../hooks/usePermission';
+import { useConfirm } from './ConfirmModal';
 import { serverSupportsFastCollections } from '../utils/plexVersion';
+import { formatTimestamp } from '../utils/format';
+import { pausableInterval } from '../utils/pausableInterval';
 import { InfoTip } from './InfoTip';
 import { RestoreModeSelector } from './RestoreModeSelector';
 import { UserFilterPanel, EMPTY_FILTER } from './UserFilterPanel';
@@ -35,7 +38,7 @@ import { type BackendType, backendCounts, serversForBackend } from './BackendTab
 import type { PingResult } from '../api';
 
 export function SchedulesPanel() {
-  // PR-A4 - read/write gate. ``schedules.view`` is implied to reach
+  // Read/write gate. ``schedules.view`` is implied to reach
   // this panel at all (App.tsx hides the sub-tab without it).
   // ``schedules.edit`` is what gates the destructive controls.
   const canEditSchedules = usePermission('schedules.edit');
@@ -65,16 +68,15 @@ export function SchedulesPanel() {
   // Re-fetch the server clock every 30 s so the displayed wallclock
   // doesn't drift while the panel is open.
   useEffect(() => {
-    const tick = window.setInterval(() => {
+    return pausableInterval(() => {
       api.getServerTime().then(setServerTime).catch(() => { /* keep prior */ });
     }, 30_000);
-    return () => window.clearInterval(tick);
   }, []);
 
-  // A.10 (2026-05-16): library fetch fix - refresh per selected
-  // server, handle all schedule modes, and cancel stale responses.
-  // Previous behaviour was gated on editing.source_server_name only,
-  // so restore-mode schedules never loaded a library list (the source
+  // Library fetch: refresh per selected server, handle all schedule
+  // modes, and cancel stale responses. Gating on
+  // editing.source_server_name alone would leave restore-mode
+  // schedules without a library list (the source
   // is input_files, not a server). The dep array was also too broad
   // (every editing-object change re-fired); narrow it to just the
   // fields that actually drive the fetch.
@@ -125,7 +127,7 @@ export function SchedulesPanel() {
     minute: 0,
     day_of_week: 0,
     enabled: true,
-    // PR-3 / Phase D - four-flag data-type filter on schedules.
+    // Four-flag data-type filter on schedules.
     // Defaults match the Run-Job form: every data type migrated.
     include_watch_history: true,
     include_ratings: true,
@@ -165,9 +167,10 @@ export function SchedulesPanel() {
     }
   };
 
+  const confirm = useConfirm();
   const removeOne = async (id?: string) => {
     if (!id) return;
-    if (!confirm('Delete this schedule?')) return;
+    if (!(await confirm({ body: 'Delete this schedule?', danger: true }))) return;
     try {
       await api.deleteSchedule(id);
       await refresh();
@@ -176,7 +179,7 @@ export function SchedulesPanel() {
     }
   };
 
-  // Phase C: schedule whose resolutions_status === 'needs_review'
+  // A schedule whose resolutions_status === 'needs_review'
   // surfaces a top-of-page banner pointing at the resolution editor.
   const needsReviewItems = items.filter((s) => s.resolutions_status === 'needs_review');
   // Tracks which schedule's resolution editor is currently open.
@@ -241,7 +244,7 @@ export function SchedulesPanel() {
                   <td>{s.frequency}{s.frequency === 'weekly' && ` (${DAYS[s.day_of_week]})`}</td>
                   <td className="mono">{pad2(s.hour)}:{pad2(s.minute)}</td>
                   <td className="mono">{s.output_dir || '(default)'}</td>
-                  <td className="mono">{s.next_run_at ? formatTs(s.next_run_at) : '-'}</td>
+                  <td className="mono">{s.next_run_at ? formatTimestamp(s.next_run_at) : '-'}</td>
                   <td>{s.enabled ? '✓' : '-'}</td>
                   <td>
                     {s.cross_platform_resolutions && Object.keys(s.cross_platform_resolutions).length > 0 ? (
@@ -283,7 +286,7 @@ export function SchedulesPanel() {
         )}
       </div>
 
-      {/* Phase C: resolution editor opens when the end user clicks
+      {/* Resolution editor opens when the user clicks
           the resolutions badge on a saved schedule row. Re-runs the
           schedule preflight, opens the modal with stored decisions,
           PATCHes /api/schedules/{id}/resolutions on Continue. */}
@@ -330,19 +333,19 @@ function ScheduleEditor(props: {
   const [perRunOpen, setPerRunOpen] = useState(false);
   const [perRunSubTab, setPerRunSubTab] = useState<'general' | 'advanced'>('general');
 
-  // A.1 (Plan[SCHEDULES-ALIGNMENT-V2]): Schedule timing panel is a
+  // Schedule timing panel is a
   // collapsible "reveal as you click" panel that sits at the very
   // top of the editor and absorbs the editor h2 + Name field plus the
   // schedule-only scheduling controls (frequency, hour/minute, day-
   // of-week, enabled, output dir, server-time banner). Default-open
-  // per the end user decision (both new and edit schedules).
+  // for both new and edit schedules.
   const [scheduleTimingOpen, setScheduleTimingOpen] = useState(true);
 
-  // Phase B (2026-05-16): PinPreflightModal save-time intercept.
-  // Schedules can't open the modal at fire time (no end user
-  // present), so the end user acknowledges cross-server PIN risk
+  // PinPreflightModal save-time intercept.
+  // Schedules can't open the modal at fire time (no user
+  // present), so the user acknowledges cross-server PIN risk
   // at SAVE time instead. The ack persists on the schedule row
-  // (schedule.pin_preflight_ack, shipped in step 2) and clears
+  // (schedule.pin_preflight_ack) and clears
   // automatically when source_server_name changes (the ack is
   // server-specific).
   const [pinPreflightOpen, setPinPreflightOpen] = useState(false);
@@ -351,10 +354,10 @@ function ScheduleEditor(props: {
   // Continue in the modal flips pin_preflight_ack and re-fires save.
   const [savePending, setSavePending] = useState(false);
 
-  // Phase C: cross-platform preflight step state. Modal opens at
+  // Cross-platform preflight step state. Modal opens at
   // save time when the schedule is cross-backend AND the backend's
   // preflight returns aggregate_verdict !== 'ok'. On Continue the
-  // end user's per-destination decisions persist into
+  // user's per-destination decisions persist into
   // schedule.cross_platform_resolutions before the schedule create /
   // edit is POSTed.
   const [cppOpen, setCppOpen] = useState(false);
@@ -374,11 +377,11 @@ function ScheduleEditor(props: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schedule.source_server_name]);
 
-  // A.10 (2026-05-16): user fetch fix - refresh per selected
-  // server, handle all schedule modes. Restore mode has no source
+  // User fetch: refresh per selected server, handle all schedule
+  // modes. Restore mode has no source
   // server (source = input_files), so the picker has to load users
   // from the FIRST destination server instead. snapshot / direct
-  // use the source server as before.
+  // use the source server.
   //
   // The fetch already had cancellation; this rewrite adds the mode
   // branch and narrows the dep array so changing other schedule
@@ -422,8 +425,8 @@ function ScheduleEditor(props: {
     Array.isArray(schedule.user_filter) ? schedule.user_filter : (sourceUsers || []).map((u) => u.plex_id),
   );
 
-  // Phase A: user-filter criteria state. The UserFilterPanel pushes
-  // a narrowed plex_id set up here whenever the end user toggles a
+  // User-filter criteria state. The UserFilterPanel pushes
+  // a narrowed plex_id set up here whenever the user toggles a
   // criterion. The selection grid below only renders users in the
   // filtered set, and the Save button's gate fails when the filter
   // produces zero matches.
@@ -448,7 +451,7 @@ function ScheduleEditor(props: {
     set('user_filter', null);
   };
 
-  // v0.14 - Fast Collection Detection version gating. When the
+  // Fast Collection Detection version gating. When the
   // schedule's source server is at Plex ≥ 1.32, default the toggle
   // ON; below 1.32 (or unknown version) force it OFF and disable
   // the input. Re-runs every time the source server changes so
@@ -477,9 +480,8 @@ function ScheduleEditor(props: {
     set('libraries', Array.from(cur));
   };
 
-  // Auto-sync schedule.libraries from library_metrics. The Libraries
-  // checkbox panel has been removed (2026-05-16); the per-library
-  // matrix in DataToMigratePanel is the only library selector now.
+  // Auto-sync schedule.libraries from library_metrics. The per-library
+  // matrix in DataToMigratePanel is the only library selector.
   // A library is "selected" if (a) it has no entry in library_metrics
   // (default all-on) OR (b) it has an entry with at least one true
   // flag. End users exclude a library via the matrix row's "none"
@@ -538,8 +540,8 @@ function ScheduleEditor(props: {
   const populatedBackends = (['plex', 'jellyfin', 'emby'] as BackendType[])
     .filter((b) => backendCounts(servers)[b] > 0);
   const showWorkflowTabs = populatedBackends.length >= 2;
-  // 2026-05-16 Set Backend simplification: backends derived from
-  // actual picked servers, not from chip state.
+  // Backends are derived from actual picked servers, not from chip
+  // state.
   const sourceBackend: BackendOrCross = (() => {
     if (!schedule.source_server_name) {
       return workflowMode === 'cross' ? 'plex' : workflowMode;
@@ -594,7 +596,7 @@ function ScheduleEditor(props: {
     : scheduleMode === 'restore' ? (schedule.dest_server_names?.length ?? 0) > 0
     : !!schedule.source_server_name && (schedule.dest_server_names?.length ?? 0) > 0;
 
-  // Phase E (2026-05-16): build JobConfigOwner from the schedule
+  // Build JobConfigOwner from the schedule
   // object + local state. Schedule fields are read directly; writes
   // go through set('field', value). JobConfigBody renders the shared
   // panel stack from this owner.
@@ -621,15 +623,14 @@ function ScheduleEditor(props: {
     rateMode, setRateMode,
     rateThreshold, setRateThreshold,
     userCreateSpecCount: 0,
-    onOpenUserCreateModal: () => { /* Subsumed by CrossPlatformPreflightModal in Phase C */ },
+    onOpenUserCreateModal: () => { /* Subsumed by CrossPlatformPreflightModal */ },
     servers,
     pings: emptyPings,
     sourceServerId,
     setSourceServerId: (id) => {
-      // 2026-05-16 (developer Emby fix): set both id-keyed and
-      // name-keyed fields. Backend prefers source_server_id; name
-      // stays for back-compat with any code paths still routing
-      // by name.
+      // Set both id-keyed and name-keyed fields. Backend prefers
+      // source_server_id; name stays for back-compat with any code
+      // paths still routing by name.
       onChange({
         ...schedule,
         source_server_id: id || null,
@@ -944,9 +945,9 @@ function ScheduleEditor(props: {
         <button
           className="primary"
           onClick={async () => {
-            // Phase B + Phase C: chained preflight intercepts.
-            //   1. PIN preflight (existing) - if at-risk users, modal opens.
-            //   2. Cross-platform preflight (new) - if route is cross-backend
+            // Chained preflight intercepts.
+            //   1. PIN preflight - if at-risk users, modal opens.
+            //   2. Cross-platform preflight - if route is cross-backend
             //      and aggregate_verdict != 'ok', modal opens.
             //   3. Save.
             const runCrossPlatformPreflightAndSave = async () => {
@@ -955,8 +956,13 @@ function ScheduleEditor(props: {
                 return;
               }
               try {
+                // FEUI-04: this runs after the PIN intercept may have
+                // scheduled set('pin_preflight_ack', true). The local
+                // `schedule` const is a stale prop snapshot, so build
+                // the up-to-date object explicitly for the probe.
+                const next = { ...schedule, pin_preflight_ack: true };
                 const r = await api.schedulesCrossPlatformPreflight(
-                  schedule as unknown as Record<string, unknown>,
+                  next as unknown as Record<string, unknown>,
                 );
                 if (r.aggregate_verdict === 'ok') {
                   onSave();
@@ -973,7 +979,7 @@ function ScheduleEditor(props: {
               }
             };
 
-            // Step 1: PIN preflight intercept (same as Phase B).
+            // Step 1: PIN preflight intercept.
             if (schedule.pin_preflight_ack) {
               await runCrossPlatformPreflightAndSave();
               return;
@@ -1005,7 +1011,7 @@ function ScheduleEditor(props: {
           disabled={
             !schedule.name.trim() ||
             // Mode-specific source/destination requirements. Mirrors
-            // the backend ScheduleIn validator so the end user sees
+            // the backend ScheduleIn validator so the user sees
             // the gate up front rather than only on submit.
             ((schedule.mode ?? 'snapshot') !== 'restore' && !schedule.source_server_name) ||
             ((schedule.mode ?? 'snapshot') !== 'snapshot' &&
@@ -1016,13 +1022,12 @@ function ScheduleEditor(props: {
             // Sum strategy requires explicit additive-merge confirmation
             // (the validator on the backend matches this).
             (schedule.merge_watch_strategy === 'sum' && !schedule.confirm_additive_merge) ||
-            // Phase A: when user filters are active they must yield
+            // When user filters are active they must yield
             // at least one match. Saving a schedule with no users
             // who satisfy the filter would silently process nothing
-            // on every fire, so we block the save outright per the
-            // end user's stated policy.
+            // on every fire, so block the save outright.
             (userFilterActive && userFilteredIds.size === 0) ||
-            // Phase C: with per-library metrics, the invariant is "at
+            // With per-library metrics, the invariant is "at
             // least one cell in the matrix is true somewhere". When
             // library_metrics is unset or empty, default ALL_ON
             // applies, so the gate is trivially satisfied. When it's
@@ -1045,11 +1050,11 @@ function ScheduleEditor(props: {
         <button onClick={onCancel}>Cancel</button>
       </div>
 
-      {/* Phase B: PinPreflightModal mount. Opens at Save time when
-          the end user hasn't acknowledged cross-server PIN risk yet
+      {/* PinPreflightModal mount. Opens at Save time when
+          the user hasn't acknowledged cross-server PIN risk yet
           AND the preflight probe found at-risk managed users. On
           Continue: flip pin_preflight_ack=true and chain into the
-          cross-platform preflight (Phase C). */}
+          cross-platform preflight. */}
       <PinPreflightModal
         open={pinPreflightOpen}
         atRiskUsers={pinPreflightAtRisk}
@@ -1065,15 +1070,20 @@ function ScheduleEditor(props: {
           if (savePending) {
             setSavePending(false);
             // Defer one tick so the set() state update commits, then
-            // chain into the cross-platform preflight (Phase C).
+            // chain into the cross-platform preflight.
             window.setTimeout(async () => {
               if (!isCrossBackend) {
                 onSave();
                 return;
               }
               try {
+                // FEUI-04: the closed-over `schedule` prop is stale -
+                // set('pin_preflight_ack', true) above only scheduled a
+                // parent update, it did not mutate this const. Build
+                // the current object so the probe sees the ack.
+                const next = { ...schedule, pin_preflight_ack: true };
                 const r = await api.schedulesCrossPlatformPreflight(
-                  schedule as unknown as Record<string, unknown>,
+                  next as unknown as Record<string, unknown>,
                 );
                 if (r.aggregate_verdict === 'ok') {
                   onSave();
@@ -1089,8 +1099,8 @@ function ScheduleEditor(props: {
         }}
       />
 
-      {/* Phase C: cross-platform preflight modal at schedule save
-          time. End user's per-destination decisions persist into
+      {/* Cross-platform preflight modal at schedule save
+          time. The user's per-destination decisions persist into
           schedule.cross_platform_resolutions before the schedule
           create / edit POSTs. */}
       <SchedulePreflightStep
@@ -1117,10 +1127,6 @@ function ScheduleEditor(props: {
 
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 function pad2(n: number) { return n < 10 ? `0${n}` : String(n); }
-function formatTs(ts: number) {
-  const d = new Date(ts * 1000);
-  return d.toLocaleString();
-}
 
 // Extract HH:MM from a backend ISO-with-offset string so we render the
 // server's wallclock, not the browser's. Server sends e.g.

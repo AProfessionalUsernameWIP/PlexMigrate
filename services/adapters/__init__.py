@@ -1,5 +1,5 @@
 """
-Backend-agnostic media server interface for PlexMigrate.
+Backend-agnostic media server interface for Hestia-MediaManager.
 
 The engine (services/snapshotter.py + services/restorer.py + the direct
 transfer + restore wrappers in server/) historically called plexapi
@@ -69,9 +69,12 @@ Identifier glossary
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Iterator, List, Optional, Tuple
+
+log = logging.getLogger("plexmigrate.services.adapters")
 
 
 # ── Discovery dataclasses ───────────────────────────────────────────────────
@@ -129,12 +132,33 @@ class ItemRef:
     by the playlist-copy orchestrator's path-tail fallback resolver
     when the GUID-based match misses (common on music tracks that
     have no public metadata GUIDs). Empty when the source adapter
-    didn't surface a path."""
+    didn't surface a path.
+
+    ``item_type`` / ``artist`` / ``show_title`` carry the metadata
+    fuzzy-title matching needs to disambiguate same-titled tracks
+    across artists or same-titled episodes across shows. Empty when
+    the source adapter didn't surface them, so a caller that omits
+    them gets the historical behaviour."""
     backend_item_id: str
     guids: Tuple[str, ...] = ()
     library_id: Optional[str] = None
     title: str = ""
     file_path: str = ""
+    item_type: str = ""        # "movie" | "episode" | "track" | "album" | ...
+    artist: str = ""           # grandparentTitle for tracks
+    show_title: str = ""       # grandparentTitle for episodes
+    album: str = ""            # parentTitle for tracks; used as a
+                               # fuzzy-ambiguity tiebreaker so two
+                               # same-titled tracks (e.g. "Car Radio"
+                               # by twenty one pilots on both Vessel +
+                               # the deluxe edition) can be
+                               # disambiguated by the source's album.
+    # The parent item's cross-server GUID - the series GUID for an
+    # episode, the artist GUID for a track. Preferred over show_title
+    # / artist string matching by the resolver's hierarchy tier
+    # because a GUID is immune to localized titles + agent drift.
+    # Empty for movies + backends that don't expose a parent GUID.
+    grandparent_guid: str = ""
 
 
 @dataclass(frozen=True)
@@ -165,14 +189,32 @@ class ItemSnapshot:
     last_viewed_at: Optional[float] = None  # unix epoch seconds
     view_offset_ms: int = 0
     user_rating: Optional[float] = None     # 0.0 - 10.0
-    is_favorite: bool = False               # Jellyfin / Emby; always False for Plex
+    # The favorite face of the
+    # neutral per-user affinity record. None when the backend has no
+    # favorite concept (Plex); True / False for Jellyfin / Emby.
+    is_favorite: Optional[bool] = None
     added_at: Optional[float] = None        # unix epoch; item-added-to-library timestamp
     # TV hierarchy (empty for non-episodes).
     show_title: str = ""
     season_title: str = ""
+    # Numeric episode indices. Plex emits these via
+    # ``episode.parentIndex`` (season number) and ``episode.index``
+    # (episode number); Jellyfin/Emby return ``ParentIndexNumber`` and
+    # ``IndexNumber`` on the same Items response. Without these,
+    # cross-server episode matching degrades to fuzzy-title which is
+    # unreliable when shows have similarly-named episodes ("Pilot" in
+    # Season 1 of every TV show). The restore-time matcher uses them
+    # as tiebreakers after GUID + show_title match.
+    season_index: Optional[int] = None
+    episode_index: Optional[int] = None
     # Music hierarchy (empty for non-tracks).
     artist: str = ""
     album: str = ""
+    # The parent item's cross-server GUID (series GUID for episodes,
+    # artist GUID for tracks). The resolver's hierarchy tier prefers a
+    # parent-GUID match over the title/index columns. Empty for
+    # movies + backends that don't expose a parent GUID.
+    grandparent_guid: str = ""
 
     def as_ref(self) -> ItemRef:
         return ItemRef(
@@ -180,6 +222,11 @@ class ItemSnapshot:
             guids=self.guids,
             library_id=self.library_id,
             title=self.title,
+            item_type=self.type,
+            artist=self.artist,
+            show_title=self.show_title,
+            album=self.album,
+            grandparent_guid=self.grandparent_guid,
         )
 
 
@@ -217,6 +264,9 @@ def item_snapshot_to_engine_dict(
         "last_viewed_at": snap.last_viewed_at,
         "view_offset": int(snap.view_offset_ms or 0),
         "user_rating": snap.user_rating,
+        # The neutral favorite face. None for Plex (no favorite
+        # concept); bool for J/E.
+        "is_favorite": snap.is_favorite,
         "added_at": str(snap.added_at) if snap.added_at else "",
         "user": user,
         "library_section_id": snap.library_id,
@@ -224,9 +274,23 @@ def item_snapshot_to_engine_dict(
     if snap.type == "episode":
         data["show_title"] = snap.show_title
         data["season_title"] = snap.season_title
+        # Include numeric episode indices when available
+        # so cross-server matching can disambiguate same-titled
+        # episodes across shows / seasons. Mirrors what the Plex
+        # engine emits via ``episode.parentIndex`` (season) and
+        # ``episode.index`` (episode).
+        if snap.season_index is not None:
+            data["parent_index"] = int(snap.season_index)
+        if snap.episode_index is not None:
+            data["episode_index"] = int(snap.episode_index)
     elif snap.type == "track":
         data["artist"] = snap.artist
         data["album"] = snap.album
+    # Parent GUID rides on every
+    # hierarchy-bearing item type (episode + track). Emitted only
+    # when populated so movie rows + GUID-less backends stay clean.
+    if snap.grandparent_guid:
+        data["grandparent_guid"] = snap.grandparent_guid
     return data
 
 
@@ -249,6 +313,10 @@ class UserContext:
     username: str              # for logging only
     auth_token: str
     is_admin: bool = False     # true when auth_token is the admin token
+    # CONSOLE-07: set when a non-owner per-user context could not get
+    # the user's own token and fell back to the admin/owner token; a
+    # write under it lands under the OWNER, not the requested user.
+    admin_fallback: bool = False
 
 
 # ── Write result ────────────────────────────────────────────────────────────
@@ -287,12 +355,33 @@ class PlaylistSpec:
     ``is_smart`` rows are skipped on transfer today; the criteria are
     preserved in ``smart_filter_json`` (Plex schema) so the end user
     can manually recreate. Jellyfin / Emby smart-playlist support is
-    plugin-mediated and not portable; same behaviour applies."""
+    plugin-mediated and not portable; same behaviour applies.
+
+    Library-attribution fields surface WHICH library each playlist's
+    items belong to, so the Playlist Management UI can group per-user
+    playlists by source library and treat video / photo playlists as
+    first-class alongside audio:
+
+      * ``playlist_type``: ``"audio"`` / ``"video"`` / ``"photo"`` /
+        ``"mixed"`` / ``""``. On Plex this comes from
+        ``Playlist.playlistType``; on Jellyfin / Emby it comes from
+        ``MediaType``. Unknown values fall through to ``""``.
+      * ``primary_library_id``: backend-native id of the library
+        section that holds the majority of the playlist's items
+        (None when undeterminable — empty playlist, or every item
+        lacks a library tag).
+      * ``primary_library_name``: friendly name for the same library
+        (None when undeterminable). The UI prefers name; id stays
+        for stable grouping when names collide.
+    """
     playlist_id: str
     name: str
     is_smart: bool = False
     smart_filter_json: Optional[str] = None
     items: Tuple[ItemRef, ...] = ()
+    playlist_type: str = ""
+    primary_library_id: Optional[str] = None
+    primary_library_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -358,6 +447,45 @@ class MediaServerAdapter(ABC):
         for share-state context. For Jellyfin / Emby it's
         ``GET /Users``."""
 
+    def probe_user(self, username: str) -> str:
+        """Return one of ``'ok' | 'auth_error' | 'unreachable' | 'unknown'``
+        for the named user. Cheap; the user-activity sweeper calls
+        this once per managed user per cycle.
+
+        Default implementation: best-effort fallback that calls
+        ``list_users()`` and checks whether the username appears. Real
+        adapters override with backend-native probes:
+          - Plex: ``myPlexAccount().user(username)``
+          - Jellyfin / Emby: ``GET /Users/{userId}`` with admin key
+
+        Override-friendly: keep this method on the ABC so test
+        fixtures and any future backend adapter that hasn't shipped
+        a specific probe yet still gets a working (if slower)
+        default.
+        """
+        try:
+            roster = self.list_users() or []
+        except Exception as exc:
+            log.debug(
+                "probe_user default fallback: list_users failed: %s",
+                exc,
+            )
+            return "unreachable"
+        needle = (username or "").strip().lower()
+        for u in roster:
+            uname = (getattr(u, "username", "") or "").strip().lower()
+            if uname == needle:
+                return "ok"
+        # A user absent from the roster is reported as auth_error by
+        # design - the user-activity sweeper treats a removed/unknown
+        # user the same as a credential failure so it still counts
+        # toward the inactivity-tombstone threshold. The PlexAdapter
+        # override maps a 404 the same way for the same reason. (This
+        # was the ADAPT-08 finding; on review the conflation is the
+        # intended contract - pinned by test_adapter_probe_user_logger
+        # - so the default is left as-is.)
+        return "auth_error"
+
     # ── Item enumeration ───────────────────────────────────────────────
 
     def resolve_by_guids(
@@ -365,6 +493,7 @@ class MediaServerAdapter(ABC):
         guids: Tuple[str, ...],
         *,
         library_id: Optional[str] = None,
+        item_type_hint: str = "",
     ) -> Optional[str]:
         """Given a tuple of normalized cross-server GUIDs (from
         :func:`services.guid_translator.normalize_guids`), return the
@@ -377,6 +506,81 @@ class MediaServerAdapter(ABC):
 
         Default returns ``None`` (unsupported); per-backend
         implementations override."""
+        return None
+
+    def resolve_by_full_path(
+        self,
+        file_path: str,
+        *,
+        library_id: Optional[str] = None,
+        item_type_hint: str = "",
+    ) -> Optional[str]:
+        """Tier 2 of the playlist-copy resolution chain. Exact-match
+        the absolute ``file_path``
+        against the destination server's items. Useful when the source
+        + destination servers share an identical mount-point shape
+        (typical for NAS-backed setups where the same path is mounted
+        at the same prefix on both Plexes).
+
+        Returns the backend-native item id on hit, ``None`` on miss.
+        Default returns ``None`` (unsupported); per-backend
+        implementations override."""
+        return None
+
+    def resolve_by_path_tail(
+        self,
+        file_path: str,
+        *,
+        tail_components: int = 3,
+        item_type_hint: str = "",
+        library_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Tier 3 of the playlist-copy resolution chain. Match by the
+        last ``tail_components`` path components (default 3,
+        ``artist/album/song``) so a track resolves across servers that
+        share an on-disk layout beneath a different mount root.
+
+        Returns the backend-native item id on hit, ``None`` on miss.
+        Default returns ``None`` (unsupported); per-backend
+        implementations override."""
+        return None
+
+    def resolve_by_fuzzy_title(
+        self,
+        title: str,
+        *,
+        item_type: str = "",
+        artist: str = "",
+        show_title: str = "",
+        album: str = "",
+        source_file_path: str = "",
+        ambiguous_behavior: str = "strict",
+        library_id: Optional[str] = None,
+        item_type_hint: str = "",
+    ) -> Optional[List[str]]:
+        """Tier 4 (last-resort) of the playlist-copy resolution chain.
+        Title-based search filtered by
+        ``item_type``, ``artist`` (tracks), ``show_title`` (episodes).
+        Critical for music libraries because Plex doesn't expose
+        ``getByGuid`` for ``mbid://`` MusicBrainz IDs.
+
+        Ambiguity handling:
+          1. First narrow candidates by ``album`` (tracks) when the
+             source surfaced it AND the dest exposes parentTitle.
+          2. Then narrow by ``source_file_path`` — match candidates
+             whose own ``media[0].parts[0].file`` shares the longest
+             trailing path segment (artist/album/file). Picks the
+             best-aligned candidate when the source's path is known.
+          3. If multiple candidates STILL survive, apply
+             ``ambiguous_behavior``:
+               * ``'strict'`` — return None (caller records miss)
+               * ``'first'`` — return [first.ratingKey]
+               * ``'all'`` — return [every candidate's ratingKey]
+
+        Returns ``None`` on miss / strict-refusal, OR a list of
+        backend-native item ids (one for unique/first; many for
+        'all' mode). The caller turns each id into a destination
+        write."""
         return None
 
     @abstractmethod
@@ -410,11 +614,74 @@ class MediaServerAdapter(ABC):
         view_count: int,
         last_viewed_at: Optional[float],
         user_context: UserContext,
+        current_view_count: Optional[int] = None,
     ) -> WriteResult:
         """Record one watch event. ``view_count`` is the absolute target
-        count on backends that support setting it directly; for Plex
-        the adapter translates to N ``:/scrobble`` calls and tolerates
-        the cap from ``services/state.VIEWCOUNT_INCREMENT_CAP``."""
+        count to write on the destination.
+
+        Exact-target contract:
+          * Jellyfin / Emby: a single ``POST .../UserData`` call sets
+            the exact ``PlayCount`` regardless of current state, so
+            ``current_view_count`` is ignored.
+          * Plex: ``/:/scrobble`` only +1's and ``/:/unscrobble`` only
+            zeroes; there is no "set to N" endpoint. When
+            ``current_view_count`` is provided, the adapter does the
+            exact math:
+              - target == 0           -> single unscrobble
+              - target == current     -> noop (already correct)
+              - target > current      -> (target - current) scrobbles
+              - 0 < target < current  -> unscrobble + target scrobbles
+            When ``current_view_count`` is None (legacy callers), the
+            adapter falls back to the "loop ``view_count`` scrobbles"
+            semantics and the caller is responsible for having pre-
+            computed any delta. ``state.VIEWCOUNT_INCREMENT_CAP`` is
+            still respected in either mode."""
+
+    def get_current_view_count(
+        self,
+        item_ref: ItemRef,
+        *,
+        user_context: UserContext,
+    ) -> Optional[int]:
+        """Return the destination's CURRENT play count for ``item_ref``
+        under ``user_context``, or None when the adapter can't read it
+        cheaply.
+
+        Used by the restorer's Replace mode to compute the exact-target
+        delta on Plex (where the API only exposes +1 / zero primitives).
+        Jellyfin / Emby ``set_watched`` writes exact via the UserData
+        endpoint, so they have no use for the read and the base-class
+        default returns None.
+
+        Implementations should bound the cost: a single GET is
+        acceptable; an enumeration walk is not. Return None on failure
+        rather than raising so the caller can fall back to delta-mode."""
+        return None
+
+    def get_view_state(
+        self,
+        item_ref: ItemRef,
+        *,
+        user_context: UserContext,
+    ) -> Optional[Tuple[int, Optional[float]]]:
+        """Return ``(view_count, last_viewed_at_epoch)`` for ``item_ref``
+        under ``user_context``, or None when the count can't be read
+        cheaply. ``last_viewed_at_epoch`` may be None even when the
+        count is known.
+
+        Used by the sync engine's ``latest_wins`` conflict policy,
+        which needs a per-side last-changed timestamp to decide which
+        side's count is newer (JOBS-03). The base implementation
+        delegates to :meth:`get_current_view_count` and reports no
+        timestamp; an adapter that can cheaply read the last-viewed
+        time should override this so ``latest_wins`` works against it.
+        Same single-GET cost bound as :meth:`get_current_view_count`."""
+        vc = self.get_current_view_count(
+            item_ref, user_context=user_context,
+        )
+        if vc is None:
+            return None
+        return (vc, None)
 
     @abstractmethod
     def set_resume_position(
@@ -470,7 +737,7 @@ class MediaServerAdapter(ABC):
     ) -> Tuple[ItemRef, ...]:
         """Return the ordered items of one playlist as ItemRef tuples.
 
-        Added for Plan[PLAYLIST-MANAGEMENT]-2026-05-16 to back the
+        Backs the
         Playlist Management copy flow + cache layer. The default
         implementation derives items from ``list_playlists`` (Plex
         returns items inline, so no extra fetch is needed). Backends
@@ -481,6 +748,27 @@ class MediaServerAdapter(ABC):
             if spec.playlist_id == playlist_id:
                 return spec.items
         return ()
+
+    def get_playlist(
+        self,
+        playlist_id: str,
+        *,
+        user_context: UserContext,
+    ) -> Optional[PlaylistSpec]:
+        """Return a single playlist's full PlaylistSpec (name + is_smart
+        + items) WITHOUT enumerating the user's other playlists.
+
+        Calling ``list_playlists`` to look up one playlist's name +
+        is_smart and then ``get_playlist_items`` to re-fetch its
+        items is wasteful: the first call eagerly fetches items for
+        EVERY playlist the user has, which can add a multi-minute
+        delay. This method fetches ONE playlist directly and
+        populates one PlaylistSpec.
+
+        Default returns ``None`` (caller falls back to the old slow
+        path). PlexAdapter overrides via ``server.fetchItem(rk)``;
+        Jellyfin / Emby override via their per-id Playlist GET."""
+        return None
 
     @abstractmethod
     def create_playlist(
@@ -503,6 +791,23 @@ class MediaServerAdapter(ABC):
         user_context: UserContext,
     ) -> int:
         """Append items to an existing playlist; returns count added."""
+
+    def delete_playlist(
+        self,
+        playlist_id: str,
+        *,
+        user_context: UserContext,
+    ) -> WriteResult:
+        """Delete a playlist by id. Used by Replace-mode restore to
+        prune dest-only rows so the destination becomes an exact mirror
+        of the source.
+
+        Default returns unsupported; per-backend adapters override.
+        The orchestrator counts unsupported results separately so the
+        run summary makes the gap visible without aborting the run."""
+        return WriteResult.not_supported(
+            f"backend {self.backend!r} does not expose a playlist-delete API"
+        )
 
     # ── Collections ────────────────────────────────────────────────────
 
@@ -533,6 +838,16 @@ class MediaServerAdapter(ABC):
         items: List[ItemRef],
     ) -> int:
         """Append items to a collection; returns count added."""
+
+    def delete_collection(
+        self,
+        collection_id: str,
+    ) -> WriteResult:
+        """Delete a collection / BoxSet by id. Used by Replace-mode
+        restore to prune dest-only rows. Default returns unsupported."""
+        return WriteResult.not_supported(
+            f"backend {self.backend!r} does not expose a collection-delete API"
+        )
 
     # ── User management (Jellyfin / Emby only) ─────────────────────────
 

@@ -1,6 +1,5 @@
-// Top panel for the Playlist Management surface. Replaces the prior
-// two-PlaylistColumn shape (rejected 2026-05-16: end user wanted
-// multi-select on users + per-user playlists fan-out below).
+// Top panel for the Playlist Management surface. Supports multi-select
+// on users with a per-user playlists fan-out below.
 //
 // Layout, modelled on Run Job's Mode-and-Servers panel:
 //
@@ -27,28 +26,33 @@ import type {
 } from '../api';
 import { ServerPicker } from './ServerPicker';
 import { PlaylistCacheStatusChip } from './PlaylistCacheStatusChip';
+import { errorText } from '../utils/format';
 
 // Stable per-row identity for a Playlist Management user.
 //
-// 2026-05-16 (developer schema-v12 follow-up): prefer the canonical
-// `app_user_uuid` — guaranteed unique per (server, user) by the
-// boot-time backfill. Fallback chain handles the edge where a user
-// appears live on the adapter but hasn't been written to managed_users
-// yet:
+// Prefer the canonical `app_user_uuid` - guaranteed unique per
+// (server, user) by the boot-time backfill. The fallback chain
+// handles the edge where a user appears live on the adapter but
+// hasn't been written to managed_users yet:
 //   1. app_user_uuid    (canonical, always unique once persisted)
 //   2. backend_user_id  (the backend's own ID; per-backend, may be '')
 //   3. username         (always present; unique within a server)
 //
-// Bug history: keying React rows / check-sets on raw backend_user_id
-// caused EVERY row to "select together" because adapters that don't
-// populate the field returned `""` for every user — they all collided
-// on the empty-string key.
+// Raw backend_user_id must not be used as the key: adapters that
+// don't populate the field return `""` for every user, so all rows
+// would collide on the empty-string key and select together.
 function userKey(u: PlaylistMgmtUser): string {
   return u.app_user_uuid || u.backend_user_id || u.username;
 }
 
 interface Props {
-  servers: ServerView[];
+  // Source picker server list. In Smart Playlist mode the parent
+  // passes Plex servers only (smart playlists are a Plex-only
+  // concept); otherwise it matches the destination list.
+  sourceServers: ServerView[];
+  // Destination picker server list. Every backend in Smart Playlist
+  // and Cross modes; the active backend's servers otherwise.
+  destServers: ServerView[];
   pings: Record<string, PingResult>;
   cacheStatus: Record<string, PlaylistCacheStatus>;
 
@@ -88,9 +92,9 @@ interface Props {
   // false are hidden from the dest list — same rule the snapshot UI
   // applies for users who can't be written to (e.g. Plex per_user_token
   // mode with strict_identity_resolution=true and no saved token).
-  // Defaults to "show all" when omitted. Mirrors the all-or-nothing
-  // exclusion model the end user asked for (2026-05-16): users who'd
-  // definitely fail at copy time don't appear in the picker at all.
+  // Defaults to "show all" when omitted. Follows an all-or-nothing
+  // exclusion model: users who'd definitely fail at copy time don't
+  // appear in the picker at all.
   destUserIsTransferable?: (u: PlaylistMgmtUser) => boolean;
 }
 
@@ -169,7 +173,7 @@ function Side({
       })
       .catch((e) => {
         if (cancelled) return;
-        setUsersError(String(e instanceof Error ? e.message : e));
+        setUsersError(errorText(e));
         onUsersChange([]);
       });
     return () => { cancelled = true; };
@@ -194,11 +198,16 @@ function Side({
     return cacheStatus[cacheKey(serverId, userId)];
   };
 
+  const sideKey = label === 'Source' ? 'source' : 'dest';
   return (
     <div className="panel" style={{ display: 'flex', flexDirection: 'column' }}>
       <h3 style={{ marginTop: 0, marginBottom: 8 }}>{label}</h3>
 
-      <div className="field" style={{ marginBottom: 12 }}>
+      <div
+        className="field"
+        data-testid={sideKey === 'source' ? 'plmgmt-source-server' : 'plmgmt-dest-server'}
+        style={{ marginBottom: 12 }}
+      >
         <span className="label">Server</span>
         <ServerPicker
           value={serverId}
@@ -247,6 +256,7 @@ function Side({
                 return (
                   <div
                     key={userKey(u)}
+                    data-testid={`plmgmt-${sideKey}-user-${u.username}`}
                     style={{
                       display: 'flex',
                       alignItems: 'center',
@@ -329,7 +339,8 @@ function Side({
 }
 
 export function PlaylistMgmtServersAndUsersPanel({
-  servers,
+  sourceServers,
+  destServers,
   pings,
   cacheStatus,
   sourceServerId,
@@ -355,7 +366,7 @@ export function PlaylistMgmtServersAndUsersPanel({
     <div className="grid-2" style={{ marginTop: 12 }}>
       <Side
         label="Source"
-        servers={servers}
+        servers={sourceServers}
         pings={pings}
         cacheStatus={cacheStatus}
         serverId={sourceServerId}
@@ -369,7 +380,7 @@ export function PlaylistMgmtServersAndUsersPanel({
       />
       <Side
         label="Destination"
-        servers={servers}
+        servers={destServers}
         pings={pings}
         cacheStatus={cacheStatus}
         serverId={destServerId}

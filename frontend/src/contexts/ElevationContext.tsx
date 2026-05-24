@@ -1,4 +1,4 @@
-// Item 1 (admin-management plan, 2026-05-15): app-wide elevation state.
+// App-wide elevation state.
 //
 // Tracks whether the current session is currently elevated (a recent
 // password re-confirm via /api/auth/elevate) and the unix timestamp
@@ -24,6 +24,7 @@ import {
 import type { ReactNode } from 'react';
 import { api } from '../api';
 import { ElevationModal } from '../components/ElevationModal';
+import { pausableInterval } from '../utils/pausableInterval';
 
 interface ElevationContextValue {
   // Unix-time (seconds) the elevation expires at, or null if not
@@ -87,7 +88,7 @@ export function ElevationProvider({ children }: { children: ReactNode }) {
   // session is cold because most users never elevate.
   useEffect(() => {
     if (expiresAt === null) return;
-    const id = window.setInterval(() => {
+    return pausableInterval(() => {
       const now = Math.floor(Date.now() / 1000);
       if (now >= expiresAt) {
         setExpiresAt(null);
@@ -95,7 +96,6 @@ export function ElevationProvider({ children }: { children: ReactNode }) {
         setTick((t) => t + 1);
       }
     }, 1000);
-    return () => window.clearInterval(id);
   }, [expiresAt]);
 
   // Stable resolver pointer so the modal's callbacks don't capture a

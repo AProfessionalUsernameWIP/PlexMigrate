@@ -18,6 +18,7 @@
 // (e.g. Run Job and an inline Schedules editor) without the
 // radios competing.
 
+import { useEffect } from 'react';
 import type { ServerView } from '../api';
 import { InfoTip } from './InfoTip';
 import { serverSupportsFastCollections } from '../utils/plexVersion';
@@ -145,6 +146,20 @@ export function PerRunSettingsPanel(props: Props) {
   } = props;
 
   const wrName = `wr-strategy-${idScope}`;
+
+  // The fast-collection toggle is gated on the source server's Plex
+  // version. When the server can't support it the checkbox renders
+  // disabled + unchecked - but the parent's state must be forced off
+  // too, or a job would still submit fastCollectionDetection=true
+  // that the operator was never shown or able to change.
+  const fastCollectionsSupported = serverSupportsFastCollections(
+    sourceServer?.plex_version ?? '',
+  );
+  useEffect(() => {
+    if (!fastCollectionsSupported && fastCollectionDetection) {
+      onFastCollectionDetectionChange(false);
+    }
+  }, [fastCollectionsSupported, fastCollectionDetection, onFastCollectionDetectionChange]);
 
   return (
     <div className="panel">
@@ -413,7 +428,7 @@ export function PerRunSettingsPanel(props: Props) {
                   </label>
                   {(() => {
                     const ver = sourceServer?.plex_version ?? '';
-                    const supported = serverSupportsFastCollections(ver);
+                    const supported = fastCollectionsSupported;
                     const unknown = !ver;
                     const disabled = !supported;
                     return (

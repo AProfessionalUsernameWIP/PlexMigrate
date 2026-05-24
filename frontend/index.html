@@ -3,9 +3,25 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PlexMigrate</title>
-    <meta name="description" content="Web dashboard for PlexMigrate - export and import Plex watch history, playlists, collections, and ratings." />
+    <title>Hestia-MediaManager</title>
+    <meta name="description" content="Hestia-MediaManager (HM²) - snapshot, restore, and migrate Plex watch history, playlists, collections, and ratings across servers." />
     <link rel="icon" href="data:," />
+    <script>
+      // Apply the saved theme before first paint so users don't see a
+      // flash of the default theme on every page load. Mirrors the
+      // logic in ThemeSwitcher.tsx; keep them in sync.
+      (function () {
+        try {
+          var saved = window.localStorage.getItem('app.theme');
+          var valid = saved && ['dark','true-dark','tron','hearth','chameleon','warm-dark','paper'].indexOf(saved) !== -1;
+          if (valid) {
+            document.documentElement.setAttribute('data-theme', saved);
+          } else if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {
+            document.documentElement.setAttribute('data-theme', 'paper');
+          }
+        } catch (e) { /* localStorage blocked - fall back to default */ }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

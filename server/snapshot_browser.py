@@ -44,7 +44,7 @@ def _archive_dir() -> Path:
     Resolve the JSON-archive directory: ``<output_dir>/legacy/``.
 
     Standalone JSON archives (end user-kept after deleting a
-    snapshot, or pre-PR-13 archives relocated by
+    snapshot, or legacy archives relocated by
     ``relocate_legacy_exports``) live here. The directory is named
     ``legacy/`` for historical reasons; the UI labels it "JSON
     Archives" and the JobForm exposes it as "From JSON archive".
@@ -66,11 +66,11 @@ def list_snapshots() -> List[Dict[str, Any]]:
     (UNIX timestamp), ``library`` (parsed from file metadata), and
     ``captured_at`` (parsed from file metadata, ISO 8601 string).
 
-    Pre-fix this read the top of ``output_dir`` which mixed active
-    cached sidecars (registered to live .db files) with genuine
-    archives. The Exports panel now distinguishes the two: registered
-    snapshots come from ``/api/snapshots``; archived JSON files come
-    from here.
+    Only the ``legacy/`` subdirectory is read, not the top of
+    ``output_dir`` which mixes active cached sidecars (registered to
+    live .db files) with genuine archives. The Exports panel
+    distinguishes the two: registered snapshots come from
+    ``/api/snapshots``; archived JSON files come from here.
     """
     base = _archive_dir()
     if not base.exists():
@@ -196,8 +196,8 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
         data = json.loads(head.decode("utf-8", errors="replace"))
         if isinstance(data, dict):
             out["library"] = data.get("library")
-            # PR-13 compat: legacy files used ``exported_at``; new files
-            # use ``captured_at``. Accept either when reading so
+            # Legacy files use ``exported_at``; current files use
+            # ``captured_at``. Accept either when reading so
             # pre-rename .plexexport.json files remain browseable.
             out["captured_at"] = data.get("captured_at") or data.get("exported_at")
             out["source_server_name"] = data.get("source_server_name")
@@ -214,7 +214,7 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
     # values are easy to extract with a tiny string search.
     text = head.decode("utf-8", errors="replace")
     out["library"] = _extract_top_level_string(text, "library")
-    # PR-13 compat: try the new key first, fall back to legacy.
+    # Try the current key first, fall back to legacy.
     out["captured_at"] = (
         _extract_top_level_string(text, "captured_at")
         or _extract_top_level_string(text, "exported_at")
@@ -226,7 +226,7 @@ def _peek_metadata(path: Path) -> Dict[str, Optional[str]]:
     return out
 
 
-# ── Slug-scoped cascade helpers (v0.9.5) ─────────────────────────────────────
+# ── Slug-scoped cascade helpers ──────────────────────────────────────────────
 
 def _slug_pattern(slug: str) -> "re.Pattern[str]":
     """
@@ -244,9 +244,9 @@ def _slug_pattern(slug: str) -> "re.Pattern[str]":
     library name (e.g. a library literally named "My-Server" with a
     different server slug).
 
-    Pre-v0.9.0 exports carry no slug at all (``<library>_<ts>``);
-    those never match this pattern by design - they aren't
-    attributable to any specific registered server.
+    Legacy exports carry no slug at all (``<library>_<ts>``); those
+    never match this pattern by design - they aren't attributable to
+    any specific registered server.
     """
     return re.compile(
         r"_" + re.escape(slug) + r"_\d{8}_\d{6}\.plexexport\.json$"
@@ -293,44 +293,86 @@ def delete_exports_by_slug(slug: str) -> Tuple[int, List[str]]:
     return deleted, errors
 
 
-def _extract_top_level_string(text: str, key: str) -> Optional[str]:
-    """
-    Pull a top-level string value out of indented pretty-printed JSON.
+def _read_json_string_after(text: str, pos: int) -> Optional[str]:
+    """Read the JSON string value that begins at/after ``pos``.
 
-    Looks for ``"key": "<value>"`` and returns the unescaped value.
-    Tolerant of indentation and trailing commas. Not a full JSON parser
-    - only handles the simple case the snapshotter actually writes.
+    The value must be a string: the next non-whitespace character
+    after ``pos`` has to be the opening quote. If it is anything else
+    (``null``, a number, an object) there is no string to return.
+    Walks backslash escapes so a value containing an escaped quote is
+    not truncated, and returns None if the prefix was cut off mid-
+    value. Only ``\\"`` and ``\\\\`` are unescaped - the only escapes
+    ``json.dump`` emits for ASCII output.
     """
-    needle = f'"{key}"'
-    idx = text.find(needle)
-    if idx < 0:
-        return None
-    # Walk past ': "' to the opening quote of the value.
-    colon = text.find(":", idx + len(needle))
-    if colon < 0:
-        return None
-    open_quote = text.find('"', colon + 1)
-    if open_quote < 0:
-        return None
-    # L4: find the *unescaped* closing quote. A bare
-    # ``text.find('"', ...)`` stops at the first quote even when it is
-    # a ``\"`` escape inside the value, truncating any value that
-    # contains a quote (e.g. a library name with a double-quote in it).
-    # Walk the string honouring backslash escapes instead.
-    i = open_quote + 1
+    j = pos
     n = len(text)
-    close_quote = -1
+    while j < n and text[j] in " \t\r\n":
+        j += 1
+    if j >= n or text[j] != '"':
+        return None
+    open_quote = j
+    i = open_quote + 1
     while i < n:
         c = text[i]
         if c == "\\":
             i += 2  # skip the escaped char (\\ or \")
             continue
         if c == '"':
-            close_quote = i
-            break
+            return text[open_quote + 1:i].replace('\\"', '"').replace("\\\\", "\\")
         i += 1
-    if close_quote < 0:
-        return None
-    # Basic unescape: only handle \" and \\, which are the only
-    # escapes json.dump produces by default on ASCII strings.
-    return text[open_quote + 1:close_quote].replace('\\"', '"').replace("\\\\", "\\")
+    return None
+
+
+def _extract_top_level_string(text: str, key: str) -> Optional[str]:
+    """
+    Pull a TOP-LEVEL string value out of indented pretty-printed JSON.
+
+    'Top-level' means a key of the ROOT object only. The scan tracks
+    brace / bracket nesting depth and string state, so a same-named
+    key nested inside an array entry or a sub-object is never matched
+    - e.g. the per-entry ``"library"`` keys inside a wrapper payload's
+    ``libraries`` array do not satisfy a request for the root
+    ``"library"``, and a key under ``snapshot_meta`` is not mistaken
+    for a root key. Returns None when ``key`` has no root-level
+    occurrence; the caller treats that as "unknown".
+
+    Not a full JSON parser - it locates a root-level ``"key": "..."``
+    pair and unescapes the string value. Tolerant of a truncated
+    prefix: depth tracking still holds for the portion present.
+    """
+    needle = f'"{key}"'
+    depth = 0           # 0 = before the root '{'; 1 = a root-object key
+    in_string = False
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if in_string:
+            # Inside a string token: consume to the unescaped closing
+            # quote. Braces / brackets in here must not move depth.
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if c == '"':
+            # A string token starts here. A root-object key sits at
+            # depth 1. Match the key text AND confirm it is used as a
+            # key (the next non-whitespace char is ':'), so a string
+            # *value* that merely equals the key text is not matched.
+            if depth == 1 and text.startswith(needle, i):
+                after = i + len(needle)
+                colon = text.find(":", after)
+                if colon >= 0 and text[after:colon].strip() == "":
+                    return _read_json_string_after(text, colon + 1)
+            in_string = True
+            i += 1
+            continue
+        if c == "{" or c == "[":
+            depth += 1
+        elif c == "}" or c == "]":
+            depth -= 1
+        i += 1
+    return None

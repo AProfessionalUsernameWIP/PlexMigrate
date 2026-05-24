@@ -1,4 +1,4 @@
-// PR-10 - User Management sub-tab under Servers.
+// User Management sub-tab under Servers.
 //
 // Three render modes inside one panel:
 //
@@ -23,10 +23,14 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { api, GlobalTombstone, ServerManagedUser, ServerView, UserIdentityMap } from '../api';
+import { useResourceQuery } from '../hooks/useResourceQuery';
+import { DbAdminAuthModal } from './DbAdminAuthModal';
 import { InfoTip } from './InfoTip';
 import { useElevation } from '../contexts/ElevationContext';
+import { useAuthContext } from '../contexts/AuthContext';
 import { UserCopyPanel } from './UserCopyPanel';
 import { UserMappingPanel } from './UserMappingPanel';
+import { RevealCredentialsModal } from './RevealCredentialsModal';
 import {
   BackendTabStrip,
   BackendType,
@@ -39,17 +43,15 @@ export function UserManagementPanel() {
   const [servers, setServers] = useState<ServerView[] | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
-  // Phase B of the backend-filter UI restructure (see
-  // Finding[BACKEND-FILTER-AUDIT]-2026-05-16.md). Backend tier above
-  // the existing per-server ServerSelector so the end user can
-  // narrow to Plex / Jellyfin / Emby users separately.
+  // Backend tier above the existing per-server ServerSelector so the
+  // user can narrow to Plex / Jellyfin / Emby users separately.
   const [activeBackend, setActiveBackend] = useState<BackendType>('plex');
   const [detailUsername, setDetailUsername] = useState<string | null>(null);
   // ``refreshKey`` is bumped after a global sync so the currently-
-  // visible UserListView re-fetches without the end user having to
+  // visible UserListView re-fetches without the user having to
   // switch servers manually.
   const [refreshKey, setRefreshKey] = useState(0);
-  // PR-11.1 follow-up - global "Sync all servers" state.
+  // Global "Sync all servers" state.
   const [syncingAll, setSyncingAll] = useState(false);
   const [globalSyncResult, setGlobalSyncResult] = useState<
     | null
@@ -76,7 +78,7 @@ export function UserManagementPanel() {
 
   // Derived: registered-server list filtered to the active backend.
   // Passed into ServerSelector so its per-server strip only shows
-  // backends the end user chose. Memoised so the dependency-tracked
+  // backends the user chose. Memoised so the dependency-tracked
   // effect below doesn't fire on every render.
   const backendServers = useMemo(
     () => serversForBackend(servers || [], activeBackend),
@@ -85,7 +87,7 @@ export function UserManagementPanel() {
 
   // Auto-correct activeBackend when its bucket is empty and another
   // backend has servers. Mirrors the same pattern in ServersPanel
-  // so an end user who deletes the last server of the active backend
+  // so a user who deletes the last server of the active backend
   // doesn't stare at an empty pane.
   useEffect(() => {
     if (!servers || servers.length === 0) return;
@@ -141,7 +143,7 @@ export function UserManagementPanel() {
       });
       const synced_total = per_server.reduce((acc, p) => acc + p.synced, 0);
       setGlobalSyncResult({ synced_total, per_server });
-      // Force the visible UserListView to refetch so the end user
+      // Force the visible UserListView to refetch so the user
       // sees fresh data immediately.
       setRefreshKey((k) => k + 1);
     } finally {
@@ -236,13 +238,11 @@ export function UserManagementPanel() {
         />
       )}
 
-      {/* Plan[RUN-JOB-UI] follow-up: the unscoped (global) identity-
-          mapping panel that used to live here has been dropped. The
-          per-user detail view now hosts a scoped UserMappingPanel
-          that filters to the viewed user; the end user manages
-          mappings from inside each user's detail page rather than
-          from a single global list at the bottom of the User
-          Management tab. */}
+      {/* The per-user detail view hosts a scoped UserMappingPanel
+          that filters to the viewed user; the user manages mappings
+          from inside each user's detail page rather than from a
+          single global list at the bottom of the User Management
+          tab. */}
     </>
   );
 }
@@ -319,9 +319,9 @@ function UserListView({
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
-  // PR-11.1 - 'Show hidden' toggle. Includes both per-server and
-  // globally tombstoned rows. Default off so the picker contract
-  // (visible users only) and the everyday end user view match.
+  // 'Show hidden' toggle. Includes both per-server and globally
+  // tombstoned rows. Default off so the picker contract (visible
+  // users only) and the everyday user view match.
   const [showHidden, setShowHidden] = useState(false);
 
   const refresh = async () => {
@@ -417,11 +417,11 @@ function UserListView({
             <tbody>
               {users.map((u) => {
                 const isHidden = u.hidden_scope !== 'none';
-                // 2026-05-15: grey out rows where Plex.tv reports no
-                // active share on this server. The picker also filters
-                // them; surfacing them here (rather than hiding) lets
-                // the end user confirm the cache reflects the change
-                // they made on Plex.tv.
+                // Grey out rows where Plex.tv reports no active share
+                // on this server. The picker also filters them;
+                // surfacing them here (rather than hiding) lets the
+                // user confirm the cache reflects the change they
+                // made on Plex.tv.
                 const inactiveShare = u.kind !== 'owner' && u.active_share === false;
                 const sharedAtLabel = u.shared_state_refreshed_at
                   ? `Share state refreshed ${new Date(u.shared_state_refreshed_at * 1000).toLocaleString()}`
@@ -444,15 +444,25 @@ function UserListView({
                       <StatusPill stored={u.has_token} label={u.has_token ? 'Stored' : 'Not stored'} />
                     </td>
                     <td>
-                      <StatusPill
-                        stored={u.has_pin || u.has_password}
-                        label={
-                          u.has_pin && u.has_password ? 'PIN + password' :
-                          u.has_pin ? 'PIN stored' :
-                          u.has_password ? 'Password stored' :
-                          'Not stored'
-                        }
-                      />
+                      {/* List view recognises all three per-backend
+                          PIN columns from migration v16. Checking
+                          only ``has_pin`` would be Plex-specific and
+                          would show "Not stored" here for an Emby /
+                          Jellyfin user whose EasyPassword was saved
+                          via the detail view. */}
+                      {(() => {
+                        const anyPin = u.has_pin || u.has_emby_pin || u.has_jellyfin_pin;
+                        const stored = anyPin || u.has_password;
+                        const label = (() => {
+                          if (anyPin && u.has_password) return 'PIN + password';
+                          if (u.has_pin) return 'PIN stored';
+                          if (u.has_emby_pin) return 'EasyPassword stored';
+                          if (u.has_jellyfin_pin) return 'EasyPassword stored';
+                          if (u.has_password) return 'Password stored';
+                          return 'Not stored';
+                        })();
+                        return <StatusPill stored={stored} label={label} />;
+                      })()}
                     </td>
                     <td title={sharedAtLabel}>
                       {u.kind === 'owner' ? (
@@ -462,14 +472,23 @@ function UserListView({
                       ) : (
                         <StatusPill stored={true} label="Active" />
                       )}
-                      {u.is_pin_protected && (
-                        <span style={{ marginLeft: 6 }}>
-                          <StatusPill
-                            stored={u.has_pin}
-                            label={u.has_pin ? 'PIN-protected (stored)' : 'PIN-protected (no PIN stored)'}
-                          />
-                        </span>
-                      )}
+                      {u.is_pin_protected && (() => {
+                        // ``is_pin_protected`` is sourced from the
+                        // backend's share-state column (Plex live API
+                        // for Plex rows; backend-specific signal
+                        // elsewhere). The badge reflects whether a PIN
+                        // of any backend has actually been stored on
+                        // this row.
+                        const anyPin = u.has_pin || u.has_emby_pin || u.has_jellyfin_pin;
+                        return (
+                          <span style={{ marginLeft: 6 }}>
+                            <StatusPill
+                              stored={anyPin}
+                              label={anyPin ? 'PIN-protected (stored)' : 'PIN-protected (no PIN stored)'}
+                            />
+                          </span>
+                        );
+                      })()}
                     </td>
                     <td>
                       {u.last_seen
@@ -493,10 +512,10 @@ function UserListView({
         )}
       </div>
 
-      {/* PR-11.1 - global tombstones panel. Lists usernames hidden
-          across every server; lets the end user unhide directly from
-          here (useful when the username has no row on the current
-          server because the sync has been skipping it). */}
+      {/* Global tombstones panel. Lists usernames hidden across every
+          server; lets the user unhide directly from here (useful when
+          the username has no row on the current server because the
+          sync has been skipping it). */}
       <GlobalTombstonesPanel onChange={refresh} />
     </>
   );
@@ -504,20 +523,12 @@ function UserListView({
 
 
 function GlobalTombstonesPanel({ onChange }: { onChange: () => void | Promise<void> }) {
-  const [rows, setRows] = useState<GlobalTombstone[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<string | null>(null);
-
-  const refresh = async () => {
-    setError(null);
-    try {
-      const r = await api.listGlobalTombstones();
-      setRows(r.usernames);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-  useEffect(() => { void refresh(); }, []);
+  const { data: rows, error, reload: refresh, setError } = useResourceQuery<GlobalTombstone[] | null>(
+    () => api.listGlobalTombstones().then((r) => r.usernames),
+    [],
+    null,
+  );
 
   const submitUnhide = async (creds: { username: string; password: string }) => {
     if (!pending) return;
@@ -527,7 +538,7 @@ function GlobalTombstonesPanel({ onChange }: { onChange: () => void | Promise<vo
         db_admin_password: creds.password,
       });
       setPending(null);
-      await refresh();
+      refresh();
       await onChange();
     } catch (e) {
       setError(String(e));
@@ -602,28 +613,41 @@ function StatusPill({ stored, label }: { stored: boolean; label: string }) {
 // ── Detail view ─────────────────────────────────────────────────────────────
 
 type WritePayload =
-  // Per-server credential writes (existing PR-10 behaviour).
+  // Per-server credential writes. PIN variants carry
+  // ``cross_backend`` which, when true, triggers
+  // cross-backend identity-link propagation downstream - that's the
+  // "Save & apply across backends" two-button affordance.
   | { kind: 'save_display'; display_name: string | null }
   | { kind: 'save_token'; auth_token: string }
   | { kind: 'clear_token' }
-  | { kind: 'save_pin'; plex_home_pin: string }
-  | { kind: 'clear_pin' }
+  | { kind: 'save_pin'; plex_home_pin: string; cross_backend?: boolean }
+  | { kind: 'clear_pin'; cross_backend?: boolean }
+  | { kind: 'save_emby_pin'; emby_easy_pin: string; cross_backend?: boolean }
+  | { kind: 'clear_emby_pin'; cross_backend?: boolean }
+  | { kind: 'save_jellyfin_pin'; jellyfin_easy_pin: string; cross_backend?: boolean }
+  | { kind: 'clear_jellyfin_pin'; cross_backend?: boolean }
   | { kind: 'save_password'; service_password: string }
   | { kind: 'clear_password' }
-  // PR-11.1 - tombstones replace the old purge-on-delete. Per-server
-  // hide preserves the row + credentials; global hide adds the
-  // username to the global tombstones table so the sync helper skips
-  // it on every server going forward.
+  // Per-server hide preserves the row + credentials; global hide adds
+  // the username to the global tombstones table so the sync helper
+  // skips it on every server going forward.
   | { kind: 'hide_server' }
   | { kind: 'hide_global' }
   | { kind: 'unhide_server' }
   | { kind: 'unhide_global' }
-  // PR-13 fix #2 - same credential applied to every server where
-  // this username has a row. db_admin gated; backend walks the
-  // registry and writes to each matching managed_users row.
-  | { kind: 'global_save_token'; auth_token: string }
-  | { kind: 'global_save_pin'; plex_home_pin: string }
-  | { kind: 'global_save_password'; service_password: string };
+  // Same credential applied to every server where this username has a
+  // row. db_admin gated; backend walks the registry and writes to
+  // each matching managed_users row.
+  //
+  // The every_backend flag governs the service_type_filter forwarded
+  // to the backend. Default (undefined / false) scopes the sweep to
+  // the origin row's backend; true tells the backend to skip the
+  // filter and walk every registered server regardless of backend.
+  | { kind: 'global_save_token'; auth_token: string; every_backend?: boolean }
+  | { kind: 'global_save_pin'; plex_home_pin: string; cross_backend?: boolean; every_backend?: boolean }
+  | { kind: 'global_save_emby_pin'; emby_easy_pin: string; cross_backend?: boolean; every_backend?: boolean }
+  | { kind: 'global_save_jellyfin_pin'; jellyfin_easy_pin: string; cross_backend?: boolean; every_backend?: boolean }
+  | { kind: 'global_save_password'; service_password: string; every_backend?: boolean };
 
 
 function UserDetailView({
@@ -637,24 +661,37 @@ function UserDetailView({
   allServers: ServerView[];
   onBack: () => void;
 }) {
-  // Plan[RUN-JOB-UI] follow-up: copy-user-to-destination panel.
-  // Visibility toggle gates the panel so the detail view does not
-  // grow vertically by default.
+  // Copy-user-to-destination panel. Visibility toggle gates the panel
+  // so the detail view does not grow vertically by default.
   const [copyPanelOpen, setCopyPanelOpen] = useState(false);
   const [user, setUser] = useState<ServerManagedUser | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
   const [displayDraft, setDisplayDraft] = useState('');
   const [tokenDraft, setTokenDraft] = useState('');
+  // Single PIN draft regardless of backend. The user is on one row at
+  // a time, so only one PIN section is rendered; the draft + the
+  // payload kind are picked from the row's service_type at submit
+  // time (see ``pinConfig`` below).
   const [pinDraft, setPinDraft] = useState('');
   const [passwordDraft, setPasswordDraft] = useState('');
+  // Count of cross-backend identity_map links for this user. >0
+  // enables the "Save & apply across backends" affordance on PIN
+  // sections. We fetch once on detail-view load + refresh after any
+  // successful write that could change link state (unlikely for
+  // credential writes, but cheap).
+  const [crossBackendLinkCount, setCrossBackendLinkCount] = useState(0);
   const [pendingWrite, setPendingWrite] = useState<WritePayload | null>(null);
-  // Item 5: per-user token rotation. The button calls
-  // requireElevation() (opens the ElevationModal if the operator
-  // isn't currently elevated), then POSTs to the dedicated
-  // rotate-token endpoint. Refresh + toast on success.
+  // Per-user token rotation. The button calls requireElevation()
+  // (opens the ElevationModal if the operator isn't currently
+  // elevated), then POSTs to the dedicated rotate-token endpoint.
+  // Refresh + toast on success.
   const elevation = useElevation();
+  const auth = useAuthContext();
   const [rotating, setRotating] = useState(false);
+  // Root-admin-only "Reveal credentials" affordance. Modal handles
+  // the three-gate auth + the 30-second auto-hide on disclosure.
+  const [revealOpen, setRevealOpen] = useState(false);
   const rotateToken = async () => {
     const elev = await elevation.requireElevation(`rotate token for ${username}`);
     if (!elev) return;
@@ -676,6 +713,36 @@ function UserDetailView({
     }
   };
 
+  // Per-user "Sync this user" affordance. Distinct from rotateToken
+  // above: no elevation required (operator role is enough), scoped to
+  // ONE username only via the /capture-token endpoint, and the
+  // bulk-sync's full-server scope is never used. Useful for capturing
+  // a missing token on a single user (e.g. after the operator just
+  // saved their PIN under User Management) without sweeping every
+  // other row.
+  const [syncingThisUser, setSyncingThisUser] = useState(false);
+  const syncThisUser = async () => {
+    setError(null); setOk(null); setSyncingThisUser(true);
+    try {
+      const res = await api.captureUserToken(serverId, username);
+      const cap = res.token_capture;
+      if (cap.captured > 0) {
+        setOk(`Captured per-user token for ${username}.`);
+      } else if (cap.throttled) {
+        setError('Capture throttled; try again in a moment.');
+      } else if (cap.errors && cap.errors.length > 0) {
+        setError(`Capture did not store a new token: ${cap.errors[0]}`);
+      } else {
+        setError('No token was captured (no credential stored for this user, or AuthenticateByName rejected).');
+      }
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSyncingThisUser(false);
+    }
+  };
+
   const refresh = async () => {
     setError(null);
     try {
@@ -690,6 +757,41 @@ function UserDetailView({
     void refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverId, username]);
+
+  // Compute the number of cross-backend identity_map links for this
+  // user. A link is "cross-backend" when the OTHER server's
+  // service_type differs from this server's service_type. The count
+  // gates the "Save & apply across backends" PIN affordance — there's
+  // nothing to apply to if every linked row is on the same backend.
+  useEffect(() => {
+    let cancelled = false;
+    const thisServer = allServers.find((s) => s.id === serverId);
+    const thisServiceType = (thisServer?.service_type || '').toLowerCase();
+    api.listUserIdentityMaps()
+      .then((r) => {
+        if (cancelled) return;
+        let count = 0;
+        for (const m of r.maps || []) {
+          const aMatches = m.server_a_id === serverId
+            && (m.user_a_handle || '').toLowerCase() === username.toLowerCase();
+          const bMatches = m.server_b_id === serverId
+            && (m.user_b_handle || '').toLowerCase() === username.toLowerCase();
+          if (!aMatches && !bMatches) continue;
+          const otherServerId = aMatches ? m.server_b_id : m.server_a_id;
+          const other = allServers.find((s) => s.id === otherServerId);
+          const otherSvc = (other?.service_type || '').toLowerCase();
+          if (otherSvc && thisServiceType && otherSvc !== thisServiceType) {
+            count += 1;
+          }
+        }
+        setCrossBackendLinkCount(count);
+      })
+      .catch(() => {
+        if (!cancelled) setCrossBackendLinkCount(0);
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverId, username, allServers]);
 
   const submitWrite = async (creds: { username: string; password: string }) => {
     if (!pendingWrite) return;
@@ -742,26 +844,56 @@ function UserDetailView({
         setOk('Global tombstone cleared. Username will resync.');
         return;
       }
-      // PR-13 fix #2 - global credential apply. One endpoint per
-      // credential kind, walks every registered server.
+      // Global credential apply. One endpoint per credential kind,
+      // walks every registered server. Migration v16 adds
+      // emby/jellyfin PIN kinds + forwards cross_backend_pin when the
+      // operator picked "Save & apply across backends".
       if (
         pendingWrite.kind === 'global_save_token' ||
         pendingWrite.kind === 'global_save_pin' ||
+        pendingWrite.kind === 'global_save_emby_pin' ||
+        pendingWrite.kind === 'global_save_jellyfin_pin' ||
         pendingWrite.kind === 'global_save_password'
       ) {
-        const kind: 'auth_token' | 'plex_home_pin' | 'service_password' =
+        const kind:
+          | 'auth_token'
+          | 'plex_home_pin'
+          | 'emby_easy_pin'
+          | 'jellyfin_easy_pin'
+          | 'service_password' =
           pendingWrite.kind === 'global_save_token' ? 'auth_token' :
           pendingWrite.kind === 'global_save_pin' ? 'plex_home_pin' :
+          pendingWrite.kind === 'global_save_emby_pin' ? 'emby_easy_pin' :
+          pendingWrite.kind === 'global_save_jellyfin_pin' ? 'jellyfin_easy_pin' :
           'service_password';
         const plaintext =
           pendingWrite.kind === 'global_save_token' ? pendingWrite.auth_token :
           pendingWrite.kind === 'global_save_pin' ? pendingWrite.plex_home_pin :
+          pendingWrite.kind === 'global_save_emby_pin' ? pendingWrite.emby_easy_pin :
+          pendingWrite.kind === 'global_save_jellyfin_pin' ? pendingWrite.jellyfin_easy_pin :
           pendingWrite.service_password;
+        const crossBackend =
+          pendingWrite.kind === 'global_save_pin' ||
+          pendingWrite.kind === 'global_save_emby_pin' ||
+          pendingWrite.kind === 'global_save_jellyfin_pin'
+            ? Boolean(pendingWrite.cross_backend)
+            : undefined;
+        // Scope the sweep to the origin row's backend by default; the
+        // operator's "Include other backends" toggle sets
+        // every_backend=true on the payload to omit the filter.
+        const originSvc = (user?.service_type || '').toLowerCase();
+        const serviceTypeFilter =
+          !pendingWrite.every_backend
+          && (originSvc === 'plex' || originSvc === 'emby' || originSvc === 'jellyfin')
+            ? (originSvc as 'plex' | 'emby' | 'jellyfin')
+            : undefined;
         const r = await api.setGlobalManagedUserCredential(username, {
           db_admin_username: creds.username,
           db_admin_password: creds.password,
           kind,
           plaintext,
+          ...(crossBackend !== undefined ? { cross_backend_pin: crossBackend } : {}),
+          ...(serviceTypeFilter !== undefined ? { service_type_filter: serviceTypeFilter } : {}),
         });
         setPendingWrite(null);
         setTokenDraft('');
@@ -791,9 +923,27 @@ function UserDetailView({
           break;
         case 'save_pin':
           body.plex_home_pin = pendingWrite.plex_home_pin;
+          if (pendingWrite.cross_backend) body.cross_backend_pin = true;
           break;
         case 'clear_pin':
           body.clear_plex_home_pin = true;
+          if (pendingWrite.cross_backend) body.cross_backend_pin = true;
+          break;
+        case 'save_emby_pin':
+          body.emby_easy_pin = pendingWrite.emby_easy_pin;
+          if (pendingWrite.cross_backend) body.cross_backend_pin = true;
+          break;
+        case 'clear_emby_pin':
+          body.clear_emby_easy_pin = true;
+          if (pendingWrite.cross_backend) body.cross_backend_pin = true;
+          break;
+        case 'save_jellyfin_pin':
+          body.jellyfin_easy_pin = pendingWrite.jellyfin_easy_pin;
+          if (pendingWrite.cross_backend) body.cross_backend_pin = true;
+          break;
+        case 'clear_jellyfin_pin':
+          body.clear_jellyfin_easy_pin = true;
+          if (pendingWrite.cross_backend) body.cross_backend_pin = true;
           break;
         case 'save_password':
           body.service_password = pendingWrite.service_password;
@@ -913,13 +1063,41 @@ function UserDetailView({
         onSave={() => setPendingWrite({ kind: 'save_token', auth_token: tokenDraft })}
         onClear={() => setPendingWrite({ kind: 'clear_token' })}
         onSaveGlobal={() => setPendingWrite({ kind: 'global_save_token', auth_token: tokenDraft })}
+        onSaveGlobalEveryBackend={() => setPendingWrite({ kind: 'global_save_token', auth_token: tokenDraft, every_backend: true })}
         inputType="password"
       />
 
-      {/* Item 5: per-user manual token rotation. Bypasses the
-          additive-only contract on the Refresh sweep so the end user
-          can re-capture a stale token without overwriting other
-          users' stored tokens. Requires sudo-style elevation. */}
+      {/* Per-user "Sync this user" button. Captures a missing or
+          stale auth_token for this single user without sweeping the
+          rest of the server. Operator role only - no elevation gate,
+          because the action is no more destructive than the bulk
+          "Sync users from server" button (which is also
+          operator-only). For the fully-destructive "rotate a
+          known-leaked token" case the existing elevation-gated
+          Rotate-token button below is the right choice. */}
+      <div className="panel" style={{ paddingTop: 8, paddingBottom: 8 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+          <span className="help" style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+            Capture or refresh this user's per-user auth token from
+            the live API. Scoped to this user only — does not touch
+            anyone else on the server. Use after saving a new PIN /
+            password to immediately try AuthenticateByName for this
+            user.
+          </span>
+          <button
+            onClick={syncThisUser}
+            disabled={syncingThisUser}
+            title="Capture a per-user auth_token for THIS user only. Other users on the server are untouched."
+          >
+            {syncingThisUser ? 'Syncing…' : 'Sync this user'}
+          </button>
+        </div>
+      </div>
+
+      {/* Per-user manual token rotation. Bypasses the additive-only
+          contract on the Refresh sweep so the user can re-capture a
+          stale token without overwriting other users' stored tokens.
+          Requires sudo-style elevation. */}
       <div className="panel" style={{ paddingTop: 8, paddingBottom: 8 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
           <span className="help" style={{ color: 'var(--text-dim)', fontSize: 12 }}>
@@ -939,32 +1117,120 @@ function UserDetailView({
         </div>
       </div>
 
-      {user.service_type === 'plex' && (
-        <CredentialSection
-          title="Plex Home PIN"
-          tip="Numeric PIN protecting this managed user's profile. Required to access PIN-scoped content; PR-12 uses this for the pre-flight check before jobs run."
-          stored={user.has_pin}
-          draft={pinDraft}
-          setDraft={setPinDraft}
-          onSave={() => setPendingWrite({ kind: 'save_pin', plex_home_pin: pinDraft })}
-          onClear={() => setPendingWrite({ kind: 'clear_pin' })}
-          onSaveGlobal={() => setPendingWrite({ kind: 'global_save_pin', plex_home_pin: pinDraft })}
-          inputType="password"
-          inputMode="numeric"
-          pattern="[0-9]*"
+      {/* Credential reveal. Root-admin only; the button is hidden for
+          every other role so the forensic trail is shorter. The modal
+          handles its own three-gate auth and 30-second auto-hide on
+          disclosure. */}
+      {auth.effectiveRole === 'root_admin' && (
+        <div className="panel" style={{ paddingTop: 8, paddingBottom: 8 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+            <span className="help" style={{ color: 'var(--text-dim)', fontSize: 12 }}>
+              Decrypt + display this user's stored auth token + Plex Home PIN
+              in cleartext for 30 seconds. Requires the database admin
+              credentials AND your own root admin password. Every reveal is
+              recorded to the database access log.
+            </span>
+            <button
+              type="button"
+              onClick={() => setRevealOpen(true)}
+              className="danger"
+              title="Root admin only. Reveals stored credentials in cleartext for 30 seconds."
+            >
+              Reveal credentials
+            </button>
+          </div>
+        </div>
+      )}
+      {revealOpen && (
+        <RevealCredentialsModal
+          serverId={serverId}
+          username={username}
+          displayName={user.display_name}
+          onClose={() => setRevealOpen(false)}
         />
+      )}
+
+      {/* ONE PIN section, config driven by the row's backend. Only
+          the title + the underlying payload kind change per backend;
+          the input control, the draft state, the checkbox semantics,
+          the cross-backend propagation behaviour, and the validation
+          rules are identical, so we render one ``CredentialSection``
+          and feed it the per-backend config. */}
+      {(user.service_type === 'plex' || user.service_type === 'emby' || user.service_type === 'jellyfin') && (
+        (() => {
+          const svc = user.service_type;
+          const cfg = svc === 'plex'
+            ? {
+                title: 'Plex Home PIN',
+                tip: "Numeric PIN protecting this managed user's profile. Required to access PIN-scoped content; it is also used for the pre-flight check before jobs run.",
+                stored: user.has_pin,
+                numeric: true,
+              }
+            : svc === 'emby'
+            ? {
+                title: 'Emby EasyPassword (PIN)',
+                tip: "Short Emby EasyPassword for this user. Encrypted at rest; the operator stores it once here for future per-user impersonation work + identity-link propagation.",
+                stored: user.has_emby_pin,
+                numeric: false,
+              }
+            : {
+                title: 'Jellyfin EasyPassword (PIN)',
+                tip: "Short Jellyfin EasyPassword for this user. Encrypted at rest; the operator stores it once here for future per-user impersonation work + identity-link propagation.",
+                stored: user.has_jellyfin_pin,
+                numeric: false,
+              };
+          const makeSave = (cross_backend: boolean): WritePayload =>
+            svc === 'plex'
+              ? { kind: 'save_pin', plex_home_pin: pinDraft, ...(cross_backend ? { cross_backend: true } : {}) }
+              : svc === 'emby'
+              ? { kind: 'save_emby_pin', emby_easy_pin: pinDraft, ...(cross_backend ? { cross_backend: true } : {}) }
+              : { kind: 'save_jellyfin_pin', jellyfin_easy_pin: pinDraft, ...(cross_backend ? { cross_backend: true } : {}) };
+          const makeClear = (): WritePayload =>
+            svc === 'plex' ? { kind: 'clear_pin' }
+              : svc === 'emby' ? { kind: 'clear_emby_pin' }
+              : { kind: 'clear_jellyfin_pin' };
+          const makeGlobal = (every_backend: boolean): WritePayload =>
+            svc === 'plex'
+              ? { kind: 'global_save_pin', plex_home_pin: pinDraft, ...(every_backend ? { every_backend: true } : {}) }
+              : svc === 'emby'
+              ? { kind: 'global_save_emby_pin', emby_easy_pin: pinDraft, ...(every_backend ? { every_backend: true } : {}) }
+              : { kind: 'global_save_jellyfin_pin', jellyfin_easy_pin: pinDraft, ...(every_backend ? { every_backend: true } : {}) };
+          return (
+            <CredentialSection
+              title={cfg.title}
+              tip={cfg.tip}
+              stored={cfg.stored}
+              draft={pinDraft}
+              setDraft={setPinDraft}
+              onSave={() => setPendingWrite(makeSave(false))}
+              onClear={() => setPendingWrite(makeClear())}
+              onSaveGlobal={() => setPendingWrite(makeGlobal(false))}
+              onSaveGlobalEveryBackend={() => setPendingWrite(makeGlobal(true))}
+              onSaveAcrossBackends={
+                crossBackendLinkCount > 0
+                  ? () => setPendingWrite(makeSave(true))
+                  : undefined
+              }
+              crossBackendLinkCount={crossBackendLinkCount}
+              inputType="password"
+              inputMode={cfg.numeric ? 'numeric' : undefined}
+              pattern={cfg.numeric ? '[0-9]*' : undefined}
+            />
+          );
+        })()
       )}
 
       {(user.service_type === 'emby' || user.service_type === 'jellyfin') && (
         <CredentialSection
           title="Service password"
-          tip="Login password for this user on the Emby / Jellyfin server. Encrypted at rest; used by the engine to authenticate per-user calls."
+          tip="Full login password for this user on the Emby / Jellyfin server (distinct from the short EasyPassword/PIN above). Encrypted at rest; used by the engine to authenticate per-user calls."
           stored={user.has_password}
           draft={passwordDraft}
           setDraft={setPasswordDraft}
           onSave={() => setPendingWrite({ kind: 'save_password', service_password: passwordDraft })}
           onClear={() => setPendingWrite({ kind: 'clear_password' })}
           onSaveGlobal={() => setPendingWrite({ kind: 'global_save_password', service_password: passwordDraft })}
+          onSaveGlobalEveryBackend={() => setPendingWrite({ kind: 'global_save_password', service_password: passwordDraft, every_backend: true })}
           inputType="password"
         />
       )}
@@ -1056,11 +1322,11 @@ function UserDetailView({
         />
       )}
 
-      {/* Plan[RUN-JOB-UI] follow-up: per-user copy-to-destination
-          panel. Toggled by the button below; opens inline so the
-          end user does not lose the detail-view context. The panel
-          drives /api/users/copy_to_destination and, when "Run
-          automatic transfer" is checked, also submits a follow-up
+      {/* Per-user copy-to-destination panel. Toggled by the button
+          below; opens inline so the user does not lose the
+          detail-view context. The panel drives
+          /api/users/copy_to_destination and, when "Run automatic
+          transfer" is checked, also submits a follow-up
           /api/job/direct constrained to this single user. */}
       {user && (
         <div className="panel" style={{ marginTop: 12 }}>
@@ -1085,7 +1351,16 @@ function UserDetailView({
             <UserCopyPanel
               sourceServer={
                 allServers.find((s) => s.id === serverId) || {
-                  id: serverId, name: serverId, service_type: 'plex',
+                  id: serverId, name: serverId,
+                  // Server IDs carry the backend prefix
+                  // (emby_/jellyfin_/plex_) since the SERVER-UID
+                  // migration, so derive service_type from the id
+                  // when the registry lookup misses. Hardcoding
+                  // 'plex' here would mislabel Emby/Jellyfin servers
+                  // in fallback panels.
+                  service_type: serverId.startsWith('emby_') ? 'emby'
+                              : serverId.startsWith('jellyfin_') ? 'jellyfin'
+                              : 'plex',
                 } as ServerView
               }
               sourceUser={user}
@@ -1097,14 +1372,14 @@ function UserDetailView({
         </div>
       )}
 
-      {/* Plan[RUN-JOB-UI] follow-up: scoped identity-map panel.
-          When inside a user detail view, the mapping list is
-          filtered to rows involving this user; the add-form's
-          server A + user A are locked to the viewed user. End user
-          only picks server B and (optionally) edits user B if the
-          target uses a different name. The global mapping panel
-          at the bottom of the User Management page stays unscoped
-          for cases where the end user wants the full list. */}
+      {/* Scoped identity-map panel. When inside a user detail view,
+          the mapping list is filtered to rows involving this user;
+          the add-form's server A + user A are locked to the viewed
+          user. The user only picks server B and (optionally) edits
+          user B if the target uses a different name. The global
+          mapping panel at the bottom of the User Management page
+          stays unscoped for cases where the user wants the full
+          list. */}
       {user && (
         <div style={{ marginTop: 12 }}>
           <UserMappingPanel
@@ -1112,7 +1387,16 @@ function UserDetailView({
             scopedTo={{
               server:
                 allServers.find((s) => s.id === serverId) || {
-                  id: serverId, name: serverId, service_type: 'plex',
+                  id: serverId, name: serverId,
+                  // Server IDs carry the backend prefix
+                  // (emby_/jellyfin_/plex_) since the SERVER-UID
+                  // migration, so derive service_type from the id
+                  // when the registry lookup misses. Hardcoding
+                  // 'plex' here would mislabel Emby/Jellyfin servers
+                  // in fallback panels.
+                  service_type: serverId.startsWith('emby_') ? 'emby'
+                              : serverId.startsWith('jellyfin_') ? 'jellyfin'
+                              : 'plex',
                 } as ServerView,
               userHandle: username,
               userDisplayName: user.display_name || undefined,
@@ -1130,17 +1414,51 @@ function describeAction(p: WritePayload): string {
     case 'save_display':    return p.display_name === null ? 'Clear display name' : 'Save display name';
     case 'save_token':      return 'Save auth token';
     case 'clear_token':     return 'Clear auth token';
-    case 'save_pin':        return 'Save Plex Home PIN';
-    case 'clear_pin':       return 'Clear Plex Home PIN';
+    case 'save_pin':        return p.cross_backend
+      ? 'Save Plex Home PIN (apply across backends)'
+      : 'Save Plex Home PIN';
+    case 'clear_pin':       return p.cross_backend
+      ? 'Clear Plex Home PIN (apply across backends)'
+      : 'Clear Plex Home PIN';
+    case 'save_emby_pin':   return p.cross_backend
+      ? 'Save Emby EasyPassword (apply across backends)'
+      : 'Save Emby EasyPassword';
+    case 'clear_emby_pin':  return p.cross_backend
+      ? 'Clear Emby EasyPassword (apply across backends)'
+      : 'Clear Emby EasyPassword';
+    case 'save_jellyfin_pin': return p.cross_backend
+      ? 'Save Jellyfin EasyPassword (apply across backends)'
+      : 'Save Jellyfin EasyPassword';
+    case 'clear_jellyfin_pin': return p.cross_backend
+      ? 'Clear Jellyfin EasyPassword (apply across backends)'
+      : 'Clear Jellyfin EasyPassword';
     case 'save_password':       return 'Save service password';
     case 'clear_password':      return 'Clear service password';
     case 'hide_server':         return 'Hide user on this server';
     case 'hide_global':         return 'Hide username globally';
     case 'unhide_server':       return 'Unhide user on this server';
     case 'unhide_global':       return 'Remove global tombstone';
-    case 'global_save_token':   return 'Save auth token on every server';
-    case 'global_save_pin':     return 'Save Plex Home PIN on every server';
-    case 'global_save_password':return 'Save service password on every server';
+    case 'global_save_token':   return p.every_backend
+      ? 'Save auth token on every server (all backends)'
+      : 'Save auth token on every server (same backend)';
+    case 'global_save_pin':     return (
+      (p.every_backend ? 'Save Plex Home PIN on every server (all backends)'
+                       : 'Save Plex Home PIN on every server (same backend)')
+      + (p.cross_backend ? ' (apply across backends via identity map)' : '')
+    );
+    case 'global_save_emby_pin': return (
+      (p.every_backend ? 'Save Emby EasyPassword on every server (all backends)'
+                       : 'Save Emby EasyPassword on every server (same backend)')
+      + (p.cross_backend ? ' (apply across backends via identity map)' : '')
+    );
+    case 'global_save_jellyfin_pin': return (
+      (p.every_backend ? 'Save Jellyfin EasyPassword on every server (all backends)'
+                       : 'Save Jellyfin EasyPassword on every server (same backend)')
+      + (p.cross_backend ? ' (apply across backends via identity map)' : '')
+    );
+    case 'global_save_password':return p.every_backend
+      ? 'Save service password on every server (all backends)'
+      : 'Save service password on every server (same backend)';
   }
 }
 
@@ -1149,7 +1467,9 @@ function describeAction(p: WritePayload): string {
 
 function CredentialSection({
   title, tip, stored, draft, setDraft,
-  onSave, onClear, onSaveGlobal, inputType, inputMode, pattern,
+  onSave, onClear, onSaveGlobal, onSaveGlobalEveryBackend,
+  onSaveAcrossBackends, crossBackendLinkCount,
+  inputType, inputMode, pattern,
 }: {
   title: string;
   tip: string;
@@ -1158,17 +1478,62 @@ function CredentialSection({
   setDraft: (v: string) => void;
   onSave: () => void;
   onClear: () => void;
-  // PR-13 fix #2 - optional global-apply hook. When provided, the
-  // section renders an "Apply to every server where this user
-  // exists" checkbox. Checking it flips the Save button's callback
-  // from ``onSave`` (this server only) to ``onSaveGlobal`` (walk the
-  // registry).
+  // Optional global-apply hook. When provided, the section renders
+  // an "Apply to every server where this user exists" checkbox.
+  // Checking it flips the Save button's callback from ``onSave``
+  // (this server only) to ``onSaveGlobal`` (walk the registry).
+  //
+  // The default sweep is scoped to the origin row's backend. A
+  // second sub-toggle "Include other backends" promotes the sweep to
+  // every-backend by dispatching ``onSaveGlobalEveryBackend``
+  // instead. The two paths are kept as separate callbacks so the
+  // WritePayload kind carries ``every_backend: true`` explicitly when
+  // the operator opts in.
   onSaveGlobal?: () => void;
+  onSaveGlobalEveryBackend?: () => void;
+  // Optional cross-backend hook. When provided, the section renders
+  // a second "Save & apply across backends" button next to the
+  // default Save. The second button is shown only on PIN sections
+  // AND only when the user has at least one identity_map link to a
+  // row on a different backend (the operator explicitly linked a
+  // Plex managed user to an Emby / Jellyfin row as the same human).
+  // Pressing it triggers cross-backend PIN propagation downstream in
+  // the backend.
+  onSaveAcrossBackends?: () => void;
+  crossBackendLinkCount?: number;
   inputType: 'text' | 'password';
   inputMode?: 'numeric' | 'text';
   pattern?: string;
 }) {
   const [globalApply, setGlobalApply] = useState(false);
+  // Both checkboxes are visible at the same time;
+  // ``includeOtherBackends`` is the cross-backend signal regardless
+  // of whether ``globalApply`` is on. The single Save button picks
+  // its action + label from the combined state. ``onSaveAcrossBackends``
+  // only fires when the operator can reach a cross-backend identity
+  // link from this row (count > 0); the checkbox is hidden otherwise.
+  const [includeOtherBackends, setIncludeOtherBackends] = useState(false);
+  const hasCrossBackendOption = !!onSaveAcrossBackends && (crossBackendLinkCount ?? 0) > 0;
+
+  // Single-save-button action + label, decided from the four
+  // checkbox-combination states.
+  const usingEveryBackendSweep = globalApply && includeOtherBackends && !!onSaveGlobalEveryBackend;
+  const usingSameBackendSweep = globalApply && !usingEveryBackendSweep && !!onSaveGlobal;
+  const usingCrossBackendOnly = !globalApply && includeOtherBackends && !!onSaveAcrossBackends;
+  const saveAction = usingEveryBackendSweep
+    ? onSaveGlobalEveryBackend!
+    : usingSameBackendSweep
+    ? onSaveGlobal!
+    : usingCrossBackendOnly
+    ? onSaveAcrossBackends!
+    : onSave;
+  const saveLabel = usingEveryBackendSweep
+    ? 'Save on every server (all backends)'
+    : usingSameBackendSweep
+    ? 'Save on every server (same backend)'
+    : usingCrossBackendOnly
+    ? 'Save & apply across backends'
+    : 'Save';
   return (
     <div className="panel">
       <h2>
@@ -1198,12 +1563,33 @@ function CredentialSection({
           />
           <span>Apply to every server where this user exists</span>
           <span className="help">
-            Writes the same value into every registered server's
-            <code> managed_users</code> row matching this username.
-            Use this when the same Plex Home user has the same PIN /
-            password / token across multiple servers. Backend walks
-            the server registry; servers where the username has no
-            row yet are skipped (run a sync first to populate them).
+            Walks the server registry and writes the same value into
+            every <code>managed_users</code> row matching this
+            username. By default the sweep is scoped to the same
+            backend as the current row; check &quot;Include other
+            backends&quot; below to extend it across backends. Rows
+            that don&apos;t exist yet on a server are skipped (run a
+            sync there first to populate them).
+          </span>
+        </label>
+      )}
+      {hasCrossBackendOption && (
+        <label className="switch" style={{ marginTop: 4 }}>
+          <input
+            type="checkbox"
+            checked={includeOtherBackends}
+            onChange={(e) => setIncludeOtherBackends(e.target.checked)}
+          />
+          <span>Include other backends</span>
+          <span className="help">
+            Extends the write across backends for the
+            {' '}{crossBackendLinkCount} identity-linked
+            {(crossBackendLinkCount ?? 0) === 1 ? ' account' : ' accounts'}
+            {' '}on Emby/Jellyfin/Plex. Without &quot;Apply to every
+            server&quot;, this acts on identity-linked rows only.
+            With both checked, the same-backend sweep is extended to
+            every backend; each row receives the value into its
+            backend-natural PIN column.
           </span>
         </label>
       )}
@@ -1211,103 +1597,15 @@ function CredentialSection({
         <button
           className="primary"
           disabled={!draft}
-          onClick={globalApply && onSaveGlobal ? onSaveGlobal : onSave}
+          onClick={saveAction}
         >
-          {globalApply && onSaveGlobal ? 'Save on every server' : 'Save'}
+          {saveLabel}
         </button>
         {stored && (
           <button className="danger" onClick={onClear}>
             Clear stored value
           </button>
         )}
-      </div>
-    </div>
-  );
-}
-
-
-// ── DB admin auth modal ─────────────────────────────────────────────────────
-
-function DbAdminAuthModal({
-  action,
-  onCancel,
-  onSubmit,
-}: {
-  action: string;
-  onCancel: () => void;
-  onSubmit: (creds: { username: string; password: string }) => Promise<void>;
-}) {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const canSubmit = !submitting && username.length > 0 && password.length > 0;
-
-  const submit = async () => {
-    if (!canSubmit) return;
-    setError(null);
-    setSubmitting(true);
-    try {
-      await onSubmit({ username, password });
-      // onSubmit closes the modal on success; we leave state here so
-      // if the caller decides to keep the modal open (e.g. for a
-      // multi-step flow) the user doesn't lose their typing.
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <div
-      onClick={onCancel}
-      style={{
-        position: 'fixed', inset: 0,
-        background: 'rgba(0,0,0,0.55)',
-        zIndex: 1000,
-        display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
-        paddingTop: '8vh',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="panel"
-        style={{ width: 480, maxWidth: '92vw' }}
-      >
-        <h2 style={{ marginTop: 0 }}>Confirm with database admin</h2>
-        <span className="help" style={{ display: 'block', color: 'var(--text-dim)', fontSize: 12, marginBottom: 12 }}>
-          <strong>{action}</strong> requires Database Admin Account
-          credentials. Set up or rotate these under
-          Settings → Account Management → Database Admin Account.
-        </span>
-        {error && <div className="banner error">{error}</div>}
-        <label className="field">
-          <span className="label">Database admin username</span>
-          <input
-            type="text"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            autoComplete="username"
-            autoFocus
-          />
-        </label>
-        <label className="field">
-          <span className="label">Database admin password</span>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="current-password"
-          />
-        </label>
-        <div className="row-buttons" style={{ marginTop: 12 }}>
-          <button className="primary" disabled={!canSubmit} onClick={submit}>
-            {submitting ? 'Confirming…' : 'Confirm'}
-          </button>
-          <button onClick={onCancel} disabled={submitting}>Cancel</button>
-        </div>
       </div>
     </div>
   );
@@ -1335,27 +1633,16 @@ function IdentityLinksPanel({
   user: ServerManagedUser;
   allServers: ServerView[];
 }) {
-  const [links, setLinks] = useState<UserIdentityMap[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setError(null);
-    setLinks(null);
-    api.listUserIdentityMaps()
-      .then((r) => {
-        if (cancelled) return;
-        // Filter to rows that name this (server, user) on either side.
-        const matches = (r.maps || []).filter(
-          (m) =>
-            (m.server_a_id === serverId && (m.user_a_handle || '').toLowerCase() === username.toLowerCase())
-            || (m.server_b_id === serverId && (m.user_b_handle || '').toLowerCase() === username.toLowerCase())
-        );
-        setLinks(matches);
-      })
-      .catch((e) => { if (!cancelled) setError(String(e)); });
-    return () => { cancelled = true; };
-  }, [serverId, username]);
+  // Filter to rows that name this (server, user) on either side.
+  const { data: links, error } = useResourceQuery<UserIdentityMap[] | null>(
+    () => api.listUserIdentityMaps().then((r) => (r.maps || []).filter(
+      (m) =>
+        (m.server_a_id === serverId && (m.user_a_handle || '').toLowerCase() === username.toLowerCase())
+        || (m.server_b_id === serverId && (m.user_b_handle || '').toLowerCase() === username.toLowerCase()),
+    )),
+    [serverId, username],
+    null,
+  );
 
   const ownUuid = user.app_user_uuid;
   const serverNameById = (sid: string | null | undefined): string => {

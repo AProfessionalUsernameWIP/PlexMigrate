@@ -1,6 +1,6 @@
-// Plan[RUN-JOB-UI] follow-up: standalone cross-server identity
-// mapping panel. Surfaces under Servers > User Management as a
-// separate section beneath the per-server user list.
+// Standalone cross-server identity mapping panel. Surfaces under
+// Servers > User Management as a separate section beneath the
+// per-server user list.
 //
 // Two responsibilities:
 //   1. List every identity-map row across all registered servers,
@@ -45,6 +45,7 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
   const [maps, setMaps] = useState<UserIdentityMap[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
 
   // Add-form state. When scopedTo is set, server A + handle A are
   // locked to the viewed user's context. Handle B is intentionally
@@ -67,6 +68,13 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
   // demand when the end user picks a server; cache the result so
   // they can switch back without re-fetching.
   const [userCache, setUserCache] = useState<Record<string, ServerManagedUser[]>>({});
+  // FEUI-S-15: server ids whose managed-user fetch FAILED. The handle
+  // picker falls back to a free-text input when the user list is
+  // empty; that is legitimate for a server with no managed users,
+  // but when the fetch errored the fallback is a silent downgrade
+  // from a verified dropdown - so the free-text input flags itself
+  // as unverified for these servers.
+  const [userFetchFailed, setUserFetchFailed] = useState<Set<string>>(new Set());
 
   // Load identity maps on mount + refresh button.
   const refresh = async () => {
@@ -107,8 +115,18 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
     try {
       const r = await api.listServerManagedUsers(server_id);
       setUserCache((prev) => ({ ...prev, [server_id]: r.users || [] }));
+      setUserFetchFailed((prev) => {
+        if (!prev.has(server_id)) return prev;
+        const next = new Set(prev);
+        next.delete(server_id);
+        return next;
+      });
     } catch {
+      // FEUI-S-15: record the failure so the free-text fallback can
+      // tell the operator the handle is not being verified (rather
+      // than silently looking like a server with no managed users).
       setUserCache((prev) => ({ ...prev, [server_id]: [] }));
+      setUserFetchFailed((prev) => new Set(prev).add(server_id));
     }
   };
   useEffect(() => { void fetchUsersFor(addServerA); }, [addServerA]);
@@ -132,6 +150,11 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
     if (!scopedTo) return maps;
     const sId = scopedTo.server.id;
     const handle = scopedTo.userHandle;
+    // An empty handle can't identify a user: it would match every
+    // unresolved row (handle "" === handle "") and splice unrelated
+    // mappings into the scoped view. With no usable handle, show the
+    // full list rather than a bogus filtered one.
+    if (!handle) return maps;
     return maps.filter((m) =>
       (m.server_a_id === sId && m.user_a_handle === handle)
       || (m.server_b_id === sId && m.user_b_handle === handle),
@@ -198,15 +221,17 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
             : 'User identity mappings'}
         </h3>
         <div style={{ display: 'flex', gap: 6 }}>
-          {/* USER-MGMT-IDENTITY-AUDIT follow-on: explicit end user
-              trigger for the backend_user_id auto-link helper. The
-              helper also fires automatically after every
-              managed-users sync; this button is for "I just added a
-              manual mapping" or "I just registered a new server and
-              want immediate cross-server detection" moments. */}
+          {/* Explicit end user trigger for the backend_user_id
+              auto-link helper. The helper also fires automatically
+              after every managed-users sync; this button is for "I
+              just added a manual mapping" or "I just registered a new
+              server and want immediate cross-server detection"
+              moments. */}
           <button
             type="button"
             onClick={async () => {
+              setError(null);
+              setInfo(null);
               try {
                 const r = await api.rerunAutoLinkIdentityMap();
                 const msg = (r.pairs_written > 0)
@@ -214,12 +239,10 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
                   : (r.pairs_skipped_duplicate > 0)
                     ? `Auto-link found ${r.pairs_skipped_duplicate} pair${r.pairs_skipped_duplicate === 1 ? '' : 's'} already mapped.`
                     : 'No cross-server duplicates detected.';
-                // eslint-disable-next-line no-alert
-                window.alert(msg);
-                refresh();
+                await refresh();
+                setInfo(msg);
               } catch (e) {
-                // eslint-disable-next-line no-alert
-                window.alert(`Auto-link failed: ${String(e)}`);
+                setError(`Auto-link failed: ${String(e)}`);
               }
             }}
             title="Re-run the backend_user_id auto-link helper. Normally fires on every sync; click to force a rerun now."
@@ -266,6 +289,19 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
           marginBottom: 10,
         }}>
           {error}
+        </div>
+      )}
+
+      {info && (
+        <div style={{
+          padding: '6px 10px',
+          background: 'rgba(74, 122, 252, 0.10)',
+          border: '1px solid var(--accent, #4a7afc)',
+          borderRadius: 4,
+          fontSize: 12,
+          marginBottom: 10,
+        }}>
+          {info}
         </div>
       )}
 
@@ -384,13 +420,20 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
                   ))}
                 </select>
               ) : (
-                <input
-                  type="text"
-                  value={addHandleA}
-                  onChange={(e) => setAddHandleA(e.target.value)}
-                  placeholder="username (free-text)"
-                  style={{ width: '100%', fontSize: 12 }}
-                />
+                <>
+                  <input
+                    type="text"
+                    value={addHandleA}
+                    onChange={(e) => setAddHandleA(e.target.value)}
+                    placeholder="username (free-text)"
+                    style={{ width: '100%', fontSize: 12 }}
+                  />
+                  {userFetchFailed.has(addServerA) && (
+                    <div style={{ fontSize: 10, color: '#d9a441', marginTop: 2 }}>
+                      ⚠ Couldn't load this server's users — handle is not verified.
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>
@@ -427,13 +470,20 @@ export function UserMappingPanel({ allServers, scopedTo }: UserMappingPanelProps
                   ))}
                 </select>
               ) : (
-                <input
-                  type="text"
-                  value={addHandleB}
-                  onChange={(e) => setAddHandleB(e.target.value)}
-                  placeholder="username (free-text)"
-                  style={{ width: '100%', fontSize: 12 }}
-                />
+                <>
+                  <input
+                    type="text"
+                    value={addHandleB}
+                    onChange={(e) => setAddHandleB(e.target.value)}
+                    placeholder="username (free-text)"
+                    style={{ width: '100%', fontSize: 12 }}
+                  />
+                  {userFetchFailed.has(addServerB) && (
+                    <div style={{ fontSize: 10, color: '#d9a441', marginTop: 2 }}>
+                      ⚠ Couldn't load this server's users — handle is not verified.
+                    </div>
+                  )}
+                </>
               )}
             </div>
           </div>

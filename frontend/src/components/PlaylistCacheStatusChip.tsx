@@ -4,8 +4,8 @@
 // fresh (green), aged but usable (yellow), or stale (red).
 //
 // Tooltips give the absolute timestamp + the end user-tunable
-// thresholds for context (defaults from Plan[PLAYLIST-MANAGEMENT]
-// section 8a: 30m general / 15m snapshot threshold / 12h invalidate).
+// thresholds for context (defaults: 30m general / 15m snapshot
+// threshold / 12h invalidate).
 
 import type { PlaylistCacheStatus } from '../api';
 
