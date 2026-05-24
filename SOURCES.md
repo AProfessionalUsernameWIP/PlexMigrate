@@ -1,13 +1,13 @@
-# PlexMigrate — Documentation Sources
+# Hestia-MediaManager - Documentation Sources
 
 This file records every external resource, API documentation page, library
 reference, and concept source that informed decisions made in each version.
 
-Append only — never truncate or overwrite previous entries.
+Append only - never truncate or overwrite previous entries.
 
 ---
 
-## Sources — v0.2.0 — 2026-05-09
+## Sources - v0.2.0 - 2026-05-09
 
 ### What These Sources Cover
 
@@ -17,14 +17,14 @@ Covers the initial build (v0.1.0) and the v0.2.0 additive merge redesign. Librar
 |---|---|---|---|---|
 | 1 | python-plexapi documentation | https://python-plexapi.readthedocs.io/en/latest/ | Full API reference for PlexServer, LibrarySection, Playlist, Collection, and media objects | Used to identify correct method calls: `getByGuid()`, `markWatched()`, `Playlist.create()`, `Playlist.addItems()`, `Collection.create()`, `Collection.addItems()`, `section.search()`, `section.collections()`, `server.playlists()` |
 | 2 | python-plexapi GitHub repository | https://github.com/pkkid/python-plexapi | Source code for PlexServer, Playlist, and Collection classes | Consulted to verify that `addItems()` exists on both Playlist and Collection in plexapi >= 4.0, and to understand what `markWatched()` does internally (it calls `/:/scrobble`) |
-| 3 | Python `concurrent.futures` documentation | https://docs.python.org/3/library/concurrent.futures.html | How to create and manage thread pools; `ThreadPoolExecutor`, `as_completed()`, `Future.exception()` | Used to design the multi-stage parallel pipeline for library export and the concurrent watch history import |
-| 4 | Python `queue.Queue` documentation | https://docs.python.org/3/library/queue.html | Thread-safe queue for producer-consumer patterns; `put()`, `get()`, `Empty` exception | Used to pass progress signals from export worker threads to the tqdm progress-watcher thread |
-| 5 | Python `threading` documentation | https://docs.python.org/3/library/threading.html | `threading.Lock` for protecting shared mutable state; `threading.Thread` with `daemon=True` | Used for `_log_lock` (protects `_lib_successes`, `_lib_failures`, `_failure_categories`) and for the progress-watcher daemon thread in `run_export()` |
+| 3 | Python `concurrent.futures` documentation | https://docs.python.org/3/library/concurrent.futures.html | How to create and manage thread pools; `ThreadPoolExecutor`, `as_completed()`, `Future.exception()` | Used to design the multi-stage parallel pipeline for library snapshot and the concurrent watch history import |
+| 4 | Python `queue.Queue` documentation | https://docs.python.org/3/library/queue.html | Thread-safe queue for producer-consumer patterns; `put()`, `get()`, `Empty` exception | Used to pass progress signals from snapshot worker threads to the tqdm progress-watcher thread |
+| 5 | Python `threading` documentation | https://docs.python.org/3/library/threading.html | `threading.Lock` for protecting shared mutable state; `threading.Thread` with `daemon=True` | Used for `_log_lock` (protects `_lib_successes`, `_lib_failures`, `_failure_categories`) and for the progress-watcher daemon thread in `run_snapshot()` |
 | 6 | Python `logging` documentation | https://docs.python.org/3/library/logging.html | How to configure handlers, formatters, and log levels; `FileHandler`, `StreamHandler` | Used to build the shared logger in `setup_logging()` with both a file handler (always DEBUG) and a console handler (INFO or DEBUG based on --verbose) |
 | 7 | Python `argparse` documentation | https://docs.python.org/3/library/argparse.html | How to define flags, handle `nargs`, `action="store_true"`, `dest=`, and mutually exclusive arguments | Used to build the CLI in `build_parser()` |
 | 8 | Python `pathlib.Path` documentation | https://docs.python.org/3/library/pathlib.html | Cross-platform filesystem path handling; `mkdir(parents=True, exist_ok=True)`, `Path.exists()` | Used throughout for creating directories and checking file existence without OS-specific path separators |
 | 9 | MusicBrainz Identifier documentation | https://musicbrainz.org/doc/MusicBrainz_Identifier | What MusicBrainz IDs are, how they are assigned, and why they are globally unique | Used to explain why `plex://` and `mb://` GUIDs are portable across servers while `local://` GUIDs are not |
-| 10 | tqdm documentation | https://tqdm.github.io/ | Progress bar API; `tqdm(total=N)`, `pbar.update()`, `leave=False` | Used for live progress bars during export and import operations |
+| 10 | tqdm documentation | https://tqdm.github.io/ | Progress bar API; `tqdm(total=N)`, `pbar.update()`, `leave=False` | Used for live progress bars during snapshot and import operations |
 | 11 | rich library documentation | https://rich.readthedocs.io/en/stable/ | `Console`, `Table`, `Prompt.ask()` for formatted terminal output | Used for the library discovery table, mode prompt, and colour-coded status messages |
 | 12 | requests library documentation | https://requests.readthedocs.io/en/latest/ | `requests.get()`, `requests.put()`, `params=`, `timeout=` | Used for direct Plex HTTP API calls that python-plexapi does not expose as methods: `/:/scrobble`, `/:/progress`, `/:/rate` |
 | 13 | Plex `/:/scrobble` endpoint | [no specific public documentation URL] | Marks an item as watched, increments viewCount by 1, sets isWatched=True | Used in `_scrobble()` to add views one at a time as part of the delta merge |
@@ -35,27 +35,27 @@ Covers the initial build (v0.1.0) and the v0.2.0 additive merge redesign. Librar
 
 ### Concept Explanations
 
-**python-plexapi**: A community Python library (not from Plex Inc.) that wraps Plex's HTTP API in Python objects. Instead of writing raw HTTP requests, you write `server.playlists()` or `item.markWatched()`. PlexMigrate talks to Plex through it whenever possible and falls back to raw HTTP only for endpoints the library doesn't expose (`/:/rate`, `/:/progress`).
+**python-plexapi**: A community Python library (not from Plex Inc.) that wraps Plex's HTTP API in Python objects. Instead of writing raw HTTP requests, you write `server.playlists()` or `item.markWatched()`. Hestia-MediaManager talks to Plex through it whenever possible and falls back to raw HTTP only for endpoints the library doesn't expose (`/:/rate`, `/:/progress`).
 
 **MusicBrainz GUIDs (the `mb://` prefix)**: MusicBrainz is a free, open music encyclopedia where every song, album, and artist has a globally unique ID. When Plex matches your music library to MusicBrainz, it stores that ID alongside each track. The ID is the same everywhere in the world for that track, so we can use it to find the same track on a different Plex server. Tracks that haven't been matched to MusicBrainz get a `local://` GUID instead. Those IDs are only meaningful on the one server, which makes cross-server matching hard. The README's "Fix Match" advice exists for that reason.
 
 **Plex GUIDs (the `plex://` prefix)**: Plex maintains its own metadata database (Plex Media Database, or PMDb) that assigns unique IDs to movies, TV shows, and music. Like MusicBrainz IDs for music, `plex://` GUIDs are stable across different Plex servers for the same item, so they're reliable for cross-server matching.
 
-**ThreadPoolExecutor**: Python runs one piece of code at a time by default. A ThreadPoolExecutor creates a pool of worker threads that run tasks in parallel. It matters here because PlexMigrate spends most of its time waiting for Plex to respond to HTTP requests. While one thread waits, the others send their own requests. 8 threads might run 5–6× faster than serial execution even on a 4-core machine.
+**ThreadPoolExecutor**: Python runs one piece of code at a time by default. A ThreadPoolExecutor creates a pool of worker threads that run tasks in parallel. It matters here because Hestia-MediaManager spends most of its time waiting for Plex to respond to HTTP requests. While one thread waits, the others send their own requests. 8 threads might run 5–6× faster than serial execution even on a 4-core machine.
 
-**Producer-consumer pattern with `queue.Queue`**: In the export pipeline, producer threads (the ones doing library export work) put completion signals onto a shared queue. A single consumer thread reads the queue and updates the progress bar. The queue is a safe handoff point: producers don't need to know about the progress bar, the consumer doesn't need to know about export logic, and `queue.Queue` handles thread safety internally.
+**Producer-consumer pattern with `queue.Queue`**: In the snapshot pipeline, producer threads (the ones doing library snapshot work) put completion signals onto a shared queue. A single consumer thread reads the queue and updates the progress bar. The queue is a safe handoff point: producers don't need to know about the progress bar, the consumer doesn't need to know about snapshot logic, and `queue.Queue` handles thread safety internally.
 
-**`threading.Lock`**: When multiple threads update the same Python object at once, one might overwrite another's write. A `Lock` prevents that. Only one thread holds the lock at a time; any other thread that tries to acquire it waits until the current holder releases. In PlexMigrate, `_log_lock` protects `_lib_successes`, `_lib_failures`, and `_failure_categories` from concurrent writes.
+**`threading.Lock`**: When multiple threads update the same Python object at once, one might overwrite another's write. A `Lock` prevents that. Only one thread holds the lock at a time; any other thread that tries to acquire it waits until the current holder releases. In Hestia-MediaManager, `_log_lock` protects `_lib_successes`, `_lib_failures`, and `_failure_categories` from concurrent writes.
 
-**Plex `ratingKey`**: Every item in a Plex library has an integer ID called `ratingKey`, assigned locally by that server's database. The same movie might be ratingKey `1234` on the old server and `5678` on the new one, so PlexMigrate can't use ratingKey for cross-server matching. We use GUIDs and file paths instead. Within a single server session ratingKey is stable and unique, so we do use it for duplicate detection when merging playlists and collections on the target.
+**Plex `ratingKey`**: Every item in a Plex library has an integer ID called `ratingKey`, assigned locally by that server's database. The same movie might be ratingKey `1234` on the old server and `5678` on the new one, so Hestia-MediaManager can't use ratingKey for cross-server matching. We use GUIDs and file paths instead. Within a single server session ratingKey is stable and unique, so we do use it for duplicate detection when merging playlists and collections on the target.
 
-**`viewOffset` (resume position)**: When you pause a video, Plex saves your position in milliseconds as `viewOffset`. Next time you open the item, Plex offers to resume from where you left off. PlexMigrate restores this value via the `/:/progress` endpoint, but only when the target server has `viewOffset == 0`. That guard prevents overwriting a newer resume position the user has already set.
+**`viewOffset` (resume position)**: When you pause a video, Plex saves your position in milliseconds as `viewOffset`. Next time you open the item, Plex offers to resume from where you left off. Hestia-MediaManager restores this value via the `/:/progress` endpoint, but only when the target server has `viewOffset == 0`. That guard prevents overwriting a newer resume position the user has already set.
 
-**Set membership lookup in Python**: A Python `set` stores values in a hash table, so `value in my_set` is O(1) regardless of the set's size. `value in my_list` is O(n) because it scans every element. For playlist merge logic where hundreds of new items need checking against thousands of existing ones, the speed difference matters. PlexMigrate builds a `Set[int]` of existing `ratingKey` values once, then uses `item.ratingKey not in existing_keys` for each candidate.
+**Set membership lookup in Python**: A Python `set` stores values in a hash table, so `value in my_set` is O(1) regardless of the set's size. `value in my_list` is O(n) because it scans every element. For playlist merge logic where hundreds of new items need checking against thousands of existing ones, the speed difference matters. Hestia-MediaManager builds a `Set[int]` of existing `ratingKey` values once, then uses `item.ratingKey not in existing_keys` for each candidate.
 
 ---
 
-## Sources — v0.3.0 — 2026-05-09
+## Sources - v0.3.0 - 2026-05-09
 
 ### What These Sources Cover
 
@@ -63,28 +63,28 @@ Covers the four gap fixes introduced in v0.3.0. Documented here: libtype-aware l
 
 | # | Source Name | URL | What It Covers | How It Was Used |
 |---|---|---|---|---|
-| 18 | python-plexapi `MusicSection` documentation | https://python-plexapi.readthedocs.io/en/latest/modules/library.html#plexapi.library.MusicSection | `MusicSection.searchTracks()`, `MusicSection.searchAlbums()`, `MusicSection.searchArtists()` — methods for fetching music items at each level | Used to replace `section.search(unwatched=False)` (which is invalid for music) with `section.searchTracks()` in `export_watch_history` and `export_ratings` |
-| 19 | python-plexapi `ShowSection` documentation | https://python-plexapi.readthedocs.io/en/latest/modules/library.html#plexapi.library.ShowSection | `ShowSection.searchEpisodes()` — fetches all episodes across all shows in the section | Used to replace `section.search()` (which returns Show objects) with `section.searchEpisodes()` in `export_watch_history`, ensuring episode-level viewCount data is captured |
-| 20 | python-plexapi `MyPlexAccount` documentation | https://python-plexapi.readthedocs.io/en/latest/modules/myplex.html#plexapi.myplex.MyPlexAccount | `server.myPlexAccount()`, `account.users()`, `user.get_token(machineIdentifier)` — the API for enumerating home users and obtaining per-user auth tokens | Used to implement `get_home_users()`: enumerates managed users, retrieves a server-scoped token for each, and creates a `PlexServer` connection authenticated as that user |
-| 21 | python-plexapi `Playlist` source — `smart` attribute | https://github.com/pkkid/python-plexapi/blob/master/plexapi/playlist.py | `Playlist.smart` (bool) — True for smart (filter-based) playlists; `Playlist.content` (str) — the filter URL that defines the playlist's contents | Used in `serialize_playlist` to detect smart playlists, save the filter URL, and skip item iteration. Used in `import_playlists` to route smart playlists to the `smart_playlist_skipped` failure category |
-| 22 | Plex Media Server — Plex Home documentation | https://support.plex.tv/articles/203948776-managed-users/ | How Plex Home managed users work: each user is a separate profile with independent watch history, ratings, and playlists; each has their own auth token | Used to understand the data isolation model: admin and each home user have separate viewCounts and userRatings even for the same media file. Informed the decision to export and import per-user data independently |
-| 23 | Python `enumerate()` documentation | https://docs.python.org/3/library/functions.html#enumerate | `enumerate(iterable)` yields `(index, item)` pairs — the standard Python way to get a loop counter alongside the item | Used in `serialize_playlist` to capture each item's position index (`for position, item in enumerate(playlist.items())`) for playlist order preservation |
+| 18 | python-plexapi `MusicSection` documentation | https://python-plexapi.readthedocs.io/en/latest/modules/library.html#plexapi.library.MusicSection | `MusicSection.searchTracks()`, `MusicSection.searchAlbums()`, `MusicSection.searchArtists()` - methods for fetching music items at each level | Used to replace `section.search(unwatched=False)` (which is invalid for music) with `section.searchTracks()` in `snapshot_watch_history` and `snapshot_ratings` |
+| 19 | python-plexapi `ShowSection` documentation | https://python-plexapi.readthedocs.io/en/latest/modules/library.html#plexapi.library.ShowSection | `ShowSection.searchEpisodes()` - fetches all episodes across all shows in the section | Used to replace `section.search()` (which returns Show objects) with `section.searchEpisodes()` in `snapshot_watch_history`, ensuring episode-level viewCount data is captured |
+| 20 | python-plexapi `MyPlexAccount` documentation | https://python-plexapi.readthedocs.io/en/latest/modules/myplex.html#plexapi.myplex.MyPlexAccount | `server.myPlexAccount()`, `account.users()`, `user.get_token(machineIdentifier)` - the API for enumerating home users and obtaining per-user auth tokens | Used to implement `get_home_users()`: enumerates managed users, retrieves a server-scoped token for each, and creates a `PlexServer` connection authenticated as that user |
+| 21 | python-plexapi `Playlist` source - `smart` attribute | https://github.com/pkkid/python-plexapi/blob/master/plexapi/playlist.py | `Playlist.smart` (bool) - True for smart (filter-based) playlists; `Playlist.content` (str) - the filter URL that defines the playlist's contents | Used in `serialize_playlist` to detect smart playlists, save the filter URL, and skip item iteration. Used in `import_playlists` to route smart playlists to the `smart_playlist_skipped` failure category |
+| 22 | Plex Media Server - Plex Home documentation | https://support.plex.tv/articles/203948776-managed-users/ | How Plex Home managed users work: each user is a separate profile with independent watch history, ratings, and playlists; each has their own auth token | Used to understand the data isolation model: admin and each home user have separate viewCounts and userRatings even for the same media file. Informed the decision to snapshot and import per-user data independently |
+| 23 | Python `enumerate()` documentation | https://docs.python.org/3/library/functions.html#enumerate | `enumerate(iterable)` yields `(index, item)` pairs - the standard Python way to get a loop counter alongside the item | Used in `serialize_playlist` to capture each item's position index (`for position, item in enumerate(playlist.items())`) for playlist order preservation |
 
 ### Concept Explanations
 
-**`section.type` and libtype-aware method selection**: Every `LibrarySection` in python-plexapi has a `.type` attribute: `"artist"` for music, `"show"` for TV, `"movie"` for movies. Each section type exposes different search methods. `MusicSection` has `searchTracks()`, `searchAlbums()`, and `searchArtists()`. `ShowSection` has `searchEpisodes()` and `searchShows()`. `MovieSection` has `all()` for top-level items. The generic `section.search(unwatched=False)` filter only works on video libraries and crashes with "Unknown filter field" on music. PlexMigrate now branches on `section.type` to call the right method for each library kind.
+**`section.type` and libtype-aware method selection**: Every `LibrarySection` in python-plexapi has a `.type` attribute: `"artist"` for music, `"show"` for TV, `"movie"` for movies. Each section type exposes different search methods. `MusicSection` has `searchTracks()`, `searchAlbums()`, and `searchArtists()`. `ShowSection` has `searchEpisodes()` and `searchShows()`. `MovieSection` has `all()` for top-level items. The generic `section.search(unwatched=False)` filter only works on video libraries and crashes with "Unknown filter field" on music. Hestia-MediaManager now branches on `section.type` to call the right method for each library kind.
 
-**Why watch history must be at the leaf level**: In Plex's data model the items you actually watch are "leaves": Movies, Episodes, Tracks. Each leaf has its own `viewCount` (how many times played) and `viewOffset` (resume position). Parent containers (Shows, Seasons, Artists, Albums) also expose a `viewCount`, but it's an aggregate rolled up from their children. You can't scrobble it. PlexMigrate works at the leaf level because `/:/scrobble` acts on one leaf at a time. Fetching at the container level would give inaccurate aggregates and the wrong `ratingKey` for scrobble calls.
+**Why watch history must be at the leaf level**: In Plex's data model the items you actually watch are "leaves": Movies, Episodes, Tracks. Each leaf has its own `viewCount` (how many times played) and `viewOffset` (resume position). Parent containers (Shows, Seasons, Artists, Albums) also expose a `viewCount`, but it's an aggregate rolled up from their children. You can't scrobble it. Hestia-MediaManager works at the leaf level because `/:/scrobble` acts on one leaf at a time. Fetching at the container level would give inaccurate aggregates and the wrong `ratingKey` for scrobble calls.
 
-**Plex Home managed users**: Plex Home lets one server be shared by multiple people, each with their own managed user profile. Managed users are fully independent viewers. They each have their own watch history, view counts, and star ratings, even for the same media file. When the admin watches a movie it bumps the admin's viewCount. When a managed user watches it, it bumps that user's viewCount. The two never mix. To read or write a managed user's data you authenticate as that user. Admin credentials only see admin data. PlexMigrate handles this by calling `user.get_token(machineIdentifier)` and creating a separate `PlexServer(base_url, user_token)` connection per user.
+**Plex Home managed users**: Plex Home lets one server be shared by multiple people, each with their own managed user profile. Managed users are fully independent viewers. They each have their own watch history, view counts, and star ratings, even for the same media file. When the admin watches a movie it bumps the admin's viewCount. When a managed user watches it, it bumps that user's viewCount. The two never mix. To read or write a managed user's data you authenticate as that user. Admin credentials only see admin data. Hestia-MediaManager handles this by calling `user.get_token(machineIdentifier)` and creating a separate `PlexServer(base_url, user_token)` connection per user.
 
-**Smart playlists in Plex**: A smart playlist's contents come from a saved filter query rather than a fixed list. Example: "all movies in the Action genre rated above 8." Plex stores the filter as a URL string in `playlist.content`, which includes server-specific library section IDs. Those IDs are assigned locally by each Plex database and differ between servers, so the filter URL isn't portable. Recreating the smart playlist requires a human to open Plex on the target and re-enter the filter criteria. PlexMigrate saves the `content` URL in the backup for reference and logs it prominently so the user has what they need.
+**Smart playlists in Plex**: A smart playlist's contents come from a saved filter query rather than a fixed list. Example: "all movies in the Action genre rated above 8." Plex stores the filter as a URL string in `playlist.content`, which includes server-specific library section IDs. Those IDs are assigned locally by each Plex database and differ between servers, so the filter URL isn't portable. Recreating the smart playlist requires a human to open Plex on the target and re-enter the filter criteria. Hestia-MediaManager saves the `content` URL in the backup for reference and logs it prominently so the user has what they need.
 
-**Playlist item order**: Regular (non-smart) Plex playlists are ordered. The position of each item is significant, and Plex stores and displays items in insertion order. When PlexMigrate resolves playlist items via multi-threaded matching, thread scheduling can cause items to resolve in any order. Without explicit position tracking, the reconstructed playlist would land in unpredictable order. PlexMigrate saves a `"position"` index for each item at export time (using `enumerate()` for the 0-based index), then sorts resolved items by that index before passing them to `Playlist.create()` or `addItems()` at import time.
+**Playlist item order**: Regular (non-smart) Plex playlists are ordered. The position of each item is significant, and Plex stores and displays items in insertion order. When Hestia-MediaManager resolves playlist items via multi-threaded matching, thread scheduling can cause items to resolve in any order. Without explicit position tracking, the reconstructed playlist would land in unpredictable order. Hestia-MediaManager saves a `"position"` index for each item at snapshot time (using `enumerate()` for the 0-based index), then sorts resolved items by that index before passing them to `Playlist.create()` or `addItems()` at import time.
 
 ---
 
-## Sources — v0.4.0 — 2026-05-10
+## Sources - v0.4.0 - 2026-05-10
 
 ### What These Sources Cover
 
@@ -92,12 +92,12 @@ Sources for the Rich Live display redesign (replacing tqdm with Rich's Progress 
 
 | # | Source Name | URL | What It Covers | How It Was Used |
 |---|---|---|---|---|
-| 24 | rich.live documentation | https://rich.readthedocs.io/en/stable/live.html | `Live(renderable, console=, refresh_per_second=)` context manager — renders a renderable and re-renders it in place at a fixed rate; log output above the live area scrolls normally | Used to wrap the entire export and import operation so the progress panel stays pinned at the bottom while log lines scroll above |
+| 24 | rich.live documentation | https://rich.readthedocs.io/en/stable/live.html | `Live(renderable, console=, refresh_per_second=)` context manager - renders a renderable and re-renders it in place at a fixed rate; log output above the live area scrolls normally | Used to wrap the entire snapshot and import operation so the progress panel stays pinned at the bottom while log lines scroll above |
 | 25 | rich.progress documentation | https://rich.readthedocs.io/en/stable/progress.html | `Progress`, `TaskID`, `add_task()`, `update()`, `SpinnerColumn`, `BarColumn`, `MofNCompleteColumn`, `TextColumn`, `TimeRemainingColumn`; thread-safety note (internal RLock) | Used to build the per-library progress bars and the overall bar; `update()` called from worker threads directly because of the internal RLock |
-| 26 | rich.logging documentation | https://rich.readthedocs.io/en/stable/logging.html | `RichHandler(console=, show_time=, show_path=, markup=, rich_tracebacks=)` — a `logging.Handler` subclass that routes log records through a Rich Console; designed to coexist with `Live` when both use the same Console | Used to replace `StreamHandler(sys.stdout)` in `setup_logging()` so log lines no longer corrupt the Live panel |
-| 27 | requests.adapters.HTTPAdapter documentation | https://requests.readthedocs.io/en/latest/api/#requests.adapters.HTTPAdapter | `HTTPAdapter(max_retries=, pool_connections=, pool_maxsize=)` — mounts a retry policy and connection pool on a `requests.Session` for a URL prefix | Used in `_make_retry_adapter()` to wrap the `Retry` object and mount it on both the direct-call session and plexapi's internal session |
-| 28 | urllib3.util.retry.Retry documentation | https://urllib3.readthedocs.io/en/stable/reference | `Retry(total=, connect=, read=, backoff_factor=, status_forcelist=, allowed_methods=, raise_on_status=)` — controls how many times and under what conditions a failed HTTP request is retried | Used in `_make_retry_adapter()` with `total=2`, `backoff_factor=0.5`, `status_forcelist=[500,502,503,504]`, `allowed_methods=frozenset(["GET","PUT"])` |
-| 29 | Python `threading.Semaphore` documentation | https://docs.python.org/3/library/threading.html#threading.Semaphore | `Semaphore(n)` — allows at most n threads to enter the guarded block simultaneously; threads beyond n block at `acquire()` until a holder calls `release()` | Used as `scrobble_sem = threading.Semaphore(SCROBBLE_WORKERS)` in `import_watch_history()` to cap concurrent Plex database writes while item resolution runs at full `MAX_WORKERS` concurrency |
+| 26 | rich.logging documentation | https://rich.readthedocs.io/en/stable/logging.html | `RichHandler(console=, show_time=, show_path=, markup=, rich_tracebacks=)` - a `logging.Handler` subclass that routes log records through a Rich Console; designed to coexist with `Live` when both use the same Console | Used to replace `StreamHandler(sys.stdout)` in `setup_logging()` so log lines no longer corrupt the Live panel |
+| 27 | requests.adapters.HTTPAdapter documentation | https://requests.readthedocs.io/en/latest/api/#requests.adapters.HTTPAdapter | `HTTPAdapter(max_retries=, pool_connections=, pool_maxsize=)` - mounts a retry policy and connection pool on a `requests.Session` for a URL prefix | Used in `_make_retry_adapter()` to wrap the `Retry` object and mount it on both the direct-call session and plexapi's internal session |
+| 28 | urllib3.util.retry.Retry documentation | https://urllib3.readthedocs.io/en/stable/reference | `Retry(total=, connect=, read=, backoff_factor=, status_forcelist=, allowed_methods=, raise_on_status=)` - controls how many times and under what conditions a failed HTTP request is retried | Used in `_make_retry_adapter()` with `total=2`, `backoff_factor=0.5`, `status_forcelist=[500,502,503,504]`, `allowed_methods=frozenset(["GET","PUT"])` |
+| 29 | Python `threading.Semaphore` documentation | https://docs.python.org/3/library/threading.html#threading.Semaphore | `Semaphore(n)` - allows at most n threads to enter the guarded block simultaneously; threads beyond n block at `acquire()` until a holder calls `release()` | Used as `scrobble_sem = threading.Semaphore(SCROBBLE_WORKERS)` in `import_watch_history()` to cap concurrent Plex database writes while item resolution runs at full `MAX_WORKERS` concurrency |
 
 ### Concept Explanations
 
@@ -105,7 +105,7 @@ Sources for the Rich Live display redesign (replacing tqdm with Rich's Progress 
 
 **Why `RichHandler` and `StreamHandler` are not interchangeable**: `StreamHandler` writes a formatted string straight to `sys.stdout` via Python's file I/O. It has no awareness of any terminal control sequences other code might be writing at the same time. When tqdm manages a progress bar with ANSI cursor-move sequences and `StreamHandler` writes a log line, the two streams of ANSI codes interleave and the screen turns to garbage. `RichHandler` doesn't write to stdout directly. It hands the log record to the shared `Console`, which queues the render and applies it at the next safe moment, coordinated with the `Live` panel's own refresh cycle.
 
-**How `Progress.update()` is thread-safe**: Rich's `Progress` object holds an internal `threading.RLock`. Every call to `update()`, `add_task()`, or `advance()` acquires the lock before touching the task list and releases on return. Any number of threads can call `update()` at once without corrupting data; the calls just serialise internally. That's why PlexMigrate's worker threads call `_live_progress.update()` directly with no external synchronisation.
+**How `Progress.update()` is thread-safe**: Rich's `Progress` object holds an internal `threading.RLock`. Every call to `update()`, `add_task()`, or `advance()` acquires the lock before touching the task list and releases on return. Any number of threads can call `update()` at once without corrupting data; the calls just serialise internally. That's why Hestia-MediaManager's worker threads call `_live_progress.update()` directly with no external synchronisation.
 
 **`requests.adapters.HTTPAdapter` and what "mounting" means**: A `requests.Session` routes each request through an adapter based on URL scheme. `session.mount("http://", adapter)` tells the session to use this adapter for every URL starting with `http://`. The adapter controls connection pooling (how many persistent TCP connections to keep open) and the retry policy. By default, sessions use a basic adapter with no retries and a pool of one connection per host. `HTTPAdapter` with a `Retry` object adds automatic re-sending of failed requests according to the rules in the `Retry` config.
 
@@ -118,13 +118,13 @@ Sources for the Rich Live display redesign (replacing tqdm with Rich's Progress 
 - `allowed_methods=frozenset(["GET", "PUT"])`: only retry GET and PUT requests. POST is excluded because it isn't idempotent; retrying could submit the same data twice.
 - `raise_on_status=False`: after all retries are exhausted, return the error response rather than raising. The caller decides how to handle it.
 
-**`threading.Semaphore` vs `threading.Lock`**: A `Lock` allows exactly one thread at a time. A `Semaphore(n)` allows exactly n threads at a time, a generalisation of a lock where the capacity is configurable. In PlexMigrate, item resolution (reading from Plex's database) safely runs at `MAX_WORKERS` concurrency because it's read-only. Scrobbling (writing viewCount) should be throttled to `SCROBBLE_WORKERS` simultaneous threads so Plex's write queue doesn't get overwhelmed. A semaphore expresses "allow n simultaneous writers" without a separate thread pool or queue.
+**`threading.Semaphore` vs `threading.Lock`**: A `Lock` allows exactly one thread at a time. A `Semaphore(n)` allows exactly n threads at a time, a generalisation of a lock where the capacity is configurable. In Hestia-MediaManager, item resolution (reading from Plex's database) safely runs at `MAX_WORKERS` concurrency because it's read-only. Scrobbling (writing viewCount) should be throttled to `SCROBBLE_WORKERS` simultaneous threads so Plex's write queue doesn't get overwhelmed. A semaphore expresses "allow n simultaneous writers" without a separate thread pool or queue.
 
 ---
 
-## Sources — v0.5.0 — 2026-05-10
+## Sources - v0.5.0 - 2026-05-10
 
-### Source 30 — `dataclasses` module (Python standard library)
+### Source 30 - `dataclasses` module (Python standard library)
 
 **Used for**: `ActivityEntry`, `LibraryProgress`
 
@@ -136,7 +136,7 @@ Sources for the Rich Live display redesign (replacing tqdm with Rich's Progress 
 
 ---
 
-### Source 31 — `collections.deque` (Python standard library)
+### Source 31 - `collections.deque` (Python standard library)
 
 **Used for**: `DashboardState.activity`, the live activity feed ring buffer
 
@@ -148,7 +148,7 @@ Sources for the Rich Live display redesign (replacing tqdm with Rich's Progress 
 
 ---
 
-### Source 32 — `threading.Event` (Python standard library)
+### Source 32 - `threading.Event` (Python standard library)
 
 **Used for**: Pause/resume in `DashboardState`; stop signal for `_keyboard_thread()`
 
@@ -160,7 +160,7 @@ Unlike a `Lock`, an Event has no ownership. Any thread can set, clear, or wait o
 
 ---
 
-## Sources — v0.6.0 — 2026-05-10
+## Sources - v0.6.0 - 2026-05-10
 
 ### What These Sources Cover
 
@@ -172,7 +172,7 @@ Covers the cross-platform path suffix matching feature and supporting changes in
 | 34 | Python `str.lower()` documentation | https://docs.python.org/3/library/stdtypes.html#str.lower | Case folding for case-insensitive comparison | Used in `_normalize_path_parts()` to normalise paths to lowercase so `DSOTM` and `dsotm` match |
 | 35 | Python `dict.setdefault()` documentation | https://docs.python.org/3/library/stdtypes.html#dict.setdefault | Returns the value for a key if it exists, inserts and returns a default if not | Used in suffix index building: `sfx.setdefault(key, []).append(item)` initialises the list on first use and appends on all subsequent uses without an explicit `if key in dict` check |
 | 36 | Python `list` slicing with negative indices | https://docs.python.org/3/library/stdtypes.html#sequence-types-list-tuple-range | `parts[-n:]` returns the last N elements of a list | Used in `_suffix_key()` to extract the last N path components efficiently |
-| 37 | Plex Web token authentication URL format | [General knowledge — no public documentation URL] | `/web/index.html?X-Plex-Token=TOKEN` opens the Plex Web UI pre-authenticated | Used in `_open_plex_server()` to construct the auto-login URL for the `[S]` keyboard shortcut |
+| 37 | Plex Web token authentication URL format | [General knowledge - no public documentation URL] | `/web/index.html?X-Plex-Token=TOKEN` opens the Plex Web UI pre-authenticated | Used in `_open_plex_server()` to construct the auto-login URL for the `[S]` keyboard shortcut |
 | 38 | `PlexServer.myPlexUsername` attribute | https://python-plexapi.readthedocs.io/en/latest/modules/server.html | Attribute on a connected PlexServer object that returns the Plex.tv account username | Used in `main()` to get the real account name for log attribution instead of the hard-coded string "Plex Owner" |
 | 39 | Python `getattr()` with default | https://docs.python.org/3/library/functions.html#getattr | Returns the named attribute of an object, or a default if the attribute does not exist | Used as `getattr(server, "myPlexUsername", None) or "Plex Owner"` to safely retrieve the account name with a fallback if plexapi ever renames or removes the attribute |
 
@@ -186,9 +186,9 @@ Covers the cross-platform path suffix matching feature and supporting changes in
 
 ---
 
-### Source 33 — `concurrent.futures.wait()` with `timeout` (Python standard library)
+### Source 33 - `concurrent.futures.wait()` with `timeout` (Python standard library)
 
-**Used for**: Display loop polling in `run_export()` and `run_import()` dashboard mode
+**Used for**: Display loop polling in `run_snapshot()` and `run_import()` dashboard mode
 
 **Concept**: `concurrent.futures.wait(fs, timeout=0.25)` returns two sets: `(done, not_done)`. It blocks for at most `timeout` seconds. If any futures complete before the timeout it returns early with those futures in `done`; otherwise it returns after `timeout` with `done=set()`. That gives the display loop a 250 ms maximum refresh interval while still processing completions the moment they happen. `as_completed()` would block until the next future finishes (potentially minutes), freezing the dashboard, which is why we use `wait()` with a timeout instead.
 
@@ -198,7 +198,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ---
 
-### Source 34 — `msvcrt.kbhit()` / `msvcrt.getwch()` (Windows-only, Python standard library)
+### Source 34 - `msvcrt.kbhit()` / `msvcrt.getwch()` (Windows-only, Python standard library)
 
 **Used for**: Non-blocking keyboard input on Windows in `_keyboard_thread()`
 
@@ -210,7 +210,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ---
 
-### Source 35 — `tty` / `termios` / `select` (Unix-only, Python standard library)
+### Source 35 - `tty` / `termios` / `select` (Unix-only, Python standard library)
 
 **Used for**: Non-blocking keyboard input on macOS and Linux in `_keyboard_thread()`
 
@@ -223,7 +223,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ---
 
-### Source 36 — `subprocess.Popen()` for opening files (Python standard library)
+### Source 36 - `subprocess.Popen()` for opening files (Python standard library)
 
 **Used for**: `_open_log_folder()`, opens the log directory in the OS file manager
 
@@ -233,7 +233,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ---
 
-### Source 37 — `rich.panel.Panel` and `rich.text.Text` (third-party)
+### Source 37 - `rich.panel.Panel` and `rich.text.Text` (third-party)
 
 **Used for**: `_build_dashboard()`, the rendered dashboard panel
 
@@ -247,7 +247,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ---
 
-### Source 38 — `contextlib.contextmanager` (Python standard library)
+### Source 38 - `contextlib.contextmanager` (Python standard library)
 
 **Used for**: `_thread_category()`, registers/unregisters a thread's work category in the dashboard
 
@@ -259,7 +259,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ## v0.6.1 Sources
 
-### Source 39 — `str.replace()` chaining for path separator normalisation
+### Source 39 - `str.replace()` chaining for path separator normalisation
 
 **Used for**: fixing remap body separators in `_resolve_item_impl()`
 
@@ -269,7 +269,7 @@ The 0.25 s (4 Hz) timeout was chosen to match the Live panel's effective refresh
 
 ---
 
-### Source 40 — `plexapi.library.MusicSection.searchTracks()` and `ShowSection.searchEpisodes()`
+### Source 40 - `plexapi.library.MusicSection.searchTracks()` and `ShowSection.searchEpisodes()`
 
 **Used for**: `_section_leaf_items()`, fetching leaf-level media objects for Music and TV sections
 
@@ -345,7 +345,7 @@ Nine new technologies were introduced in v0.8.0 for the optional Docker + FastAP
 
 ### Pydantic v2 (Python)
 
-**Used for**: every request and response schema in `server/models.py` (`SettingsIn`, `ExportJobIn`, `ImportJobIn`, `ScheduleIn`, `JobStatusOut`).
+**Used for**: every request and response schema in `server/models.py` (`SettingsIn`, `SnapshotJobIn`, `ImportJobIn`, `ScheduleIn`, `JobStatusOut`).
 
 **Concept**: Pydantic is a runtime validation library. You declare a class inheriting from `BaseModel` with type-annotated fields; instantiating from a dict (or having FastAPI do so from the request body) validates every field against its type and raises a structured `ValidationError` on mismatch. v2 is a near-total rewrite in Rust that runs roughly 10× faster than v1.
 
@@ -399,7 +399,7 @@ Nine new technologies were introduced in v0.8.0 for the optional Docker + FastAP
 
 **Documentation**: https://www.typescriptlang.org/docs/
 
-**Why TypeScript for this UI**: The frontend mirrors the engine's CLI flag set 1:1. Without compile-time field-name checking, every flag-rename in the backend would silently break the form. With TypeScript, the build fails the moment `ExportJobIn` and `ExportJobPayload` disagree on a field name.
+**Why TypeScript for this UI**: The frontend mirrors the engine's CLI flag set 1:1. Without compile-time field-name checking, every flag-rename in the backend would silently break the form. With TypeScript, the build fails the moment `SnapshotJobIn` and `ExportJobPayload` disagree on a field name.
 
 ---
 
@@ -407,7 +407,7 @@ Nine new technologies were introduced in v0.8.0 for the optional Docker + FastAP
 
 **Used for**: serving the compiled React bundle and reverse-proxying `/api/*` and `/ws/*` to the backend container. Config in `frontend/nginx.conf`.
 
-**Concept**: Nginx is an event-driven HTTP and reverse-proxy server. The features we use: `try_files $uri $uri/ /index.html` for SPA fallback (so deep links like `/exports` resolve to the React shell on hard refresh), `proxy_pass` for the API forward, and `proxy_set_header Upgrade $http_upgrade` for the WebSocket upgrade handshake.
+**Concept**: Nginx is an event-driven HTTP and reverse-proxy server. The features we use: `try_files $uri $uri/ /index.html` for SPA fallback (so deep links like `/snapshots` resolve to the React shell on hard refresh), `proxy_pass` for the API forward, and `proxy_set_header Upgrade $http_upgrade` for the WebSocket upgrade handshake.
 
 **Documentation**: https://nginx.org/en/docs/
 
@@ -435,13 +435,13 @@ No new external dependencies in v0.9.0. The multi-server registry, direct server
 
 ### Module-Level Variable Reassignment Across Run Boundaries
 
-**Used for**: prefixing per-run log directories and export filenames with the friendly server name without editing the engine.
+**Used for**: prefixing per-run log directories and snapshot filenames with the friendly server name without editing the engine.
 
-**Concept**: `services.state._run_timestamp` is a module-level variable set once at module import time. Both `services.logging_ops.setup_logging` and `services.exporter.export_library` read it *lazily*; each call computes `f"run_{state._run_timestamp}"` or `f"{lib}_{state._run_timestamp}.plexbackup.json"` at the moment the filename is built. The job worker takes advantage of this by reassigning `state._run_timestamp` to `f"{server_slug}_{datetime.now().strftime(...)}"` immediately before invoking the engine. Both filename builders read the current value at call time rather than capturing it at import time, so the prefix lands in the right places with zero changes to engine source.
+**Concept**: `services.state._run_timestamp` is a module-level variable set once at module import time. Both `services.logging_ops.setup_logging` and `services.snapshotter.snapshot_library` read it *lazily*; each call computes `f"run_{state._run_timestamp}"` or `f"{lib}_{state._run_timestamp}.plexbackup.json"` at the moment the filename is built. The job worker takes advantage of this by reassigning `state._run_timestamp` to `f"{server_slug}_{datetime.now().strftime(...)}"` immediately before invoking the engine. Both filename builders read the current value at call time rather than capturing it at import time, so the prefix lands in the right places with zero changes to engine source.
 
 **Documentation**: https://docs.python.org/3/reference/datamodel.html#modules (module objects are mutable namespaces; assigning to `module.attribute` from anywhere is visible to every reader of `module.attribute`).
 
-**Why this matters**: The pattern lets the multi-server layer satisfy "every log file and export filename includes the friendly server name" from the spec *without* touching `services/exporter.py` or `services/logging_ops.py`. Reassigning a global on the boundary between consumer and engine is uglier than passing a parameter, but the engine constraint ranks higher than aesthetic purity here.
+**Why this matters**: The pattern lets the multi-server layer satisfy "every log file and snapshot filename includes the friendly server name" from the spec *without* touching `services/snapshotter.py` or `services/logging_ops.py`. Reassigning a global on the boundary between consumer and engine is uglier than passing a parameter, but the engine constraint ranks higher than aesthetic purity here.
 
 ---
 
@@ -449,7 +449,7 @@ No new external dependencies in v0.9.0. The multi-server registry, direct server
 
 **Used for**: making direct server-to-server transfer feasible without duplicating engine code.
 
-**Concept**: `services.importer.import_backup_file` takes an optional `preloaded_data: Optional[dict] = None` parameter. The parameter was added in v0.4.0 so `run_import` could pre-read all backup JSON up front (to compute progress-bar totals) and pass each parsed document to the per-file worker without re-reading from disk. That same parameter lets us hand it any dict shaped like a `.plexbackup.json`, regardless of where the dict came from. The direct-transfer orchestrator builds the dict in memory by calling the export-side primitives directly against the source Plex; the import side has no idea the source wasn't a file.
+**Concept**: `services.importer.import_backup_file` takes an optional `preloaded_data: Optional[dict] = None` parameter. The parameter was added in v0.4.0 so `run_import` could pre-read all backup JSON up front (to compute progress-bar totals) and pass each parsed document to the per-file worker without re-reading from disk. That same parameter lets us hand it any dict shaped like a `.plexbackup.json`, regardless of where the dict came from. The direct-transfer orchestrator builds the dict in memory by calling the snapshot-side primitives directly against the source Plex; the import side has no idea the source wasn't a file.
 
 **Documentation**: not applicable; this is a pattern, not a library. It's a worked example of why optional pre-loaded parameters on otherwise file-driven functions are useful for unforeseen reuse.
 
@@ -493,13 +493,13 @@ No new external dependencies in v0.9.2. One short design-pattern note worth reco
 
 **Used for**: the v0.9.2 bug fix for the Current Job header.
 
-**Concept**: `DashboardState.snapshot()` carries two related but distinct progress counter sets: the engine-level resolution counters (`completed`, `skipped`, `failed`, `unresolved`, `guid_hits`, `filepath_hits`, `suffix_hits`, `fuzzy_hits`) and the per-library progress counters embedded in the `libraries` array (`lib.completed`, `lib.total`). The engine-level counters are incremented per *matched item*: every call to `_record_success` or `_record_failure` increments them. The per-library counters are incremented per *pipeline phase* via `advance_library`; a library import advances four times for the four phases (Play Count, Playlists, Collections, Ratings) plus once per home-user task. Both counter sets are correct for their own purpose; they answer different questions.
+**Concept**: `DashboardState.to_dashboard_frame()` carries two related but distinct progress counter sets: the engine-level resolution counters (`completed`, `skipped`, `failed`, `unresolved`, `guid_hits`, `filepath_hits`, `suffix_hits`, `fuzzy_hits`) and the per-library progress counters embedded in the `libraries` array (`lib.completed`, `lib.total`). The engine-level counters are incremented per *matched item*: every call to `_record_success` or `_record_failure` increments them. The per-library counters are incremented per *pipeline phase* via `advance_library`; a library import advances four times for the four phases (Play Count, Playlists, Collections, Ratings) plus once per home-user task. Both counter sets are correct for their own purpose; they answer different questions.
 
 **Why this matters**: A reader who sees `dash.completed = 12` and `sum(lib.completed for lib in dash.libraries) = 36` might assume one is buggy. Neither is; they measure different things. The Run Stats panel correctly shows engine-level counts (matched items). The Libraries section and the Current Job header correctly show per-library progress (phases plus matched items). The v0.9.2 bug was that the header had been reading from the wrong set; the fix was a one-line source switch with no engine change. When adding new top-of-dashboard widgets later, pick the counter set deliberately and document the choice in a comment.
 
 ---
 
-## Audit Backfill — 2026-05-11
+## Audit Backfill - 2026-05-11
 
 A read-through of the current codebase against this file turned up a handful of libraries and APIs that are actively in use but never got their own entry. They're grouped below by where they're called and what they do. None of these are new dependencies; this is documentation catching up to code that already shipped.
 
@@ -561,9 +561,9 @@ A read-through of the current codebase against this file turned up a handful of 
 
 ### `fastapi.responses.FileResponse`
 
-**Used for**: streaming `.plexbackup.json` files to the browser via `GET /api/exports/{file_name}`.
+**Used for**: streaming `.plexbackup.json` files to the browser via `GET /api/snapshots/{file_name}`.
 
-**Concept**: `FileResponse(path=..., filename=..., media_type=...)` streams the file from disk in chunks and sets `Content-Disposition: attachment; filename="..."` so the browser saves the file instead of trying to render it. Streaming matters for large library exports that can hit hundreds of MB. Loading the whole file into memory first would blow up RAM under load.
+**Concept**: `FileResponse(path=..., filename=..., media_type=...)` streams the file from disk in chunks and sets `Content-Disposition: attachment; filename="..."` so the browser saves the file instead of trying to render it. Streaming matters for large library snapshots that can hit hundreds of MB. Loading the whole file into memory first would blow up RAM under load.
 
 **Documentation**: https://fastapi.tiangolo.com/advanced/custom-response/#fileresponse
 
@@ -591,9 +591,9 @@ A read-through of the current codebase against this file turned up a handful of 
 
 ### Browser `WebSocket` API
 
-**Used for**: the live dashboard subscription in `SnapshotSocket` (also in `frontend/src/api.ts`). One `new WebSocket(url)` per page lifetime, with `onmessage` / `onclose` / `onerror` handlers and a reconnect loop with linear backoff.
+**Used for**: the live dashboard subscription in `DashboardWsClient` (also in `frontend/src/api.ts`). One `new WebSocket(url)` per page lifetime, with `onmessage` / `onclose` / `onerror` handlers and a reconnect loop with linear backoff.
 
-**Concept**: The browser-native WebSocket constructor takes a `ws://` or `wss://` URL and returns an object that emits events when the connection opens, receives a frame, errors, or closes. There's no built-in reconnect. We add one in `SnapshotSocket.ensureConnected()` with 1-to-10-second backoff so a backend restart doesn't leave the dashboard frozen.
+**Concept**: The browser-native WebSocket constructor takes a `ws://` or `wss://` URL and returns an object that emits events when the connection opens, receives a frame, errors, or closes. There's no built-in reconnect. We add one in `DashboardWsClient.ensureConnected()` with 1-to-10-second backoff so a backend restart doesn't leave the dashboard frozen.
 
 **Documentation**: https://developer.mozilla.org/en-US/docs/Web/API/WebSocket
 
@@ -636,3 +636,81 @@ The two Dockerfiles in this repo build on three official images. Each is documen
 **Documentation**: https://www.gnu.org/software/make/manual/make.html
 
 **Why Make and not a shell script**: The targets have logical names (`docker`, `cli`) that read better than `./scripts/docker.sh`. Make is preinstalled on macOS and every Linux distro we'd realistically run this on; Windows users running everything else here through Docker Desktop have Git Bash, which ships GNU Make.
+
+---
+
+## PR-13 Sources - Snapshot pipeline + retention
+
+Added during the export -> snapshot rename + capture pipeline (Commit A/B/C). The bulk of the code reuses existing patterns already documented above; this section calls out only the new external API surface PR-13 introduced.
+
+### `sqlite3.Connection.backup()` and ATTACH DATABASE
+
+**Used for**: `server/snapshot_capture.py :: create_snapshot_db`. The
+function attaches the live `media.db` to a freshly-created snapshot
+database via `ATTACH DATABASE` and runs filtered `INSERT ... SELECT`
+queries against the attached schema. ATTACH lets one connection
+read from two database files in the same query, which is the
+cleanest way to filter-and-copy without staging intermediate data
+in Python.
+
+**Concept**: `ATTACH DATABASE 'path' AS alias` exposes the second
+file's tables under the `alias.tablename` namespace within the
+current connection. Cross-database queries work normally
+(`INSERT INTO main.foo SELECT * FROM src.foo WHERE ...`). The
+attached database closes on `DETACH DATABASE alias` or when the
+connection itself closes.
+
+**Documentation**:
+* https://www.sqlite.org/lang_attach.html
+* https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.backup
+
+**Why not `Connection.backup()`**: The online backup API copies the
+*entire* source database byte-for-byte. PR-13 snapshots are scoped
+to one `server_id`; a full backup would carry every server's data
+into every snapshot. ATTACH + filtered INSERT is the only way to
+project a subset.
+
+**Why `?mode=ro` URI**: The source connection is opened with the
+SQLite URI form `file:path?mode=ro` so a concurrent engine writer
+on `media.db` doesn't fight us for the WAL. Read-only mode also
+guarantees the snapshot can't accidentally mutate the live store.
+
+---
+
+### `ATTACH DATABASE` lock interactions with WAL
+
+**Used for**: the same `snapshot_capture.create_snapshot_db` path -
+relevant because snapshots are sometimes captured while an engine
+job is mid-write to `media.db`.
+
+**Concept**: WAL journal mode (set on `media.db` at init time)
+allows one writer and any number of readers to coexist. An ATTACH
+of a WAL database from a separate connection sees a consistent
+point-in-time view through the WAL even if the writer commits new
+pages during the read. The PR-13 capture pipeline depends on this
+behaviour.
+
+**Documentation**: https://www.sqlite.org/wal.html (section
+"Concurrency")
+
+---
+
+### Fernet symmetric encryption (cryptography library)
+
+**Used for**: existing in `server/secrets.py` since v0.9.5 for the
+Plex-server-token at-rest encryption. PR-10 extended it to encrypt
+per-managed-user credentials (token, Plex Home PIN, service
+password) stored in `media.db.managed_users`. PR-13's snapshot
+capture explicitly *excludes* the `managed_users` table from
+snapshot `.db` files because Fernet ciphertext is bound to this
+host's `.keyfile` and would be unreadable if the snapshot were
+restored on a different host.
+
+**Documentation**: https://cryptography.io/en/latest/fernet/
+
+**Why exclude credentials from snapshots**: Restorability across
+hosts is a stated PR-13 goal. Carrying ciphertext bound to one
+host's keyfile would break that. PR-11's sync re-populates the
+table from the live API after a restore - credentials are then
+re-entered by the operator via User Management.
+

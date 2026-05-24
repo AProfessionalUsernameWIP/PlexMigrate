@@ -1,27 +1,25 @@
 """
-PlexMigrate server package — v0.8.0.
+Hestia-MediaManager server package - v0.8.0.
 
-This package is a *wrapper* around the existing PlexMigrate engine
-(``services/`` + ``plexmigrate.py``). It does NOT reimplement export,
-import, resolution, dashboard tracking, or logging. It only adds a
-FastAPI + WebSocket layer on top of the engine so that the same
-functionality is reachable from a browser as well as the CLI.
+This package is a *wrapper* around the existing Hestia-MediaManager engine
+(``services/``). It does NOT reimplement snapshot, import, resolution,
+dashboard tracking, or logging. It only adds a FastAPI + WebSocket
+layer on top of the engine so the functionality is reachable from a
+browser.
 
 Module layout
 -------------
-* ``app``               — FastAPI application factory and route handlers.
-* ``models``            — Pydantic request / response schemas.
-* ``persistence``       — JSON-file storage for schedules and settings.
-* ``jobs``              — Single-worker job queue that drives the engine.
-* ``schedules``         — Background scheduler that fires saved schedules.
-* ``ws``                — WebSocket broadcaster that streams dashboard snapshots.
-* ``log_browser``       — Read-only access to ``plex_logs/``.
-* ``export_browser``    — Read-only access to ``plex_exports/``.
-* ``runtime_patches``   — Monkey-patches the engine for headless server use.
+* ``app``               - FastAPI application factory and route handlers.
+* ``models``            - Pydantic request / response schemas.
+* ``persistence``       - JSON-file storage for schedules and settings.
+* ``jobs``              - Single-worker job queue that drives the engine.
+* ``schedules``         - Background scheduler that fires saved schedules.
+* ``ws``                - WebSocket broadcaster that streams dashboard snapshots.
+* ``log_browser``       - Read-only access to ``plex_logs/``.
+* ``snapshot_browser``    - Read-only access to ``snapshots/``.
+* ``runtime_patches``   - Monkey-patches the engine for headless server use.
 
-Importing ``server.app`` (which uvicorn does) triggers all setup. The
-CLI entry point (``plexmigrate.py``) does not import this package, so
-the terminal mode is entirely unaffected by anything here.
+Importing ``server.app`` (which uvicorn does) triggers all setup.
 """
 
 # Single source of truth for the server's wire-protocol version. The

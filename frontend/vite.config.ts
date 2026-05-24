@@ -1,4 +1,4 @@
-// Vite build configuration for the PlexMigrate frontend.
+// Vite build configuration for the Hestia-MediaManager frontend.
 //
 // In production the bundle is served by nginx (see frontend/nginx.conf)
 // and same-origin proxying handles /api and /ws. In `npm run dev`

@@ -1,12 +1,20 @@
-/* PlexMigrate frontend — global styles.
+/* Hestia-MediaManager frontend - global styles.
  *
  * Dark theme by default (matches the terminal dashboard aesthetic).
- * Single CSS file, no preprocessor — the styling surface is small
+ * Single CSS file, no preprocessor - the styling surface is small
  * enough that a Tailwind / styled-components dependency would be
  * overkill, and keeping plain CSS makes the bundle a few KB smaller.
  */
 
+/* Shared variables that don't change with the theme. */
 :root {
+  --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+/* Default + explicit dark theme. Matches the terminal-dashboard
+   aesthetic the app shipped with. */
+:root,
+[data-theme="dark"] {
   --bg: #0e1116;
   --bg-elev: #161b22;
   --bg-panel: #1c2129;
@@ -30,7 +38,216 @@
   --color-done: #3fb950;
   --color-error: #f85149;
   --color-started: #c9d1d9;
-  --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, Consolas, monospace;
+  --color-capturing: #a78bfa;
+}
+
+/* Paper theme (replaces the old harsh "light"). Warm cream background,
+   warm dark-brown text, burnt-umber accent. Designed to be readable
+   in bright rooms without the eye-strain of pure-white #ffffff +
+   pure-black #000 contrast. Pairs with the fire wordmark naturally
+   since the whole palette stays in the warm-earth family. */
+[data-theme="paper"] {
+  --bg: #f5f0e6;
+  --bg-elev: #ebe5d7;
+  --bg-panel: #e0d8c6;
+  --border: #b8a988;
+  --text: #3a3326;
+  --text-dim: #6b5f48;
+  --accent: #8b5a2b;
+  --accent-hover: #a06a35;
+  --good: #5a7c3a;
+  --warn: #9a6700;
+  --bad: #a4282d;
+  --muted: #8c7f63;
+  --color-merged: #5a7c3a;
+  --color-created: #5a7c3a;
+  --color-appended: #8b5a2b;
+  --color-skipped: #8c7f63;
+  --color-rated: #9a6700;
+  --color-failed: #a4282d;
+  --color-unresolved: #a4282d;
+  --color-phase: #8b5a2b;
+  --color-done: #5a7c3a;
+  --color-error: #a4282d;
+  --color-started: #3a3326;
+  --color-capturing: #7a4a8a;
+}
+
+/* Tron. Deep void black with neon-green primary, electric-cyan
+   secondary, derezz-magenta for danger. Designed to read like a
+   live grid: selected/focused elements pulse between green and cyan
+   via tron-pulse-border below, mimicking the wireframe glow of the
+   Tron universe. The HM² fire wordmark stays fire-colored - that's
+   the brand, not the theme, so it reads as a warm program glowing
+   inside the grid. */
+[data-theme="tron"] {
+  --bg: #050608;
+  --bg-elev: #0c141c;
+  --bg-panel: #08111a;
+  --border: #1a4d3a;
+  --text: #c9f7d3;
+  --text-dim: #5fa67f;
+  --accent: #39ff14;
+  --accent-hover: #6dff52;
+  --good: #39ff14;
+  --warn: #ffb800;
+  --bad: #ff2d6c;
+  --muted: #3a6b52;
+  --color-merged: #39ff14;
+  --color-created: #39ff14;
+  --color-appended: #00e5ff;
+  --color-skipped: #3a6b52;
+  --color-rated: #ffb800;
+  --color-failed: #ff2d6c;
+  --color-unresolved: #ff2d6c;
+  --color-phase: #00e5ff;
+  --color-done: #39ff14;
+  --color-error: #ff2d6c;
+  --color-started: #c9f7d3;
+  --color-capturing: #b865ff;
+}
+
+/* True dark / OLED inversion. Pure black backgrounds, high-contrast
+   text. */
+[data-theme="true-dark"] {
+  --bg: #000000;
+  --bg-elev: #0a0a0a;
+  --bg-panel: #0f0f0f;
+  --border: #1f1f1f;
+  --text: #e8e8e8;
+  --text-dim: #9a9a9a;
+  --accent: #58a6ff;
+  --accent-hover: #79b8ff;
+  --good: #3fb950;
+  --warn: #d29922;
+  --bad: #f85149;
+  --muted: #707070;
+  --color-merged: #3fb950;
+  --color-created: #3fb950;
+  --color-appended: #58a6ff;
+  --color-skipped: #707070;
+  --color-rated: #d29922;
+  --color-failed: #f85149;
+  --color-unresolved: #ff6e76;
+  --color-phase: #58a6ff;
+  --color-done: #3fb950;
+  --color-error: #f85149;
+  --color-started: #e8e8e8;
+  --color-capturing: #a78bfa;
+}
+
+/* Hearth. Cobblestone-gray background with charcoal-black panels and
+   warm fire accents. Panels are intentionally DARKER than the
+   background so each card feels like a recessed cavity holding the
+   embers, with the room walls (bg) lit only by ambient glow. The
+   HM² wordmark + selected/focused elements supply the moving fire
+   on top via hm-fire-border / hm-fire-button animations below. */
+[data-theme="hearth"] {
+  /* bg = cobblestone (room walls, unchanged gray). bg-elev paints
+     .panel + the topbar, jet black so on-page panels read as deep
+     cavities recessed into the stone. bg-panel is a touch lifted off
+     jet black for cards-inside-panels (.stat, .server-card) so they
+     still differentiate from the panel surface beneath them. The
+     "clickable" tone (primary button fill + selected card fill)
+     becomes a lighter log brown, defined by the .primary + .selected
+     rules below since they're shared with the backend-tint variants. */
+  --bg: #2c2d32;
+  --bg-elev: #000000;
+  --bg-panel: #0a0a0d;
+  --border: #45464e;
+  --text: #d8d4cc;
+  --text-dim: #918d87;
+  --accent: #ffae42;
+  --accent-hover: #ffc270;
+  --good: #88a878;
+  --warn: #d29922;
+  --bad: #e76f51;
+  --muted: #6b6864;
+  --color-merged: #88a878;
+  --color-created: #88a878;
+  --color-appended: #ffae42;
+  --color-skipped: #6b6864;
+  --color-rated: #d29922;
+  --color-failed: #e76f51;
+  --color-unresolved: #e76f51;
+  --color-phase: #ffae42;
+  --color-done: #88a878;
+  --color-error: #e76f51;
+  --color-started: #d8d4cc;
+  --color-capturing: #b08560;
+}
+
+/* Chameleon. Same structural palette as hearth (cobblestone walls,
+   jet black panels, log-brown clickables) but the accent + selection
+   pulse adapts to whatever media-server backend you're currently
+   touching. Hover a Plex server and the UI tints amber; hover a
+   Jellyfin server and it tints purple/teal; hover Emby and it tints
+   green. Click into a backend-filtered surface and the tint sticks
+   until you leave. Default state (no backend in scope) is a neutral
+   silver/pearl accent so the "no decision yet" mode reads
+   distinctly from any of the backend-specific looks. */
+[data-theme="chameleon"] {
+  /* Default state (no backend in scope) reuses hearth's palette: the
+     chameleon at rest is a chameleon wearing hearth fire. When a
+     backend tint kicks in (data-backend-tint=plex|jellyfin|emby) the
+     [data-theme="chameleon"][data-backend-tint="..."] blocks below
+     override panel + border + clickable colors for that backend's
+     full identity. */
+  --bg: #2c2d32;
+  --bg-elev: #000000;
+  --bg-panel: #0a0a0d;
+  --border: #45464e;
+  --text: #d8d4cc;
+  --text-dim: #918d87;
+  --accent: #ffae42;
+  --accent-hover: #ffc270;
+  --good: #88a878;
+  --warn: #d29922;
+  --bad: #e76f51;
+  --muted: #6b6864;
+  --color-merged: #88a878;
+  --color-created: #88a878;
+  --color-appended: #ffae42;
+  --color-skipped: #6b6864;
+  --color-rated: #d29922;
+  --color-failed: #e76f51;
+  --color-unresolved: #e76f51;
+  --color-phase: #ffae42;
+  --color-done: #88a878;
+  --color-error: #e76f51;
+  --color-started: #d8d4cc;
+  --color-capturing: #b08560;
+}
+
+/* Warm dark / hearth-glow. Deep warm browns and embers, cream text,
+   fire-amber accent. Whole-room ember tone; the wordmark blends with
+   the chrome by design (use [data-theme="hearth"] instead if you want
+   the wordmark to pop). */
+[data-theme="warm-dark"] {
+  --bg: #1a1310;
+  --bg-elev: #241a14;
+  --bg-panel: #2c1f17;
+  --border: #4a3527;
+  --text: #e8d8c8;
+  --text-dim: #b09a82;
+  --accent: #ff9856;
+  --accent-hover: #ffb37a;
+  --good: #d4a04a;
+  --warn: #e0b070;
+  --bad: #e76f51;
+  --muted: #806a55;
+  --color-merged: #d4a04a;
+  --color-created: #d4a04a;
+  --color-appended: #ff9856;
+  --color-skipped: #806a55;
+  --color-rated: #e0b070;
+  --color-failed: #e76f51;
+  --color-unresolved: #e76f51;
+  --color-phase: #ff9856;
+  --color-done: #d4a04a;
+  --color-error: #e76f51;
+  --color-started: #e8d8c8;
+  --color-capturing: #c89060;
 }
 
 * { box-sizing: border-box; }
@@ -42,6 +259,7 @@ html, body, #root {
   color: var(--text);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   font-size: 14px;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 a { color: var(--accent); text-decoration: none; }
@@ -171,6 +389,23 @@ label.switch > span.help {
   border-bottom-color: var(--accent);
 }
 
+/* Secondary tab bar nested under Servers */
+.tabs.sub-tabs {
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px;
+}
+.tabs.sub-tabs > button {
+  padding: 7px 12px;
+  font-size: 13px;
+  color: var(--text-dim);
+  border-bottom-color: transparent;
+}
+.tabs.sub-tabs > button.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
 .main {
   flex: 1;
   padding: 20px;
@@ -296,13 +531,35 @@ table.list td.num  { text-align: right; font-family: var(--mono); }
 .tag.done     { color: var(--color-done);     }
 .tag.error    { color: var(--color-error);    background:#3a1414; }
 .tag.started  { color: var(--color-started);  }
+.tag.capturing { color: var(--color-capturing); }
+/* Spec Section 4.3 - per-phase stall escalation. Amber and red are
+   saturated so they pull the operator's eye away from the
+   blue/violet/green phase identity colours. ``red`` carries a pulse
+   animation so a genuinely stuck worker stands out across the room. */
+.tag.stall-amber {
+  color: #fff;
+  background: #d97706;
+  border-color: #d9770655;
+  font-weight: 700;
+}
+.tag.stall-red {
+  color: #fff;
+  background: #dc2626;
+  border-color: #dc262655;
+  font-weight: 700;
+  animation: stallPulse 1.4s ease-in-out infinite;
+}
+@keyframes stallPulse {
+  0%, 100% { opacity: 1.0; box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.6); }
+  50%      { opacity: 0.85; box-shadow: 0 0 0 6px rgba(220, 38, 38, 0); }
+}
 /* v0.9.6 Feature 2C: rate-limit feed entries get their own amber
    visual identity so a 429 burst is unmistakable. Distinct from
-   ``error`` (red) and ``unresolved`` (red background) — rate limiting
+   ``error`` (red) and ``unresolved`` (red background) - rate limiting
    is not a failure, just back-pressure from Plex. */
 .tag.rate_limit { color:#ffb74d; background:#3a2a14; }
 
-/* v0.9.7 Item 8: log keyword filter — highlight matched substrings
+/* v0.9.7 Item 8: log keyword filter - highlight matched substrings
    inside filtered log lines. Tinted amber so the highlight is
    visible against the standard dark log background without
    masking the surrounding text. Inherits the line's font and
@@ -324,8 +581,12 @@ mark.log-match {
   background: var(--bg-panel);
   font-size: 11px;
   font-family: var(--mono);
+  /* Signals the native ``title=`` tooltip is available - cursor flips
+     to the help variant so operators know hovering yields extra
+     context (the full description from Help -> Thread Pool). */
+  cursor: help;
 }
-/* v0.9.2: emphasis split inside a thread pill — the category × count
+/* v0.9.2: emphasis split inside a thread pill - the category × count
  * stays bright, the plain-English description is dimmed so the pill
  * stays scannable but the meaning is right there. */
 .thread-pill-label { font-weight: 600; color: var(--text); }
@@ -359,6 +620,7 @@ mark.log-match {
 .banner.error { background: #3a1414; border: 1px solid var(--bad); color: #ffd2cd; }
 .banner.info  { background: #14233a; border: 1px solid var(--accent); color: #c8e1ff; }
 .banner.good  { background: #14361b; border: 1px solid var(--good); color: #b9f5c4; }
+.banner.warn  { background: #3a2c14; border: 1px solid var(--warn); color: #ffe6b3; }
 
 .kv {
   display: grid;
@@ -448,3 +710,743 @@ mark.log-match {
   color: var(--text-dim);
   white-space: nowrap;
 }
+
+/* v0.10.0 - fan-out destination cards. One ``.panel`` per destination
+   in a multi-destination job; the border colour reflects the
+   destination's current state so the page is scannable at a glance. */
+.fanout-card.fanout-state-running {
+  border-left: 3px solid var(--accent);
+}
+.fanout-card.fanout-state-completed {
+  border-left: 3px solid var(--good);
+}
+.fanout-card.fanout-state-failed {
+  border-left: 3px solid var(--bad);
+}
+.fanout-card.fanout-state-cancelled {
+  border-left: 3px solid var(--warn);
+}
+.fanout-card.fanout-state-queued {
+  border-left: 3px solid var(--border);
+  opacity: 0.85;
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+.badge-running   { color: var(--accent); border-color: var(--accent); }
+.badge-completed { color: var(--good);   border-color: var(--good);   }
+.badge-failed    { color: var(--bad);    border-color: var(--bad);    }
+.badge-cancelled { color: var(--warn);   border-color: var(--warn);   }
+.badge-queued    { color: var(--text-dim); }
+
+
+/* ── Mobile / tablet responsive rules ───────────────────────────────────────
+ * The desktop layout above is the source of truth; everything below it is
+ * narrow-viewport refinements. Two breakpoints:
+ *
+ *   * 900px and under - tablets in portrait, narrow desktop windows.
+ *     Grids collapse, padding shrinks, tab strips become horizontally
+ *     scrollable instead of wrapping into stacks.
+ *   * 540px and under - true phone widths. Topbar items stack vertically,
+ *     row-grid feeds simplify, kv grids become single-column.
+ *
+ * Tables get an outer-scroll treatment at the tablet breakpoint because
+ * 5-column tables (User Accounts, Servers, Schedules) don't fit even on
+ * a portrait iPad without truncation. The native ``overflow-x: auto`` on
+ * the table itself works because the table's children stay laid out as
+ * a normal table; only the wrapper viewport is narrow.
+ *
+ * Touch-target sizing: buttons get a min-height ≈ 36px to stay reachable
+ * with a thumb. Existing 14px font + 6px padding is close already; we
+ * just lock the floor.
+ */
+
+@media (max-width: 900px) {
+  .main {
+    padding: 12px;
+  }
+  .panel {
+    padding: 12px;
+    margin-bottom: 12px;
+  }
+
+  /* Tab strips become single-line horizontal scrollers instead of wrapping
+   * to multiple rows. Wrapping looked bad once we got past three or four
+   * buttons (Servers + Networking + etc, fan-out destinations, Account
+   * Management inner nav). The horizontal scroll matches what every
+   * mobile browser already does for overflowing nav strips. */
+  .tabs,
+  .tabs.sub-tabs {
+    padding: 0 12px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    flex-wrap: nowrap;
+    scrollbar-width: thin;
+  }
+  .tabs > button,
+  .tabs.sub-tabs > button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  /* Two-column form grids collapse to a single column. JobFormPanel's
+   * worker fields, AccountSettingsPanel's password fields, etc. all use
+   * .grid-2 - one column reads better on narrow screens than two
+   * 140px-wide fields. */
+  .grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Tables overflow horizontally rather than crush their columns. The
+   * scroll affordance is the standard pattern - every browser handles
+   * it natively, and the operator can swipe to see the right-side
+   * columns (delete buttons, timestamps). */
+  table.list {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  table.list thead,
+  table.list tbody {
+    display: table;
+    width: 100%;
+    min-width: 600px;
+  }
+
+  /* Activity feed: the 70 / 110 / 110 / 1fr grid is too wide. Flow it
+   * into a two-row layout where the timestamp + tag + library all sit
+   * on row 1 and the title gets the full width on row 2. */
+  .feed .row {
+    grid-template-columns: 70px 100px 1fr;
+    grid-template-areas:
+      "ts tag lib"
+      "title title title";
+    row-gap: 2px;
+  }
+  .feed .row > span:nth-child(1) { grid-area: ts; }
+  .feed .row > span:nth-child(2) { grid-area: tag; }
+  .feed .row > span:nth-child(3) { grid-area: lib; }
+  .feed .row > span:nth-child(4) { grid-area: title; word-break: break-word; }
+
+  /* Key-value grids - 200px label column doesn't fit when the screen is
+   * 768px wide; stack them. */
+  .kv {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .kv .k { font-weight: 600; }
+
+  /* Touch-target floor. */
+  button {
+    min-height: 36px;
+  }
+}
+
+
+@media (max-width: 540px) {
+  /* Phone-tight layout. The topbar's user chip, Switch View Mode, and
+   * Log out cluster gets cramped - let the right-side group wrap below
+   * the brand. */
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .topbar .conn {
+    width: 100%;
+    align-items: flex-end;
+  }
+
+  .main {
+    padding: 8px;
+  }
+  .panel {
+    padding: 10px;
+    margin-bottom: 10px;
+    border-radius: 6px;
+  }
+  .panel h2 {
+    font-size: 14px;
+    margin-bottom: 8px;
+  }
+
+  /* Even narrower padding on the tab strips. */
+  .tabs,
+  .tabs.sub-tabs {
+    padding: 0 8px;
+  }
+  .tabs > button {
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+
+  /* Stack server-card metadata vertically so the URL doesn't truncate
+   * mid-domain and the response-time chip gets its own row. */
+  .server-card {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .server-card-meta {
+    width: 100%;
+    text-align: right;
+  }
+
+  /* Modal default widths set inline are typically ``92vw`` already so
+   * those scale fine. The few remaining inline ``width: 480`` /
+   * ``width: 520`` literals in App.tsx + UserAccountsExplorer already
+   * have ``maxWidth: '92vw'`` next to them, so this CSS doesn't need
+   * to overrule them. */
+}
+
+/* ── HM² fire wordmark + theme switcher ─────────────────────────────
+   Brand glow for the topbar. Reddish-gold flicker with a matching
+   ember box-shadow that breathes in and out. Reduced-motion users
+   get a steady ember tone instead. */
+
+@keyframes hm-fire-flicker {
+  0%   { color: #ffae42; text-shadow: 0 0 6px rgba(255,140,50,0.65), 0 0 14px rgba(255,90,30,0.45), 0 0 22px rgba(220,60,20,0.25); }
+  20%  { color: #ffd166; text-shadow: 0 0 8px rgba(255,170,70,0.75), 0 0 18px rgba(255,110,40,0.50), 0 0 28px rgba(220,70,20,0.30); }
+  40%  { color: #ff7733; text-shadow: 0 0 6px rgba(220,90,30,0.70), 0 0 14px rgba(180,60,20,0.50), 0 0 22px rgba(140,40,10,0.30); }
+  60%  { color: #ffb347; text-shadow: 0 0 8px rgba(255,130,50,0.70), 0 0 16px rgba(255,90,30,0.45), 0 0 26px rgba(220,60,20,0.25); }
+  80%  { color: #ff9856; text-shadow: 0 0 7px rgba(240,110,40,0.70), 0 0 16px rgba(220,80,30,0.50), 0 0 24px rgba(180,50,20,0.30); }
+  100% { color: #ffae42; text-shadow: 0 0 6px rgba(255,140,50,0.65), 0 0 14px rgba(255,90,30,0.45), 0 0 22px rgba(220,60,20,0.25); }
+}
+
+@keyframes hm-ember-glow {
+  0%, 100% {
+    box-shadow: inset 0 0 12px rgba(255,90,30,0.25), 0 0 18px rgba(255,100,30,0.30);
+    border-color: rgba(255,140,50,0.55);
+  }
+  50% {
+    box-shadow: inset 0 0 18px rgba(255,130,50,0.35), 0 0 26px rgba(255,120,40,0.45);
+    border-color: rgba(255,170,70,0.75);
+  }
+}
+
+.wordmark-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  background: linear-gradient(135deg, #1a0d05 0%, #2a1308 60%, #1a0d05 100%);
+  border: 1px solid rgba(255, 140, 50, 0.55);
+  color: #ffae42;
+  font-size: 16px;
+  padding: 2px 10px;
+  border-radius: 6px;
+  vertical-align: middle;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  animation:
+    hm-fire-flicker 3.5s ease-in-out infinite,
+    hm-ember-glow 4.5s ease-in-out infinite;
+}
+
+/* Always-visible glowing brand text. Used as the hero brand on the
+   login + setup pages, where there's no need to hide the full name. */
+.wordmark-text {
+  display: inline-block;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: 0.02em;
+  color: #ffae42;
+  margin-left: 12px;
+  vertical-align: middle;
+  animation: hm-fire-flicker 3.5s ease-in-out infinite;
+}
+
+/* Hover-reveal version for the in-app topbar. The HM² badge sits on
+   the left; the full name lives in a width-collapsed sibling that
+   grows in when the brand area is hovered or keyboard-focused. */
+.brand-fullname {
+  display: inline-block;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.02em;
+  color: #ffae42;
+  max-width: 0;
+  overflow: hidden;
+  opacity: 0;
+  white-space: nowrap;
+  vertical-align: middle;
+  margin-left: 0;
+  transition:
+    max-width 0.35s ease,
+    opacity 0.25s ease 0.05s,
+    margin-left 0.35s ease;
+  animation: hm-fire-flicker 3.5s ease-in-out infinite;
+}
+.brand:hover .brand-fullname,
+.brand:focus-within .brand-fullname {
+  max-width: 280px;
+  margin-left: 8px;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wordmark-badge,
+  .wordmark-text,
+  .brand-fullname {
+    animation: none;
+    color: #ffae42;
+    text-shadow: 0 0 10px rgba(255, 100, 30, 0.5);
+  }
+  .wordmark-badge {
+    box-shadow: 0 0 16px rgba(255, 100, 30, 0.3);
+  }
+  .brand:hover .brand-fullname,
+  .brand:focus-within .brand-fullname {
+    transition: opacity 0.2s ease;
+  }
+}
+
+.topbar .brand {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Theme switcher widget. Lives inside .topbar next to the conn cluster. */
+.theme-switcher {
+  position: relative;
+  display: inline-block;
+}
+.theme-switcher-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.theme-switcher-button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.theme-switcher-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+}
+.theme-swatch-dark { background: #0e1116; }
+.theme-swatch-true-dark { background: #000000; }
+.theme-swatch-warm-dark { background: #1a1310; border-color: #ff9856; }
+.theme-swatch-paper { background: #f5f0e6; border-color: #b8a988; }
+.theme-swatch-tron {
+  background: radial-gradient(circle at 50% 50%, #39ff14 0%, #39ff14 25%, #050608 32%, #050608 100%);
+  border-color: #39ff14;
+  box-shadow: 0 0 6px rgba(57, 255, 20, 0.5);
+}
+.theme-swatch-hearth {
+  background: radial-gradient(circle at 50% 50%, #ffae42 0%, #ffae42 28%, #2f3037 32%, #1c1d22 100%);
+  border-color: #ffae42;
+}
+.theme-swatch-chameleon {
+  background: conic-gradient(from 0deg, #e5a00d 0deg, #aa5cc3 90deg, #00a4dc 180deg, #52b54b 270deg, #e5a00d 360deg);
+  border-color: #b9b6ad;
+}
+
+.theme-switcher-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  padding: 4px;
+  min-width: 200px;
+  z-index: 200;
+}
+.theme-switcher-menu[hidden] { display: none; }
+.theme-switcher-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: left;
+  font-family: inherit;
+}
+.theme-switcher-option:hover { background: var(--bg-panel); }
+.theme-switcher-option.active {
+  background: rgba(88, 166, 255, 0.10);
+  color: var(--accent);
+}
+.theme-switcher-option .theme-switcher-swatch { width: 14px; height: 14px; }
+.theme-switcher-option-label { flex: 1; }
+.theme-switcher-option-meta { font-size: 11px; color: var(--muted); }
+
+/* ── Hearth-theme fire-pulse animations ──────────────────────────────
+   In the hearth theme, selected / focused / primary elements get a
+   moving fire glow instead of a static gold border. Two animations:
+   hm-fire-border cycles outline color + ember halo for outlined
+   elements; hm-fire-button cycles the fill on solid primary
+   buttons so the whole button looks like a moving flame. Scoped to
+   [data-theme="hearth"] so other themes stay static. */
+
+@keyframes hm-fire-border {
+  0%, 100% {
+    border-color: #ffae42;
+    box-shadow: 0 0 10px rgba(255, 140, 50, 0.30);
+  }
+  25% {
+    border-color: #ffd166;
+    box-shadow: 0 0 14px rgba(255, 170, 70, 0.42);
+  }
+  50% {
+    border-color: #ff7733;
+    box-shadow: 0 0 11px rgba(220, 90, 30, 0.36);
+  }
+  75% {
+    border-color: #ffb347;
+    box-shadow: 0 0 13px rgba(255, 130, 50, 0.38);
+  }
+}
+
+/* Outlined elements that show selection or focus state. Tabs are
+   intentionally NOT in this list - the bottom-border accent on
+   active tabs reads better as a static highlight than as a moving
+   one. */
+[data-theme="hearth"] .server-card.selected,
+[data-theme="hearth"] input[type="text"]:focus,
+[data-theme="hearth"] input[type="password"]:focus,
+[data-theme="hearth"] input[type="number"]:focus,
+[data-theme="hearth"] select:focus,
+[data-theme="hearth"] textarea:focus,
+[data-theme="hearth"] button.primary:not(:disabled) {
+  animation: hm-fire-border 3.5s ease-in-out infinite;
+}
+
+/* Primary buttons + selected cards in hearth read as wood logs
+   sitting in the fireplace: a steady lighter-log-brown fill with the
+   flames animating around the edge via hm-fire-border above. The
+   same brown is used for selected cards (below) so every clickable
+   "wood object" reads as a single material. */
+[data-theme="hearth"] button.primary:not(:disabled) {
+  background: #7a5230;
+  color: #ffe8c0;
+}
+[data-theme="hearth"] button.primary:not(:disabled):hover {
+  background: #8b6038;
+}
+
+/* Hearth-specific selectable-card fill. Same lighter log brown as
+   primary buttons - every clickable "wood object" in hearth reads as
+   the same material. The fire-border animation above supplies the
+   moving selection signal around the edge. */
+[data-theme="hearth"] .server-card.selected {
+  background: #7a5230;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="hearth"] .server-card.selected,
+  [data-theme="hearth"] input[type="text"]:focus,
+  [data-theme="hearth"] input[type="password"]:focus,
+  [data-theme="hearth"] input[type="number"]:focus,
+  [data-theme="hearth"] select:focus,
+  [data-theme="hearth"] textarea:focus,
+  [data-theme="hearth"] button.primary:not(:disabled) {
+    animation: none;
+    border-color: #ffae42;
+    box-shadow: 0 0 10px rgba(255, 140, 50, 0.30);
+  }
+}
+
+/* ── Tron-theme grid-pulse animation ─────────────────────────────────
+   Selected / focused / primary elements pulse between neon green and
+   electric cyan with a soft outer glow, mimicking a live grid line. */
+
+@keyframes tron-pulse-border {
+  0%, 100% {
+    border-color: #39ff14;
+    box-shadow:
+      0 0 8px rgba(57, 255, 20, 0.45),
+      0 0 16px rgba(57, 255, 20, 0.20);
+  }
+  50% {
+    border-color: #00e5ff;
+    box-shadow:
+      0 0 12px rgba(0, 229, 255, 0.55),
+      0 0 22px rgba(0, 229, 255, 0.25);
+  }
+}
+
+[data-theme="tron"] .server-card.selected,
+[data-theme="tron"] input[type="text"]:focus,
+[data-theme="tron"] input[type="password"]:focus,
+[data-theme="tron"] input[type="number"]:focus,
+[data-theme="tron"] select:focus,
+[data-theme="tron"] textarea:focus,
+[data-theme="tron"] button.primary:not(:disabled) {
+  animation: tron-pulse-border 2.4s ease-in-out infinite;
+}
+
+/* Tron primary buttons: dark "program" green fill with the grid-line
+   pulse running around the edge. Keeps the button readable while
+   broadcasting the active-grid feel. */
+[data-theme="tron"] button.primary:not(:disabled) {
+  background: #0a3a2a;
+  color: #d0ffd9;
+}
+[data-theme="tron"] button.primary:not(:disabled):hover {
+  background: #0f4d36;
+}
+
+/* Selected server-card override: replace the base rule's hardcoded
+   blue (#1a2532) with a deep dark-green so it sits inside the Tron
+   palette. The animated pulse above supplies the visible signal. */
+[data-theme="tron"] .server-card.selected {
+  background: #0a2218;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="tron"] .server-card.selected,
+  [data-theme="tron"] input[type="text"]:focus,
+  [data-theme="tron"] input[type="password"]:focus,
+  [data-theme="tron"] input[type="number"]:focus,
+  [data-theme="tron"] select:focus,
+  [data-theme="tron"] textarea:focus,
+  [data-theme="tron"] button.primary:not(:disabled) {
+    animation: none;
+    border-color: #39ff14;
+    box-shadow: 0 0 10px rgba(57, 255, 20, 0.35);
+  }
+}
+
+/* ── Chameleon backend-context tints ────────────────────────────────
+   The chameleon theme adapts its accent + selection pulse to
+   whatever media backend you're currently touching. Hover a Plex
+   server card and the UI tints amber; hover Jellyfin -> purple/teal;
+   hover Emby -> green. Click into a backend-filtered surface and
+   the tint sticks until you leave. data-backend-tint is set on
+   <html> by the BackendTintContext: persistent tint from
+   BackendTabStrip selection, transient hover-tint from per-card
+   hover (hover takes precedence while active).
+
+   Default chameleon (no data-backend-tint) keeps a neutral
+   silver/pearl accent + a slow pearl pulse on the same selectors so
+   the "no decision yet" mode reads distinctly from any of the
+   backend-specific looks.
+
+   Clickable wood objects (primary buttons, selected cards) stay the
+   same log brown as hearth - the backend signal lives in the moving
+   border + glow, not the fill. */
+
+/* Chameleon default-state (no backend in scope): hearth fire pulse,
+   the same hm-fire-border keyframes hearth uses. */
+[data-theme="chameleon"]:not([data-backend-tint]) .server-card.selected,
+[data-theme="chameleon"]:not([data-backend-tint]) input[type="text"]:focus,
+[data-theme="chameleon"]:not([data-backend-tint]) input[type="password"]:focus,
+[data-theme="chameleon"]:not([data-backend-tint]) input[type="number"]:focus,
+[data-theme="chameleon"]:not([data-backend-tint]) select:focus,
+[data-theme="chameleon"]:not([data-backend-tint]) textarea:focus,
+[data-theme="chameleon"]:not([data-backend-tint]) button.primary:not(:disabled) {
+  animation: hm-fire-border 3.5s ease-in-out infinite;
+}
+
+/* Primary buttons + selected cards: same log brown as hearth across
+   every backend tint. The backend signal is in the border, not the
+   fill. */
+[data-theme="chameleon"] button.primary:not(:disabled) {
+  background: #7a5230;
+  color: #ffe8c0;
+}
+[data-theme="chameleon"] button.primary:not(:disabled):hover {
+  background: #8b6038;
+}
+[data-theme="chameleon"] .server-card.selected {
+  background: #7a5230;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="chameleon"]:not([data-backend-tint]) .server-card.selected,
+  [data-theme="chameleon"]:not([data-backend-tint]) input[type="text"]:focus,
+  [data-theme="chameleon"]:not([data-backend-tint]) input[type="password"]:focus,
+  [data-theme="chameleon"]:not([data-backend-tint]) input[type="number"]:focus,
+  [data-theme="chameleon"]:not([data-backend-tint]) select:focus,
+  [data-theme="chameleon"]:not([data-backend-tint]) textarea:focus,
+  [data-theme="chameleon"]:not([data-backend-tint]) button.primary:not(:disabled) {
+    animation: none;
+    border-color: #ffae42;
+    box-shadow: 0 0 10px rgba(255, 140, 50, 0.30);
+  }
+}
+
+/* Plex tint: amber/gold (#e5a00d official brand). The closest to the
+   default hearth fire palette - subtle shift, mostly the steady-state
+   accent moves from fire orange to Plex amber. */
+@keyframes hm-plex-pulse {
+  0%, 100% { border-color: #e5a00d; box-shadow: 0 0 10px rgba(229, 160, 13, 0.40); }
+  25%      { border-color: #f7c948; box-shadow: 0 0 14px rgba(247, 201, 72, 0.50); }
+  50%      { border-color: #cc8400; box-shadow: 0 0 11px rgba(204, 132, 0, 0.45); }
+  75%      { border-color: #ffb733; box-shadow: 0 0 13px rgba(255, 183, 51, 0.45); }
+}
+/* Plex accent + pulse. Applied on EITHER persistent selection or
+   hover, so the moving highlight tracks whatever the user is
+   currently touching - even briefly while hovering. */
+[data-theme="chameleon"][data-backend-tint="plex"] {
+  --accent: #e5a00d;
+  --accent-hover: #f7c948;
+}
+
+/* Plex committed identity: only fires on persistent (tab-selected)
+   tint. Clickable wood (primary buttons + selected cards) shifts to
+   Plex's gold-ingot tone so every "you'll be running this against
+   Plex" button reads as Plex. Panels and borders stay default
+   chameleon (cobblestone bg + jet-black panels) - the room around
+   the chameleon doesn't shift, only its skin where you'd touch it. */
+[data-theme="chameleon"][data-backend-tint-persistent="plex"] button.primary:not(:disabled) {
+  background: #8b6a1e;
+  color: #1a0f04;
+}
+[data-theme="chameleon"][data-backend-tint-persistent="plex"] button.primary:not(:disabled):hover {
+  background: #a07d24;
+}
+[data-theme="chameleon"][data-backend-tint-persistent="plex"] .server-card.selected {
+  background: #8b6a1e;
+}
+[data-theme="chameleon"][data-backend-tint="plex"] .server-card.selected,
+[data-theme="chameleon"][data-backend-tint="plex"] input[type="text"]:focus,
+[data-theme="chameleon"][data-backend-tint="plex"] input[type="password"]:focus,
+[data-theme="chameleon"][data-backend-tint="plex"] input[type="number"]:focus,
+[data-theme="chameleon"][data-backend-tint="plex"] select:focus,
+[data-theme="chameleon"][data-backend-tint="plex"] textarea:focus,
+[data-theme="chameleon"][data-backend-tint="plex"] button.primary:not(:disabled) {
+  animation: hm-plex-pulse 3.5s ease-in-out infinite;
+}
+
+/* Jellyfin tint: cycles between official purple #aa5cc3 and teal
+   #00a4dc (the gradient on the Jellyfin logo). Very distinct from
+   Plex/Emby; instantly readable as "you're touching Jellyfin." */
+@keyframes hm-jellyfin-pulse {
+  0%, 100% { border-color: #aa5cc3; box-shadow: 0 0 10px rgba(170, 92, 195, 0.40); }
+  50%      { border-color: #00a4dc; box-shadow: 0 0 14px rgba(0, 164, 220, 0.50); }
+}
+/* Jellyfin accent + pulse (persistent or hover). */
+[data-theme="chameleon"][data-backend-tint="jellyfin"] {
+  --accent: #aa5cc3;
+  --accent-hover: #c47ad8;
+}
+
+/* Jellyfin committed identity (persistent only): amethyst clickables
+   on the same default chameleon panels. */
+[data-theme="chameleon"][data-backend-tint-persistent="jellyfin"] button.primary:not(:disabled) {
+  background: #4a3a6e;
+  color: #e6dcf2;
+}
+[data-theme="chameleon"][data-backend-tint-persistent="jellyfin"] button.primary:not(:disabled):hover {
+  background: #5a4880;
+}
+[data-theme="chameleon"][data-backend-tint-persistent="jellyfin"] .server-card.selected {
+  background: #4a3a6e;
+}
+[data-theme="chameleon"][data-backend-tint="jellyfin"] .server-card.selected,
+[data-theme="chameleon"][data-backend-tint="jellyfin"] input[type="text"]:focus,
+[data-theme="chameleon"][data-backend-tint="jellyfin"] input[type="password"]:focus,
+[data-theme="chameleon"][data-backend-tint="jellyfin"] input[type="number"]:focus,
+[data-theme="chameleon"][data-backend-tint="jellyfin"] select:focus,
+[data-theme="chameleon"][data-backend-tint="jellyfin"] textarea:focus,
+[data-theme="chameleon"][data-backend-tint="jellyfin"] button.primary:not(:disabled) {
+  animation: hm-jellyfin-pulse 3.5s ease-in-out infinite;
+}
+
+/* Emby tint: cycles through emerald green shades anchored at the
+   official #52b54b. */
+@keyframes hm-emby-pulse {
+  0%, 100% { border-color: #52b54b; box-shadow: 0 0 10px rgba(82, 181, 75, 0.40); }
+  25%      { border-color: #7dd476; box-shadow: 0 0 14px rgba(125, 212, 118, 0.50); }
+  50%      { border-color: #3a8a35; box-shadow: 0 0 11px rgba(58, 138, 53, 0.45); }
+  75%      { border-color: #66c45f; box-shadow: 0 0 13px rgba(102, 196, 95, 0.45); }
+}
+/* Emby accent + pulse (persistent or hover). */
+[data-theme="chameleon"][data-backend-tint="emby"] {
+  --accent: #52b54b;
+  --accent-hover: #7dd476;
+}
+
+/* Emby committed identity (persistent only): moss-stone clickables
+   on the same default chameleon panels. */
+[data-theme="chameleon"][data-backend-tint-persistent="emby"] button.primary:not(:disabled) {
+  background: #2e5a2e;
+  color: #e0f0e0;
+}
+[data-theme="chameleon"][data-backend-tint-persistent="emby"] button.primary:not(:disabled):hover {
+  background: #3a6c3a;
+}
+[data-theme="chameleon"][data-backend-tint-persistent="emby"] .server-card.selected {
+  background: #2e5a2e;
+}
+[data-theme="chameleon"][data-backend-tint="emby"] .server-card.selected,
+[data-theme="chameleon"][data-backend-tint="emby"] input[type="text"]:focus,
+[data-theme="chameleon"][data-backend-tint="emby"] input[type="password"]:focus,
+[data-theme="chameleon"][data-backend-tint="emby"] input[type="number"]:focus,
+[data-theme="chameleon"][data-backend-tint="emby"] select:focus,
+[data-theme="chameleon"][data-backend-tint="emby"] textarea:focus,
+[data-theme="chameleon"][data-backend-tint="emby"] button.primary:not(:disabled) {
+  animation: hm-emby-pulse 3.5s ease-in-out infinite;
+}
+
+/* Mixed tint: rotates through all three backend colors (Plex amber
+   -> Jellyfin purple -> Jellyfin teal -> Emby green) so the user can
+   tell at a glance that they're in a multi-backend view. Slower
+   cadence (6s) so the color changes don't feel frantic. */
+@keyframes hm-mixed-pulse {
+  0%, 100% { border-color: #e5a00d; box-shadow: 0 0 10px rgba(229, 160, 13, 0.40); }
+  25%      { border-color: #aa5cc3; box-shadow: 0 0 12px rgba(170, 92, 195, 0.45); }
+  50%      { border-color: #00a4dc; box-shadow: 0 0 13px rgba(0, 164, 220, 0.45); }
+  75%      { border-color: #52b54b; box-shadow: 0 0 12px rgba(82, 181, 75, 0.45); }
+}
+/* Mixed "aurora": no single backend dominates, so the structural
+   palette stays neutral (default chameleon hearth-tone). Only the
+   pulse signals multi-backend - tri-color rotation through Plex
+   amber, Jellyfin purple/teal, Emby green. */
+[data-theme="chameleon"][data-backend-tint="mixed"] {
+  --accent: #e8c870;
+  --accent-hover: #f4dc8e;
+}
+[data-theme="chameleon"][data-backend-tint="mixed"] .server-card.selected,
+[data-theme="chameleon"][data-backend-tint="mixed"] input[type="text"]:focus,
+[data-theme="chameleon"][data-backend-tint="mixed"] input[type="password"]:focus,
+[data-theme="chameleon"][data-backend-tint="mixed"] input[type="number"]:focus,
+[data-theme="chameleon"][data-backend-tint="mixed"] select:focus,
+[data-theme="chameleon"][data-backend-tint="mixed"] textarea:focus,
+[data-theme="chameleon"][data-backend-tint="mixed"] button.primary:not(:disabled) {
+  animation: hm-mixed-pulse 6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-theme="chameleon"][data-backend-tint] .server-card.selected,
+  [data-theme="chameleon"][data-backend-tint] input[type="text"]:focus,
+  [data-theme="chameleon"][data-backend-tint] input[type="password"]:focus,
+  [data-theme="chameleon"][data-backend-tint] input[type="number"]:focus,
+  [data-theme="chameleon"][data-backend-tint] select:focus,
+  [data-theme="chameleon"][data-backend-tint] textarea:focus,
+  [data-theme="chameleon"][data-backend-tint] button.primary:not(:disabled) {
+    animation: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+  }
+}
+
