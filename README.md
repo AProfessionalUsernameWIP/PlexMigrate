@@ -105,11 +105,19 @@ Auth is always on. On first boot the UI walks you through creating the Root Admi
 
 Connecting to a backend starts with pooling every user on that server: verifying their last connection time, confirming they are still active, and collecting their authentication token. Administrator credentials are required to access this data in the first place (an admin token on Plex, an admin API key on Jellyfin and Emby).
 
-For managed users, Hestia collects usernames and tokens where possible. The complication is accounts protected by their own credential: Emby and Jellyfin admin accounts with passwords, and Plex Home users with PINs set. Without those credentials, Hestia would have to fall back to the administrator token, which means any playlists or collections restored to that account would not be manageable by the end user. To solve this properly, Hestia lets you store per-user passwords and PINs for each respective backend in the encrypted vault. When a restore, migration, playlist deployment, or direct transfer runs, Hestia authenticates as that user, deploys the artifacts under their identity, and ensures they have full ownership and control over what was restored.
+For managed users (primarily Plex Home users with PINs), Hestia collects usernames and tokens where possible. The complication is accounts protected by their own credential: Emby and Jellyfin admin accounts with passwords, and Plex Home users with PINs set. Without those credentials, Hestia would have to fall back to the administrator token, which means any playlists or collections restored to that account would not be manageable by the end user. To solve this properly, Hestia lets you store per-user passwords and PINs for each respective backend in the encrypted vault. When a restore, migration, playlist deployment, or direct transfer runs, Hestia authenticates as that user, deploys the artifacts under their identity, and ensures they have full ownership and control over what was restored.
 
 On the Plex side this uses the real per-user token derived from the stored PIN. On Jellyfin and Emby, where the API allows it, the admin key is used with the destination `UserId` so the write is attributed to the user without holding a separate token.
 
 This matters for the long-term usability of these backends. It also opens up a natural expansion: playlist sharing between users. If one user has a playlist they want another user to own (not just see, but actually manage), the user impersonation layer makes it possible.
+
+### Understanding the cross-platform preflight modal and user mapping
+
+When you run a restore, direct transfer, or playlist copy involving users from different servers (or servers of different types), Hestia shows an interactive modal on the Run Job form before the job starts. This **cross-platform preflight modal** lets you explicitly map users: "the Plex user 'Crystal Jean' on Server A is the same person as the Jellyfin user 'crystal.jean' on Server B." These mappings live in the **`user_identity_map`** table and are reusable across jobs and schedules.
+
+If you do not make an explicit mapping, Hestia falls back to the 5-step resolution chain below, trying each method in order until it finds a match. The `strict_identity_resolution` tunable (defined later) lets you short-circuit that chain to require explicit maps for every user.
+
+**PIN and password capture:** For Plex Home users with a PIN set, use the Servers tab's PIN preflight modal (in the Server Users block) to store the PIN before running a restore. This ensures playlists and collections restore under the right user's identity. Jellyfin and Emby admin accounts with passwords follow the same pattern: capture the password in the Servers tab before the job runs. Stored credentials are encrypted at rest.
 
 ### How users are identified across servers (the app_user_uuid)
 
@@ -123,15 +131,28 @@ Hestia tracks three identifiers per user, each with a different lifetime and sco
 
 Every user added to the app gets an `app_user_uuid` generated at insert time. That covers every path a user can enter the app: managed-user sync, snapshot capture, snapshot restore, the User Management endpoints, the per-user-token save endpoint, and inline cross-platform user creation. There is no path that adds a user without a UUID.
 
-The cross-server `user_identity_map` keys off two `app_user_uuid` values, so a Hestia-user-authored mapping like "the Plex 'Crystal Jean' on Server A is the same human as the Jellyfin 'crystal.jean' on Server B" survives renames on either side, `backend_user_id` rotation, and even a backend being re-registered. Snapshot restore, direct transfer, and playlist copy all walk the same 5-step resolution chain for each source user's payload:
+The cross-server `user_identity_map` keys off two `app_user_uuid` values, so an explicit mapping from the preflight modal (e.g., "Plex Crystal Jean" is the same person as "Jellyfin crystal.jean") survives renames on either side, `backend_user_id` rotation (when a backend reassigns its internal user IDs), and even a backend being re-registered. Snapshot restore, direct transfer, and playlist copy all walk the same 5-step resolution chain for each source user's payload:
 
 1. Per-job override (Map decision from the cross-platform preflight modal).
 2. `user_identity_map` lookup (authoritative).
 3. `backend_user_id` direct match within the same service type.
 4. Case-insensitive username match (the legacy fallback).
-5. Owner-role single-admin fallback (when the source user is the owner and the destination has exactly one admin).
+5. Owner-role single-admin fallback (when the source user is the account owner and the destination has exactly one admin user). Used only when no other tier matches.
 
-The `strict_identity_resolution` tunable cuts the chain short after step 2 for Hestia users who want every routing to come from an explicit map.
+The `strict_identity_resolution` tunable cuts the chain short after step 2 for Hestia users who want every routing to come from an explicit map. When `strict_identity_resolution` is enabled, steps 3-5 are skipped; the preflight modal mapping (step 1) or an existing `user_identity_map` row (step 2) becomes mandatory for every cross-server user.
+
+### Tombstoning: skipping users you do not want Hestia to touch
+
+Tombstoning marks a managed user as "do not enumerate, do not write to." A tombstoned user is filtered out at the source of every code path that reaches into a server: home-user enumeration, restore preflight, direct transfer, playlist copy, and mirror sync all honour the same filter. The user still exists on the backend; Hestia just stops seeing them.
+
+There are two flavors:
+
+- **Manual tombstone (Hestia-User driven).** In the Servers tab's **User Management** subsection, tombstone any managed user you no longer want Hestia to manage even though they still exist on Plex / Jellyfin / Emby. Two scopes are available: a **per-server tombstone** (the user is filtered only on that one server, stored on the `managed_users.tombstoned` flag) and a **global tombstone** (the username is filtered across every registered server, stored in the `global_tombstones` table). Reverse either from the same UI.
+- **Auto-tombstone (background sweeper, off by default).** The user-activity sweeper daemon polls each registered server on a configurable cadence to confirm every managed user can still authenticate. When a user fails the consecutive-auth-probe threshold, the sweeper can auto-tombstone them so subsequent jobs do not waste time or API quota on a user who cannot be reached. This is a 5-layer opt-in: the sweeper itself (`user_activity_sweeper_enabled`), the engine-side filter (`user_activity_filter_enabled`), and two separate auto-tombstone triggers (`auto_tombstone_on_auth_error` for credential rejections and `auto_tombstone_on_unreachable` for "can't reach the server" errors) all default OFF. Turn them on incrementally as you trust the behavior. The threshold (`user_activity_consecutive_failure_threshold`, default `3`) and sweep cadence (`user_activity_sweep_interval_hours`, default `12`) are independently tunable.
+
+Auto-tombstoning is intentionally conservative because a single network blip can rack up "unreachable" counts for every user on a server. Leave `auto_tombstone_on_unreachable` off unless you have a stable LAN to your backend; the auth-error trigger is the safer of the two because it only fires when the backend explicitly rejects a credential.
+
+Restores already skip users not present on the target by default (see the [Plex Home Users](#plex-home-users-operator-faq) FAQ for the gap report); tombstoning is the explicit operator-driven version of "I do not want this user touched" rather than the implicit "this user is not on the destination."
 
 ---
 
@@ -336,15 +357,13 @@ To restore a smart playlist manually: open the destination, create a new Smart P
 
 ## Plex Home Users
 
-If your Plex server is linked to a Plex.tv account and you use Plex Home (multiple user profiles sharing one server), Hestia automatically snapshots and restores each managed user's watch history, playlists, and ratings independently. Each user's data lives in the snapshot under a `"users"` section and is restored into the correct profile on the target server.
+If your Plex server is linked to a Plex.tv account and runs Plex Home (multiple user profiles), the identity layer described in [Identity Mapping and User Impersonation](#identity-mapping-and-user-impersonation) (see the [5-step resolution chain](#how-users-are-identified-across-servers-the-app_user_uuid) for details) does the heavy lifting automatically. This section covers the two Plex-Home-specific operator behaviors you'll see in the UI.
 
-**Requirements for multi-user support:**
-- The server must be linked to a Plex.tv account (not using a LocalAdminToken).
-- The managed users must exist on the target server with the same usernames before you run the restore, or be mapped via the cross-platform preflight modal.
+**Prerequisite.** The server must be linked to a Plex.tv account (not running on a LocalAdminToken). Without the Plex.tv link Hestia has no way to enumerate managed users on that server.
 
-**What happens if a user is on the old server but not the new one yet?** Hestia logs which users it found on the target server and which ones exist in the snapshot before it starts restoring, so you can see the gap immediately. Users not found on the target are skipped with an INFO log, not an error. The end-of-restore summary lists which users were restored and which were skipped, by name.
+**Per-user PIN preflight.** Before a job submits, if any managed user has a Plex Home PIN set and Hestia has no captured token for them, the Run Job form lists those at-risk users. Two recovery paths: capture the PIN in the Servers tab via the PIN preflight modal and re-run, or continue and have those users skipped with a clear log line.
 
-If a managed user has a Plex Home PIN set and Hestia does not have a captured token for them, the Run Job form shows a preflight warning listing the at-risk users before the job submits. You can either fix it (capture the PIN in the Servers tab via the PIN preflight modal, then re-run) or continue, in which case those users are dropped from the run with a clear log line.
+**Missing-user gap report.** At job start, Hestia logs which managed users it found on the target server and which exist only in the snapshot, so you can see the gap immediately. Users not found on the target are skipped with an INFO log, not an error. The end-of-restore summary lists by name which users were restored and which were skipped.
 
 ---
 
