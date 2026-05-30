@@ -113,7 +113,7 @@ This matters for the long-term usability of these backends. It also opens up a n
 
 ### Understanding the cross-platform preflight modal and user mapping
 
-When you run a restore, direct transfer, or playlist copy involving users from different servers (or servers of different types), Hestia shows an interactive modal on the Run Job form before the job starts. This **cross-platform preflight modal** lets you explicitly map users: "the Plex user 'Crystal Jean' on Server A is the same person as the Jellyfin user 'crystal.jean' on Server B." These mappings live in the **`user_identity_map`** table and are reusable across jobs and schedules.
+When you run a restore, direct transfer, or playlist copy involving users from different servers (or servers of different types), Hestia shows an interactive modal on the Run Job form before the job starts. This **cross-platform preflight modal** lets you explicitly map users: "the Plex user 'Diesel' on Server A is the same person as the Jellyfin user 'diesel' on Server B." These mappings live in the **`user_identity_map`** table and are reusable across jobs and schedules.
 
 If you do not make an explicit mapping, Hestia falls back to the 5-step resolution chain below, trying each method in order until it finds a match. The `strict_identity_resolution` tunable (defined later) lets you short-circuit that chain to require explicit maps for every user.
 
@@ -131,7 +131,7 @@ Hestia tracks three identifiers per user, each with a different lifetime and sco
 
 Every user added to the app gets an `app_user_uuid` generated at insert time. That covers every path a user can enter the app: managed-user sync, snapshot capture, snapshot restore, the User Management endpoints, the per-user-token save endpoint, and inline cross-platform user creation. There is no path that adds a user without a UUID.
 
-The cross-server `user_identity_map` keys off two `app_user_uuid` values, so an explicit mapping from the preflight modal (e.g., "Plex Crystal Jean" is the same person as "Jellyfin crystal.jean") survives renames on either side, `backend_user_id` rotation (when a backend reassigns its internal user IDs), and even a backend being re-registered. Snapshot restore, direct transfer, and playlist copy all walk the same 5-step resolution chain for each source user's payload:
+The cross-server `user_identity_map` keys off two `app_user_uuid` values, so an explicit mapping from the preflight modal (e.g., "Plex Diesel" is the same person as "Jellyfin diesel") survives renames on either side, `backend_user_id` rotation (when a backend reassigns its internal user IDs), and even a backend being re-registered. Snapshot restore, direct transfer, and playlist copy all walk the same 5-step resolution chain for each source user's payload:
 
 1. Per-job override (Map decision from the cross-platform preflight modal).
 2. `user_identity_map` lookup (authoritative).
