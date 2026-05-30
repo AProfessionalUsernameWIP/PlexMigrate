@@ -143,16 +143,10 @@ The `strict_identity_resolution` tunable cuts the chain short after step 2 for H
 
 ### Tombstoning: skipping users you do not want Hestia to touch
 
-Tombstoning marks a managed user as "do not enumerate, do not write to." A tombstoned user is filtered out at the source of every code path that reaches into a server: home-user enumeration, restore preflight, direct transfer, playlist copy, and mirror sync all honour the same filter. The user still exists on the backend; Hestia just stops seeing them.
+Tombstoning marks a managed user as "do not enumerate, do not write to" so Hestia stops seeing them across every code path that reaches into a server (home-user enumeration, restore preflight, direct transfer, playlist copy, mirror sync). The user still exists on the backend. Both flavors are reversible from the UI.
 
-There are two flavors:
-
-- **Manual tombstone (Hestia-User driven).** In the Servers tab's **User Management** subsection, tombstone any managed user you no longer want Hestia to manage even though they still exist on Plex / Jellyfin / Emby. Two scopes are available: a **per-server tombstone** (the user is filtered only on that one server, stored on the `managed_users.tombstoned` flag) and a **global tombstone** (the username is filtered across every registered server, stored in the `global_tombstones` table). Reverse either from the same UI.
-- **Auto-tombstone (background sweeper, off by default).** The user-activity sweeper daemon polls each registered server on a configurable cadence to confirm every managed user can still authenticate. When a user fails the consecutive-auth-probe threshold, the sweeper can auto-tombstone them so subsequent jobs do not waste time or API quota on a user who cannot be reached. This is a 5-layer opt-in: the sweeper itself (`user_activity_sweeper_enabled`), the engine-side filter (`user_activity_filter_enabled`), and two separate auto-tombstone triggers (`auto_tombstone_on_auth_error` for credential rejections and `auto_tombstone_on_unreachable` for "can't reach the server" errors) all default OFF. Turn them on incrementally as you trust the behavior. The threshold (`user_activity_consecutive_failure_threshold`, default `3`) and sweep cadence (`user_activity_sweep_interval_hours`, default `12`) are independently tunable.
-
-Auto-tombstoning is intentionally conservative because a single network blip can rack up "unreachable" counts for every user on a server. Leave `auto_tombstone_on_unreachable` off unless you have a stable LAN to your backend; the auth-error trigger is the safer of the two because it only fires when the backend explicitly rejects a credential.
-
-Restores already skip users not present on the target by default (see the [Plex Home Users](#plex-home-users-operator-faq) FAQ for the gap report); tombstoning is the explicit operator-driven version of "I do not want this user touched" rather than the implicit "this user is not on the destination."
+- **Manual (Hestia-User driven).** Servers tab > User Management. Choose per-server scope (this one server only) or global scope (every registered server). Use when an end user has churned off your stack and you do not want their roster row reached for.
+- **Auto (background sweeper, default OFF).** A daemon polls each server on a configurable cadence and auto-tombstones users who fail the consecutive-auth-probe threshold. A 5-layer opt-in in Settings (sweeper, engine filter, auth-error trigger, unreachable trigger) gates the behavior; leave the unreachable trigger off unless your LAN to the backend is stable, since one network blip can rack up failures for every user at once.
 
 ---
 
