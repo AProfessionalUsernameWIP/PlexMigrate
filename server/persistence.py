@@ -1,14 +1,14 @@
 """
-Persistence layer for the PlexMigrate server.
+Persistence layer for the Hestia-MediaManager server.
 
 The server keeps two pieces of state on disk so they survive container
 restarts and rebuilds:
 
-* ``settings.json`` — Plex server URL + auth token + default output/log
+* ``settings.json`` - Plex server URL + auth token + default output/log
   directories. There is one settings document; the file is rewritten
   in full on every change.
-* ``schedules.json`` — list of saved schedule entries (which libraries
-  to export, how often, where to write the output, next-run timestamp).
+* ``schedules.json`` - list of saved schedule entries (which libraries
+  to snapshot, how often, where to write the output, next-run timestamp).
 
 Both files live in ``$PLEXMIGRATE_DATA_DIR`` (defaulting to
 ``./server_data``). In the Docker setup ``./server_data`` is a bind
@@ -20,7 +20,7 @@ trivially inspectable and editable from a host shell if the server is
 ever wedged. SQLite would be overkill.
 
 Concurrent access from the server's own threads is guarded by
-``_FILE_LOCK`` — both the scheduler thread and the request handler may
+``_FILE_LOCK`` - both the scheduler thread and the request handler may
 write at the same time.
 """
 
@@ -67,7 +67,7 @@ def _schedules_path() -> Path:
 
 
 # ── Cross-thread write lock ───────────────────────────────────────────────────
-# A single lock guarding both files is enough — writes are tiny and
+# A single lock guarding both files is enough - writes are tiny and
 # infrequent, and the simpler invariant ("only one thread is writing
 # any persistence file at a time") is easier to reason about than two
 # locks.
@@ -77,17 +77,103 @@ _FILE_LOCK = threading.Lock()
 # ── Default documents ────────────────────────────────────────────────────────
 
 # The schema for settings.json. Any key omitted from an on-disk
-# document is filled in with these defaults on load — that keeps the
-# server compatible with older settings files when new fields are added.
+# document is filled in with these defaults on load, keeping the
+# server compatible with older settings files. Per-key rationale -
+# when and why to change a value - lives in
+# dev_docs/settings-reference.md; the comments here are held to one
+# terse line per key (a clamp range or other non-obvious constraint).
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "plex_url": "http://host.docker.internal:32400",
     "plex_token": "",
-    "output_dir": "./plex_exports",
+    "output_dir": "./snapshots",
     "log_dir": "./plex_logs",
     "workers": 16,
     "scrobble_workers": 8,
     "verbose": False,
     "strict_match": True,
+    # Global snapshot-retention ceiling; the per-server override map
+    # may only lower it for a given server, never raise it.
+    "snapshot_retention_global": 30,
+    "snapshot_retention_per_server": {},
+    "prebuild_json_sidecar_default": False,
+    # Owner-phase watch+ratings capture strategy:
+    # "smart" | "force_bulk" | "force_server_side".
+    "watch_ratings_filter_strategy": "smart",
+    # Smart-mode bulk-fetch size threshold, in library items.
+    "smart_bulk_threshold_items": 5000,
+    # run_timings.db retention: keep the most recent N distinct
+    # run_ids after each flush. 0 disables enforcement (unbounded).
+    "run_timings_retention_count": 200,
+    # Snapshot structural validation. after-capture defaults on (cheap,
+    # catches malformed captures); before-restore defaults off (it adds
+    # wall time to every restore).
+    "validate_snapshot_after_capture": True,
+    "validate_snapshot_before_restore": False,
+    # Application-log rotation (applied today to db_access.log).
+    "log_rotate_max_size_mb": 50,
+    "log_rotate_backup_count": 5,
+    # Per-server snapshot-time defaults; see SettingsIn.snapshot_defaults_per_server.
+    "snapshot_defaults_per_server": {},
+    # Direct-transfer resolver-tier policy: filepath fallback on, fuzzy
+    # off. snapshot/import paths keep both fallbacks active regardless.
+    "transfer_resolution": {
+        "allow_filepath_fallback": True,
+        "allow_fuzzy_fallback": False,
+    },
+    # Global restore-mode fallback (per-server / per-job overrides win).
+    # merge_watch_strategy: "higher" (idempotent) or "sum"; ignored when
+    # mode == "replace".
+    "restore_defaults": {
+        "mode": "merge",
+        "auto_capture_before_replace": True,
+        "merge_watch_strategy": "higher",
+    },
+    # Libraries-in-parallel cap for the file-mediated restore path;
+    # clamped to min(value, library_count). Does not apply to direct
+    # transfer (serial).
+    "restore_library_workers": 3,
+    # Libraries-in-parallel cap for the snapshot path. 0 = inherit from
+    # ``workers``; a positive integer decouples it from the HTTP pool.
+    "snapshot_library_workers": 0,
+    # Per-fan-out destination concurrency cap. 0 = no cap (one worker
+    # thread per destination).
+    "fan_out_destination_workers": 0,
+    # media.db retention + cascade-delete policy. prune_stale_*_days
+    # are placeholders (the sweep logic is not yet shipped).
+    "media_db_retention": {
+        "cascade_delete_on_server_remove": True,
+        "prevent_cascade_delete": False,
+        "prune_stale_watch_events_days": 0,
+        "prune_stale_server_data_days": 0,
+    },
+    # Library-walk job cadence; interval_seconds is floored at 1h by
+    # the scheduler. stale_threshold_days is the Prune UI slider's
+    # opening value.
+    "library_walk": {
+        "enabled": True,
+        "interval_seconds": 86400,
+        "stale_threshold_days": 7,
+    },
+    # Per-server cap on user-token capture attempts; floored at 1/hour.
+    "user_token_capture_throttle_per_hour": 4,
+    # sudo-style elevation TTL for root_admin destructive writes;
+    # clamped to [60, 3600] seconds by the elevation helper.
+    "elevation_ttl_seconds": 600,
+    # When true, Refresh-server also overwrites any stored token whose
+    # Plex-side value changed.
+    "auto_rotate_tokens_on_refresh": False,
+    # When true, PIN migration matches managed users by username as
+    # well as Plex user id.
+    "pin_migration_allow_username_fallback": False,
+    # Global InfoTip popover toggle.
+    "tooltips_enabled": True,
+    # System Tunables override map; services.tunables owns the
+    # source-of-truth defaults.
+    "tunables": {},
+    # Per-server tunable overrides: {server_id: {tunable_key: value}}.
+    "tunables_per_server": {},
+    # ETR colour multiplier; 1.0 = ship defaults.
+    "etr_color_multiplier": 1.0,
 }
 
 
@@ -98,14 +184,14 @@ def load_settings() -> Dict[str, Any]:
     Return a complete settings dict. Missing file or missing keys are
     backfilled from ``_DEFAULT_SETTINGS``.
 
-    v0.9.5: if the on-disk document carries ``"_encrypted": True``,
-    the ``plex_token`` field is decrypted before being returned. If
-    the marker is absent, the field is treated as plaintext (legacy /
-    pre-migration shape) and returned as-is — the v0.8→v0.9 migration
-    in ``server_registry.migrate_legacy_settings`` is the one path
-    that depends on this; once it runs, ``_clear_legacy_fields`` writes
-    an empty string back through ``save_settings``, which sets the
-    marker for all subsequent loads.
+    If the on-disk document carries ``"_encrypted": True``, the
+    ``plex_token`` field is decrypted before being returned. If the
+    marker is absent, the field is treated as plaintext (legacy shape)
+    and returned as-is - the legacy-settings migration in
+    ``server_registry.migrate_legacy_settings`` is the one path that
+    depends on this; once it runs, ``_clear_legacy_fields`` writes an
+    empty string back through ``save_settings``, which sets the marker
+    for all subsequent loads.
     """
     path = _settings_path()
     if not path.exists():
@@ -138,21 +224,54 @@ def load_settings() -> Dict[str, Any]:
     return merged
 
 
+# HTTP-related tunables that require ``services.auth.invalidate_sessions``
+# to be called after a save so live requests Sessions pick up the new
+# adapter / retry policy without a process restart.
+_HTTP_TUNABLE_KEYS = frozenset((
+    "plex_retry_total_budget",
+    "plex_retry_backoff_factor",
+    "http_pool_connections",
+    "http_pool_maxsize_cap",
+))
+
+
+def _http_tunables_changed(
+    before: Dict[str, Any], after: Dict[str, Any],
+) -> bool:
+    """True iff any HTTP-pool / retry tunable differs between
+    ``before`` and ``after``. Both dicts are full settings documents."""
+    b = (before or {}).get("tunables") or {}
+    a = (after or {}).get("tunables") or {}
+    for key in _HTTP_TUNABLE_KEYS:
+        if b.get(key) != a.get(key):
+            return True
+    return False
+
+
 def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     """
     Atomically replace the on-disk settings document. Returns the full
     merged document so the caller can echo it back to the client.
 
-    Keys not present in ``settings`` retain their previous values —
+    Keys not present in ``settings`` retain their previous values -
     this is a partial update.
 
-    v0.9.5: the ``plex_token`` field is encrypted before write and
-    the ``_encrypted`` marker is set. The returned dict still holds
-    the plaintext token so callers that immediately consume the
-    document don't need to know about encryption.
+    The ``plex_token`` field is encrypted before write and the
+    ``_encrypted`` marker is set. The returned dict still holds the
+    plaintext token so callers that immediately consume the document
+    don't need to know about encryption.
+
+    When a save changes any HTTP-related tunable (retry budget,
+    backoff, pool sizes) the function rebuilds every live requests
+    Session's HTTPAdapter via ``services.auth.invalidate_sessions``.
+    The tunables module's mtime-keyed cache invalidates automatically
+    on the next read.
     """
     with _FILE_LOCK:
         existing = load_settings()
+        # Snapshot the pre-save shape so we can decide whether to
+        # rebuild HTTP sessions after the write.
+        before = dict(existing)
         existing.update(settings)
 
         # Build the on-disk payload with the token encrypted. Returned
@@ -164,7 +283,22 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
         on_disk["_encrypted"] = True
 
         _atomic_write_json(_settings_path(), on_disk)
-        return existing
+
+    # Outside the file lock: rebuild HTTP sessions when an HTTP
+    # tunable changed. Done after the write so a transient
+    # invalidate_sessions failure doesn't block the persistence.
+    if _http_tunables_changed(before, existing):
+        try:
+            from services.auth import invalidate_sessions
+            invalidate_sessions()
+            log.info(
+                "save_settings: HTTP tunables changed - rebuilt %s live session(s).",
+                "all",
+            )
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("save_settings: invalidate_sessions failed")
+
+    return existing
 
 
 # ── Schedule I/O ─────────────────────────────────────────────────────────────
@@ -230,19 +364,97 @@ def delete_schedule(schedule_id: str) -> bool:
         return True
 
 
-def delete_schedules_by_server_name(server_name: str) -> int:
+def rename_schedules_for_server(
+    old_name: str, new_name: str, *, service_type: str = "plex",
+) -> int:
     """
-    Remove every schedule whose ``source_server_name`` equals
-    ``server_name``. Returns the number of rows removed.
+    Rewrite every schedule's ``source_server_name`` and
+    ``dest_server_names`` entries from ``old_name`` to ``new_name``
+    when the row's ``source_service_type`` (or per-destination
+    ``dest_service_types``) matches ``service_type``. Returns the
+    number of schedule rows rewritten.
 
-    Used by the server-removal cascade (v0.9.5): when a registered
-    server is deleted, schedules that fire against it can never run
-    again, so they're cleared in lockstep rather than left to log a
-    "no source_server_name set" warning every 30 seconds.
+    Without this rewrite, renaming a server would leave every schedule
+    referencing its old name dangling: the scheduler would fail to
+    resolve the source or - worse, if the old name had been reassigned
+    - silently target a different server.
+
+    Called by :func:`server_registry.update_server` whenever a name
+    field changes. Best-effort: schedule file unavailable / locked
+    paths are reported in the return tuple but never raise.
+
+    ``service_type`` filters so renaming a Plex server doesn't touch
+    same-named-different-backend Jellyfin / Emby schedules. Legacy
+    schedules without ``source_service_type`` default to "plex" on read.
     """
+    target_service = (service_type or "plex").lower()
+    if not old_name or not new_name or old_name == new_name:
+        return 0
+    rewritten = 0
     with _FILE_LOCK:
         items = load_schedules()
-        kept = [s for s in items if s.get("source_server_name") != server_name]
+        for s in items:
+            changed = False
+            # Source rewrite.
+            if (
+                s.get("source_server_name") == old_name
+                and (s.get("source_service_type") or "plex").lower() == target_service
+            ):
+                s["source_server_name"] = new_name
+                changed = True
+            # Per-destination rewrite. dest_server_names is a list
+            # of strings; dest_service_types is the parallel array.
+            dest_names = s.get("dest_server_names") or []
+            dest_services = s.get("dest_service_types") or []
+            if dest_names:
+                new_dests = []
+                for i, dn in enumerate(dest_names):
+                    if i < len(dest_services):
+                        ds = (dest_services[i] or "plex").lower()
+                    else:
+                        ds = "plex"
+                    if dn == old_name and ds == target_service:
+                        new_dests.append(new_name)
+                        changed = True
+                    else:
+                        new_dests.append(dn)
+                if changed:
+                    s["dest_server_names"] = new_dests
+            if changed:
+                rewritten += 1
+        if rewritten:
+            _atomic_write_json(_schedules_path(), items)
+    return rewritten
+
+
+def delete_schedules_by_server_name(
+    server_name: str, *, service_type: str = "plex",
+) -> int:
+    """
+    Remove every schedule whose ``source_server_name`` AND
+    ``source_service_type`` match. Returns the number of rows removed.
+
+    Used by the server-removal cascade: when a registered server is
+    deleted, schedules that fire against it can never run again, so
+    they're cleared in lockstep rather than left to log a "no
+    source_server_name set" warning every 30 seconds.
+
+    ``service_type`` filters by the schedule's ``source_service_type``
+    field. Legacy rows that omit the field are read as "plex" - so
+    deleting a Plex server with the default keyword removes legacy
+    schedules cleanly. Deleting an Emby server only matches schedules
+    explicitly stamped with ``source_service_type='emby'``; same-named
+    Plex schedules survive.
+    """
+    server_type = (service_type or "plex").lower()
+    with _FILE_LOCK:
+        items = load_schedules()
+        def _matches(s: Dict[str, Any]) -> bool:
+            if s.get("source_server_name") != server_name:
+                return False
+            row_service = (s.get("source_service_type") or "plex").lower()
+            return row_service == server_type
+        kept = [s for s in items if not _matches(s)]
         removed = len(items) - len(kept)
         if removed:
             _atomic_write_json(_schedules_path(), kept)
@@ -257,23 +469,52 @@ def _atomic_write_json(path: Path, payload: Any) -> None:
 
     We write to a sibling temp file then ``os.replace()`` it on top of
     the destination. That gives us a crash-safety guarantee: either
-    the new file is fully there, or the old one is still there — never
+    the new file is fully there, or the old one is still there - never
     a half-written file. This matters because both files are read on
     every request.
+
+    The temp file is chmod'd to ``0o600`` before the replace so the
+    destination (``settings.json`` / ``servers.json``) is never
+    world-readable - both can carry Fernet-encrypted Plex tokens, and
+    the keyfile lives in the same directory. ``chmod`` only has real
+    effect on POSIX hosts; on Windows the data-directory ACL is the
+    actual security boundary and must be locked down separately.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, default=str)
+        # Force the data blocks to disk before the rename. os.replace
+        # is atomic against torn writes; the fsync makes it durable
+        # against a power loss between the write and the rename.
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        # Best-effort; never block a settings write on a chmod failure.
+        pass
     os.replace(tmp, path)
+    # Best-effort POSIX rename durability: fsync the parent directory
+    # so the rename entry itself survives a crash. Not every platform
+    # allows opening a directory; a settings write must never fail on
+    # this nicety, hence the broad OSError swallow.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
-# ── Path validation (v0.9.5) ─────────────────────────────────────────────────
+# ── Path validation ──────────────────────────────────────────────────────────
 
 # Catches Windows-style host paths that won't work inside the Linux
 # container: drive-letter roots (``C:\``, ``Y:/``, ``z:\foo``) and UNC
 # paths (``\\server\share``). Linux paths and relative paths (``./`` or
-# bare names like ``plex_exports``) pass through.
+# bare names like ``snapshots``) pass through.
 _WINDOWS_PATH_RE = re.compile(r"^([A-Za-z]:[\\/]|\\\\)")
 
 
@@ -283,27 +524,69 @@ def validate_container_path(path: str, field_label: str) -> None:
     container.
 
     The backend runs in Docker; it only sees host paths that are
-    explicitly bind-mounted via ``docker-compose.yml``. Operators
-    occasionally enter a Windows host path like ``Y:\\plexbackups`` in
+    explicitly bind-mounted via ``docker-compose.yml``. End users
+    occasionally enter a Windows host path like ``Y:\\plexexports`` in
     the Settings tab; the engine then ``mkdir``s a literal directory
-    named ``Y:\\plexbackups`` inside ``/app/`` (since backslash and
-    colon are legal in Linux filenames) and writes the export there,
+    named ``Y:\\plexexports`` inside ``/app/`` (since backslash and
+    colon are legal in Linux filenames) and writes the snapshot there,
     where the host can never see it.
 
     This guard rejects such paths at the API boundary with an actionable
-    error message that names the field and tells the operator exactly
+    error message that names the field and tells the end user exactly
     how to wire up an external drive instead.
 
-    Empty strings are not rejected — the engine has its own per-field
-    default fallback (``./plex_exports``, ``./plex_logs``) so leaving a
+    Empty strings are not rejected - the engine has its own per-field
+    default fallback (``./snapshots``, ``./plex_logs``) so leaving a
     field blank is a valid "use default" signal.
 
+    Two additional containment checks beyond the Windows-path guard.
+    Bind-mounting an export drive at an arbitrary container path (e.g.
+    ``/app/nas_exports``) is a supported, documented workflow, so we do
+    NOT confine to a single data root - but a path must not (1) contain
+    a ``..`` component, or (2) resolve to the ``server_data/`` directory
+    or anything inside it. ``server_data/``
+    holds the keyfile, ``auth.db``, ``settings.json``, and
+    ``media.db``; letting an authenticated caller aim a snapshot write
+    or import read at it would expose or clobber credentials.
+
     Raises:
-        ValueError — with a multi-line user-facing message. Callers in
+        ValueError - with a multi-line user-facing message. Callers in
         FastAPI handlers should catch this and translate to 400.
     """
     if not path:
         return
+
+    # No parent-directory traversal. Normalise separators first -
+    # ``_WINDOWS_PATH_RE`` only catches drive-letter / UNC *prefixes*,
+    # so an embedded ``foo\..\bar`` would slip past it.
+    if ".." in path.replace("\\", "/").split("/"):
+        raise ValueError(
+            f"{field_label} {path!r} contains a '..' path component. "
+            f"Parent-directory traversal is not allowed - enter a "
+            f"direct path to the target directory."
+        )
+
+    # Must not resolve into the credentials directory.
+    try:
+        data_dir = get_data_dir().resolve()
+        resolved = Path(path).resolve()
+        resolved.relative_to(data_dir)
+    except ValueError:
+        # relative_to raised - the path is NOT inside server_data/.
+        pass
+    except OSError:
+        # resolve() can raise on some platforms for pathological
+        # input; fall through to the Windows-path check rather than
+        # crashing the request.
+        pass
+    else:
+        raise ValueError(
+            f"{field_label} {path!r} resolves inside the server_data "
+            f"directory, which holds credentials and databases. Pick a "
+            f"different location - this directory is never a valid "
+            f"export target or import source."
+        )
+
     if not _WINDOWS_PATH_RE.match(path):
         return
     raise ValueError(
@@ -312,7 +595,7 @@ def validate_container_path(path: str, field_label: str) -> None:
         f"paths that are bind-mounted in docker-compose.yml. "
         f"To use this location: "
         f"(1) open docker-compose.yml and add a volume entry such as "
-        f"`Y:/plexbackups:/app/nas_exports` under the backend's "
+        f"`Y:/plexexports:/app/nas_exports` under the backend's "
         f"`volumes:` block (use forward slashes on the host side); "
         f"(2) run `docker compose up -d` to recreate the container with "
         f"the new mount; "
@@ -327,10 +610,156 @@ def redact_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
 
     The Plex token is replaced with a boolean ``has_token``. The raw
     token never leaves the server. The internal ``_encrypted`` marker
-    is dropped from the response too — it's a storage detail.
+    is dropped from the response too - it's a storage detail.
     """
     redacted = dict(settings)
     token: Optional[str] = redacted.pop("plex_token", None)
     redacted.pop("_encrypted", None)
     redacted["has_token"] = bool(token)
     return redacted
+
+
+# ── Startup migrations ───────────────────────────────────────────────────────
+
+def migrate_output_dir_setting() -> None:
+    """
+    Rename the default ``plex_exports`` output directory to
+    ``snapshots`` in ``settings.json``. Custom non-default paths are
+    left untouched - we only flip the exact pre-rename literal so an
+    end user who intentionally pointed at a different directory keeps
+    their choice.
+
+    Idempotent: running on an already-migrated install is a no-op
+    silent return.
+    """
+    log = logging.getLogger("plexmigrate.server.persistence")
+    try:
+        settings = load_settings()
+    except Exception:
+        log.exception("migrate_output_dir_setting: load_settings failed; skipping")
+        return
+    current = settings.get("output_dir")
+    # Match the most common default-value spellings: bare 'plex_exports',
+    # leading './', and an optional trailing slash. Anything else is
+    # treated as an end user-customised path and left untouched.
+    legacy_defaults = {
+        "plex_exports", "plex_exports/",
+        "./plex_exports", "./plex_exports/",
+    }
+    if isinstance(current, str) and current in legacy_defaults:
+        settings["output_dir"] = "./snapshots"
+        save_settings(settings)
+        log.info(
+            "Migrated output_dir setting from %r to './snapshots'.",
+            current,
+        )
+
+
+def relocate_legacy_exports() -> int:
+    """
+    Move any pre-rename ``.plexexport.json`` files out of the old
+    ``plex_exports/`` directory (and out of the root of the new
+    ``snapshots/`` directory if any leaked there) into
+    ``<output_dir>/legacy/``.
+
+    Returns the count moved. Idempotent; silently no-ops when there
+    is nothing to relocate. Errors on individual files are logged
+    and counted but don't stop the sweep.
+
+    Registry-aware: any ``.plexexport.json`` whose stem matches a
+    ``snapshot_name`` in ``snapshots.db`` is a current sidecar produced
+    by ``materialise_sidecar``, NOT a legacy archive. Moving those
+    fresh sidecars into ``legacy/`` would make the registry's
+    ``prebuilt_json_path`` go stale and the file show up in the wrong
+    UI panel, so we skip any file the registry claims, in either of
+    two ways: a stem matching a row's ``snapshot_name``, OR a file_path
+    matching a row's ``prebuilt_json_path`` exactly.
+    """
+    import shutil
+    log = logging.getLogger("plexmigrate.server.persistence")
+    settings = load_settings()
+    output_dir = (settings.get("output_dir") or "snapshots").strip()
+    new_dir = Path(output_dir)
+    legacy_dir = new_dir / "legacy"
+
+    # Build the don't-touch set from the snapshot registry. Best-effort:
+    # if the registry isn't initialised yet (very early boot, fresh
+    # install) this returns an empty set and every top-level
+    # .plexexport.json is treated as legacy - which is the right thing
+    # on a clean install where there's nothing in the registry to
+    # protect anyway.
+    protected_stems: set = set()
+    protected_paths: set = set()
+    try:
+        from server import snapshot_registry
+        for row in snapshot_registry.list_snapshots():
+            name = (row.get("snapshot_name") or "").strip()
+            if name:
+                # Strip the " (recovered)" suffix - the sidecar on disk
+                # uses the bare snapshot_name, not the registry's label.
+                bare = name.removesuffix(" (recovered)").strip()
+                protected_stems.add(bare)
+            pre = (row.get("prebuilt_json_path") or "").strip()
+            if pre:
+                try:
+                    protected_paths.add(str(Path(pre).resolve()))
+                except OSError:
+                    protected_paths.add(pre)
+    except Exception:
+        log.exception(
+            "relocate_legacy_exports: snapshot_registry consult failed; "
+            "proceeding without registry protection (treating every "
+            "top-level .plexexport.json as legacy).",
+        )
+
+    moved = 0
+    # Look in BOTH locations: the literal old directory (for installs
+    # that ran a snapshot before this migration landed) and the new
+    # directory's own root (for any leaked per-library files).
+    for source_dir in (Path("plex_exports"), new_dir):
+        try:
+            if not source_dir.exists() or not source_dir.is_dir():
+                continue
+        except OSError:
+            continue
+        for f in list(source_dir.iterdir()):
+            try:
+                if not f.is_file():
+                    continue
+            except OSError:
+                continue
+            if not f.name.endswith((".plexexport.json", ".plexbackup.json")):
+                continue
+            # Skip protected files - the registry claims them as the
+            # cached sidecar of a real snapshot, not legacy data.
+            stem = f.name[:-len(".plexexport.json")]
+            try:
+                abs_path = str(f.resolve())
+            except OSError:
+                abs_path = str(f)
+            if stem in protected_stems or abs_path in protected_paths:
+                continue
+            # Don't touch files that live inside the new snapshot
+            # tree's subdirectories (iterdir at the root level only).
+            legacy_dir.mkdir(parents=True, exist_ok=True)
+            target = legacy_dir / f.name
+            # Avoid clobber: if a same-named file already exists in
+            # legacy/, suffix the move target with a numeric.
+            n = 1
+            while target.exists():
+                target = legacy_dir / f"{f.stem}_{n}{f.suffix}"
+                n += 1
+            try:
+                shutil.move(str(f), str(target))
+                moved += 1
+            except OSError:
+                log.exception("Failed to relocate legacy export %s", f)
+        # Best-effort rmdir of the empty old plex_exports/ directory.
+        if source_dir.name == "plex_exports":
+            try:
+                source_dir.rmdir()
+            except OSError:
+                pass  # not empty (end user put non-JSON files there); leave it
+    if moved:
+        log.info("Relocated %d legacy .plexexport.json file(s) to %s", moved, legacy_dir)
+    return moved

@@ -3,8 +3,8 @@
 // Owns the offset tracking, sticky-bottom scroll behaviour, 2 s poll
 // loop, and the body buffer for one log file inside one run dir. Used
 // by:
-//   * LogsPanel — full-size, manual Reload button.
-//   * DashboardPanel — small height, embedded under the JobHeader so
+//   * LogsPanel - full-size, manual Reload button.
+//   * DashboardPanel - small height, embedded under the JobHeader so
 //     the user can watch the current run without switching tabs.
 //
 // Always polls when ``finished`` is false; freezes when true (typically
@@ -12,9 +12,11 @@
 // recognises that suffix and stops the loop so we don't 404-spam after
 // the run renames the directory.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, LogFileContent } from '../api';
 import { isRunGoneError } from './DashboardPanel';
+import { pausableInterval } from '../utils/pausableInterval';
+import { renderHighlighted } from '../utils/highlight';
 
 const TAIL_POLL_MS = 2000;
 
@@ -40,6 +42,12 @@ export function LogTailer({
   const [error, setError] = useState<string | null>(null);
   const [liveTail, setLiveTail] = useState<boolean>(liveDefault);
   const [lastPolledAt, setLastPolledAt] = useState<number | null>(null);
+  // v0.9.7 Item 8: client-side keyword filter. Empty = no filter,
+  // render the raw text blob (current behaviour, zero performance
+  // regression on idle viewing). Non-empty = split into lines and
+  // filter case-insensitively. The cost of per-line rendering is
+  // only paid when the end user is actively filtering.
+  const [filter, setFilter] = useState<string>('');
 
   const offsetRef = useRef<number>(0);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -78,10 +86,14 @@ export function LogTailer({
       });
   }, [runName, fileName]);
 
-  // Poll loop — appends only the new bytes via ?since=offset.
+  // Poll loop - appends only the new bytes via ?since=offset.
   useEffect(() => {
     if (!liveTail || externalFreeze || !runName || !fileName) return;
-    const tick = window.setInterval(async () => {
+    // pausableInterval's cancel fn isn't available until it returns,
+    // so hold it in a mutable binding the poll body can reach to
+    // self-cancel when the run directory disappears.
+    let stop: (() => void) | null = null;
+    stop = pausableInterval(async () => {
       try {
         const r = await api.readLogFile(runName, fileName, offsetRef.current);
         if (r.content.length > 0) setBody((prev) => prev + r.content);
@@ -89,11 +101,11 @@ export function LogTailer({
         setMeta(r);
         setLastPolledAt(Date.now());
       } catch (e) {
-        if (isRunGoneError(e)) { window.clearInterval(tick); return; }
+        if (isRunGoneError(e)) { stop?.(); return; }
         setError(String(e));
       }
     }, TAIL_POLL_MS);
-    return () => window.clearInterval(tick);
+    return () => stop?.();
   }, [liveTail, externalFreeze, runName, fileName]);
 
   // Keep the viewport pinned to the bottom whenever new bytes arrive
@@ -121,15 +133,36 @@ export function LogTailer({
       setLastPolledAt(Date.now());
       stickyRef.current = true;
     } catch (e) {
+      // Suppress the run-gone 404 the same way the initial load does:
+      // a manual Reload on a run whose directory was renamed at job
+      // end would otherwise flash a banner the user can't act on.
+      if (isRunGoneError(e)) return;
       setError(String(e));
     }
   };
 
   const statusLabel = externalFreeze
-    ? 'Tail paused — run finished'
+    ? 'Tail paused - run finished'
     : liveTail
-      ? `Live · last polled ${lastPolledAt ? new Date(lastPolledAt).toLocaleTimeString() : '—'}`
+      ? `Live · last polled ${lastPolledAt ? new Date(lastPolledAt).toLocaleTimeString() : '-'}`
       : 'Paused';
+
+  // v0.9.7 Item 8: when the filter is active, split the body once
+  // per (body, filter) change and render matched lines with the
+  // matched substring highlighted. When the filter is empty, fall
+  // through to the raw-blob render path (no split, no per-line
+  // React elements) so unfiltered viewing has zero overhead.
+  const filteredLines = useMemo(() => {
+    if (!filter) return null;
+    const needle = filter.toLowerCase();
+    const out: string[] = [];
+    // Split-on-newline only happens when the end user types into
+    // the filter input; otherwise the raw body renders unchanged.
+    for (const line of body.split('\n')) {
+      if (line.toLowerCase().includes(needle)) out.push(line);
+    }
+    return out;
+  }, [body, filter]);
 
   return (
     <div>
@@ -153,15 +186,64 @@ export function LogTailer({
       {error && <div className="banner error" style={{ marginBottom: 6 }}>{error}</div>}
       {meta?.truncated && (
         <div style={{ color: 'var(--warn)', fontSize: 12, marginBottom: 6 }}>
-          Truncated — older bytes not shown; new lines still append as they arrive.
+          Truncated - older bytes not shown; new lines still append as they arrive.
         </div>
       )}
+
+      {/* v0.9.7 Item 8: case-insensitive keyword filter. Empty
+          input renders the raw blob below (current fast path);
+          non-empty input switches to per-line filtered render
+          with the matched substring highlighted. */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 6,
+        marginBottom: 6, fontSize: 12,
+      }}>
+        <span style={{ color: 'var(--text-dim)' }}>Filter:</span>
+        <input
+          type="text"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="case-insensitive substring…"
+          style={{ flex: 1, fontFamily: 'var(--mono, monospace)' }}
+        />
+        {filter && (
+          <>
+            <span style={{ color: 'var(--text-dim)', fontSize: 11 }}>
+              {filteredLines?.length ?? 0} match{(filteredLines?.length ?? 0) === 1 ? '' : 'es'}
+            </span>
+            <button
+              onClick={() => setFilter('')}
+              title="Clear filter"
+              style={{ padding: '2px 8px' }}
+            >
+              ×
+            </button>
+          </>
+        )}
+      </div>
+
       <div
         className="logview"
         ref={bodyRef}
         onScroll={onBodyScroll}
         style={{ height, maxHeight: height }}
-      >{body || 'Loading…'}</div>
+        data-testid="log-content"
+      >
+        {filteredLines === null ? (
+          // Fast path: raw text blob, browser-native rendering.
+          // Zero overhead vs. pre-v0.9.7.
+          body || 'Loading…'
+        ) : filteredLines.length === 0 ? (
+          <span style={{ color: 'var(--text-dim)' }}>
+            No lines match {JSON.stringify(filter)}.
+          </span>
+        ) : (
+          filteredLines.map((line, i) => (
+            <div key={i}>{renderHighlighted(line, filter)}</div>
+          ))
+        )}
+      </div>
     </div>
   );
 }
+

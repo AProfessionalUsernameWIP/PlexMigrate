@@ -1,4 +1,4 @@
-# PlexMigrate runtime dependencies.
+# Hestia-MediaManager runtime dependencies.
 #
 # Engine deps (also required for CLI-only use):
 plexapi>=4.15
@@ -6,7 +6,7 @@ rich>=13.0
 requests>=2.31
 # v0.9.5: Fernet symmetric encryption for stored Plex tokens
 # (server_data/servers.json, legacy settings.json). Used by
-# server/secrets.py — required for both the CLI (--add-server)
+# server/secrets.py - required for both the CLI (--add-server)
 # and the FastAPI server.
 cryptography>=41.0
 
@@ -18,3 +18,18 @@ uvicorn[standard]>=0.27
 pydantic>=2.0
 websockets>=12.0
 python-multipart>=0.0.9
+
+# v0.11.0 - opt-in application authentication.
+# Only exercised when PLEXMIGRATE_AUTH_ENABLED=true. The default is
+# false so existing installs keep working without these packages
+# loaded - they import lazily inside server/auth_db.py and
+# server/auth_router.py.
+#
+# We use the ``bcrypt`` library directly rather than passlib's wrapper
+# because passlib 1.7.x has a known incompatibility with bcrypt 4.x+
+# (the ``bcrypt.__about__.__version__`` attribute it expects was
+# removed). ``bcrypt`` exposes ``hashpw``/``checkpw`` with a stable
+# API and a built-in 72-byte truncation check, which we handle by
+# refusing oversized inputs at the form layer.
+PyJWT>=2.8
+bcrypt>=4.0
