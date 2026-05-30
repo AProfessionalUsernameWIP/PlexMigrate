@@ -1896,7 +1896,7 @@ def auth_set_user_permissions(
     # query trace WHICH permissions changed, not just that something
     # changed.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_event(
             "PERMISSIONS_GRANT grantor=%r grantee=%r extra=%r revoked=%r "
             "elevate_confirmed=true",

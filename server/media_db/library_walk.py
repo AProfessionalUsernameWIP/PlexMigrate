@@ -415,7 +415,7 @@ def prune_stale_items(
             raise
 
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="items,server_items,watch_events,ratings,playlists,collections",
             where={"server_id": server_id, "older_than_seconds": older_than_seconds},

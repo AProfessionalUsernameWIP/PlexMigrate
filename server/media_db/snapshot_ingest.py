@@ -113,7 +113,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
             "ingest_snapshot_payload: payload missing library_section_id. "
             "Every per-library payload must carry the Plex section key as "
             "the integrity anchor for restore. The capture path in "
-            "services.snapshotter.snapshot_library is responsible for "
+            "services.snapshot.plex_native.snapshotter.snapshot_library is responsible for "
             "supplying it; see v0.15 schema-anchor invariant."
         )
     try:
@@ -400,7 +400,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
     # when it carries a real rating or a favorite (SNAP-06). Imported
     # locally - backend_translation is a pure stdlib-only module, so
     # this can never introduce an import cycle.
-    from services.backend_translation import affinity_row_is_meaningful
+    from services.translation.backend_translation import affinity_row_is_meaningful
     for rec in (owner_block.get("ratings") or []):
         rk = rec.get("rating_key")
         if rk is None:
@@ -547,7 +547,7 @@ def ingest_snapshot_payload(server_id: str, payload: Dict[str, Any]) -> Dict[str
         library_name, server_id, counters,
     )
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         total_rows = (
             counters.get("items", 0)
             + counters.get("server_items", 0)

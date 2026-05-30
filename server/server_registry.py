@@ -2203,9 +2203,9 @@ def get_server_users(server_id: str, logger: logging.Logger) -> Dict[str, Any]:
     # for the owner role.
     # Owner identifier derivation + the per-SystemAccount skip check
     # both live in the shared helper in
-    # ``services.plex_owner_identity`` so this surface and
+    # ``services.identity.plex_owner_identity`` so this surface and
     # PlexAdapter.list_users stay in lockstep.
-    from services.plex_owner_identity import (
+    from services.identity.plex_owner_identity import (
         derive_owner_identifiers,
         dedupe_owner_against_managed,
         is_owner_system_account,
@@ -2324,7 +2324,7 @@ def update_server_settings(
     their ``_DEFAULT_SERVER`` value on read.
 
     Used by:
-      - services.user_activity_sweeper: stamps
+      - services.user_management.activity_sweeper: stamps
         ``user_activity_last_sweep_at`` +
         ``user_activity_last_sweep_summary`` after each per-server
         sweep cycle.
@@ -2663,7 +2663,7 @@ def _connect_http_backend(
     Raises ``ConnectionError`` with status recorded on the registry
     row when the probe fails."""
     # Late imports to avoid circular dependency: adapter modules
-    # import services.guid_translator which is safe; the registry
+    # import services.translation.guid_translator which is safe; the registry
     # itself never imports the adapters at module load.
     # Hand the adapter the app registry UID so MirrorResolveMixin
     # keys the server mirror on the same backend-neutral id the sync

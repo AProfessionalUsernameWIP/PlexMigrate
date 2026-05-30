@@ -232,7 +232,7 @@ _resolver_allow_fuzzy_var: contextvars.ContextVar = contextvars.ContextVar(
 # / built-in default" - same semantics as the empty radio option in
 # the JobFormPanel UI. Valid non-empty values: "smart", "force_bulk",
 # "force_server_side". Read by
-# ``services.snapshotter._resolve_watch_ratings_strategy``.
+# ``services.snapshot.plex_native.snapshotter._resolve_watch_ratings_strategy``.
 _watch_ratings_strategy_override_var: contextvars.ContextVar = contextvars.ContextVar(
     "plexmigrate_watch_ratings_strategy_override", default="",
 )
@@ -240,7 +240,7 @@ _watch_ratings_strategy_override_var: contextvars.ContextVar = contextvars.Conte
 # Per-snapshot-run in-memory payload collector.
 #
 # Rule 1: media.db is never the source of truth for snapshot content.
-# Each call to ``services.snapshotter.snapshot_library`` appends its
+# Each call to ``services.snapshot.plex_native.snapshotter.snapshot_library`` appends its
 # live-fetched ``export_data`` dict (one library per entry) to this
 # list. ``server.jobs._capture_snapshot_after_run`` reads the list at
 # the end of the run and hands it to
@@ -278,7 +278,7 @@ _live_instance: Optional[Any] = None      # active Live context; set in run_snap
 # ``server.runtime_patches.signal_stop`` / ``signal_hard_stop`` read it
 # so the ``/api/job/stop`` endpoint can flip the flag.
 _active_stop_event: Optional[threading.Event] = None
-# Per-run restoration log writer (services.restoration_log.RestorationLogWriter
+# Per-run restoration log writer (services.restore.restoration_log.RestorationLogWriter
 # or its null-writer shim). ``run_restore`` opens this at the top of every
 # import job and closes it in the finally-block; the per-metric helpers
 # emit RESTORED / NOOP / SKIPPED / FAILED entries through it. Treated as
@@ -287,7 +287,7 @@ _active_stop_event: Optional[threading.Event] = None
 _restoration_log: Optional[Any] = None
 # Phase 4 of the dashboard / log reorg: captured snapshot of the users
 # with at least one RESTORED entry from the last run's restoration
-# log. Populated by services.restorer when it closes the writer; read
+# log. Populated by services.restore.plex_native when it closes the writer; read
 # by server.jobs at finalisation to populate run_history. Reset to []
 # when no restore has happened. Never carries sensitive data - just
 # usernames / Plex.tv emails.
@@ -357,7 +357,7 @@ _run_schedule_name: str = ""
 # PR-13 fix #3 - registered server id (from the registry's
 # ``servers.json``) of the source the engine is snapshotting. Set
 # by the job runner and the CLI before ``run_snapshot`` fires;
-# read inside ``services.snapshotter.snapshot_library`` so the
+# read inside ``services.snapshot.plex_native.snapshotter.snapshot_library`` so the
 # per-library payload can be ingested directly into
 # ``media.db`` via ``media_db.ingest_snapshot_payload(server_id, ...)``.
 # Empty string means "no registered server" - the engine refuses to

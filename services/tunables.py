@@ -117,7 +117,7 @@ _DEFAULTS: Dict[str, Any] = {
     # stored ``display_name`` for the raw ``username`` in log lines
     # and run-history fields that reference a user. Default False
     # (logs read the raw handle every existing end user is used to).
-    # When true, services.user_display.display_for_logging substitutes
+    # When true, services.identity.user_display.display_for_logging substitutes
     # the managed_users.display_name when present and falls back to
     # the username when no display_name is stored. Pure presentation
     # tweak; routing / identity_map logic is unaffected.
@@ -154,7 +154,7 @@ _DEFAULTS: Dict[str, Any] = {
     # end user explicitly flips it on.
     #
     # The auto-seed lives at the resolution boundary (see
-    # ``services.snapshotter._should_cache_payload_to_media_db``)
+    # ``services.snapshot.plex_native.snapshotter._should_cache_payload_to_media_db``)
     # rather than in this tunable's value, so settings.json stays a
     # clean reflection of end user intent - auto-seed is a one-shot
     # behaviour, not a stored state.
@@ -746,7 +746,7 @@ def viewcount_increment_cap(server_id: Optional[str] = None) -> int:
 def log_use_display_name() -> bool:
     """
     USER-MGMT-IDENTITY-AUDIT cosmetic toggle. True flips
-    services.user_display.display_for_logging into "substitute
+    services.identity.user_display.display_for_logging into "substitute
     managed_users.display_name where present" mode. Logs read more
     naturally ("Crystal Jean did X" vs "crystalj1 did X") for
     non-power-users while leaving raw handles in the database
@@ -772,7 +772,7 @@ def auto_backfill_pin_from_identity_links() -> bool:
 def strict_identity_resolution() -> bool:
     """
     USER-MGMT-IDENTITY-AUDIT R-4 toggle. True flips the
-    services.user_resolution.resolve_destination_user chain into
+    services.identity.user_resolution.resolve_destination_user chain into
     strict mode: it stops after step 2 (backend_user_id direct
     match) and refuses to fall back to case-insensitive username
     match. End users who want every cross-server user routing to
@@ -795,7 +795,7 @@ def user_activity_sweeper_enabled() -> bool:
 
 def user_activity_filter_enabled() -> bool:
     """Master switch on the engine-wide user-health filter.
-    When False (default) services.user_activity_filter.list_active_users
+    When False (default) services.user_management.activity_filter.list_active_users
     behaves exactly like today's list_managed_users(include_hidden=
     False) — tombstone gate only. When True, also drops users
     whose consecutive_auth_failures > 0."""
@@ -1042,7 +1042,7 @@ def owner_display_style() -> str:
     or ``"custom_name_owner"``. Unknown values fall through to
     ``"plex_owner"`` so a typo in settings.json never crashes a run.
 
-    The actual label resolution lives in :mod:`services.user_labels`,
+    The actual label resolution lives in :mod:`services.user_management.labels`,
     which combines this style with the live dashboard's cached
     ``user_display_names`` map.
     """

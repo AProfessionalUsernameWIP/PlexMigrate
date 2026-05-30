@@ -414,7 +414,7 @@ def purge_server_data(server_id: str) -> Dict[str, int]:
     # Audit-log the purge. Best-effort: a log failure must not break
     # the purge itself.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         kv_summary = " ".join(f"{k}={v}" for k, v in counts.items())
         db_access_log.log_event(
             "purge_server_data server_id=%s %s", server_id, kv_summary,

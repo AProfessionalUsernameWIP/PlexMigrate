@@ -710,7 +710,7 @@ def _refresh_share_state(
         )
         return
 
-    from services import plex_shares
+    from services.identity import plex_shares
     shared = plex_shares.fetch_shared_servers(account, machine_id)
     protected_map = plex_shares.fetch_home_users_protected_map(account)
     # Friends index gives us {plex_user_id: {username, title, email}} for
@@ -956,7 +956,7 @@ def set_managed_user_tombstone(
     # M13: tombstone mutators are auditable state changes on a
     # credential-bearing table - record them like every other write.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="managed_users",
             field="tombstoned",
@@ -1037,7 +1037,7 @@ def update_managed_user_auth_signal(
             return None
     out = get_managed_user(server_id, username)
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="managed_users",
             field="last_auth_status",
@@ -1077,7 +1077,7 @@ def reset_managed_user_auth_signal(
         if cur.rowcount == 0:
             return None
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="managed_users",
             field="consecutive_auth_failures",
@@ -1114,7 +1114,7 @@ def add_global_tombstone(username: str) -> None:
         )
     # M13: auditable - hides a user across every registered server.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="global_tombstones",
             where={"username": uname},
@@ -1141,7 +1141,7 @@ def remove_global_tombstone(username: str) -> None:
         )
     # Auditable - makes a hidden user syncable again.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="global_tombstones",
             where={"username": uname},
@@ -1261,9 +1261,10 @@ def set_managed_user_credential(
     # :func:`set_managed_user_display_name`.
     if propagate_to_linked and kind in _PIN_KINDS:
         try:
+            from server import media_db as _md
             origin = get_managed_user(server_id, username)
             origin_service = (origin or {}).get("service_type") or ""
-            _propagate_pin_across_links(
+            _md._propagate_pin_across_links(
                 origin_server_id=server_id,
                 origin_username=username,
                 origin_service_type=origin_service,
@@ -1283,7 +1284,7 @@ def set_managed_user_credential(
     # Audit trail. Recorded regardless of plaintext/empty so the
     # end user can also see "clear" operations.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="managed_users",
             field=column,
@@ -1439,7 +1440,8 @@ def set_managed_user_display_name(
     # own short call (avoids holding the lock across BFS reads).
     if propagate_to_linked:
         try:
-            _propagate_display_name_across_links(
+            from server import media_db as _md
+            _md._propagate_display_name_across_links(
                 origin_server_id=server_id,
                 origin_username=username,
                 display_name=dn,
@@ -1666,7 +1668,7 @@ def get_managed_user_credential(
     ).fetchone()
     found = bool(row is not None and row["enc"])
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_read(
             table="managed_users",
             field=column,
@@ -1713,7 +1715,7 @@ def delete_managed_user(server_id: str, username: str) -> None:
                 f"No managed user {username!r} on server {server_id!r}."
             )
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="managed_users",
             where={"server_id": server_id, "username": username},

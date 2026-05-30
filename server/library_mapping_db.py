@@ -7,7 +7,7 @@ library" when transferring content between servers whose library names
 don't match.
 
 Mappings have two origins:
-  * ``auto``     — computed by :mod:`services.library_mapper`. Cleared
+  * ``auto``     — computed by :mod:`services.library_mapping.mapper`. Cleared
                    on mirror sync invalidation (so a re-warm refreshes
                    the suggestions).
   * ``operator`` — operator confirmed via the UI or overrode an auto

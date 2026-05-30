@@ -31,7 +31,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 import services.state as state
 from server import network_collector
-from server.fan_out import get_active_result as get_active_fan_out
+from services.fan_out.coordinator import get_active_result as get_active_fan_out
 from server.jobs import JobRecord, get_queue
 from server.server_registry import list_servers
 

@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Iterator, List, Optional
 
-from services.guid_translator import normalize_guids
+from services.translation.guid_translator import normalize_guids
 
 from . import (
     CollectionSpec,
@@ -694,7 +694,7 @@ class JellyfinAdapter(MirrorResolveMixin, HttpMediaAdapterMixin, MediaServerAdap
     # resolution answers from SQLite instead of a live API walk.
 
     def iter_sections_for_mirror(self) -> List[Any]:
-        """Yield ``services.server_mirror.SectionInfo`` for every
+        """Yield ``services.mirror_sync.server_mirror.SectionInfo`` for every
         library section.
 
         ``live_total_size`` is the leaf item count (one cheap count
@@ -703,7 +703,7 @@ class JellyfinAdapter(MirrorResolveMixin, HttpMediaAdapterMixin, MediaServerAdap
         sync layer's freshness probe the same full-vs-delta-vs-probe
         signal PlexAdapter derives from ``section.totalSize`` +
         ``section.updatedAt``."""
-        from services.server_mirror import SectionInfo
+        from services.mirror_sync.server_mirror import SectionInfo
         out: List[Any] = []
         try:
             payload = self._get_json("/Library/VirtualFolders")
@@ -816,7 +816,7 @@ class JellyfinAdapter(MirrorResolveMixin, HttpMediaAdapterMixin, MediaServerAdap
     def iter_section_items_for_mirror(
         self, section_id: str, since_ts: Optional[float] = None,
     ) -> Iterator[Any]:
-        """Yield ``services.server_mirror.ItemRow`` for every leaf item
+        """Yield ``services.mirror_sync.server_mirror.ItemRow`` for every leaf item
         in a library section. The sync layer's ``item_provider``.
 
         Delta sync: when ``since_ts`` is set the walk asks the server
@@ -831,7 +831,7 @@ class JellyfinAdapter(MirrorResolveMixin, HttpMediaAdapterMixin, MediaServerAdap
 
         ``EnableUserData=false`` - the mirror stores the item universe,
         not per-user playback state."""
-        from services.server_mirror import ItemRow
+        from services.mirror_sync.server_mirror import ItemRow
         uid = self._owner_user_id
         if not uid:
             try:

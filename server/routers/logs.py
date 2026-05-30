@@ -154,10 +154,10 @@ def read_app_log(
     category_to_filename: Dict[str, str] = {
         "db-access": "db_access.log",
         # Playlist-cache refresh audit trail. Written by
-        # services.playlist_cache_log on every refresh attempt
+        # services.playlist_copy.log on every refresh attempt
         # (per-user + bulk-server).
         "playlist-cache": "playlist_cache.log",
-        # Sync engine activity. Written by services.sync_log on
+        # Sync engine activity. Written by services.mirror_sync.log on
         # every sync_worker poll cycle + every sync-initiated
         # playlist copy. Lives in a separate file so it never
         # bleeds into a running job's runtime.log.
@@ -176,7 +176,7 @@ def read_app_log(
         "user-activity": "user_activity.log",
         # Smart Playlist Migration job activity - filter decode,
         # id->name translation, preflight warnings, re-create
-        # outcomes. Written by services.smart_playlist_log; the
+        # outcomes. Written by services.smart_playlist.log; the
         # migration panel's in-panel live log reads this category.
         "smart-playlist": "smart_playlist.log",
     }

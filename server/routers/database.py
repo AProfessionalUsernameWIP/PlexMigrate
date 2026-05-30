@@ -263,7 +263,7 @@ def db_browser_schema(
         raise HTTPException(status_code=404, detail=str(exc))
     # Audit logging - best-effort, never blocks the read.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_event(
             "DB_BROWSER_SCHEMA caller=%r db_type=%r instance_id=%r "
             "tables=%d",
@@ -305,7 +305,7 @@ def db_browser_rows(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_event(
             "DB_BROWSER_ROWS caller=%r db_type=%r instance_id=%r "
             "table=%r limit=%d offset=%d returned=%d total=%d",

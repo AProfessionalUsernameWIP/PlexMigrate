@@ -163,7 +163,7 @@ def _set_run_timestamp(
 
     The engine reads ``state._run_timestamp`` lazily inside
     :func:`services.logging_ops.setup_logging` and
-    :func:`services.snapshotter.snapshot_library`, so we can reassign it
+    :func:`services.snapshot.plex_native.snapshotter.snapshot_library`, so we can reassign it
     here without touching either of those modules.
 
     Examples:

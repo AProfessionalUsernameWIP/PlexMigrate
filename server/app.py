@@ -64,6 +64,12 @@ runtime_patches.enable_headless_mode()
 log = logging.getLogger("plexmigrate.server")
 
 
+
+# Re-export get_queue at module scope so tests (and external callers) can
+# monkeypatch server.app.get_queue. This re-export was lost in the Phase-3a
+# refactor; restored as part of the carry-forward fix sweep.
+from server.jobs import get_queue  # noqa: E402, F401
+
 # ── media.db boot-time auto-archive (v0.15) ─────────────────────────────────
 #
 # The v0.15 schema break introduced ``library_sections`` as a NOT NULL

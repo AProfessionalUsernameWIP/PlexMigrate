@@ -132,7 +132,7 @@ def compute_pin_preflight(
             # activity filter so a tombstoned user never trips a
             # PIN-missing warning (the engine won't touch them on the
             # actual run either).
-            from services.user_activity_filter import list_active_users
+            from services.user_management.activity_filter import list_active_users
             users = list_active_users(server_id)
         except Exception:
             # media.db hiccup. Treat as "no managed users to worry

@@ -27,8 +27,8 @@ from pydantic import BaseModel, Field
 
 from server.auth_router import require_role
 from server.dev_console_ws import get_dev_console_manager
-from services import dev_console
-from services.dev_console import DevConsoleError
+from services.admin import dev_console
+from services.admin.dev_console import DevConsoleError
 
 log = logging.getLogger("plexmigrate.server.dev_console_router")
 

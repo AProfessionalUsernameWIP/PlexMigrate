@@ -321,7 +321,7 @@ def copy_user_to_destination(
         connect_registered_server, get_server_by_id,
     )
     from server.models import UserCreateSpec
-    from services.user_creation import (
+    from services.user_management.creation import (
         UserCreationError, create_users_for_job,
     )
 

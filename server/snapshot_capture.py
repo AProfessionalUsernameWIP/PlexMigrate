@@ -246,7 +246,7 @@ def create_snapshot_db(
     # already audits the media.db write; this closes the gap on the
     # snapshot .db file itself.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         _row_total = (
             counters.get("server_items", 0)
             + counters.get("items", 0)
@@ -737,7 +737,7 @@ def _write_snapshot_users(
 #
 # ``build_snapshot_db_from_payloads`` is the live snapshot writer:
 # it consumes the in-memory list of per-library ``export_data`` dicts
-# that ``services.snapshotter.snapshot_library`` appends to
+# that ``services.snapshot.plex_native.snapshotter.snapshot_library`` appends to
 # ``state._snapshot_payloads`` and writes the .db directly from that
 # data. media.db is never read; the snapshot file is a point-in-time
 # record of what the live-fetch payload reported.
@@ -885,7 +885,7 @@ def build_snapshot_db_from_payloads(
     #    space is local: we keep a GUID-set → items.id map keyed by
     #    canonical-GUID tuple so the same item across libraries /
     #    users gets one row.
-    from services.guid_translator import normalize_guids
+    from services.translation.guid_translator import normalize_guids
     _GUID_COL = {
         "imdb": "imdb_id",
         "tmdb": "tmdb_id",
@@ -1049,7 +1049,7 @@ def build_snapshot_db_from_payloads(
         return out
 
     # Extract per-payload library identity. The capture path
-    # in services.snapshotter populates these fields on every payload;
+    # in services.snapshot.plex_native.snapshotter populates these fields on every payload;
     # we refuse to write a snapshot if any payload is missing them.
     # See the schema-anchor invariant.
     def _payload_section_info(p: Dict[str, Any]) -> Tuple[int, str, str]:
@@ -1479,7 +1479,7 @@ def build_snapshot_db_from_payloads(
     # creation shows up in db_access.log next to the media.db ingest
     # and the snapshots.db registry insert.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         _row_total = (
             counters.get("server_items", 0)
             + counters.get("items", 0)

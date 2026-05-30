@@ -11,7 +11,7 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from services.user_uuid import (
+from services.identity.user_uuid import (
     build_app_user_uuid,
     generate_user_key,
     server_uid_from_app_user_uuid,
@@ -29,7 +29,7 @@ from ._core import _DB_LOCK, _require_conn, log
 # The app-generated stable user identifier (``app_user_uuid``) is the
 # cross-server identity anchor populated on every managed_users /
 # server_users row and used as the primary key in user_identity_map
-# pairs. Format and design rationale live in :mod:`services.user_uuid`.
+# pairs. Format and design rationale live in :mod:`services.identity.user_uuid`.
 
 def _server_host_name(server_id: str) -> str:
     """Look up the friendly server name for the HostNameSlug portion of
@@ -858,7 +858,7 @@ def rewrite_app_user_uuid_host_slug_for_server(
                 if server_uid_from_app_user_uuid(stored) != server_uid:
                     continue
                 try:
-                    from services.user_uuid import rewrite_host_slug
+                    from services.identity.user_uuid import rewrite_host_slug
                     new_uuid = rewrite_host_slug(stored, new_host_name)
                 except Exception:
                     continue
@@ -874,7 +874,7 @@ def rewrite_app_user_uuid_host_slug_for_server(
             "SELECT id, user_a_uuid, user_b_uuid "
             "FROM user_identity_map"
         ).fetchall()
-        from services.user_uuid import rewrite_host_slug
+        from services.identity.user_uuid import rewrite_host_slug
         for r in rows:
             mutated_a = mutated_b = False
             new_a = r["user_a_uuid"]
@@ -951,7 +951,7 @@ def _rewrite_server_uid_inside_app_user_uuid(
     # Rebuild using the existing (Service, HostNameSlug, userkey)
     # segments; only swap the server_uid portion.
     try:
-        from services.user_uuid import parse_app_user_uuid, build_app_user_uuid
+        from services.identity.user_uuid import parse_app_user_uuid, build_app_user_uuid
         parts = parse_app_user_uuid(stored)
     except Exception:
         return None

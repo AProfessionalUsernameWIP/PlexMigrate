@@ -69,7 +69,7 @@ class MirrorResolveMixin:
         if not server_id:
             return None
         try:
-            from services import server_mirror
+            from services.mirror_sync import server_mirror as server_mirror
             return server_mirror.effective_mode_for(server_id)
         except Exception:
             return None
@@ -94,7 +94,8 @@ class MirrorResolveMixin:
         falls through to the live path on a mirror miss anyway."""
         if not self._mirror_db_ready():
             return
-        from services import server_mirror, tunables
+        from services import tunables
+        from services.mirror_sync import server_mirror as server_mirror
         server_id = self._mirror_server_id()
         if not server_id:
             return
@@ -169,7 +170,7 @@ class MirrorResolveMixin:
         if self._mirror_usable_mode() in (None, "always-live"):
             return None
         try:
-            from services import server_mirror
+            from services.mirror_sync import server_mirror as server_mirror
             return server_mirror.lookup_by_guids(
                 server_id=self._mirror_server_id(), guids=guids,
                 section_id=library_id,
@@ -187,7 +188,7 @@ class MirrorResolveMixin:
         if self._mirror_usable_mode() in (None, "always-live"):
             return None
         try:
-            from services import server_mirror
+            from services.mirror_sync import server_mirror as server_mirror
             return server_mirror.lookup_by_full_path(
                 server_id=self._mirror_server_id(), file_path=file_path,
                 item_type_hint=item_type_hint or None,
@@ -206,7 +207,7 @@ class MirrorResolveMixin:
         if self._mirror_usable_mode() in (None, "always-live"):
             return None
         try:
-            from services import server_mirror
+            from services.mirror_sync import server_mirror as server_mirror
             return server_mirror.lookup_by_path_tail(
                 server_id=self._mirror_server_id(), file_path=file_path,
                 tail_components=tail_components,
@@ -234,7 +235,7 @@ class MirrorResolveMixin:
         if self._mirror_usable_mode() in (None, "always-live"):
             return None
         try:
-            from services import server_mirror
+            from services.mirror_sync import server_mirror as server_mirror
             return server_mirror.lookup_by_hierarchy(
                 server_id=self._mirror_server_id(),
                 item_type=item_type, title=title,
@@ -267,7 +268,7 @@ class MirrorResolveMixin:
         if self._mirror_usable_mode() in (None, "always-live"):
             return None
         try:
-            from services import server_mirror
+            from services.mirror_sync import server_mirror as server_mirror
             candidates = server_mirror.lookup_by_fuzzy_title(
                 server_id=self._mirror_server_id(), title=title,
                 item_type=item_type, artist=artist,

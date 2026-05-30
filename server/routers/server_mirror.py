@@ -53,7 +53,7 @@ def _launch_mirror_sync(
         _MIRROR_SYNC_INFLIGHT.add(server_id)
 
     def _worker() -> None:
-        from services import server_mirror
+        from services.mirror_sync import server_mirror as server_mirror
         try:
             sections = adapter.iter_sections_for_mirror()
             if not sections:
@@ -111,7 +111,7 @@ def get_server_mirror_state(
 ) -> Dict[str, Any]:
     """Return every mirror_server_state row + per-server item
     counts + db size for the operator's Servers panel badge."""
-    from services import server_mirror
+    from services.mirror_sync import server_mirror as server_mirror
     from server import server_mirror_db
     states = server_mirror.list_server_states()
     # Augment with item count + last drift event timestamp.
@@ -144,7 +144,7 @@ def get_server_mirror_drift_events(
     filters: ``server_id`` narrows to one server; ``since``
     (epoch seconds) filters to events at-or-after that time;
     ``limit`` clamps to [1, 10000]."""
-    from services import server_mirror
+    from services.mirror_sync import server_mirror as server_mirror
     try:
         clamped = max(1, min(int(limit) or 100, 10000))
     except (TypeError, ValueError):
@@ -177,7 +177,7 @@ def post_server_mirror_sync(
     on completion (mirror_server_state row).
     """
     from server import server_registry
-    from services import server_mirror
+    from services.mirror_sync import server_mirror as server_mirror
 
     try:
         conn = server_registry.connect_registered_server(
@@ -217,7 +217,7 @@ def post_server_mirror_sync_all(
     a per-server status: 'started' for newly launched walkers
     and 'in_progress' for syncs already running."""
     from server import server_registry
-    from services import server_mirror
+    from services.mirror_sync import server_mirror as server_mirror
 
     registered = server_registry.list_servers() or []
     per_server: List[Dict[str, Any]] = []
@@ -259,7 +259,7 @@ def post_server_mirror_invalidate(
     be re-auth'd anyway since the next job will pay the cold-
     start cost). Pass ``server_id='_all_'`` to wipe every server.
     """
-    from services import server_mirror
+    from services.mirror_sync import server_mirror as server_mirror
     if server_id == "_all_":
         rows = server_mirror.invalidate_mirror()
         return {"deleted": rows, "scope": "all"}
@@ -281,7 +281,7 @@ def patch_server_mirror_mode(
     null clears the override; the server then follows the
     global ``engine_mirror_mode`` tunable.
     """
-    from services import server_mirror
+    from services.mirror_sync import server_mirror as server_mirror
     raw_mode = body.get("mode") if isinstance(body, dict) else None
     if raw_mode is not None and not isinstance(raw_mode, str):
         raise HTTPException(
@@ -317,7 +317,7 @@ def post_collection_cache_invalidate(
     re-fetch every collection's children from Plex and re-warm
     the cache."""
     from server import collection_cache_db
-    from services import collection_cache_log
+    from services.collection_cache import log as collection_cache_log
     if server_id == "_all_":
         deleted = collection_cache_db.invalidate_collection_cache()
         collection_cache_log.log_clear(
@@ -387,7 +387,7 @@ def post_collection_cache_warm(
     ``"api"`` for raw external calls) so the operator can grep
     ``collection_cache.log`` by trigger surface.
     """
-    from services import collection_cache_warmer
+    from services.collection_cache import warmer as collection_cache_warmer
     from fastapi import HTTPException
     result = collection_cache_warmer.warm_collection_cache_for_server(
         server_id, logger=log, source=source,
@@ -415,7 +415,7 @@ def post_collection_cache_warm_all(
     AND in ``collection_cache.log`` so the bulk-cache UI's failure
     list and the audit log stay in sync. One server's failure does
     NOT abort the rest of the warm pass."""
-    from services import collection_cache_warmer
+    from services.collection_cache import warmer as collection_cache_warmer
     return collection_cache_warmer.warm_collection_cache_for_all_servers(
         logger=log, source=source,
     )

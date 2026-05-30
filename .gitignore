@@ -173,3 +173,36 @@ tests_structural/
 !/SOURCES.md
 !/QUICKSTART.md
 !/OVERVIEW.md
+
+# E2E test harness isolated data directory. Created by Playwright
+# globalSetup, wiped by globalTeardown. The bind-mount target for the
+# e2e docker compose override (dev_docs/tests_e2e/docker-compose.e2e.yml).
+dev_docs/tests_e2e/.e2e-data/
+dev_docs/tests_e2e/.stack-owned-by-e2e
+
+# Scratch / one-shot operational scripts at the repo root. The session
+# that wrote M0-M8 produced tmp_*.py move scripts, tmp_*.txt suite logs,
+# and a one-shot cleanup_test_contamination.py. These are not app code;
+# the engineering history lives in dev_docs/process/changelog.md.
+/tmp_*.py
+/tmp_*.txt
+/cleanup_*.py
+
+# Backup database files (created by cleanup scripts before destructive
+# DELETEs). Same family as the .db.bak / .keyfile rules above; these
+# carry a timestamp suffix like .db.bak-20260530-092535 so they need
+# their own pattern.
+/server_data/*.db.bak-*
+
+# Root-level Plex snapshot artifacts. Snapshots are user data, never
+# app code. The shipped path puts them under ./snapshots/, but
+# operator runs sometimes land .db / .plexexport.json at the repo root
+# (drag-drop, manual download). Ignore both shapes at root only; the
+# ./snapshots/ tree is already ignored via the snapshots/ rule.
+/*.db
+/*.plexexport.json
+
+# Root-level HTML review documents (POSTGRES_MIGRATION_REVIEW.html,
+# TEST_RESULTS_AND_NEXT_STEPS.html, TEST_REVIEW_PRE_RELEASE.html and
+# similar). These are local dev notes, not shipped app surface.
+/*.html

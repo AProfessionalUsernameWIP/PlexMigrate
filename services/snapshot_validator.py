@@ -8,7 +8,7 @@ Performs read-only structural assertions against a per-server snapshot
   after a fresh snapshot.db has been written but before the capture
   is considered successful. Failure aborts the job with an
   actionable error message.
-* **Pre-restore:** ``services.restorer`` invokes the validator before
+* **Pre-restore:** ``services.restore.plex_native`` invokes the validator before
   any restore primitives fire against the destination. Failure aborts
   the restore so a malformed snapshot doesn't leak partial data into
   Plex.

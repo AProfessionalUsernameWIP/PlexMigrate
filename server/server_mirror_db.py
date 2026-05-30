@@ -237,7 +237,7 @@ def _require_conn() -> sqlite3.Connection:
 def get_connection() -> sqlite3.Connection:
     """Public accessor for the shared connection.
 
-    Callers in :mod:`services.server_mirror` use this to run their
+    Callers in :mod:`services.mirror_sync.server_mirror` use this to run their
     own transactions. The connection is configured WAL + FK-on; the
     sync layer is responsible for its own BEGIN / COMMIT scoping.
     """

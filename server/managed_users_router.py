@@ -131,7 +131,7 @@ class RevealCredentialsIn(_DbAdminGate):
     No response caching, no body fields persisted in the request
     log, no token written into the response anywhere except the
     decrypted plaintext. The audit trail records who revealed which
-    credential when via :mod:`services.db_access_log`.
+    credential when via :mod:`services.run_logs.db_access`.
     """
     root_admin_password: str = Field(
         description=(
@@ -668,7 +668,7 @@ def reveal_managed_user_credentials(
     can't probe which credential was the wrong one).
 
     The decrypt + return is audit-logged via
-    :mod:`services.db_access_log` so the operator's forensic trail
+    :mod:`services.run_logs.db_access` so the operator's forensic trail
     has a record of every reveal: who, when, which server, which
     user, which credential cell.
 
@@ -744,7 +744,7 @@ def reveal_managed_user_credentials(
             pins[pin_kind] = None
     # Dedicated audit event — easier to grep than per-cell read logs.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_event(
             "Credential reveal: root_admin=%r revealed managed_users "
             "credentials for (server=%r, username=%r) after "

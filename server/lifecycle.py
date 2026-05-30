@@ -377,7 +377,7 @@ async def on_startup() -> None:
     # them; the operator confirms via the UI's "Enable real writes"
     # toggle after reviewing the dry-run log.
     try:
-        from services import sync_worker
+        from services.mirror_sync import sync_worker as sync_worker
         sync_worker.start()
     except Exception:  # pragma: no cover (defensive)
         log.exception(
@@ -390,7 +390,7 @@ async def on_startup() -> None:
     # it costs nothing on installs where the operator hasn't
     # opted in.
     try:
-        from services import user_activity_sweeper
+        from services.user_management import activity_sweeper as user_activity_sweeper
         user_activity_sweeper.start()
     except Exception:  # pragma: no cover (defensive)
         log.exception(
@@ -405,7 +405,7 @@ async def on_startup() -> None:
     # thread re-checks the enabled flag every iteration so live
     # toggling works without restart.
     try:
-        from services import playlist_cache_refresher
+        from services.playlist_copy.adapter import cache_refresher as playlist_cache_refresher
         playlist_cache_refresher.start()
     except Exception:  # pragma: no cover (defensive)
         log.exception(
@@ -419,7 +419,7 @@ async def on_startup() -> None:
     # db_admin-gated disable via /api/settings/audit-log-toggle
     # turns it off.
     try:
-        from services import db_access_log as _dal
+        from services.run_logs import db_access as _dal
         _s = persistence.load_settings() or {}
         _audit_on = _s.get("audit_log_enabled")
         _dal.set_enabled(True if _audit_on is None else bool(_audit_on))
@@ -444,7 +444,7 @@ async def on_startup() -> None:
     # the end user has moved on, so sensitive payloads don't
     # linger indefinitely.
     try:
-        from server import direct_transfer as _dt
+        from services.direct_transfer import engine as _dt
         _out_dir = (persistence.load_settings() or {}).get("output_dir") or "./snapshots"
         _dt.sweep_stale_tmp_exports(_out_dir)
     except Exception:  # pragma: no cover (defensive)

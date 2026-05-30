@@ -238,7 +238,7 @@ def post_sync_run_now(
 
     def _run() -> None:
         try:
-            from services import sync_worker
+            from services.mirror_sync import sync_worker as sync_worker
             sync_worker._reconcile_subscription(sub)
         except Exception:
             log.exception(

@@ -531,7 +531,7 @@ def _resolve_item_impl(
         _mirror_ready = False
     if _mirror_ready:
         try:
-            from services import server_mirror as _sm
+            from services.mirror_sync.server_mirror import _sm
             # the mirror is
             # keyed on the app registry UID (stamped onto the server
             # object by connect_registered_server), not the backend-
@@ -774,7 +774,7 @@ def _resolve_item_impl(
             _h_mirror_ready = False
         if _h_mirror_ready:
             try:
-                from services import server_mirror as _sm_h
+                from services.mirror_sync.server_mirror import _sm_h
                 # Phase 4C: app registry UID is the mirror key; fall
                 # back to machineIdentifier for non-registry servers.
                 _h_machine_id = str(

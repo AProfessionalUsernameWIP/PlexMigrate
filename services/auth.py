@@ -470,7 +470,7 @@ def _lookup_stored_pin(username: str, machine_identifier: str) -> Optional[str]:
         # CLI usable even when the server package is partially
         # importable.
         from server import server_registry, media_db
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
     except Exception:
         return None
     try:
@@ -561,7 +561,7 @@ def _tombstoned_usernames_for_server(machine_identifier: str) -> set:
         return set()
     try:
         from server import server_registry, media_db
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
     except Exception:
         return set()
     try:
@@ -894,7 +894,7 @@ def get_home_users(
                         # Lets the end user confirm the PIN-fetch path
                         # is firing without grepping the run log.
                         try:
-                            from services import db_access_log
+                            from services.run_logs import db_access as db_access_log
                             db_access_log.log_event(
                                 "Stored PIN authenticated home-user sign-in for %r on machine %r",
                                 title,

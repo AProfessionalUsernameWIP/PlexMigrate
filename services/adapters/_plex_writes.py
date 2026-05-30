@@ -103,7 +103,7 @@ class PlexWritesMixin:
             - target > current     -> (target - current) scrobbles
             - 0 < target < current -> 1 unscrobble + target scrobbles
           * ``current_view_count`` is None (legacy callers, e.g.
-            ``services.restorer`` which precomputes the delta):
+            ``services.restore.plex_native`` which precomputes the delta):
             - target == 0          -> noop (caller already handled it
               via plexapi's ``markUnplayed``)
             - target > 0           -> ``view_count`` scrobbles (the

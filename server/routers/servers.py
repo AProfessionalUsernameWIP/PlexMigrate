@@ -269,7 +269,7 @@ def toggle_audit_log(
     be end user-toggleable.
     """
     from server import auth_db
-    from services import db_access_log
+    from services.run_logs import db_access as db_access_log
     _auth_router_module.verify_db_admin_from_body(body)
     new_enabled = bool(body.get("enabled"))
     currently_enabled = db_access_log.is_enabled()

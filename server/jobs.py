@@ -22,7 +22,7 @@ Design notes
   dataclass copied out of the live state under lock, so the consumer
   never sees a torn read.
 * Each job calls the same orchestration functions the CLI uses
-  (:func:`services.snapshotter.run_snapshot`, :func:`services.restorer.run_restore`).
+  (:func:`services.snapshot.plex_native.snapshotter.run_snapshot`, :func:`services.restore.plex_native.run_restore`).
   No engine logic is duplicated here - this file is a *driver*.
 """
 
@@ -41,13 +41,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import services.state as state
 from services.auth import _make_session
-from services.snapshotter import run_snapshot
-from services.restorer import run_restore
+from services.snapshot.plex_native.snapshotter import run_snapshot
+from services.restore.plex_native import run_restore
 from services.logging_ops import setup_logging
 
 from server import runtime_patches
-from server.direct_transfer import run_direct_transfer
-from server.fan_out import (
+from services.direct_transfer.engine import run_direct_transfer
+from services.fan_out.coordinator import (
     FanOutResult,
     clear_active_result as _clear_fan_out_active,
     run_fan_out_direct,
@@ -76,7 +76,7 @@ STATE_QUEUED = "queued"
 STATE_RUNNING = "running"
 # "stopping" is the intermediate state between the user clicking Stop and
 # the engine actually returning. The job stays in this state until the
-# current library finishes; see services.snapshotter.run_snapshot's stop
+# current library finishes; see services.snapshot.plex_native.snapshotter.run_snapshot's stop
 # semantics. Surfaces to the frontend so the Stop button can re-label
 # itself "Stopping…" and disable, giving the user immediate feedback.
 STATE_STOPPING = "stopping"
@@ -505,7 +505,7 @@ class JobQueue:
                 rec._stop_event = threading.Event()
 
             # ── Pre-flight: clear any leftover fan-out registry ──────
-            # If the previous job was a fan-out, ``server.fan_out``'s
+            # If the previous job was a fan-out, ``services.fan_out.coordinator``'s
             # ``_active_result`` may still be set (it clears on its
             # own 8 s grace timer for the post-completion display).
             # Wiping it immediately at the start of THIS job so the WS
@@ -542,7 +542,7 @@ class JobQueue:
             # block below). The run_id is the buffer key; we use the
             # auto-generated form which embeds a wall-clock timestamp
             # so chronological sort of timings matches job history.
-            from services import run_timer
+            from services.run_logs import run_timer
             from services.dashboard import job_http_context
             job_run_id = run_timer.start_run()
             try:
@@ -1020,7 +1020,7 @@ class JobQueue:
         if _dash is not None:
             _dash.set_finalizing("writing mirror writethrough")
         try:
-            from services import server_mirror_writethrough
+            from services.mirror_sync import writethrough as server_mirror_writethrough
             server_mirror_writethrough.after_snapshot(
                 server_id=snapshot_server_id,
                 backend="plex",
@@ -1055,13 +1055,13 @@ class JobQueue:
         """Non-Plex snapshot path. Mirrors the post-engine flow of
         :func:`_run_snapshot` (close logger, finalise run dir, capture
         snapshot.db) but routes the engine call through
-        :func:`services.snapshotter_adapter.run_snapshot_adapter`
-        instead of the plexapi-driven :func:`services.snapshotter.run_snapshot`.
+        :func:`services.snapshot.adapter.snapshotter.run_snapshot_adapter`
+        instead of the plexapi-driven :func:`services.snapshot.plex_native.snapshotter.run_snapshot`.
 
         Plex stays on its own perf-tuned path; this helper is the
         parallel engine for Jellyfin / Emby."""
         from types import SimpleNamespace
-        from services.snapshotter_adapter import run_snapshot_adapter
+        from services.snapshot.adapter.snapshotter import run_snapshot_adapter
 
         # Build a connection-like for the adapter engine. We don't
         # have a ServerConnection in scope here (the worker called
@@ -1166,7 +1166,7 @@ class JobQueue:
         # Tunable-gated (engine_mirror_snapshot_writethrough, default
         # true). Failure here NEVER blocks the snapshot.
         try:
-            from services import server_mirror_writethrough
+            from services.mirror_sync import writethrough as server_mirror_writethrough
             server_mirror_writethrough.after_snapshot(
                 server_id=server_id,
                 backend=service_type,
@@ -1495,12 +1495,12 @@ class JobQueue:
         """Non-Plex restore path. Loads each input file's snapshot
         payload from disk (or from the snapshot.db registry) and
         applies it to the destination via
-        :func:`services.restorer_adapter.restore_payload_adapter`.
+        :func:`services.restore.adapter.restorer.restore_payload_adapter`.
 
         The Plex path stays on the perf-tuned
-        :func:`services.restorer.run_restore`; this is the parallel
+        :func:`services.restore.plex_native.run_restore`; this is the parallel
         engine for Jellyfin / Emby destinations."""
-        from services.restorer_adapter import restore_payload_adapter
+        from services.restore.adapter.restorer import restore_payload_adapter
         from services.adapters import UserContext
 
         # When the end user confirmed the
@@ -1513,7 +1513,7 @@ class JobQueue:
         _user_specs = settings.get("user_create_specs") or []
         if _user_specs:
             try:
-                from services.user_creation import (
+                from services.user_management.creation import (
                     UserCreationError, create_users_for_job,
                 )
                 dest_server_id = (
@@ -1715,15 +1715,15 @@ class JobQueue:
         stop_event: Optional[threading.Event],
     ) -> None:
         """Cross-backend direct transfer. Snapshots the source via
-        :func:`services.snapshotter_adapter.run_snapshot_adapter`,
+        :func:`services.snapshot.adapter.snapshotter.run_snapshot_adapter`,
         then immediately restores the in-memory payload to the
         destination via
-        :func:`services.restorer_adapter.restore_payload_adapter`.
+        :func:`services.restore.adapter.restorer.restore_payload_adapter`.
 
         Handles all four backend combinations that involve at least
         one non-Plex side: P->J, P->E, J->J, J->P, J->E, E->E, E->P,
         E->J. Plex<->Plex stays on the perf-tuned
-        :func:`server.direct_transfer.run_direct_transfer` because
+        :func:`services.direct_transfer.engine.run_direct_transfer` because
         it parallelises per-library and shares plexapi sessions
         across reads + writes.
 
@@ -1732,8 +1732,8 @@ class JobQueue:
         engine engines already populate empty arrays for those keys,
         so the payload shape is forward-compatible."""
         from types import SimpleNamespace
-        from services.snapshotter_adapter import run_snapshot_adapter
-        from services.restorer_adapter import restore_payload_adapter
+        from services.snapshot.adapter.snapshotter import run_snapshot_adapter
+        from services.restore.adapter.restorer import restore_payload_adapter
         from services.adapters import UserContext
 
         # Same create-users-first contract
@@ -1742,7 +1742,7 @@ class JobQueue:
         _user_specs = settings.get("user_create_specs") or []
         if _user_specs:
             try:
-                from services.user_creation import (
+                from services.user_management.creation import (
                     UserCreationError, create_users_for_job,
                 )
                 create_users_for_job(
@@ -2049,7 +2049,7 @@ class JobQueue:
         contents on Jellyfin / Emby. Every outcome is written to
         smart_playlist.db and logged to smart_playlist.log (the
         dedicated log the in-panel live view reads)."""
-        from services.smart_playlist_log import get_smart_playlist_logger
+        from services.smart_playlist.log import get_smart_playlist_logger
 
         sp_log = get_smart_playlist_logger()
         params = rec.params or {}
@@ -2136,8 +2136,8 @@ class JobQueue:
         """Migrate one smart playlist. Returns a per-item result dict
         and records the outcome in smart_playlist.db. Never raises -
         any failure is captured into the result's ``warning``."""
-        from services import smart_playlist
-        from services.smart_playlist_log import get_smart_playlist_logger
+        from services.smart_playlist import filter_model as smart_playlist
+        from services.smart_playlist.log import get_smart_playlist_logger
         from server import server_registry, smart_playlist_db
 
         src_server_id = str(item.get("source_server_id") or "")
@@ -2828,7 +2828,7 @@ class JobQueue:
         """
         Direct transfer: read from one registered Plex and write to
         another without an intermediate file on disk. The orchestrator
-        lives in :mod:`server.direct_transfer`; this method just
+        lives in :mod:`services.direct_transfer.engine`; this method just
         handles connection resolution, logger setup, and stop-flag
         threading.
 
@@ -3103,7 +3103,7 @@ class JobQueue:
             # Per-run override that bypasses the library mapping table.
             # Matches the restore-from-snapshot path above. Source +
             # dest server IDs are required so the mapping consult in
-            # services.restorer can identify the pair correctly.
+            # services.restore.plex_native can identify the pair correctly.
             ignore_library_mapping=bool(
                 settings.get("ignore_library_mapping") or False
             ),
@@ -3134,7 +3134,7 @@ class JobQueue:
     ) -> None:
         """
         Hand off a multi-destination direct transfer to
-        :func:`server.fan_out.run_fan_out_direct`.
+        :func:`services.fan_out.coordinator.run_fan_out_direct`.
 
         The fan-out coordinator owns its own per-destination dashboards
         and log dirs, so this method intentionally does *not* call
@@ -3273,7 +3273,7 @@ class JobQueue:
         destination is non-Plex.
 
         The existing run_fan_out_direct path is Plex<->Plex only - it
-        calls ``server.direct_transfer.run_direct_transfer`` which
+        calls ``services.direct_transfer.engine.run_direct_transfer`` which
         pokes plexapi internals (``server.library.sections()``) on
         both ends. This method handles every other backend combination
         (P->J, P->E, J->*, E->*) by dispatching each destination
@@ -3287,7 +3287,7 @@ class JobQueue:
         Per-destination errors are caught and recorded on a
         FanOutResult; one failed destination does not abort the rest.
         """
-        from server.fan_out import (
+        from services.fan_out.coordinator import (
             FanOutResult, FanOutDestResult,
             _make_pending_dashboard, _build_per_dest_log_dir,
         )
@@ -3365,7 +3365,7 @@ class JobQueue:
     ) -> None:
         """
         Hand off a multi-destination import to
-        :func:`server.fan_out.run_fan_out_restore`. The single-server
+        :func:`services.fan_out.coordinator.run_fan_out_restore`. The single-server
         connect+resolve dance is repeated per-destination inside the
         coordinator, so this dispatcher just normalises params.
         """
@@ -3474,7 +3474,7 @@ def _apply_mixed_media_state(settings: Dict[str, Any]) -> None:
     No-op when neither the global nor per-run config provides any
     setting (state.set_mixed_media_config(None) → engine treats every
     row as pass-through, matching legacy behaviour)."""
-    from services import mixed_media as _mm
+    from services.restore import mixed_media as _mm
     from services import tunables as _t
     try:
         global_settings = (load_settings() or {}).get("mixed_media") or {}
@@ -3550,7 +3550,7 @@ def _resolve_dest_names(settings: Dict[str, Any]) -> List[str]:
 
 def _apply_fan_out_result(rec: JobRecord, result: "FanOutResult") -> None:
     """
-    Translate a :class:`server.fan_out.FanOutResult` into the worker
+    Translate a :class:`services.fan_out.coordinator.FanOutResult` into the worker
     loop's terminal-state vocabulary.
 
     The worker's ``try`` block sets ``rec.state = STATE_COMPLETED``
@@ -3890,7 +3890,7 @@ def _persist_run_history_row(rec: JobRecord, job_run_id: str) -> None:
     RESTORED entry in the run's restoration log), state, duration,
     plus deep-link flags for the run-settings.log + restoration.log
     files. Reads the JobRecord fields + the per-run state seam
-    populated by services.restorer.
+    populated by services.restore.plex_native.
 
     Called from the worker's central finally block. Never raises:
     failure to record telemetry must not affect the job's recorded
@@ -4012,7 +4012,7 @@ def _dump_run_settings(
     independently as a defence in depth.
     """
     try:
-        from services.run_settings_log import write_run_settings
+        from services.run_logs.run_settings import write_run_settings
         write_run_settings(
             run_log_dir=run_log_dir,
             job_type=job_type,
@@ -4504,7 +4504,7 @@ def _capture_snapshot_after_run(
     snapshot_db_path = Path(output_dir).resolve() / f"{snapshot_name}.db"
     # Rule 1: snapshot content comes from the in-memory payload list
     # the engine appended during this run, NOT from media.db. The
-    # collector is populated by services.snapshotter.snapshot_library
+    # collector is populated by services.snapshot.plex_native.snapshotter.snapshot_library
     # after each live-fetch; reset_run_state primed it as an empty
     # list at the top of the run.
     payloads = state._snapshot_payloads or []
@@ -4528,7 +4528,7 @@ def _capture_snapshot_after_run(
         # last meaningful operation in a snapshot job and end users
         # have reported it dominating the wall-clock tail of large
         # captures.
-        from services import run_timer as _run_timer
+        from services.run_logs import run_timer as _run_timer
         with _run_timer.time_operation(
             "build_snapshot_db_from_payloads",
             scope=_run_timer.SCOPE_OPERATION,

@@ -661,7 +661,7 @@ def _capture_emby_jellyfin_managed_users(
             # the activity filter can see it. Best-effort; never
             # let the auth-signal write block the capture flow.
             try:
-                from services.user_activity_filter import (
+                from services.user_management.activity_filter import (
                     record_auth_result, RESULT_AUTH_ERROR,
                 )
                 record_auth_result(
@@ -703,7 +703,7 @@ def _capture_emby_jellyfin_managed_users(
             # failure counter to 0 so the filter / sweeper sees a
             # clean slate going forward.
             try:
-                from services.user_activity_filter import (
+                from services.user_management.activity_filter import (
                     record_auth_result, RESULT_OK,
                 )
                 record_auth_result(

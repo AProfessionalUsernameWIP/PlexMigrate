@@ -7,7 +7,7 @@ serializes its filter (and a vocabulary preflight against the
 destination's tag id space).
 
 Mixed into :class:`PlexAdapter`. Depends on ``self._server_for``
-(per-user PlexServer factory) and on ``services.smart_playlist``
+(per-user PlexServer factory) and on ``services.smart_playlist.filter_model``
 for the cross-server filter translation."""
 
 from __future__ import annotations
@@ -38,16 +38,16 @@ class PlexSmartPlaylistMixin:
         user_context: Optional[UserContext] = None,
     ) -> Optional[Any]:
         """Fetch a smart
-        playlist and return a ``services.smart_playlist.RawSmartFilter``:
+        playlist and return a ``services.smart_playlist.filter_model.RawSmartFilter``:
         the decoded filter (plexapi ``Playlist.filters()``) plus the
         source section's field-type + tag-choice maps, so
-        ``services.smart_playlist.to_portable`` can translate it into
+        ``services.smart_playlist.filter_model.to_portable`` can translate it into
         a server-agnostic form.
 
         Returns None when the playlist is missing or not smart - a
         non-smart playlist has no filter to migrate. This is the only
         place plexapi's smart-filter surface is touched."""
-        from services.smart_playlist import (
+        from services.smart_playlist.filter_model import (
             RawSmartFilter, referenced_tag_fields,
         )
         if not playlist_id:
@@ -211,7 +211,7 @@ class PlexSmartPlaylistMixin:
     ) -> str:
         """Create a smart
         playlist on this Plex server from a translated filter spec
-        (the output of ``services.smart_playlist.from_portable``).
+        (the output of ``services.smart_playlist.filter_model.from_portable``).
         plexapi's ``_validateFieldValueTag`` resolves each tag NAME in
         ``filters`` to this server's own tag id. Returns the new
         playlist's rating key."""

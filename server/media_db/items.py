@@ -10,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Dict, List, Optional
 
-from services.guid_translator import normalize_guids
+from services.translation.guid_translator import normalize_guids
 
 from ._core import _DB_LOCK, _require_conn
 
@@ -234,7 +234,7 @@ def upsert_library_section(
     # changes. Volume is low (one per library per snapshot run) so the
     # audit log doesn't bloat.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="media.db:library_sections",
             where={"server_id": server_id, "section_key": int(section_key)},
@@ -329,7 +329,7 @@ def has_any_items_for_server(server_id: str) -> bool:
     """
     True iff media.db has at least one ``server_items`` row tagged
     with this ``server_id``. Used by the snapshot-payload caching
-    decision (services.snapshotter._should_cache_payload_to_media_db)
+    decision (services.snapshot.plex_native.snapshotter._should_cache_payload_to_media_db)
     to detect a "first run" for an unseeded server and trigger a
     one-shot ingest that populates the resolver Tier 0 GUID cache.
 

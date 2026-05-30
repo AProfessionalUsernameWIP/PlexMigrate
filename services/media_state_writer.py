@@ -15,7 +15,7 @@ Two concerns live here:
     restore-style mode / strategy ("replace", "higher", "sum").
 
   * Affinity (rating + favorite) - a neutral per-user affinity is run
-    through :func:`services.backend_translation.translate_affinity` to
+    through :func:`services.translation.backend_translation.translate_affinity` to
     get what the destination backend can actually store (a numeric
     rating for Plex; a favorite flag, plus optional rating, for
     Jellyfin / Emby) and then written through the adapter.
@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from services.adapters import ItemRef, MediaServerAdapter, UserContext, WriteResult
-from services.backend_translation import translate_affinity
+from services.translation.backend_translation import translate_affinity
 
 _LOGGER = logging.getLogger(__name__)
 

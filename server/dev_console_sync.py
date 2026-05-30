@@ -140,7 +140,7 @@ def sync_server(
                 "detail": "server has pending staged changes; sync skipped"}
 
     _publish_sync(server_id, "start")
-    from services import dev_console as dc
+    from services.admin import dev_console as dc
 
     try:
         conn = dc._connect(server_id)
@@ -280,7 +280,7 @@ def sync_user_playlists(
     if dev_console_db.has_pending_staged(server_id):
         return {"server_id": server_id, "ok": False, "phase": "frozen",
                 "detail": "server has pending staged changes; sync skipped"}
-    from services import dev_console as dc
+    from services.admin import dev_console as dc
     try:
         conn = dc._connect(server_id)
     except dc.DevConsoleError as exc:

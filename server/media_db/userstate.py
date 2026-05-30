@@ -300,7 +300,7 @@ def upsert_playlist(
       with ``user_handle=<username>``. Name-based dedup loses a
       legitimately personal playlist that happens to share a name
       with a server-wide one. The rating_key dedup pattern in
-      :func:`server.direct_transfer._gather_users_data` is the
+      :func:`services.direct_transfer.engine._gather_users_data` is the
       reference implementation.
 
     :func:`ingest_snapshot_payload` below applies this discipline
@@ -375,7 +375,7 @@ def upsert_collection(
     cross-user reasoning.
 
     The correct integration pattern is the one already used by
-    :func:`server.direct_transfer._gather_users_data`: capture the
+    :func:`services.direct_transfer.engine._gather_users_data`: capture the
     owner-side collection rating_keys into a set, then for each
     user's collection list, filter out anything whose rating_key
     matches before writing user-scoped rows. Dedup by rating_key

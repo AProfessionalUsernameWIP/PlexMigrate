@@ -63,7 +63,7 @@ Each entry in the ``libraries`` array is shaped exactly like a live
 per-library .plexexport.json the engine writes during a snapshot run -
 so the restore loop can iterate over the array, treat each entry as
 one library-scoped payload, and use the existing
-:func:`services.restorer.restore_export_file` contract unchanged.
+:func:`services.restore.plex_native.restore_export_file` contract unchanged.
 There is no ``"All Libraries (reconstructed from snapshot DB)"``
 virtual library - that fallback was the source of the
 ``12,287-across-every-library`` totals bug and is gone in v0.15.
@@ -403,7 +403,7 @@ def build_payload_from_db(
     # logs the snapshot *write*; this is the matching *read* so the
     # db-access log shows the full snapshot -> restore round trip.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         total_users = sum(
             len(per_section.get(int(s["section_key"]), {}))
             for s in section_rows

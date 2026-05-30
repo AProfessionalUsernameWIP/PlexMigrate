@@ -496,7 +496,7 @@ class MediaServerAdapter(ABC):
         item_type_hint: str = "",
     ) -> Optional[str]:
         """Given a tuple of normalized cross-server GUIDs (from
-        :func:`services.guid_translator.normalize_guids`), return the
+        :func:`services.translation.guid_translator.normalize_guids`), return the
         backend-native item id on this server, or ``None`` if no match.
 
         Used by the restorer's adapter path to convert a source

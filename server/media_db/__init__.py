@@ -23,7 +23,7 @@ Schema philosophy
   ``collections``) keyed by ``(item_id, server_id, user_handle)``.
 
 * **All GUIDs are normalised** by
-  :func:`services.guid_translator.normalize_guid` before they hit the
+  :func:`services.translation.guid_translator.normalize_guid` before they hit the
   database so a legacy ``com.plexapp.agents.thetvdb://121361?lang=en``
   and a modern ``tvdb://121361`` collapse to the same row.
 
@@ -180,6 +180,7 @@ __all__ = [
     "_apply_migrations",
     "_backfill_app_user_uuids",
     "_close_for_tests",
+    "_conn",
     "_db_path",
     "_equivalence_class_for_uuid",
     "_init_lock",
@@ -251,3 +252,13 @@ __all__ = [
     "upsert_rating",
     "upsert_server_row",
 ]
+
+
+def __getattr__(name: str):
+    """Delegate attribute access to _core for mutable module-level variables
+    like _conn that get reassigned during initialization."""
+    if name == '_conn':
+        from . import _core
+        return _core._conn
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

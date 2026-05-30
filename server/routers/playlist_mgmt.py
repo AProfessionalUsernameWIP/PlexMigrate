@@ -89,7 +89,7 @@ def _playlist_mgmt_role_from_kind(kind: Optional[str], service_type: str) -> str
     """Map a ``managed_users.kind`` value to the end user-facing role
     string returned by ``/api/playlist-mgmt/users``. Mirrors the
     three-tier convention from
-    ``services.restorer_adapter._normalise_dest_role``:
+    ``services.restore.adapter.restorer._normalise_dest_role``:
 
       * Plex owner kind  → "owner"  (single-admin server model)
       * J/E  owner kind  → "admin"  (multi-admin server model)
@@ -159,12 +159,12 @@ def get_playlist_mgmt_users(
                 server_id,
             )
 
-    # Route through services.user_activity_filter so the JobForm
+    # Route through services.user_management.activity_filter so the JobForm
     # picker honours the same tombstone + auth-health filter as
     # every other backend-touching path. The auth health gate
     # fires when the master switch is on; with it off the result
     # matches list_managed_users(include_hidden=False).
-    from services.user_activity_filter import list_active_users
+    from services.user_management.activity_filter import list_active_users
     rows = list_active_users(server_id)
 
     # Cold-start recovery (matches JobFormPanel.fetchPickerUsers): if
@@ -565,7 +565,7 @@ def get_playlist_mgmt_smart_preview(
     preflight. The source must be a Plex server (smart playlists
     are a Plex-only concept)."""
     from server import server_registry
-    from services import smart_playlist as _sp
+    from services.smart_playlist import filter_model as _sp
     try:
         conn = server_registry.connect_registered_server(server_id, log)
     except ValueError as exc:

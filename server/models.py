@@ -421,7 +421,7 @@ class SettingsIn(BaseModel):
     # Owner-phase watch+ratings capture strategy. Surfaces under
     # Servers ▸ Run Defaults ▸ Snapshot Defaults. Per-server override is
     # accepted as ``snapshot_defaults_per_server[server_id]
-    # .watch_ratings_filter_strategy``. See ``services.snapshotter
+    # .watch_ratings_filter_strategy``. See ``services.snapshot.plex_native.snapshotter
     # .snapshot_library`` for resolution + behaviour.
     watch_ratings_filter_strategy: Optional[str] = Field(
         default=None,
@@ -436,7 +436,7 @@ class SettingsIn(BaseModel):
         ),
     )
     # Smart-mode size threshold for the bulk-fetch decision. See
-    # services.snapshotter._should_use_bulk for the full decision
+    # services.snapshot.plex_native.snapshotter._should_use_bulk for the full decision
     # table. Setting to 0 effectively disables the size gate
     # (smart-mode behaves as "bulk whenever both metrics are wanted").
     # Setting to a very large number forces non-show libraries onto
@@ -474,7 +474,7 @@ class SettingsIn(BaseModel):
         ),
     )
     # Log rotation tunables. Applied to application-level log writers
-    # (services.db_access_log today; auth / network / debug when their
+    # (services.run_logs.db_access today; auth / network / debug when their
     # writers ship). Per-run job logs are governed by their own
     # retention policy and are not size-rotated.
     log_rotate_max_size_mb: Optional[int] = Field(

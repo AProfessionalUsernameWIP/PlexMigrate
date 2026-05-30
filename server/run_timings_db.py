@@ -2,7 +2,7 @@
 Run timings persistence (Feature 1 phase 1.3).
 
 Stores per-operation timing entries produced by
-:mod:`services.run_timer` so the ETR rework (phase 1.4) can train on
+:mod:`services.run_logs.run_timer` so the ETR rework (phase 1.4) can train on
 historical data and the end user can audit past runs from the
 dashboard.
 
@@ -15,7 +15,7 @@ time the engine fires.
 
 Schema:
 
-``run_timings`` (one row per :class:`services.run_timer.TimingEntry`)
+``run_timings`` (one row per :class:`services.run_logs.run_timer.TimingEntry`)
     - ``id``                INTEGER PRIMARY KEY AUTOINCREMENT
     - ``run_id``            TEXT NOT NULL
     - ``scope``             TEXT NOT NULL (see run_timer.VALID_SCOPES)
@@ -195,7 +195,7 @@ def persist_entries(entries: Sequence[Any]) -> int:
     Insert every entry in ``entries`` into ``run_timings`` and then
     enforce retention. Returns the number of rows inserted.
 
-    Each entry is expected to be a :class:`services.run_timer.TimingEntry`,
+    Each entry is expected to be a :class:`services.run_logs.run_timer.TimingEntry`,
     but this helper duck-types on the fields so a future caller can
     pass dicts or a different record class without rewriting this.
     Missing optional fields land as NULL.
@@ -356,7 +356,7 @@ def list_recent_runs(*, limit: int = 25) -> List[Dict[str, Any]]:
     :func:`record_run_history`) and LEFT-JOINs the per-operation
     aggregates from run_timings for entry_count + total_items.
     Driving off run_timings instead would miss restore jobs that do
-    not emit per-operation timings via ``services.run_timer``: they
+    not emit per-operation timings via ``services.run_logs.run_timer``: they
     produce zero rows in run_timings and would be silently invisible
     to the dashboard. Runs without per-operation timings still
     surface with their wall-clock duration + job_type + state; the

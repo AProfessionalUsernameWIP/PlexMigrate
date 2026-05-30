@@ -32,7 +32,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from services.guid_translator import (
+from services.translation.guid_translator import (
     _mb_searchable_guids,
     _to_legacy_agent,
 )
@@ -270,7 +270,7 @@ class PlexResolveMixin:
         (``imdb://tt...``, ``tmdb://...``, ``tvdb://...``) and the
         legacy agent form (``com.plexapp.agents.imdb://tt...``). The
         engine has already normalised guids upstream via
-        ``services.guid_translator.normalize_guids``; we try the
+        ``services.translation.guid_translator.normalize_guids``; we try the
         normalised forms directly first, then fall back to the
         legacy agent strings so a Plex destination running an older
         agent version still resolves.

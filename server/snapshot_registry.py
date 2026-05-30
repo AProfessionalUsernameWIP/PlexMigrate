@@ -388,7 +388,7 @@ def register(
     # row). The first two are already audited in their respective
     # writers; this closes the loop.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="snapshots.db:snapshots",
             where={"id": snapshot_id, "server_id": server_id},
@@ -882,7 +882,7 @@ def _ingest_orphan(
     # bypassing register(); record the equivalent write so the audit
     # log doesn't have a gap.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="snapshots.db:snapshots",
             where={"id": snapshot_id, "server_id": server_id},
@@ -977,7 +977,7 @@ def materialise_sidecar(snapshot_id: str) -> Optional[str]:
     # Audit trail: stamping prebuilt_json_path is a mutating write on
     # the registry row that should appear in db_access.log.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="snapshots.db:snapshots",
             where={"id": snapshot_id, "column": "prebuilt_json_path"},
@@ -1115,7 +1115,7 @@ def reap_stale_sidecars(*, ttl_seconds: Optional[int] = None, now: Optional[floa
     # write surface. Skip when nothing happened to avoid log noise.
     if counters["reaped"] or counters["missing"]:
         try:
-            from services import db_access_log
+            from services.run_logs import db_access as db_access_log
             db_access_log.log_write(
                 table="snapshots.db:snapshots",
                 where={"column": "prebuilt_json_path", "reason": "sidecar_ttl_sweep"},
@@ -1249,7 +1249,7 @@ def delete(snapshot_id: str, *, keep_json: bool = False) -> Dict[str, Any]:
     # archive move, sidecar delete) are end user-visible state changes
     # that belong in db_access.log.
     try:
-        from services import db_access_log
+        from services.run_logs import db_access as db_access_log
         db_access_log.log_write(
             table="snapshots.db:snapshots",
             where={

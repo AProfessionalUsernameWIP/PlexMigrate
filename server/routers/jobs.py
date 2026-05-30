@@ -292,7 +292,7 @@ def _run_preflight_for_dest(
     """Build the destination adapter, call dry_run_resolve_users,
     marshal the dataclass into the Pydantic wire shape."""
     from server import server_registry
-    from services.restorer_adapter import dry_run_resolve_users
+    from services.restore.adapter.restorer import dry_run_resolve_users
     try:
         connection = server_registry.connect_registered_server(
             dest_name, log,
@@ -549,7 +549,7 @@ def post_jobs_inline_create_user(
     too: returns 400 with a pointer to the Plex Home invite flow."""
     from server import server_registry
     from services.adapters import UserPolicy
-    from services.restorer_adapter import _normalise_dest_role
+    from services.restore.adapter.restorer import _normalise_dest_role
     try:
         connection = server_registry.connect_registered_server(
             body.destination_server_id, log,

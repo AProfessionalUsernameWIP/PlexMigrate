@@ -51,7 +51,7 @@ def post_library_mapping_automap(
     that threshold are returned as suggestions only — operator
     confirms via /save. Default False so the matcher is purely
     read-only unless the caller opts in to auto-save."""
-    from services import library_mapper
+    from services.library_mapping import mapper as library_mapper
     from server import library_mapping_db
     source_server_id = str(body.get("source_server_id") or "").strip()
     dest_server_id = str(body.get("dest_server_id") or "").strip()

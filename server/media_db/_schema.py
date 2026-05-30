@@ -496,7 +496,7 @@ _MIGRATIONS: List[Tuple[int, str]] = [
     # user_handle) tuples to (app_user_uuid_a, app_user_uuid_b) pairs.
     #
     # Format of app_user_uuid is documented in
-    # :mod:`services.user_uuid`. Canonical 4-part form:
+    # :mod:`services.identity.user_uuid`. Canonical 4-part form:
     #     <Service>-<HostNameSlug>-<server_uid>-<userkey>
     # Example: ``Plex-JadeTV-plex_a1b2c3d4-a3f9c2d8``.
     #
@@ -682,7 +682,7 @@ _MIGRATIONS: List[Tuple[int, str]] = [
     # a display-name the local SystemAccount was relabelled to - e.g.,
     # "Kai").
     #
-    # The forward fix lives in :mod:`services.plex_owner_identity` +
+    # The forward fix lives in :mod:`services.identity.plex_owner_identity` +
     # the two call sites (PlexAdapter.list_users + get_server_users)
     # so subsequent syncs no longer write the duplicate. This
     # migration is the one-shot cleanup for DBs that already have it.
@@ -812,7 +812,7 @@ _MIGRATIONS: List[Tuple[int, str]] = [
         ALTER TABLE ratings ADD COLUMN is_favorite INTEGER;
     """),
     # CONSOLE-17: provenance columns for users created by the
-    # destination-side user-creation flow (services.user_creation).
+    # destination-side user-creation flow (services.user_management.creation).
     # ``source_user_handle`` records the source-server handle the row
     # was copied from so the identity resolver can walk
     # source -> destination on subsequent runs; ``created_via_user_creation``

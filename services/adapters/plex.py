@@ -62,13 +62,14 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from plexapi.server import PlexServer
 
-from services.guid_translator import normalize_guids
+from services.translation.guid_translator import normalize_guids
 from services.resolver import (
     _all_guids,
     _disable_autoreload,
+    _normalize_path_parts,
     _safe_file_path,
     _section_leaf_items,
-)
+)  # noqa: F401
 
 from . import (
     ItemSnapshot,
@@ -238,9 +239,9 @@ class PlexAdapter(
 
         Mirrors ``server/server_registry.py:get_server_users``;
         owner-vs-managed detection lives in the shared helper at
-        :mod:`services.plex_owner_identity` so both surfaces stay in
+        :mod:`services.identity.plex_owner_identity` so both surfaces stay in
         lockstep when new identification signals are added."""
-        from services.plex_owner_identity import (
+        from services.identity.plex_owner_identity import (
             derive_owner_identifiers,
             dedupe_owner_against_managed,
             is_owner_system_account,
@@ -361,13 +362,13 @@ class PlexAdapter(
     # through to the existing live walk so correctness is preserved.
 
     def iter_sections_for_mirror(self) -> List[Any]:
-        """Yield :class:`services.server_mirror.SectionInfo` for every
+        """Yield :class:`services.mirror_sync.server_mirror.SectionInfo` for every
         library section on this server. Used by the sync layer to
         enumerate the universe before walking items.
 
         Picks up live_total_size + live_updated_at so the sync layer
         can decide between probe-only, delta, or full sync."""
-        from services.server_mirror import SectionInfo
+        from services.mirror_sync.server_mirror import SectionInfo
         out: List[SectionInfo] = []
         try:
             sections = list(self._server.library.sections())
@@ -408,11 +409,11 @@ class PlexAdapter(
         since_ts: Optional[float] = None,
     ) -> Iterator[Any]:
         """Item provider used by the sync layer. Yields
-        :class:`services.server_mirror.ItemRow` for every leaf-level
+        :class:`services.mirror_sync.server_mirror.ItemRow` for every leaf-level
         item in ``section_id``. When ``since_ts`` is supplied, items
         whose ``updatedAt`` is older are skipped (delta sync).
         """
-        from services.server_mirror import ItemRow
+        from services.mirror_sync.server_mirror import ItemRow
         try:
             section = next(
                 (s for s in self._server.library.sections()
