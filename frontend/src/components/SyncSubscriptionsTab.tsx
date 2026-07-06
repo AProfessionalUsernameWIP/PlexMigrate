@@ -71,6 +71,66 @@ function subscriptionToPayload(sub: SyncSubscription): SyncSaveSubscriptionInput
   };
 }
 
+// Shared user-pick checkbox grid for the new-subscription and
+// edit-subscription user_filter pickers. Both sites previously
+// inlined ~36 lines of identical .map() markup that varied only in
+// which user list + which selection state to read/write. The
+// `selected` array uses raw_name as the matching key (consistent
+// with both prior sites).
+function UserFilterCheckboxGrid(props: {
+  users: ServerUser[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
+      gap: 4,
+      maxHeight: 200,
+      overflowY: 'auto',
+    }}>
+      {props.users.map((u) => {
+        const checked = props.selected.includes(u.raw_name);
+        return (
+          <label
+            key={u.plex_id || u.raw_name}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 12,
+              padding: '4px 6px',
+              borderRadius: 3,
+              background: checked ? 'var(--bg-panel-alt, rgba(74,122,252,0.08))' : undefined,
+              cursor: 'pointer',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(e) => {
+                if (e.target.checked) {
+                  props.onChange([...props.selected, u.raw_name]);
+                } else {
+                  props.onChange(props.selected.filter((x) => x !== u.raw_name));
+                }
+              }}
+            />
+            <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              {u.display_name || u.raw_name}
+            </span>
+            {u.kind === 'owner' && (
+              <span className="tag" style={{ fontSize: 9 }}>owner</span>
+            )}
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+
 export function SyncSubscriptionsTab({ servers }: { servers: ServerView[] }) {
   const [subs, setSubs] = useState<SyncSubscription[]>([]);
   const [busy, setBusy] = useState<boolean>(false);
@@ -601,50 +661,11 @@ export function SyncSubscriptionsTab({ servers }: { servers: ServerView[] }) {
                 source server.
               </div>
             ) : (
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
-                gap: 4,
-                maxHeight: 200,
-                overflowY: 'auto',
-              }}>
-                {srcUsers.map((u) => {
-                  const checked = newFilter.includes(u.raw_name);
-                  return (
-                    <label
-                      key={u.plex_id || u.raw_name}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        gap: 6,
-                        fontSize: 12,
-                        padding: '4px 6px',
-                        borderRadius: 3,
-                        background: checked ? 'var(--bg-panel-alt, rgba(74,122,252,0.08))' : undefined,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={(e) => {
-                          if (e.target.checked) {
-                            setNewFilter([...newFilter, u.raw_name]);
-                          } else {
-                            setNewFilter(newFilter.filter((x) => x !== u.raw_name));
-                          }
-                        }}
-                      />
-                      <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                        {u.display_name || u.raw_name}
-                      </span>
-                      {u.kind === 'owner' && (
-                        <span className="tag" style={{ fontSize: 9 }}>owner</span>
-                      )}
-                    </label>
-                  );
-                })}
-              </div>
+              <UserFilterCheckboxGrid
+                users={srcUsers}
+                selected={newFilter}
+                onChange={setNewFilter}
+              />
             )}
             <p className="help" style={{ marginTop: 8, marginBottom: 0, fontSize: 11, color: 'var(--text-dim)' }}>
               Only users with a check mark above will be touched by this
@@ -901,50 +922,11 @@ export function SyncSubscriptionsTab({ servers }: { servers: ServerView[] }) {
                                   <strong>Servers &rsaquo; Refresh users</strong>.
                                 </div>
                               ) : (
-                                <div style={{
-                                  display: 'grid',
-                                  gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))',
-                                  gap: 4,
-                                  maxHeight: 200,
-                                  overflowY: 'auto',
-                                }}>
-                                  {editScopeUsers.map((u) => {
-                                    const checked = editFilter.includes(u.raw_name);
-                                    return (
-                                      <label
-                                        key={u.plex_id || u.raw_name}
-                                        style={{
-                                          display: 'flex',
-                                          alignItems: 'center',
-                                          gap: 6,
-                                          fontSize: 12,
-                                          padding: '4px 6px',
-                                          borderRadius: 3,
-                                          background: checked ? 'var(--bg-panel-alt, rgba(74,122,252,0.08))' : undefined,
-                                          cursor: 'pointer',
-                                        }}
-                                      >
-                                        <input
-                                          type="checkbox"
-                                          checked={checked}
-                                          onChange={(e) => {
-                                            if (e.target.checked) {
-                                              setEditFilter([...editFilter, u.raw_name]);
-                                            } else {
-                                              setEditFilter(editFilter.filter((x) => x !== u.raw_name));
-                                            }
-                                          }}
-                                        />
-                                        <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                          {u.display_name || u.raw_name}
-                                        </span>
-                                        {u.kind === 'owner' && (
-                                          <span className="tag" style={{ fontSize: 9 }}>owner</span>
-                                        )}
-                                      </label>
-                                    );
-                                  })}
-                                </div>
+                                <UserFilterCheckboxGrid
+                                  users={editScopeUsers}
+                                  selected={editFilter}
+                                  onChange={setEditFilter}
+                                />
                               )}
                             </>
                           )}

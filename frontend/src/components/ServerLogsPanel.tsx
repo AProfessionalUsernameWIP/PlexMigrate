@@ -15,42 +15,12 @@
 // (server_slug is null) collect under "Unattributed".
 
 import { useEffect, useState } from 'react';
-import { api, getAccessToken, LogFile, LogRun, ServerView } from '../api';
+import { api, LogFile, LogRun, ServerView } from '../api';
 import { LogTailer } from './LogTailer';
 import { ConfirmDeleteModal } from './LogsPanel';
 import { formatBytes, formatTimestamp } from '../utils/format';
-
-
-// Same blob-download pattern LogsPanel uses; copied verbatim because
-// the helper is private to that module. Future refactor could lift
-// it into a shared utility if a third caller appears.
-async function downloadBlob(
-  url: string,
-  filename: string,
-  setError: (e: string | null) => void,
-): Promise<void> {
-  try {
-    const token = getAccessToken();
-    const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    const res = await fetch(url, { headers });
-    if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText);
-      throw new Error(`${res.status}: ${text}`);
-    }
-    const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = objectUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(objectUrl);
-  } catch (e) {
-    setError(`Download failed: ${e}`);
-  }
-}
+import { downloadBlob } from '../utils/downloadBlob';
+import { performLogRunDelete } from '../utils/logRunDelete';
 
 
 
@@ -99,25 +69,18 @@ export function ServerLogsPanel() {
   // the existing all-or-nothing endpoint /api/logs DELETE wipes EVERY
   // run on the host - too broad for the per-server panel. Errors
   // accumulate in the result banner; success refreshes the list.
-  const doDeleteOne = async (name: string) => {
-    setError(null);
-    setInfo(null);
-    try {
-      const r = await api.deleteLogRun(name);
-      setInfo(
-        `Deleted ${r.deleted} (${r.file_count} file${r.file_count === 1 ? '' : 's'})`
-        + (r.errors.length ? ` with ${r.errors.length} error(s): ${r.errors.join(' · ')}` : '.'),
-      );
-      if (selectedRun === name) {
+  const doDeleteOne = (name: string) => performLogRunDelete(name, {
+    setError,
+    setInfo,
+    onActiveRunDeleted: (n) => {
+      if (selectedRun === n) {
         setSelectedRun(null);
         setSelectedFile(null);
         setFiles([]);
       }
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+    },
+    refresh,
+  });
 
   const doDeleteForServer = async (runNames: string[]) => {
     setError(null);

@@ -99,56 +99,31 @@ def _strict_mode() -> bool:
 
 # ── Resolution chain ──────────────────────────────────────────────────────
 
-def resolve_destination_user(
+def _field(obj: Any, name: str) -> str:
+    """Read ``obj.name`` whether ``obj`` is a dataclass-like instance
+    (UserSpec) or a raw dict. Callers in sync paths pass plain dicts;
+    callers in restore paths pass UserSpec. The helper normalizes both
+    so the resolution chain has a single accessor contract."""
+    if isinstance(obj, dict):
+        return str(obj.get(name) or "")
+    return str(getattr(obj, name, "") or "")
+
+
+def _resolve_via_backend_lookup(
     *,
     source_username: str,
-    source_role: str,
+    source_backend_user_id: Optional[str],
+    source_service_type: Optional[str],
     dest_by_username: Dict[str, Any],
-    dest_admins: List[Any],
     source_server_id: str,
     dest_server_id: str,
     logger: logging.Logger,
-    per_job_overrides: Optional[Dict[str, str]] = None,
-    source_backend_user_id: Optional[str] = None,
-    source_service_type: Optional[str] = None,
 ) -> Optional[Any]:
-    """Pick the destination user for ``source_username``'s payload.
-
-    ``dest_by_username`` is the destination's user roster keyed by
-    lower-cased username; values are ``UserSpec``-like (anything with
-    ``username``, ``backend_user_id``, ``role``). ``dest_admins`` is
-    the subset whose ``role == 'admin'`` (or ``'owner'`` on Plex).
-
-    ``source_backend_user_id`` and ``source_service_type`` enable
-    step 2 (backend_user_id direct match within service_type). If
-    omitted, step 2 short-circuits and the chain proceeds to step 3
-    as the legacy path did.
-
-    Returns the matched destination user OR ``None`` to indicate the
-    caller should log + skip the source user's payload with an
-    actionable message.
-    """
-    # 0. Per-job override (end user Map decision without persistence).
-    if per_job_overrides:
-        normalised = (source_username or "").strip().lower()
-        if normalised in per_job_overrides:
-            target_uid = per_job_overrides[normalised]
-            for u in dest_by_username.values():
-                if (getattr(u, "backend_user_id", "") or "") == target_uid:
-                    logger.info(
-                        "user resolution: %r resolved to destination "
-                        "user_id %r via per-job override.",
-                        source_username, target_uid,
-                    )
-                    return u
-            logger.warning(
-                "user resolution: per-job override for %r points at "
-                "dest_user_id %r which is not in the destination "
-                "roster; falling through to standard resolution.",
-                source_username, target_uid,
-            )
-
-    # 1. user_identity_map lookup (authoritative).
+    """Steps 1+2 of the resolution chain: identity_map lookup, then
+    backend_user_id direct match scoped by service_type. Returns the
+    matched destination user OR None. Shared between the full chain
+    and the sync_worker 'backend_lookup_only' fast path so the lookup
+    semantics cannot drift between call sites."""
     if source_server_id and dest_server_id:
         try:
             from server.media_db import get_identity_maps_for_user
@@ -171,21 +146,15 @@ def resolve_destination_user(
                 source_username, exc,
             )
 
-    # 2. backend_user_id direct match within same service_type.
-    # Fires when no identity_map row exists yet (e.g. just-added
-    # server before auto-link has run). Scoped by service_type so a
-    # Plex.tv numeric userID can never false-link to a Jellyfin GUID
-    # that happens to coerce to the same string.
     if source_backend_user_id and source_service_type:
         bk = str(source_backend_user_id).strip()
         svc = str(source_service_type).strip().lower()
         if bk:
             for u in dest_by_username.values():
-                dest_bk = (getattr(u, "backend_user_id", "") or "").strip()
+                dest_bk = _field(u, "backend_user_id").strip()
                 dest_svc = (
-                    getattr(u, "service_type", "")
-                    or getattr(u, "backend", "")
-                    or ""
+                    _field(u, "service_type")
+                    or _field(u, "backend")
                 ).strip().lower()
                 if dest_bk == bk and dest_svc == svc:
                     logger.info(
@@ -193,11 +162,100 @@ def resolve_destination_user(
                         "via backend_user_id direct match "
                         "(service=%s, id=%s; auto-link helper has not "
                         "yet written an identity_map row).",
-                        source_username, u.username, svc, bk,
+                        source_username, _field(u, "username"), svc, bk,
                     )
                     return u
+    return None
 
-    # Strict mode short-circuits before the username + owner fallbacks.
+
+def resolve_destination_user(
+    *,
+    source_username: str,
+    source_role: str,
+    dest_by_username: Dict[str, Any],
+    dest_admins: List[Any],
+    source_server_id: str,
+    dest_server_id: str,
+    logger: logging.Logger,
+    per_job_overrides: Optional[Dict[str, str]] = None,
+    source_backend_user_id: Optional[str] = None,
+    source_service_type: Optional[str] = None,
+    mode: Optional[str] = None,
+    dest_by_backend_user_id: Optional[Dict[str, Any]] = None,
+) -> Optional[Any]:
+    """Pick the destination user for ``source_username``'s payload.
+
+    ``dest_by_username`` is the destination's user roster keyed by
+    lower-cased username; values are ``UserSpec``-like (anything with
+    ``username``, ``backend_user_id``, ``role``). ``dest_admins`` is
+    the subset whose ``role == 'admin'`` (or ``'owner'`` on Plex).
+
+    ``source_backend_user_id`` and ``source_service_type`` enable
+    step 2 (backend_user_id direct match within service_type). If
+    omitted, step 2 short-circuits and the chain proceeds to step 3
+    as the legacy path did.
+
+    ``mode='backend_lookup_only'`` short-circuits after step 2 (skips
+    per-job override, case-insensitive username match, and owner
+    fallback). Used by sync_worker which only needs the authoritative
+    identity-anchor walk and treats anything weaker as no-match.
+
+    Returns the matched destination user OR ``None`` to indicate the
+    caller should log + skip the source user's payload.
+    """
+    if mode == "backend_lookup_only":
+        return _resolve_via_backend_lookup(
+            source_username=source_username,
+            source_backend_user_id=source_backend_user_id,
+            source_service_type=source_service_type,
+            dest_by_username=dest_by_username,
+            source_server_id=source_server_id,
+            dest_server_id=dest_server_id,
+            logger=logger,
+        )
+
+    if per_job_overrides:
+        normalised = (source_username or "").strip().lower()
+        if normalised in per_job_overrides:
+            target_uid = per_job_overrides[normalised]
+            # Prefer the precomputed reverse lookup map when the caller
+            # supplied one (saves an O(U) scan per invocation in batch
+            # callers that iterate many source users). Falls back to the
+            # linear scan otherwise.
+            matched = None
+            if dest_by_backend_user_id is not None:
+                matched = dest_by_backend_user_id.get(target_uid)
+            if matched is None:
+                for u in dest_by_username.values():
+                    if _field(u, "backend_user_id") == target_uid:
+                        matched = u
+                        break
+            if matched is not None:
+                logger.info(
+                    "user resolution: %r resolved to destination "
+                    "user_id %r via per-job override.",
+                    source_username, target_uid,
+                )
+                return matched
+            logger.warning(
+                "user resolution: per-job override for %r points at "
+                "dest_user_id %r which is not in the destination "
+                "roster; falling through to standard resolution.",
+                source_username, target_uid,
+            )
+
+    result = _resolve_via_backend_lookup(
+        source_username=source_username,
+        source_backend_user_id=source_backend_user_id,
+        source_service_type=source_service_type,
+        dest_by_username=dest_by_username,
+        source_server_id=source_server_id,
+        dest_server_id=dest_server_id,
+        logger=logger,
+    )
+    if result is not None:
+        return result
+
     if _strict_mode():
         logger.info(
             "user resolution: %r unresolved after identity_map + "
@@ -222,7 +280,7 @@ def resolve_destination_user(
             "user resolution: source owner %r resolved to destination "
             "admin %r (single-admin convention; add an identity_map "
             "entry to lock this in).",
-            source_username, only_admin.username,
+            source_username, _field(only_admin, "username"),
         )
         return only_admin
 

@@ -695,8 +695,9 @@ _MIGRATIONS: List[Tuple[int, str]] = [
     #      server-side label IS the email).
     #   3. managed.username equals the owner's email local-part
     #      (the bit before ``@``, case-insensitive). This is the
-    #      operator-reported case: owner=spellofslytherin@gmail.com,
-    #      managed.username equals 'spellofslytherin'.
+    #      operator-reported case: owner=<owner_local_part>@<provider>,
+    #      managed.username equals '<owner_local_part>' (a duplicate
+    #      managed row whose username is the email's local part).
     #
     # The owner row itself (``kind='owner'``) is NEVER deleted - we
     # only collapse the redundant kind='managed' rows. Credential

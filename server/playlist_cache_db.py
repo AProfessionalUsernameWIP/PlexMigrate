@@ -867,9 +867,14 @@ def get_stats() -> Dict[str, Any]:
     diagnostic surface."""
     conn = _require_conn()
     counts: Dict[str, int] = {}
-    for table in ("playlist_cache", "playlist_cache_items", "playlist_cache_refresh"):
+    from server._sql_identifier import safe_identifier
+    _ALLOWED = frozenset({
+        "playlist_cache", "playlist_cache_items", "playlist_cache_refresh",
+    })
+    for table in _ALLOWED:
+        tbl = safe_identifier(table, _ALLOWED)
         try:
-            row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+            row = conn.execute(f"SELECT COUNT(*) AS n FROM {tbl}").fetchone()
             counts[table] = int(row["n"] or 0)
         except sqlite3.OperationalError:
             counts[table] = 0

@@ -94,11 +94,27 @@ def apply_additive_columns(
     schema references the new column in an index (so the ALTER must
     precede ``executescript``) rely on the absent-table skip above.
     """
+    import re
+    # Identifier shape guard: catches any non-literal table name that
+    # could slip past the closed-set design (callers always pass
+    # hardcoded names; the regex is defense-in-depth for that contract).
+    _identifier_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
     for table, column_def in columns:
+        if not _identifier_re.match(table):
+            raise ValueError(
+                f"apply_additive_columns: unsafe table identifier {table!r}"
+            )
+        # column_def is "<name> <type> [DEFAULT ...]" - validate just
+        # the name; the rest is DDL fragment the caller controls.
+        first_word = column_def.split()[0] if column_def.split() else ""
+        if not _identifier_re.match(first_word):
+            raise ValueError(
+                f"apply_additive_columns: unsafe column identifier {first_word!r}"
+            )
         info = conn.execute(f"PRAGMA table_info({table})").fetchall()
         if not info:
-            continue  # table absent; the schema script creates it complete
+            continue
         existing = {row[1] for row in info}
-        if column_def.split()[0] in existing:
+        if first_word in existing:
             continue
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")

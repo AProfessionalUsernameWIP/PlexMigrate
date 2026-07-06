@@ -220,7 +220,7 @@ export function CrossPlatformPreflightModal({
               <strong>Blocked:</strong>
               <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
                 {activeReport.blocking_reasons.map((r, i) => (
-                  <li key={i}>{r}</li>
+                  <li key={`${i}-${String(r).slice(0, 32)}`}>{r}</li>
                 ))}
               </ul>
             </div>

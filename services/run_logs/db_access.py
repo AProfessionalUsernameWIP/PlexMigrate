@@ -45,6 +45,20 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+def _caller_tag() -> str:
+    """Return ``" caller=<username>"`` for the currently-authenticated
+    request, or an empty string for engine-internal callers (background
+    jobs, schedule ticks) and unauthenticated paths. The lookup is best-
+    effort: any import / read failure quietly degrades to an empty tag
+    so audit logging never blocks the engine."""
+    try:
+        from server._request_context import current_caller
+        u = current_caller()
+    except Exception:
+        return ""
+    return f" caller={u}" if u else ""
+
+
 # Default rotation limits applied when the end user hasn't configured
 # the tunables (or the settings.json read fails). Sized so a chatty
 # DB-access trail can still reach a useful history without ballooning
@@ -270,11 +284,12 @@ def log_read(
     if not _enabled:
         return
     _get_logger().info(
-        "[READ] table=%s%s %s%s",
+        "[READ] table=%s%s %s%s%s",
         table,
         f" field={field}" if field else "",
         _fmt_where(where or {}),
         f" intent={intent}" if intent else "",
+        _caller_tag(),
     )
 
 
@@ -294,12 +309,13 @@ def log_write(
         return
     rows_part = "" if affected_rows is None else f" rows={affected_rows}"
     _get_logger().info(
-        "[WRITE] table=%s%s %s%s%s",
+        "[WRITE] table=%s%s %s%s%s%s",
         table,
         f" field={field}" if field else "",
         _fmt_where(where or {}),
         rows_part,
         f" intent={intent}" if intent else "",
+        _caller_tag(),
     )
 
 
@@ -311,4 +327,4 @@ def log_event(message: str, *args: Any) -> None:
     """
     if not _enabled:
         return
-    _get_logger().info("[EVENT] " + message, *args)
+    _get_logger().info("[EVENT] " + message + "%s", *args, _caller_tag())

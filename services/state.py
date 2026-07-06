@@ -809,17 +809,21 @@ class _StateModule(types.ModuleType):
     def __setattr__(self, name: str, value: Any) -> None:
         var = _TLS_BACKED.get(name)
         if var is not None:
-            var.set(value)
             # Mirror the dashboard write to the cross-thread global so
             # readers outside the engine's thread tree (WS broadcaster,
             # REST handlers) can find the active dashboard. The mirror
             # races in fan-out mode - the WS broadcaster handles that
-            # by reading ``fan_out`` array instead. See note on
-            # ``_dashboard_global`` above for details.
+            # by reading ``fan_out`` array instead. The ContextVar set
+            # and the global update happen under the SAME lock so a
+            # reader cannot observe the global as stale while the
+            # ContextVar already reflects the new value.
             if name == "_dashboard":
                 global _dashboard_global
                 with _dashboard_global_lock:
+                    var.set(value)
                     _dashboard_global = value
+            else:
+                var.set(value)
             return
         super().__setattr__(name, value)
 

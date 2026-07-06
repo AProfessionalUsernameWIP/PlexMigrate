@@ -563,7 +563,7 @@ function ContainerSummaryRow({
                 </div>
                 <ul style={{ margin: 0, paddingLeft: 16 }}>
                   {row.skipped_items.map((item, i) => (
-                    <li key={i}>
+                    <li key={`${item.title}-${i}`}>
                       <strong>{item.title}</strong>
                       {item.type ? ` (${item.type})` : ''}
                       {item.reason ? ` - ${item.reason}` : ''}
@@ -1317,7 +1317,7 @@ function FanOutMergedLogTailer({
           </div>
         ) : (
           visibleLines.map((l, i) => (
-            <div key={i}>
+            <div key={`${l.key}-${i}-${l.text.slice(0, 24)}`}>
               <span style={{ color: colorFor(l.key), fontWeight: 600 }}>
                 [{labelFor(l.key)}]
               </span>{' '}

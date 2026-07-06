@@ -50,6 +50,16 @@ _TOKEN_PATTERN = re.compile(
 
 _REDACTED_REPLACEMENT = r"\1<redacted>"
 
+# L2 widening: an Authorization header of the form ``Bearer <jwt>`` or
+# ``Bearer <token>`` is the standard shape for JWT and OAuth bearer
+# tokens. The token portion stops at whitespace / quote / angle bracket
+# so the regex is non-greedy in practice.
+_BEARER_PATTERN = re.compile(
+    r"(Bearer\s+)([A-Za-z0-9._\-+=/]{8,})",
+    re.IGNORECASE,
+)
+_BEARER_REPLACEMENT = r"\1<redacted>"
+
 # M7: Fernet ciphertext blobs (encrypted Plex / managed-user tokens at
 # rest) are base64url and always start with the version+timestamp
 # prefix ``gAAAAA``. They have no ``key=`` lead-in, so they need their
@@ -61,8 +71,10 @@ _FERNET_REPLACEMENT = "<redacted-fernet>"
 
 
 def scrub(text: str) -> str:
-    """Strip token ``key=value`` pairs and Fernet blobs from ``text``."""
+    """Strip token ``key=value`` pairs, ``Bearer <token>`` headers, and
+    Fernet blobs from ``text``."""
     text = _TOKEN_PATTERN.sub(_REDACTED_REPLACEMENT, text)
+    text = _BEARER_PATTERN.sub(_BEARER_REPLACEMENT, text)
     return _FERNET_PATTERN.sub(_FERNET_REPLACEMENT, text)
 
 

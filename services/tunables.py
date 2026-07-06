@@ -109,6 +109,19 @@ _DEFAULTS: Dict[str, Any] = {
     "user_activity_filter_enabled": False,
     "auto_tombstone_on_auth_error": False,
     "auto_tombstone_on_unreachable": False,
+    # PLEXMIGRATE_DATA_DIR resolves to a system path (e.g. /var, /etc)
+    # and the operator confirms they really want app state under it.
+    # Default False so a misconfigured env var fails fast at startup
+    # instead of silently planting .keyfile/.auth_secret in a
+    # privileged location.
+    "allow_system_data_dir": False,
+    # Skip the synchronous _build_scan_cache pre-warm in the Plex-
+    # native restore engine. On giant TV libraries the pre-warm blocks
+    # the watch-history phase 30-60s before the first resolver fires.
+    # Disabling it loses some matching speed but starts the resolvers
+    # immediately; the resolver's own coordinator handles the on-demand
+    # build path as a fallback.
+    "restore_skip_scan_cache_prewarm": False,
     # Sweep cadence + auto-tombstone threshold. Clamps in the typed
     # accessors below.
     "user_activity_sweep_interval_hours": 12,

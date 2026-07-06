@@ -993,6 +993,43 @@ const STATUS_ROWS: StatusRow[] = [
 ];
 
 
+// Shared <tr> renderer for the Activity Status and Processing Phase
+// reference tables. StatusRow and PhaseRow are structurally identical
+// (label/color/when/modes/example), and the two map() callbacks below
+// rendered identical markup with only the source array differing.
+function StatusBadgeRow({ row }: { row: StatusRow | PhaseRow }) {
+  return (
+    <tr>
+      <td>
+        <span
+          style={{
+            display: 'inline-block',
+            padding: '2px 8px',
+            borderRadius: 4,
+            fontWeight: 600,
+            fontSize: 11,
+            background: row.color + '22',
+            color: row.color,
+            border: `1px solid ${row.color}55`,
+          }}
+        >
+          {row.label}
+        </span>
+      </td>
+      <td style={{ fontSize: 12, color: 'var(--text-dim)' }}>{row.modes}</td>
+      <td>
+        <div style={{ fontSize: 13 }}>{row.when}</div>
+        {row.example && (
+          <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
+            e.g. {row.example}
+          </div>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+
 function ActivityStatusesPage() {
   // Nested sub-tab inside the "label reference" panel. Same UX as
   // Account Management → (Database Admin Account | User Accounts):
@@ -1073,33 +1110,7 @@ function ActivityStatusesPage() {
               </thead>
               <tbody>
                 {STATUS_ROWS.map((r) => (
-                  <tr key={r.label}>
-                    <td>
-                      <span
-                        style={{
-                          display: 'inline-block',
-                          padding: '2px 8px',
-                          borderRadius: 4,
-                          fontWeight: 600,
-                          fontSize: 11,
-                          background: r.color + '22',
-                          color: r.color,
-                          border: `1px solid ${r.color}55`,
-                        }}
-                      >
-                        {r.label}
-                      </span>
-                    </td>
-                    <td style={{ fontSize: 12, color: 'var(--text-dim)' }}>{r.modes}</td>
-                    <td>
-                      <div style={{ fontSize: 13 }}>{r.when}</div>
-                      {r.example && (
-                        <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
-                          e.g. {r.example}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
+                  <StatusBadgeRow key={r.label} row={r} />
                 ))}
               </tbody>
             </table>
@@ -1125,33 +1136,7 @@ function ActivityStatusesPage() {
               </thead>
               <tbody>
                 {PHASE_ROWS.map((r) => (
-                  <tr key={r.label}>
-                    <td>
-                      <span
-                        style={{
-                          display: 'inline-block',
-                          padding: '2px 8px',
-                          borderRadius: 4,
-                          fontWeight: 600,
-                          fontSize: 11,
-                          background: r.color + '22',
-                          color: r.color,
-                          border: `1px solid ${r.color}55`,
-                        }}
-                      >
-                        {r.label}
-                      </span>
-                    </td>
-                    <td style={{ fontSize: 12, color: 'var(--text-dim)' }}>{r.modes}</td>
-                    <td>
-                      <div style={{ fontSize: 13 }}>{r.when}</div>
-                      {r.example && (
-                        <div className="mono" style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 4 }}>
-                          e.g. {r.example}
-                        </div>
-                      )}
-                    </td>
-                  </tr>
+                  <StatusBadgeRow key={r.label} row={r} />
                 ))}
               </tbody>
             </table>
@@ -3259,7 +3244,7 @@ function InDepthBody({ db }: { db: DbDoc }) {
   return (
     <>
       {db.intro_long.split('\n\n').map((para, i) => (
-        <p key={i} style={{ fontSize: 13, marginTop: i === 0 ? 0 : 12 }}>{para}</p>
+        <p key={`para-${i}-${para.slice(0, 16)}`} style={{ fontSize: 13, marginTop: i === 0 ? 0 : 12 }}>{para}</p>
       ))}
 
       {db.tables.map((t) => (
@@ -4240,7 +4225,7 @@ function TroubleshootingPage() {
           <h3 style={{ fontSize: 13, margin: '8px 0 4px 0' }}>Suggested fixes</h3>
           <ol style={{ fontSize: 13, paddingLeft: 22, margin: 0 }}>
             {cat.steps.map((step, i) => (
-              <li key={i} style={{ marginBottom: 4 }}>{step}</li>
+              <li key={`step-${i}-${step.slice(0, 24)}`} style={{ marginBottom: 4 }}>{step}</li>
             ))}
           </ol>
         </div>

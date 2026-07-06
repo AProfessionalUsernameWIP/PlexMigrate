@@ -378,6 +378,13 @@ def create_app() -> FastAPI:
     # except the public probe / setup / login endpoints.
     app.add_middleware(_AuthMiddleware)
 
+    # Request-scoped caller identity for audit-log attribution. Reads
+    # the JWT sub once per request into a ContextVar so any code path
+    # that emits an audit-log line (services.run_logs.db_access, etc.)
+    # can stamp it without threading the request object through layers.
+    from server._request_context import RequestContextMiddleware
+    app.add_middleware(RequestContextMiddleware)
+
     # Mount the auth router (status / setup / login / logout / users).
     # Always mounted - when auth is disabled the public endpoints
     # respond "auth_enabled: false" so the frontend keeps a stable
@@ -390,8 +397,20 @@ def create_app() -> FastAPI:
     # per request).
     app.include_router(_managed_users_router_module.router)
 
-    # Server Commands developer console. Every route is root_admin
-    # gated AND 404s when the ``dev_console_enabled`` tunable is off.
+    # Server Commands developer console. Two gates apply on every
+    # route:
+    #   1. Role: only ``root_admin`` JWTs are honoured (enforced by
+    #      ``require_role('root_admin')`` decorator inside the
+    #      router).
+    #   2. Tunable: ``dev_console_enabled`` (default False) must be
+    #      True in Settings. When False, every route 404s instead
+    #      of leaking the route map.
+    # The router is registered unconditionally so toggling the tunable
+    # at runtime is sufficient to enable/disable - no restart required.
+    # WARNING: if the default of ``dev_console_enabled`` is ever
+    # changed to True, every Root Admin token gains immediate access
+    # to server-command execution, media.db introspection, and live
+    # write surfaces. Keep the default False.
     app.include_router(_dev_console_router_module.router)
 
     # Phase-3a router modules. Each carries its full paths verbatim

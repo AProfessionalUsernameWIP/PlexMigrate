@@ -188,16 +188,11 @@ class PlexResolveMixin:
 
     @staticmethod
     def _guid_scheme(guid: str) -> str:
-        """Extract the scheme portion of a GUID for blacklist keying.
-        ``mbid://abc-def`` -> ``mbid``; ``com.plexapp.agents.imdb://tt``
-        -> ``imdb-agent`` (so legacy-agent forms blacklist separately
-        from their canonical twin)."""
-        if not guid or "://" not in guid:
-            return ""
-        head = guid.split("://", 1)[0].lower()
-        if head.startswith("com.plexapp.agents."):
-            return head.removeprefix("com.plexapp.agents.") + "-agent"
-        return head
+        """Thin shim: the canonical implementation lives in the shared
+        translator so the legacy-prefix detection cannot diverge from
+        normalize_guid's view of what counts as a legacy agent form."""
+        from services.translation.guid_translator import scheme_for_blacklist_key
+        return scheme_for_blacklist_key(guid)
 
     def _guid_attempt_record(
         self,

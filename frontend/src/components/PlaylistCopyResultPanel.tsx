@@ -59,7 +59,7 @@ export function PlaylistCopyResultPanel(props: Props) {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           {props.results.map((entry, i) => (
             <SingleResult
-              key={i}
+              key={`${entry.destServerLabel}-${entry.playlistName}-${entry.sourceUsername}-${i}`}
               result={entry.result}
               destServerLabel={entry.destServerLabel}
               playlistName={entry.playlistName}
@@ -181,7 +181,7 @@ function SingleResult({ result, destServerLabel, playlistName, sourceUsername, d
             }}
           >
             {result.errors.map((e, i) => (
-              <li key={i} style={{ marginBottom: 2 }}>{e}</li>
+              <li key={`${i}-${String(e).slice(0, 32)}`} style={{ marginBottom: 2 }}>{e}</li>
             ))}
           </ul>
         </div>

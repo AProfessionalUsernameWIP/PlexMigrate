@@ -87,6 +87,39 @@ def get_or_create_server_user(
         return int(row["id"])
 
 
+def _userstate_prologue(
+    *,
+    func_name: str,
+    server_id: str,
+    user_handle: str,
+    section_key: int,
+    role: Optional[str] = None,
+    display_name: Optional[str] = None,
+    backend_user_id: Optional[str] = None,
+):
+    """Shared prologue for the four per-user-state upserters:
+    validate section_key (v0.15 schema-anchor invariant), upsert the
+    server_users row, and return (server_user_id, now, conn).
+
+    Centralising means a future schema-anchor rule change or a
+    server_user write contract change applies to all four upserters
+    in lockstep instead of needing 4 isolated edits.
+    """
+    if not isinstance(section_key, int) or section_key <= 0:
+        raise ValueError(
+            f"{func_name}: section_key must be a positive int "
+            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
+        )
+    server_user_id = get_or_create_server_user(
+        server_id=server_id,
+        user_handle=user_handle,
+        role=role,
+        display_name=display_name,
+        backend_user_id=backend_user_id,
+    )
+    return server_user_id, time.time(), _require_conn()
+
+
 def record_watch_event(
     *,
     item_id: int,
@@ -116,20 +149,11 @@ def record_watch_event(
     destination library); the function refuses to write rather than
     silently produce data that restore will mishandle.
     """
-    if not isinstance(section_key, int) or section_key <= 0:
-        raise ValueError(
-            f"record_watch_event: section_key must be a positive int "
-            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
-        )
-    server_user_id = get_or_create_server_user(
-        server_id=server_id,
-        user_handle=user_handle,
-        role=role,
-        display_name=display_name,
-        backend_user_id=backend_user_id,
+    server_user_id, now, conn = _userstate_prologue(
+        func_name="record_watch_event",
+        server_id=server_id, user_handle=user_handle, section_key=section_key,
+        role=role, display_name=display_name, backend_user_id=backend_user_id,
     )
-    conn = _require_conn()
-    now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
@@ -175,20 +199,11 @@ def upsert_rating(
     ``section_key`` is required - see record_watch_event for
     the integrity-anchor rationale.
     """
-    if not isinstance(section_key, int) or section_key <= 0:
-        raise ValueError(
-            f"upsert_rating: section_key must be a positive int "
-            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
-        )
-    server_user_id = get_or_create_server_user(
-        server_id=server_id,
-        user_handle=user_handle,
-        role=role,
-        display_name=display_name,
-        backend_user_id=backend_user_id,
+    server_user_id, now, conn = _userstate_prologue(
+        func_name="upsert_rating",
+        server_id=server_id, user_handle=user_handle, section_key=section_key,
+        role=role, display_name=display_name, backend_user_id=backend_user_id,
     )
-    conn = _require_conn()
-    now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
@@ -313,16 +328,10 @@ def upsert_playlist(
     is still preserved through the items list - each member item's
     own section_key in server_items remains accurate.
     """
-    if not isinstance(section_key, int) or section_key <= 0:
-        raise ValueError(
-            f"upsert_playlist: section_key must be a positive int "
-            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
-        )
-    server_user_id = get_or_create_server_user(
-        server_id=server_id, user_handle=user_handle,
+    server_user_id, now, conn = _userstate_prologue(
+        func_name="upsert_playlist",
+        server_id=server_id, user_handle=user_handle, section_key=section_key,
     )
-    conn = _require_conn()
-    now = time.time()
     with _DB_LOCK:
         conn.execute(
             """
@@ -390,16 +399,10 @@ def upsert_collection(
     one library (a Movies collection lives in Movies); see
     upsert_playlist for the rationale on per-row anchoring.
     """
-    if not isinstance(section_key, int) or section_key <= 0:
-        raise ValueError(
-            f"upsert_collection: section_key must be a positive int "
-            f"(got {section_key!r}). See v0.15 schema-anchor invariant."
-        )
-    server_user_id = get_or_create_server_user(
-        server_id=server_id, user_handle=user_handle,
+    server_user_id, now, conn = _userstate_prologue(
+        func_name="upsert_collection",
+        server_id=server_id, user_handle=user_handle, section_key=section_key,
     )
-    conn = _require_conn()
-    now = time.time()
     with _DB_LOCK:
         conn.execute(
             """

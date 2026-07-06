@@ -13,12 +13,12 @@
 // control. The form does not submit the Plex URL or token directly
 //  those live in the registry the user manages from the Servers tab.
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, ExportArchive, LeafCounts, LibraryDescriptor, PingResult, ServerManagedUser, ServerUser, ServerView, DashboardFrame, Snapshot } from '../api';
+import { useEffect, useMemo, useState } from 'react';
+import { api, ExportArchive, LeafCounts, LibraryDescriptor, ServerManagedUser, ServerUser, ServerView, DashboardFrame, Snapshot } from '../api';
 import { BackendType, backendCounts, serversForBackend } from './BackendTabStrip';
 import { useBackendTint, type BackendTint } from '../contexts/BackendTintContext';
 import { serverSupportsFastCollections } from '../utils/plexVersion';
-import { pausableInterval } from '../utils/pausableInterval';
+import { usePingPoller } from '../hooks/usePingPoller';
 import { RestoreModeSelector, RestoreMode, MergeWatchStrategy } from './RestoreModeSelector';
 import { ReplaceConfirmModal } from './ReplaceConfirmModal';
 import { InfoTip } from './InfoTip';
@@ -329,10 +329,11 @@ export function JobFormPanel({ snapshot }: Props) {
 
   // v0.9.1: live ping results keyed by server id. The selectors below
   // read this to render a status dot and latency next to each option.
-  // Kept separate from ``servers`` so a ping refresh doesn't trigger
-  // the library-fetch effect (which depends on ``servers``).
-  const [pings, setPings] = useState<Record<string, PingResult>>({});
-  const pollTimerRef = useRef<(() => void) | null>(null);
+  // usePingPoller manages the cadence, in-flight pings, and timer
+  // cleanup; it returns the per-id PingResult map directly so this
+  // file no longer needs the explicit useState/useRef pair that used
+  // to drive the inline useEffect block.
+  const pings = usePingPoller(servers, PING_INTERVAL_MS);
 
   // Library picker (snapshot + direct).
   const [libraries, setLibraries] = useState<LibraryDescriptor[]>([]);
@@ -724,39 +725,8 @@ export function JobFormPanel({ snapshot }: Props) {
       .catch((e) => setServersError(String(e)));
   }, []);
 
-  // Poll each registered server's status every 30 s so the dots in
-  // the source/destination selectors stay current. Pings are
-  // independent and cheap (single HTTP GET against /identity), so we
-  // run them all in parallel each tick.
-  useEffect(() => {
-    if (servers.length === 0) {
-      if (pollTimerRef.current !== null) {
-        pollTimerRef.current();
-        pollTimerRef.current = null;
-      }
-      return;
-    }
-    const pingAll = async () => {
-      const tasks = servers.map(async (s) => {
-        try {
-          const result = await api.pingServer(s.id);
-          setPings((prev) => ({ ...prev, [s.id]: result }));
-        } catch {
-          // Drop silently  the next tick retries.
-        }
-      });
-      await Promise.allSettled(tasks);
-    };
-    pingAll();
-    if (pollTimerRef.current !== null) pollTimerRef.current();
-    pollTimerRef.current = pausableInterval(pingAll, PING_INTERVAL_MS);
-    return () => {
-      if (pollTimerRef.current !== null) {
-        pollTimerRef.current();
-        pollTimerRef.current = null;
-      }
-    };
-  }, [servers]);
+  // Ping poll for the selector status dots is handled by
+  // usePingPoller (declared with the live ping state above).
 
   // Whenever the source server selection changes (and we're in a mode
   // that reads from source) refresh the library list against that

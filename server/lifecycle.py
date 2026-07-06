@@ -28,6 +28,29 @@ from server.ws import get_manager
 log = logging.getLogger("plexmigrate.server")
 
 
+def _check_plex_tv_override() -> None:
+    """Warn loudly when ``PLEXMIGRATE_PLEX_TV_BASE_URL`` is set to a
+    non-default value. The env var is only meaningful for the e2e mock
+    harness; a stale production setting would redirect Plex.tv token
+    flows to whatever host is configured. Best-effort: never raises."""
+    import os
+
+    raw = (os.environ.get("PLEXMIGRATE_PLEX_TV_BASE_URL") or "").strip()
+    if not raw:
+        return
+    default = "https://plex.tv"
+    if raw.rstrip("/") == default:
+        return
+    log.warning(
+        "PLEXMIGRATE_PLEX_TV_BASE_URL is set to %r (default %r). "
+        "This env var is only intended for the e2e mock harness. "
+        "If this is a production deployment, unset the variable "
+        "before next boot - leaving it set will route every Plex.tv "
+        "token-resolution call through the configured host.",
+        raw, default,
+    )
+
+
 def _install_app_log_handler() -> None:
     """Attach a rotating file handler to the ``plexmigrate`` root logger
     pointing at ``server_data/app.log``. Every plexmigrate.* descendant
@@ -104,6 +127,18 @@ async def on_startup() -> None:
         install_on_all_handlers()
     except Exception:  # pragma: no cover (defensive)
         log.exception("Log scrubber install failed; continuing.")
+
+    # Surface a non-default PLEXMIGRATE_PLEX_TV_BASE_URL as a startup
+    # warning. The env var exists for the e2e harness (which routes
+    # plexapi through a localhost mock) but has no production reason
+    # to be set. A stale value left in a production environment
+    # would silently send every Plex.tv token-resolution flow at the
+    # configured host. The warning makes it operator-visible without
+    # blocking startup.
+    try:
+        _check_plex_tv_override()
+    except Exception:  # pragma: no cover (defensive)
+        log.exception("Plex.tv override check failed; continuing.")
 
     # Initialise the auth database eagerly so the first
     # ``/api/auth/...`` request doesn't pay the cold-start cost.
@@ -518,4 +553,19 @@ async def on_shutdown() -> None:
     await get_manager().stop()
     await get_dev_console_manager().stop()
     get_dev_console_sync_worker().stop()
+    # Daemon threads (mirror sync + activity sweeper) need their stop
+    # events set so any in-flight tick can bail before the process
+    # exits. Without these, a SIGTERM mid-tick could leave a DB write
+    # partially committed: the daemon thread dies inside a transaction
+    # and SQLite has to recover on next boot.
+    try:
+        from services.mirror_sync.sync_worker import stop as _mirror_stop
+        _mirror_stop()
+    except Exception:
+        log.exception("mirror sync worker stop failed")
+    try:
+        from services.user_management.activity_sweeper import stop as _sweeper_stop
+        _sweeper_stop()
+    except Exception:
+        log.exception("activity sweeper stop failed")
     log.info("Hestia-MediaManager server stopped")

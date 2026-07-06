@@ -431,7 +431,7 @@ function DeployRow({ job, labels, onDismiss, onClone }: DeployRowProps) {
               }}
             >
               {result.errors.map((e, i) => (
-                <li key={i} style={{ marginBottom: 2 }}>{e}</li>
+                <li key={`${i}-${String(e).slice(0, 32)}`} style={{ marginBottom: 2 }}>{e}</li>
               ))}
             </ul>
           )}

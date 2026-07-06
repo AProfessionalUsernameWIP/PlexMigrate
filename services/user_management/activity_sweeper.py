@@ -181,29 +181,52 @@ def _sweep_server(server_id: str, server_row: Dict[str, Any]) -> None:
     tombstoned = 0
     errors = 0
 
-    for u in users:
+    # Filter probe-eligible users once so the parallel pool only does
+    # network work. Owner accounts (admin token = owner token) skip
+    # the probe entirely; an owner-auth failure surfaces at the
+    # server level via wh_servers.last_status.
+    eligible = [
+        u for u in users
+        if (u.get("username") or "").strip()
+        and (u.get("kind") or "").lower() != "owner"
+    ]
+
+    def _probe_one(u):
         if _worker_stop.is_set():
+            return None
+        uname = (u.get("username") or "").strip()
+        try:
+            return (uname, adapter.probe_user(uname), None)
+        except Exception as exc:
+            return (uname, "unknown", exc)
+
+    # Probes are network round-trips with no shared state; run them
+    # in parallel. Capped at 4 workers to avoid oversubscribing the
+    # adapter's HTTP session pool.
+    import concurrent.futures
+    pool_size = max(1, min(4, len(eligible)))
+    if pool_size > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as pool:
+            results = list(pool.map(_probe_one, eligible))
+    else:
+        results = [_probe_one(u) for u in eligible]
+
+    # Sequential post-processing: record_auth_result + auto-tombstone
+    # both write to the shared _DB_LOCK, so parallelizing them does
+    # nothing for wall time and complicates the counters.
+    for entry in results:
+        if entry is None:
             log.info(
                 "sweep server=%s name=%s: stop signal received "
                 "mid-sweep; bailing", server_id, name,
             )
             break
-        uname = (u.get("username") or "").strip()
-        if not uname:
-            continue
-        # Owner: skip the probe entirely. The owner-token IS the
-        # admin token; an admin auth failure is a server-level
-        # problem we already report via wh_servers.last_status.
-        if (u.get("kind") or "").lower() == "owner":
-            continue
-        try:
-            result = adapter.probe_user(uname)
-        except Exception as exc:
+        uname, result, exc = entry
+        if exc is not None:
             log.warning(
                 "sweep server=%s user=%s: probe raised: %s",
                 server_id, uname, exc,
             )
-            result = "unknown"
             errors += 1
         probed += 1
         log.info(

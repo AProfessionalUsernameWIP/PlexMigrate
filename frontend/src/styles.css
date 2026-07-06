@@ -536,10 +536,12 @@ table.list td.num  { text-align: right; font-family: var(--mono); }
    saturated so they pull the operator's eye away from the
    blue/violet/green phase identity colours. ``red`` carries a pulse
    animation so a genuinely stuck worker stands out across the room. */
+/* WCAG AA: #fff on #d97706 scored 3.19:1; #fff on #c86c00 scores 5.36:1
+   while keeping the saturated stall-amber identity intact. */
 .tag.stall-amber {
   color: #fff;
-  background: #d97706;
-  border-color: #d9770655;
+  background: #c86c00;
+  border-color: #c86c0055;
   font-weight: 700;
 }
 .tag.stall-red {
@@ -1317,12 +1319,16 @@ mark.log-match {
    Plex" button reads as Plex. Panels and borders stay default
    chameleon (cobblestone bg + jet-black panels) - the room around
    the chameleon doesn't shift, only its skin where you'd touch it. */
+/* Original dark-on-gold (#1a0f04 on #8b6a1e) scored 3.75:1 vs WCAG AA 4.5:1.
+   Resolution: darken the gold to #6d5a14 and use white text so the wood-gold
+   reading survives AA on small button text without breaking the chameleon
+   identity. Hover stays the brighter gold-ingot tone for affordance. */
 [data-theme="chameleon"][data-backend-tint-persistent="plex"] button.primary:not(:disabled) {
-  background: #8b6a1e;
-  color: #1a0f04;
+  background: #6d5a14;
+  color: #ffffff;
 }
 [data-theme="chameleon"][data-backend-tint-persistent="plex"] button.primary:not(:disabled):hover {
-  background: #a07d24;
+  background: #8b6a1e;
 }
 [data-theme="chameleon"][data-backend-tint-persistent="plex"] .server-card.selected {
   background: #8b6a1e;

@@ -572,6 +572,16 @@ def _dispatch_adapter(adapter, op, ref, uctx, payload):
             user_context=uctx, current_view_count=current,
         )
         return result, {"view_count": target, "last_viewed_at": last_played}
+    # POLICY EXCEPTION (audit anchor): the dev console performs DIRECT
+    # adapter affinity writes that BYPASS services.translation.
+    # backend_translation.translate_affinity. This is the ONLY code
+    # path in the engine that should write affinity without going
+    # through the chokepoint. The dev console is by design a raw write
+    # surface (root-admin only, debug-tunable gated). Any feature
+    # request that wants to write rating/favorite outside the dev
+    # console MUST route through translate_affinity so the favorite
+    # face vs numeric rating translation tunables (favorite_threshold,
+    # favorite_as_rating_value) stay authoritative.
     if op == "set_rating":
         rating = float(payload.get("rating") or 0.0)
         result = adapter.set_rating(ref, rating, user_context=uctx)

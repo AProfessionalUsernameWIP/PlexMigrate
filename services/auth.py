@@ -880,7 +880,13 @@ def get_home_users(
                             f"PIN sign-in failed ({pin_err})"
                         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(users)) as pool:
+        # Cap parallelism at 6 to avoid oversubscribing Plex's per-
+        # connection rate-limit (~6 req/s) when a server has many
+        # managed users. Unbounded len(users) spawned 20+ concurrent
+        # workers on multi-user Plex Homes and triggered 429 storms.
+        _AUTH_FANOUT_MAX_WORKERS = 6
+        pool_size = max(1, min(_AUTH_FANOUT_MAX_WORKERS, len(users)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as pool:
             futs = {pool.submit(_connect_user, u): u for u in users}
             for fut in concurrent.futures.as_completed(futs):
                 u = futs[fut]

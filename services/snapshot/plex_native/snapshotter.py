@@ -477,6 +477,18 @@ def snapshot_watch_history(
                 all_items = [m for m in section.all()
                              if getattr(m, "viewCount", 0)]
 
+        # Mitigate plexapi's per-item .reload() N+1 in the serialize
+        # loop below. Items from the prefetch helper already had this
+        # applied, but the searchTracks / searchEpisodes / search
+        # fallback paths above did not. The helper is silent on
+        # objects without _autoReload and a no-op when the
+        # plexapi_autoreload_enabled tunable opts back into vanilla
+        # plexapi behaviour, so applying it unconditionally is safe.
+        try:
+            _disable_autoreload(*all_items)
+        except Exception:
+            pass
+
         # Discover-don't-predict: register the real watched-item count
         # the moment we've enumerated it. The watch batch + the
         # total-run tracker both grow by exactly this much, so the
@@ -679,50 +691,61 @@ def build_playlist_cache(
 
     server_label = getattr(server, "friendlyName", "") or "(server-wide)"
     user_label = user_display or owner_display_label()
+
+    # Two-phase: first cheap in-memory filtering (smart, owner, type)
+    # so the parallel pool only does network work; then fan out the
+    # per-playlist ``pl.items()`` HTTP round-trips.
+    survivors = []
     for pl in all_playlists:
         # Throttle-reduction: skip smart playlists entirely. ``pl.items()``
         # on a smart playlist makes Plex *run the filter* server-side -
         # a real round-trip - yet the snapshotter can't migrate a smart
         # playlist anyway (the restorer records them as "recreate
-        # manually" and never imports their members). Fetching their
-        # members during the warm was pure wasted request volume, and
-        # request volume is what gets the whole run rate-limited (429 +
-        # Retry-After). ``server.playlists()`` itself populated the
-        # ``.smart`` attribute, so this check costs nothing.
+        # manually" and never imports their members).
         if getattr(pl, "smart", False):
             skipped_smart += 1
             continue
-
         if owner_id is not None:
             pl_owner = _playlist_owner_id(pl)
-            # pl_owner is None for auto-generated playlists (no userID
-            # attribute). We let those through rather than guess.
             if pl_owner is not None and pl_owner != owner_id:
                 skipped_not_owned += 1
                 continue
-
-        # Type filter. Selected libraries dictate which
-        # playlist types are relevant. Plex's ``playlistType`` is set
-        # on the lightweight list response so this short-circuits
-        # ``pl.items()`` for any out-of-scope playlist (audio playlists
-        # on a video-only snapshot, photo playlists on a music-only
-        # snapshot, etc.) before any per-playlist request fires.
         if wanted_playlist_types is not None:
             pl_type = getattr(pl, "playlistType", None)
             if pl_type and pl_type not in wanted_playlist_types:
                 skipped_wrong_type += 1
                 continue
+        survivors.append(pl)
 
+    def _fetch_one(pl):
         pl_title = getattr(pl, "title", "?")
         try:
             with _current_item(server_label, "playlist", pl_title, phase="fetching"):
-                cache.append((pl, list(pl.items())))
+                return (pl, list(pl.items()), None)
         except Exception as e:
-            cache.append((pl, []))
+            return (pl, [], e)
+
+    # Capped at 4 to avoid 429-ing the Plex server when a user has many
+    # playlists. _current_item uses a ContextVar so the dashboard's
+    # "currently fetching" tile is fine with concurrent updates - it
+    # just shows the most recently-set value.
+    if len(survivors) > 1:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(_fetch_one, survivors))
+    else:
+        results = [_fetch_one(pl) for pl in survivors]
+
+    for pl, items, exc in results:
+        cache.append((pl, items))
+        if exc is not None:
             # Plex's auto-generated playlists routinely 500 on .items();
             # demote individual errors to DEBUG and emit one summary
             # INFO line at the end so the run log stays scannable.
-            logger.debug(f"playlist '{pl_title}' returned no items: {e}")
+            logger.debug(
+                "playlist %r returned no items: %s",
+                getattr(pl, "title", "?"), exc,
+            )
             skipped_500 += 1
     if skipped_500:
         logger.info(
@@ -1315,6 +1338,12 @@ def snapshot_ratings(
                     section.title, _filter_exc,
                 )
                 all_items = section.all()
+
+        # Match the watch-history loop's autoreload mitigation.
+        try:
+            _disable_autoreload(*all_items)
+        except Exception:
+            pass
 
         # Discover-don't-predict: register the real rated-item count.
         _rated_count = sum(

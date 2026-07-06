@@ -90,48 +90,70 @@ _MAX_PAIRS_PER_CYCLE = 200
 _TICK_INTERVAL_SECONDS = 5
 
 
-# Module-global thread state.
-_worker_thread: Optional[threading.Thread] = None
-_worker_stop = threading.Event()
-_worker_lock = threading.Lock()
+class SyncWorker:
+    """Encapsulates one sync worker thread's lifecycle. The default
+    instance is module-level for back-compat; instantiate a separate
+    SyncWorker when the future fan-out-across-servers feature needs
+    parallel workers, each with its own stop event."""
+
+    def __init__(self) -> None:
+        self._thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self.stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="sync-worker", daemon=True,
+            )
+            self._thread.start()
+            log.info("sync_worker: thread started")
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    def _run(self) -> None:
+        log.info("sync_worker: main loop entering")
+        while not self.stop_event.is_set():
+            try:
+                _tick()
+            except Exception:
+                log.exception("sync_worker: tick raised; continuing")
+            for _ in range(_TICK_INTERVAL_SECONDS):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(1)
+        log.info("sync_worker: main loop exited")
+
+
+_default_worker = SyncWorker()
+
+# Module-level aliases for the default instance. Preserves every
+# existing ``_worker_stop.is_set()`` call inside this module without
+# wholesale refactoring while letting future code instantiate
+# additional SyncWorker objects independently.
+_worker_stop = _default_worker.stop_event
 
 
 def start() -> None:
-    """Start the sync worker thread. Idempotent — calling repeatedly
-    is a no-op once the thread is running."""
-    global _worker_thread
-    with _worker_lock:
-        if _worker_thread is not None and _worker_thread.is_alive():
-            return
-        _worker_stop.clear()
-        _worker_thread = threading.Thread(
-            target=_run, name="sync-worker", daemon=True,
-        )
-        _worker_thread.start()
-        log.info("sync_worker: thread started")
+    """Start the default sync worker. Idempotent."""
+    _default_worker.start()
 
 
 def stop() -> None:
-    """Signal the worker to exit. Called on app shutdown."""
-    _worker_stop.set()
+    """Signal the default sync worker to exit."""
+    _default_worker.stop()
 
 
-def _run() -> None:
-    """Worker main loop. Wakes every _TICK_INTERVAL_SECONDS, runs
-    _tick, sleeps. Exceptions inside _tick are logged + swallowed so
-    the thread keeps running across transient failures."""
-    log.info("sync_worker: main loop entering")
-    while not _worker_stop.is_set():
-        try:
-            _tick()
-        except Exception:
-            log.exception("sync_worker: tick raised; continuing")
-        # Sleep in small increments so stop() takes effect quickly.
-        for _ in range(_TICK_INTERVAL_SECONDS):
-            if _worker_stop.is_set():
-                break
-            time.sleep(1)
-    log.info("sync_worker: main loop exited")
+def is_running() -> bool:
+    return _default_worker.is_running()
 
 
 # ── Tick implementation ──────────────────────────────────────────────
@@ -537,39 +559,21 @@ def _resolve_dest_user_for_sync(
     dest_server_id: str,
     dest_by_username_lc: Dict[str, Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Lightweight 2-step destination user resolver for the sync
-    worker. identity_map first (authoritative), case-insensitive
-    username match second (skipped when ``strict_identity_resolution``
-    is on). The full 5-step chain in services.identity.user_resolution is
-    overkill here — the worker doesn't take per-job overrides and
-    doesn't need the single-admin owner fallback the restorer uses."""
-    try:
-        from server.media_db import get_identity_maps_for_user
-        for link in get_identity_maps_for_user(
-            source_server_id, source_username,
-        ) or []:
-            if link.get("other_server_id") != dest_server_id:
-                continue
-            target_handle = (
-                link.get("other_user_handle") or ""
-            ).strip().lower()
-            if target_handle and target_handle in dest_by_username_lc:
-                return dest_by_username_lc[target_handle]
-    except Exception:
-        pass
-
-    strict = False
-    try:
-        from services.tunables import strict_identity_resolution
-        strict = bool(strict_identity_resolution())
-    except Exception:
-        strict = False
-    if strict:
-        return None
-    norm = (source_username or "").strip().lower()
-    if norm and norm in dest_by_username_lc:
-        return dest_by_username_lc[norm]
-    return None
+    """Sync-worker destination resolver. Delegates to the canonical
+    5-step chain with backend_user_id omitted (so step 2 short-circuits)
+    and no dest_admins (so the owner fallback short-circuits). Effective
+    behaviour: identity_map -> case-insensitive username (skipped when
+    strict_identity_resolution is on)."""
+    from services.identity.user_resolution import resolve_destination_user
+    return resolve_destination_user(
+        source_username=source_username,
+        source_role="",
+        dest_by_username=dest_by_username_lc,
+        dest_admins=[],
+        source_server_id=source_server_id,
+        dest_server_id=dest_server_id,
+        logger=log,
+    )
 
 
 def _reconcile_one_pair_watch(

@@ -276,8 +276,11 @@ def export_table(table_id: str) -> Dict[str, Any]:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10.0)
     conn.row_factory = sqlite3.Row
     try:
+        from server._sql_identifier import safe_identifier
+        _allowed_tables = frozenset(t for _, t in _TABLE_CATALOG.values())
+        tbl = safe_identifier(table_name, _allowed_tables)
         schema_rows = conn.execute(
-            f"PRAGMA table_info({table_name})"
+            f"PRAGMA table_info({tbl})"
         ).fetchall()
         columns = [r["name"] for r in schema_rows]
         if not columns:
@@ -285,7 +288,12 @@ def export_table(table_id: str) -> Dict[str, Any]:
                 f"table {table_name!r} has no columns "
                 f"(or does not exist in {db_file})"
             )
-        cur = conn.execute(f"SELECT {', '.join(columns)} FROM {table_name}")
+        # Columns come from PRAGMA on the validated table, so they are
+        # the live schema's own identifiers. SQLite escapes them with
+        # quoted identifiers (double-quotes) to neutralize any reserved
+        # words that schemas may legitimately use.
+        quoted_cols = ", ".join('"' + c.replace('"', '""') + '"' for c in columns)
+        cur = conn.execute(f"SELECT {quoted_cols} FROM {tbl}")
         rows = [
             {col: row[col] for col in columns}
             for row in cur.fetchall()

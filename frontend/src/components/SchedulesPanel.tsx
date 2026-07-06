@@ -844,7 +844,7 @@ function ScheduleEditor(props: {
               <label className="field">
                 <span className="label">Day of week</span>
                 <select value={schedule.day_of_week} onChange={(e) => set('day_of_week', Number(e.target.value))}>
-                  {DAYS.map((d, i) => <option key={i} value={i}>{d}</option>)}
+                  {DAYS.map((d, i) => <option key={d} value={i}>{d}</option>)}
                 </select>
               </label>
             )}
@@ -932,6 +932,38 @@ function ScheduleEditor(props: {
     </>
   );
 
+  // Cross-platform preflight + save chain. Shared between the direct
+  // Save button (post-PIN-intercept) and the setTimeout call inside
+  // PinPreflightModal.onContinue (after PIN ack), so the cross-backend
+  // probe + modal-open + fallback-save semantics cannot drift between
+  // the two callers. Always spreads `{ ...schedule, pin_preflight_ack: true }`
+  // because the closed-over schedule prop is a stale snapshot in the
+  // setTimeout path (FEUI-04) and the direct-save path already has
+  // pin_preflight_ack=true by the time it reaches here.
+  const runCrossPlatformPreflightAndSave = async () => {
+    if (!isCrossBackend) {
+      onSave();
+      return;
+    }
+    try {
+      const next = { ...schedule, pin_preflight_ack: true };
+      const r = await api.schedulesCrossPlatformPreflight(
+        next as unknown as Record<string, unknown>,
+      );
+      if (r.aggregate_verdict === 'ok') {
+        onSave();
+        return;
+      }
+      setCppResponse(r);
+      setCppOpen(true);
+      // Save fires via the modal's onContinue callback below.
+    } catch {
+      // Preflight call failed - don't block save. The engine's
+      // belt-and-braces enforcement still applies at fire time.
+      onSave();
+    }
+  };
+
   return (
     <div className="panel">
       <JobConfigBody
@@ -950,34 +982,6 @@ function ScheduleEditor(props: {
             //   2. Cross-platform preflight - if route is cross-backend
             //      and aggregate_verdict != 'ok', modal opens.
             //   3. Save.
-            const runCrossPlatformPreflightAndSave = async () => {
-              if (!isCrossBackend) {
-                onSave();
-                return;
-              }
-              try {
-                // FEUI-04: this runs after the PIN intercept may have
-                // scheduled set('pin_preflight_ack', true). The local
-                // `schedule` const is a stale prop snapshot, so build
-                // the up-to-date object explicitly for the probe.
-                const next = { ...schedule, pin_preflight_ack: true };
-                const r = await api.schedulesCrossPlatformPreflight(
-                  next as unknown as Record<string, unknown>,
-                );
-                if (r.aggregate_verdict === 'ok') {
-                  onSave();
-                  return;
-                }
-                setCppResponse(r);
-                setCppOpen(true);
-                // Save fires via the modal's onContinue callback below.
-              } catch {
-                // Preflight call failed - don't block save. The
-                // engine's belt-and-braces enforcement still applies
-                // at fire time.
-                onSave();
-              }
-            };
 
             // Step 1: PIN preflight intercept.
             if (schedule.pin_preflight_ack) {
@@ -1070,30 +1074,9 @@ function ScheduleEditor(props: {
           if (savePending) {
             setSavePending(false);
             // Defer one tick so the set() state update commits, then
-            // chain into the cross-platform preflight.
-            window.setTimeout(async () => {
-              if (!isCrossBackend) {
-                onSave();
-                return;
-              }
-              try {
-                // FEUI-04: the closed-over `schedule` prop is stale -
-                // set('pin_preflight_ack', true) above only scheduled a
-                // parent update, it did not mutate this const. Build
-                // the current object so the probe sees the ack.
-                const next = { ...schedule, pin_preflight_ack: true };
-                const r = await api.schedulesCrossPlatformPreflight(
-                  next as unknown as Record<string, unknown>,
-                );
-                if (r.aggregate_verdict === 'ok') {
-                  onSave();
-                  return;
-                }
-                setCppResponse(r);
-                setCppOpen(true);
-              } catch {
-                onSave();
-              }
+            // chain into the shared cross-platform preflight helper.
+            window.setTimeout(() => {
+              runCrossPlatformPreflightAndSave();
             }, 0);
           }
         }}

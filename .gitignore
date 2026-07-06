@@ -206,3 +206,12 @@ dev_docs/tests_e2e/.stack-owned-by-e2e
 # TEST_RESULTS_AND_NEXT_STEPS.html, TEST_REVIEW_PRE_RELEASE.html and
 # similar). These are local dev notes, not shipped app surface.
 /*.html
+.lcdaemon-project.json
+.lcdaemon-frontend-handoffs/
+.lcdaemon-code-reviews/
+.lcdaemon-integrations-schema.json
+.lcdaemon-reconnect.mjs
+.lcdaemon-queue.*.jsonl
+/docs/
+/handoff/
+/findings/

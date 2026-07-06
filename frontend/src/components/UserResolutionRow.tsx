@@ -120,7 +120,7 @@ export function UserResolutionRow({
       {resolution.warnings.length > 0 && (
         <div style={{ fontSize: 11, color: 'var(--warn, #d97706)', marginBottom: 8 }}>
           {resolution.warnings.map((w, i) => (
-            <div key={i}>⚠ {w}</div>
+            <div key={`${i}-${String(w).slice(0, 32)}`}>⚠ {w}</div>
           ))}
         </div>
       )}

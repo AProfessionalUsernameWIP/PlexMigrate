@@ -116,6 +116,29 @@ class EmbyAdapter(JellyfinAdapter):
             self._session.headers["Authorization"] = self._creds.authorization_header()
         return identity
 
+    def invalidate_identity_cache(self) -> None:
+        """Force the next ``server_identity()`` call to re-probe the
+        backend instead of returning the cached value.
+
+        Identity is server-scoped and effectively immutable for a
+        registered Emby server's lifetime (the owner_user_id of a
+        backend doesn't change in normal operation). The two cases
+        that justify invalidation:
+
+        * The operator transfers Emby server ownership to a different
+          admin account. The cached ``owner_user_id`` is now stale.
+        * The Emby admin password / API key was rotated, and the
+          adapter needs to re-probe to pick up the new identity if
+          /Users/Me responses change for any reason.
+
+        Both are operator-driven events, not engine-driven, so the
+        invalidation is exposed as a public method rather than tied
+        to an automatic invalidation rule. Callers: server registry's
+        edit-server endpoint (after a token/key change) and any
+        future "transfer ownership" surface.
+        """
+        self._identity_cache = None
+
     # Everything else is inherited from JellyfinAdapter.
     #
     # If Emby's response shapes diverge from Jellyfin's in future

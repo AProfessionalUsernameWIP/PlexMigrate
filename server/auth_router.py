@@ -44,7 +44,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from server import auth_db
+from server import _login_throttle, auth_db
 from server.persistence import get_data_dir
 
 
@@ -1170,22 +1170,48 @@ def auth_login(body: LoginIn, request: Request, response: Response) -> Dict[str,
 
     Failure cases (no such user, wrong password, or matching a non-
     login role like db_admin) all return 401 with the same generic
-    message - no oracle for username enumeration.
+    message - no oracle for username enumeration. Rate-limit blocks
+    (per-IP sliding window or per-username lockout) return 429 with
+    a Retry-After header; the 429 status alone does not reveal
+    whether the username or the IP was the trigger.
 
     On success the response also carries a 7-day ``refresh_token``
     HttpOnly cookie at ``Path=/api/auth``. The frontend uses it
     silently via /api/auth/refresh to extend the session past the
     30-minute access-JWT expiry.
     """
+    throttle = _login_throttle.get_login_throttle()
+    client_ip = (request.client.host if request.client else "") or ""
+
+    retry_after = throttle.check(client_ip)
+    if retry_after is not None:
+        response.headers["Retry-After"] = str(int(retry_after) + 1)
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Try again later.",
+        )
+    locked_until = auth_db.check_account_locked(body.username)
+    if locked_until is not None:
+        retry_after = max(1.0, locked_until - time.time())
+        response.headers["Retry-After"] = str(int(retry_after) + 1)
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Try again later.",
+        )
+
     user = auth_db.verify_password(body.username, body.password)
-    if user is None:
+    if user is None or user.get("role") not in _ROLE_RANK:
+        throttle.record_failure(client_ip)
+        try:
+            auth_db.record_failed_login(body.username)
+        except Exception:  # pragma: no cover (defensive)
+            log.exception("record_failed_login failed for %r", body.username)
         raise HTTPException(status_code=401, detail="Invalid username or password.")
-    # db_admin is not a login role - reject silently with the same
-    # 401 so an attacker can't probe for its existence.
-    if user.get("role") not in _ROLE_RANK:
-        raise HTTPException(status_code=401, detail="Invalid username or password.")
-    # Best-effort: stamp last_login. Failure here must not block the
-    # response - the end user already authenticated successfully.
+    throttle.record_success(client_ip)
+    try:
+        auth_db.record_successful_login(user["username"])
+    except Exception:  # pragma: no cover (defensive)
+        log.exception("record_successful_login failed for %r", user["username"])
     try:
         auth_db.update_last_login(user["username"])
     except Exception:  # pragma: no cover (defensive)

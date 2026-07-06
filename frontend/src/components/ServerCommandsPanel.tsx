@@ -2010,7 +2010,7 @@ function ServerView({ serverId, events }: { serverId: string; events: DevConsole
           <h4 style={{ marginTop: 0 }}>Recent results</h4>
           <ul className="dc-events" style={{ maxHeight: 200, overflow: 'auto' }}>
             {log.map((l, i) => (
-              <li key={i} className={l.ok ? '' : 'error'}>
+              <li key={`${l.ts}-${i}`} className={l.ok ? '' : 'error'}>
                 <span className="muted">{new Date(l.ts).toLocaleTimeString()}</span>{' '}
                 {l.msg}
               </li>
@@ -2031,7 +2031,7 @@ function EventLog({ events }: { events: DevConsoleEvent[] }) {
       {events.length === 0 && <p className="muted">No events yet.</p>}
       <ul className="dc-events" style={{ maxHeight: 180, overflow: 'auto' }}>
         {events.map((ev, i) => (
-          <li key={i}>
+          <li key={`${ev.server_ts || 0}-${ev.type}-${i}`}>
             <span className="muted">
               {new Date((ev.server_ts || 0) * 1000).toLocaleTimeString()}
             </span>{' '}

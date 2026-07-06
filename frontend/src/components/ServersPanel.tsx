@@ -16,10 +16,11 @@
 // above and the cached library catalogue panel below stay as-is.
 
 import { useEffect, useRef, useState } from 'react';
-import { api, LibraryDescriptor, PingResult, ProbeUnsavedResult, ServerUser, ServerUsersResponse, ServerDeleteSummary, ServerView } from '../api';
+import { api, LibraryDescriptor, ProbeUnsavedResult, ServerUser, ServerUsersResponse, ServerDeleteSummary, ServerView } from '../api';
 import type { PinMigrationSuggestion, ServerManagedUser } from '../api';
 import { usePermission } from '../hooks/usePermission';
 import { pausableInterval } from '../utils/pausableInterval';
+import { usePingPoller } from '../hooks/usePingPoller';
 import { PinMigrationModal } from './PinMigrationModal';
 import { RecentRuntimesPanel } from './RecentRuntimesPanel';
 import { DriftHistoryTab } from './DriftHistoryTab';
@@ -485,12 +486,13 @@ export function ServersPanel() {
     }
   };
 
-  // Live ping state, keyed by server id. We keep this *separate* from
-  // ``servers`` so a ping update can happen without re-rendering the
-  // whole list row (which would briefly flash if we patched the row
-  // dict directly). Each value is the most recent PingResult or
-  // ``undefined`` if no ping has come back yet for that id.
-  const [pings, setPings] = useState<Record<string, PingResult>>({});
+  // Live ping state, keyed by server id. Owned by usePingPoller so a
+  // ping update can happen without re-rendering the whole list row
+  // (the dict update is internal to the hook). Each value is the most
+  // recent PingResult or ``undefined`` if no ping has come back yet
+  // for that id. See pingIntervalMs further below for the cadence
+  // source; the hook re-arms when either the server list or the
+  // interval changes.
 
   // Per-server user lists fetched on tab visit. Keyed by server id.
   // ``undefined`` = not yet fetched / refetching;
@@ -516,15 +518,13 @@ export function ServersPanel() {
   // settles (success or failure).
   const inFlightSyncsRef = useRef<Set<string>>(new Set());
 
-  // Track the polling timer so we can clear it on unmount.
-  const pollTimerRef = useRef<(() => void) | null>(null);
-
   // Live ping cadence. Loaded once from settings on mount so a user
   // who bumps it via Settings ▸ Tunables doesn't need a code change.
-  // A panel re-mount picks up subsequent changes; the effect that arms
-  // the timer below depends on this value, so a new cadence rearms
+  // A panel re-mount picks up subsequent changes; usePingPoller's
+  // useEffect deps include this value, so a new cadence rearms
   // automatically once the load completes.
   const [pingIntervalMs, setPingIntervalMs] = useState<number>(PING_INTERVAL_MS_DEFAULT);
+  const pings = usePingPoller(servers, pingIntervalMs);
   // Optional UID column toggle. Reads `servers_panel_show_server_uid`
   // (developer tunable). Off by default - flip via Settings ▸
   // Tunables ▸ UI & Display ▸ Admin & UX toggles.
@@ -574,61 +574,12 @@ export function ServersPanel() {
     }
   };
 
-  // Initial load + start the background ping poll.
+  // Initial load. The ping poll is now wired through usePingPoller
+  // (declared above) and handles its own re-arm on servers/interval
+  // changes, plus cleanup on unmount.
   useEffect(() => {
     refresh();
-    return () => {
-      if (pollTimerRef.current !== null) {
-        pollTimerRef.current();
-        pollTimerRef.current = null;
-      }
-    };
   }, []);
-
-  // Once the server list is loaded, kick off the ping poll. We
-  // re-arm whenever the list of servers changes (e.g. after Add or
-  // Remove) so newly-added rows get pinged immediately.
-  useEffect(() => {
-    if (servers.length === 0) {
-      if (pollTimerRef.current !== null) {
-        pollTimerRef.current();
-        pollTimerRef.current = null;
-      }
-      return;
-    }
-
-    const pingAll = async () => {
-      // Ping every server in parallel; each call is independent and
-      // the registry row update is the same regardless of order.
-      const tasks = servers.map(async (s) => {
-        try {
-          const result = await api.pingServer(s.id);
-          setPings((prev) => ({ ...prev, [s.id]: result }));
-        } catch {
-          // Network or server-side error - fall through; the next
-          // tick will retry. The cached status row still shows
-          // whatever the last successful ping recorded.
-        }
-      });
-      await Promise.allSettled(tasks);
-    };
-
-    // Fire one ping right now so the dots aren't grey on first paint
-    // for the 30 seconds until the first interval fires.
-    pingAll();
-    if (pollTimerRef.current !== null) pollTimerRef.current();
-    pollTimerRef.current = pausableInterval(pingAll, pingIntervalMs);
-
-    return () => {
-      if (pollTimerRef.current !== null) {
-        pollTimerRef.current();
-        pollTimerRef.current = null;
-      }
-    };
-    // Re-arm when the server list changes (the closure binds the
-    // current list) or when the end user changes the ping cadence
-    // via Settings ▸ Tunables.
-  }, [servers, pingIntervalMs]);
 
   // Fetch per-server user lists in parallel whenever the server list
   // changes. No caching - the user list on a Plex server can change
@@ -846,7 +797,7 @@ export function ServersPanel() {
               <div style={{ marginTop: 6, fontSize: 12 }}>
                 {cascadeToast.exports_failed + cascadeToast.log_dirs_failed} item(s) could not be removed:
                 <ul style={{ margin: '4px 0 0 18px' }}>
-                  {cascadeToast.errors.map((e, i) => <li key={i} className="mono">{e}</li>)}
+                  {cascadeToast.errors.map((e, i) => <li key={`${i}-${String(e).slice(0, 32)}`} className="mono">{e}</li>)}
                 </ul>
               </div>
             )}

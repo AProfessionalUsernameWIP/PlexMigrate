@@ -41,6 +41,92 @@ log = logging.getLogger("plexmigrate.server.persistence")
 
 # ── Data directory resolution ────────────────────────────────────────────────
 
+# Specific system directories the data dir must never resolve to or
+# inside, unless the env-var override is set. Catches a misset
+# PLEXMIGRATE_DATA_DIR that would otherwise silently land .keyfile /
+# .auth_secret in a privileged location. Only specific subdirectories
+# are listed; bare drive/filesystem roots are NOT in this list because
+# every user/temp directory lives under one (matching "/" or "C:\\" as
+# a prefix would block every legitimate data dir).
+_SYSTEM_PATH_BLOCKLIST = (
+    "/etc", "/usr", "/var", "/sys", "/proc", "/bin", "/sbin",
+    "/root", "/boot", "/dev",
+    # Windows system-only locations
+    "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
+)
+
+# Exact-only matches: refusing the bare root would block every nested
+# legitimate path, but resolving the data dir TO the bare root itself
+# is still wrong, so equality (not prefix) is the right check for these.
+_SYSTEM_PATH_EXACT_ONLY = ("/", "C:\\")
+
+
+def _is_system_path(p: Path) -> bool:
+    s = str(p)
+    if s in _SYSTEM_PATH_EXACT_ONLY:
+        return True
+    for banned in _SYSTEM_PATH_BLOCKLIST:
+        if s == banned:
+            return True
+        sep = "\\" if banned.startswith("C:") else "/"
+        # Only flag when s is BELOW banned: banned itself plus a separator
+        # (e.g. "/etc/foo" matches "/etc" but "/etcetera" does not).
+        if s.startswith(banned + sep):
+            return True
+    return False
+
+
+def _allow_system_data_dir() -> bool:
+    """Override escape hatch for the system-path block.
+
+    Read from the ``PLEXMIGRATE_ALLOW_SYSTEM_DATA_DIR`` env var, NOT the
+    ``allow_system_data_dir`` tunable, to avoid a chicken-and-egg
+    recursion: the tunables module reads ``settings.json``, whose path
+    is ``get_data_dir() / "settings.json"``. Calling tunables here
+    re-enters :func:`get_data_dir` before the first call has populated
+    the cache, deadlocking on ``_resolve_lock`` (or recursing forever
+    if it were an RLock). The env-var path has no such dependency.
+
+    Truthy values: "1", "true", "yes", "on" (case-insensitive).
+    Any other value (including empty/unset) returns False so the
+    default-deny posture holds.
+    """
+    raw = (os.environ.get("PLEXMIGRATE_ALLOW_SYSTEM_DATA_DIR") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _resolve_and_validate_data_dir(raw: str) -> Path:
+    """Canonicalize the raw env-var path, refuse system paths unless
+    overridden, and probe the directory is writable. Raises
+    ``RuntimeError`` on a hard failure (system path with no override,
+    or write probe failed). Logs INFO with the canonical path."""
+    canonical = Path(raw).expanduser().resolve(strict=False)
+    if _is_system_path(canonical) and not _allow_system_data_dir():
+        raise RuntimeError(
+            "PLEXMIGRATE_DATA_DIR resolves to a system path ({!r}). "
+            "Refusing to write app state under it. Either point the "
+            "var at a dedicated directory or set the "
+            "``allow_system_data_dir`` tunable to True to opt in."
+            .format(str(canonical))
+        )
+    canonical.mkdir(parents=True, exist_ok=True)
+    probe = canonical / ".write_probe"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        raise RuntimeError(
+            "PLEXMIGRATE_DATA_DIR ({!r}) is not writable: {}"
+            .format(str(canonical), exc)
+        ) from exc
+    log.info("data dir resolved: %s", canonical)
+    return canonical
+
+
+_resolved_data_dir: Optional[Path] = None
+_resolve_lock = threading.Lock()
+
+
 def get_data_dir() -> Path:
     """
     Returns the directory where settings.json and schedules.json live.
@@ -48,12 +134,27 @@ def get_data_dir() -> Path:
     Honours ``PLEXMIGRATE_DATA_DIR`` for the Docker setup; falls back
     to ``./server_data`` so a developer running ``uvicorn`` directly
     against a checkout gets a sensible default. The directory is
-    created on first access.
+    canonicalized once (symlinks resolved), checked against a system-
+    path blocklist (override via ``allow_system_data_dir`` tunable),
+    and write-probed on first call. The validated path is cached for
+    subsequent calls so the env var is only re-read once per process.
     """
+    global _resolved_data_dir
+    if _resolved_data_dir is not None:
+        return _resolved_data_dir
     raw = os.environ.get("PLEXMIGRATE_DATA_DIR", "./server_data")
-    p = Path(raw)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    with _resolve_lock:
+        if _resolved_data_dir is None:
+            _resolved_data_dir = _resolve_and_validate_data_dir(raw)
+    return _resolved_data_dir
+
+
+def _reset_data_dir_cache_for_tests() -> None:
+    """Tests that monkeypatch PLEXMIGRATE_DATA_DIR need to clear the
+    cache so the next get_data_dir() re-reads the env var."""
+    global _resolved_data_dir
+    with _resolve_lock:
+        _resolved_data_dir = None
 
 
 # ── File paths ───────────────────────────────────────────────────────────────

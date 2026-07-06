@@ -239,7 +239,7 @@ export function LogTailer({
           </span>
         ) : (
           filteredLines.map((line, i) => (
-            <div key={i}>{renderHighlighted(line, filter)}</div>
+            <div key={`${i}-${line.slice(0, 32)}`}>{renderHighlighted(line, filter)}</div>
           ))
         )}
       </div>

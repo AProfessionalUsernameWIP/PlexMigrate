@@ -15,11 +15,13 @@
 // user can retry once the job finishes.
 
 import { useEffect, useMemo, useState } from 'react';
-import { api, LogFile, LogRun, ServerView, getAccessToken } from '../api';
+import { api, LogFile, LogRun, ServerView } from '../api';
 import { LogTailer } from './LogTailer';
 import { Modal } from './Modal';
 import { formatBytes, formatTimestamp } from '../utils/format';
 import { pausableInterval } from '../utils/pausableInterval';
+import { downloadBlob } from '../utils/downloadBlob';
+import { performLogRunDelete } from '../utils/logRunDelete';
 
 
 // Per-server sub-tab view selector. 'all' shows every run for the
@@ -41,40 +43,6 @@ function backendAwareSlug(name: string, serviceType: string): string {
   return `${bare}-${(serviceType || 'plex').toLowerCase()}`;
 }
 
-
-// Auth-aware blob download. The auth middleware rejects a plain
-// <a href> navigation because it can't carry the bearer token, so we
-// fetch as a blob, then trigger a save dialog via a synthetic
-// <a download> element. Same pattern ExportsPanel uses for snapshot
-// downloads. Used for both the per-file "Download" buttons and the
-// per-run "Download zip" buttons.
-async function downloadBlob(
-  url: string,
-  filename: string,
-  setError: (e: string | null) => void,
-): Promise<void> {
-  try {
-    const token = getAccessToken();
-    const headers: Record<string, string> = {};
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-    const res = await fetch(url, { headers });
-    if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText);
-      throw new Error(`${res.status}: ${text}`);
-    }
-    const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = objectUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(objectUrl);
-  } catch (e) {
-    setError(`Download failed: ${e}`);
-  }
-}
 
 const downloadFullLog = (run: string, file: string, setError: (e: string | null) => void) =>
   downloadBlob(api.logFileDownloadUrl(run, file), file, setError);
@@ -310,26 +278,18 @@ export function LogsPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleRuns]);
 
-  const doDeleteOne = async (name: string) => {
-    setError(null);
-    setInfo(null);
-    try {
-      const r = await api.deleteLogRun(name);
-      setInfo(
-        `Deleted ${r.deleted} (${r.file_count} file${r.file_count === 1 ? '' : 's'})`
-        + (r.errors.length ? ` with ${r.errors.length} error(s): ${r.errors.join(' · ')}` : '.'),
-      );
-      // Clear the selection if the end user just deleted the active run.
-      if (selectedRun === name) {
+  const doDeleteOne = (name: string) => performLogRunDelete(name, {
+    setError,
+    setInfo,
+    onActiveRunDeleted: (n) => {
+      if (selectedRun === n) {
         setSelectedRun(null);
         setSelectedFile(null);
         setFiles([]);
       }
-      await refreshRuns();
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+    },
+    refresh: refreshRuns,
+  });
 
   const doDeleteAll = async () => {
     setError(null);

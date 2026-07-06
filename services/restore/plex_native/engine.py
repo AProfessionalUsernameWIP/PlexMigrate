@@ -334,12 +334,30 @@ def restore_export_file(
     # watched items the saving from removing the spin-wait dominates;
     # for tiny libraries the build dominates. Net positive on real
     # workloads.
+    # Tunable skip: on giant libraries the synchronous pre-warm can
+    # block the watch-history phase for 30-60s before the first
+    # resolver fires. Operators with stable identity-map coverage
+    # don't need it (resolvers fall back to fuzzy matching, which
+    # is fast on a populated cache anyway). Set
+    # ``restore_skip_scan_cache_prewarm`` to True to skip.
+    _skip_prewarm = False
     try:
-        _build_scan_cache(section, scan_cache, scan_lock, logger)
-    except Exception as e:
-        logger.warning(
-            f"[scan_cache] Build failed for '{section.title}': {e} - "
-            f"resolvers will fall back to fuzzy matching."
+        from services.tunables import get as _tunable_get
+        _skip_prewarm = bool(_tunable_get("restore_skip_scan_cache_prewarm"))
+    except Exception:
+        _skip_prewarm = False
+    if not _skip_prewarm:
+        try:
+            _build_scan_cache(section, scan_cache, scan_lock, logger)
+        except Exception as e:
+            logger.warning(
+                f"[scan_cache] Build failed for '{section.title}': {e} - "
+                f"resolvers will fall back to fuzzy matching."
+            )
+    else:
+        logger.info(
+            f"[scan_cache] Pre-warm skipped for '{section.title}' "
+            f"(restore_skip_scan_cache_prewarm=True)."
         )
 
     def _stopped() -> bool:

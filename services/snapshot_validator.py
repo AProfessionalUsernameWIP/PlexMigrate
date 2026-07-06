@@ -316,12 +316,16 @@ def _check_per_table_columns(
     v0.15 ingest helpers raise on missing values, but a snapshot
     written by an older build would have the columns missing entirely
     and the validator should call that out clearly."""
-    for table in ("server_items", "watch_events", "ratings",
-                  "playlists", "collections"):
+    from server._sql_identifier import safe_identifier
+    _ALLOWED = frozenset({
+        "server_items", "watch_events", "ratings", "playlists", "collections",
+    })
+    for table in _ALLOWED:
+        tbl = safe_identifier(table, _ALLOWED)
         try:
             cols = {
                 r["name"]
-                for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()
             }
         except sqlite3.OperationalError as exc:
             report.issues.append(ValidationIssue(

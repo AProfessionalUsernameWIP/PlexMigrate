@@ -62,6 +62,13 @@ def _db_path() -> Path:
 _init_lock = threading.Lock()
 _initialised = False
 
+# Bcrypt cost factor for every password hash this module generates.
+# Explicit so a library upgrade can't silently lower the work factor.
+# Each +1 doubles the hashing time; 12 is the modern lower bound,
+# 14 is the high-security ceiling before user-perceived latency on
+# login becomes noticeable. Raise it if hashing CPU stops mattering.
+BCRYPT_COST = 12
+
 
 def _connect() -> sqlite3.Connection:
     """
@@ -135,7 +142,12 @@ def init_auth_db() -> None:
                     -- Effective = ROLE_PERMS ∪ extra_permissions \\ revoked_permissions
                     -- with root_admin immune to revokes (always ALL_PERMS).
                     extra_permissions   TEXT,
-                    revoked_permissions TEXT
+                    revoked_permissions TEXT,
+                    -- Brute-force protection: counter resets on success,
+                    -- locked_until is the unix timestamp when the lock
+                    -- expires (NULL when not locked).
+                    failed_login_attempts INTEGER NOT NULL DEFAULT 0,
+                    locked_until          REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_app_users_username
                     ON app_users(username);
@@ -159,6 +171,7 @@ def init_auth_db() -> None:
             _migrate_schema(conn)
             _migrate_permission_columns(conn)
             _migrate_refresh_token_columns(conn)
+            _migrate_lockout_columns(conn)
         finally:
             conn.close()
         _initialised = True
@@ -190,6 +203,16 @@ def _migrate_refresh_token_columns(conn: sqlite3.Connection) -> None:
     """
     apply_additive_columns(conn, [
         ("refresh_tokens", "rotated_at REAL"),
+    ])
+
+
+def _migrate_lockout_columns(conn: sqlite3.Connection) -> None:
+    """Brute-force protection columns on ``app_users``. Idempotent.
+    Older databases get failed_login_attempts=0 / locked_until=NULL.
+    """
+    apply_additive_columns(conn, [
+        ("app_users", "failed_login_attempts INTEGER NOT NULL DEFAULT 0"),
+        ("app_users", "locked_until REAL"),
     ])
 
 
@@ -353,7 +376,7 @@ def _dummy_hash() -> bytes:
     global _DUMMY_HASH
     if _DUMMY_HASH is None:
         import bcrypt as _bcrypt
-        _DUMMY_HASH = _bcrypt.hashpw(b"dummy", _bcrypt.gensalt())
+        _DUMMY_HASH = _bcrypt.hashpw(b"dummy", _bcrypt.gensalt(rounds=BCRYPT_COST))
     return _DUMMY_HASH
 
 
@@ -412,7 +435,7 @@ def create_user(
         )
 
     dn = (display_name or "").strip() or None
-    hashed = _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt()).decode("ascii")
+    hashed = _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt(rounds=BCRYPT_COST)).decode("ascii")
     now = time.time()
     conn = _connect()
     try:
@@ -785,6 +808,93 @@ def update_last_login(username: str, ts: Optional[float] = None) -> None:
         conn.close()
 
 
+# Per-username brute-force protection. Defaults: 5 failed attempts triggers
+# a 15-minute lock. Constants live here so the policy is one-line-changeable.
+LOCKOUT_FAILURE_THRESHOLD = 5
+LOCKOUT_DURATION_SECONDS = 900.0
+
+
+def check_account_locked(username: str) -> Optional[float]:
+    """Return ``locked_until`` (unix ts) if the account is currently
+    locked, else None. Silently returns None for unknown usernames so
+    callers can keep the generic 401 enumeration story intact."""
+    init_auth_db()
+    uname = (username or "").strip()
+    if not uname:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT locked_until FROM app_users WHERE username = ?",
+            (uname,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or row["locked_until"] is None:
+        return None
+    locked_until = float(row["locked_until"])
+    if locked_until <= time.time():
+        return None
+    return locked_until
+
+
+def record_failed_login(username: str) -> Optional[float]:
+    """Increment the failure counter for ``username``. If the counter
+    reaches the threshold, set ``locked_until = now + LOCKOUT_DURATION``
+    and reset the counter to 0. Returns the new locked_until timestamp
+    if the lock was just applied, else None. Silently no-ops for
+    unknown usernames."""
+    init_auth_db()
+    uname = (username or "").strip()
+    if not uname:
+        return None
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT failed_login_attempts FROM app_users WHERE username = ?",
+            (uname,),
+        ).fetchone()
+        if row is None:
+            return None
+        new_count = int(row["failed_login_attempts"] or 0) + 1
+        if new_count >= LOCKOUT_FAILURE_THRESHOLD:
+            locked_until = time.time() + LOCKOUT_DURATION_SECONDS
+            conn.execute(
+                "UPDATE app_users "
+                "SET failed_login_attempts = 0, locked_until = ? "
+                "WHERE username = ?",
+                (locked_until, uname),
+            )
+            return locked_until
+        conn.execute(
+            "UPDATE app_users SET failed_login_attempts = ? WHERE username = ?",
+            (new_count, uname),
+        )
+        return None
+    finally:
+        conn.close()
+
+
+def record_successful_login(username: str) -> None:
+    """Reset the failure counter and clear ``locked_until`` after a
+    successful authentication. Best-effort; failure does not block
+    the login response."""
+    init_auth_db()
+    uname = (username or "").strip()
+    if not uname:
+        return
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE app_users "
+            "SET failed_login_attempts = 0, locked_until = NULL "
+            "WHERE username = ?",
+            (uname,),
+        )
+    finally:
+        conn.close()
+
+
 def delete_user(username: str) -> None:
     """
     Remove a user row. Used by ``DELETE /api/auth/users/{u}``.
@@ -895,7 +1005,7 @@ def update_password(username: str, new_password: str) -> None:
             f"Password is too long (max {_MAX_PASSWORD_LEN} bytes)."
         )
     hashed = _bcrypt.hashpw(
-        new_password.encode("utf-8"), _bcrypt.gensalt()
+        new_password.encode("utf-8"), _bcrypt.gensalt(rounds=BCRYPT_COST)
     ).decode("ascii")
     conn = _connect()
     try:

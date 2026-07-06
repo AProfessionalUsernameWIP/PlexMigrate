@@ -104,6 +104,27 @@ _CANONICAL_RE = re.compile(
 )
 
 
+_LEGACY_AGENT_PREFIX = "com.plexapp.agents."
+
+
+def scheme_for_blacklist_key(guid: str) -> str:
+    """Extract the GUID's scheme portion in a form suitable for keying
+    a (section, scheme) attempt-blacklist. The legacy agent form
+    ``com.plexapp.agents.imdb://...`` returns ``imdb-agent`` so legacy
+    GUIDs blacklist independently of their canonical twin
+    (``imdb://...`` returns ``imdb``). Empty / malformed returns ``""``.
+
+    The single source of truth for the legacy-prefix detection lives
+    here; resolvers and downstream code should delegate to this helper
+    instead of reimplementing the prefix walk inline."""
+    if not guid or "://" not in guid:
+        return ""
+    head = guid.split("://", 1)[0].lower()
+    if head.startswith(_LEGACY_AGENT_PREFIX):
+        return head.removeprefix(_LEGACY_AGENT_PREFIX) + "-agent"
+    return head
+
+
 def normalize_guid(guid: str) -> str:
     """
     Canonicalise one GUID string.

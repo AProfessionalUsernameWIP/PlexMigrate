@@ -20,6 +20,7 @@
 // confirmation step.
 
 import { useContext, useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import { api, SettingsView, ServerView } from '../api';
 import { TooltipContext } from '../contexts/TooltipContext';
 import { useResourceQuery } from '../hooks/useResourceQuery';
@@ -549,6 +550,40 @@ export function TunablesPanel() {
     setOne(key, v as TunablesShape[typeof key]);
   };
 
+  // Shared boolean-tunable toggle. Two near-identical IIFE blocks
+  // for plexapi_autoreload + media.db caching were collapsed into
+  // this helper; pass the tunable key + label + help-text children.
+  // Closes over values/setOne so callers do not have to thread state.
+  function BooleanTunableSwitch<K extends keyof TunablesShape>(props: {
+    tunable: K;
+    label: string;
+    children: ReactNode;
+  }) {
+    const fallback = DEFAULTS[props.tunable] as boolean;
+    const current = values[props.tunable] as boolean | undefined;
+    const effective = current === undefined ? fallback : current;
+    const isCustom = current !== undefined && current !== fallback;
+    return (
+      <label className="switch" style={{ marginTop: 8 }}>
+        <input
+          type="checkbox"
+          checked={effective}
+          onChange={(e) => setOne(props.tunable, e.target.checked as TunablesShape[K])}
+        />
+        <span>
+          {props.label}
+          {isCustom && (
+            <span className="tag" style={{ marginLeft: 6, fontSize: 10 }}>custom</span>
+          )}
+          <span style={{ color: 'var(--text-dim)', marginLeft: 6, fontSize: 11 }}>
+            (default {fallback ? 'on' : 'off'})
+          </span>
+        </span>
+        <span className="help">{props.children}</span>
+      </label>
+    );
+  }
+
   // Did the end user touch any Danger Zone field? Drives the "I
   // understand" gate on the Save button. The numeric DANGER_FIELDS
   // are checked first; the developer_mode_enabled boolean toggle
@@ -683,40 +718,19 @@ export function TunablesPanel() {
       {activeTab === 'performance' && (
       <div className="panel">
         <h2>plexapi Auto-Reload</h2>
-        {(() => {
-          const fallback = DEFAULTS.plexapi_autoreload_enabled as boolean;
-          const current = values.plexapi_autoreload_enabled;
-          const effective = current === undefined ? fallback : current;
-          const isCustom = current !== undefined && current !== fallback;
-          return (
-            <label className="switch" style={{ marginTop: 8 }}>
-              <input
-                type="checkbox"
-                checked={effective}
-                onChange={(e) => setOne('plexapi_autoreload_enabled', e.target.checked)}
-              />
-              <span>
-                Enable plexapi auto-reload
-                {isCustom && (
-                  <span className="tag" style={{ marginLeft: 6, fontSize: 10 }}>custom</span>
-                )}
-                <span style={{ color: 'var(--text-dim)', marginLeft: 6, fontSize: 11 }}>
-                  (default {fallback ? 'on' : 'off'})
-                </span>
-              </span>
-              <span className="help">
-                When <strong>off</strong> (default), the engine actively disables plexapi's per-item
-                auto-reload on bulk-fetched lists and serialised items. This keeps snapshot runs
-                fast even on libraries where most items are unmatched, unwatched, or unrated.
-                When <strong>on</strong>, plexapi will reload partial objects the moment you read
-                an attribute whose value is <code>None</code> - bundling <code>includeMarkers</code>
-                + <code>includeChapters</code> which can trigger Plex intro/chapter analysis at
-                <strong> 20–30 seconds per item</strong>. Only flip this on as a diagnostic if a
-                bulk response is genuinely missing data you expect to be present.
-              </span>
-            </label>
-          );
-        })()}
+        <BooleanTunableSwitch
+          tunable="plexapi_autoreload_enabled"
+          label="Enable plexapi auto-reload"
+        >
+          When <strong>off</strong> (default), the engine actively disables plexapi's per-item
+          auto-reload on bulk-fetched lists and serialised items. This keeps snapshot runs
+          fast even on libraries where most items are unmatched, unwatched, or unrated.
+          When <strong>on</strong>, plexapi will reload partial objects the moment you read
+          an attribute whose value is <code>None</code> - bundling <code>includeMarkers</code>
+          + <code>includeChapters</code> which can trigger Plex intro/chapter analysis at
+          <strong> 20–30 seconds per item</strong>. Only flip this on as a diagnostic if a
+          bulk response is genuinely missing data you expect to be present.
+        </BooleanTunableSwitch>
       </div>
       )}
 
@@ -728,41 +742,20 @@ export function TunablesPanel() {
       {activeTab === 'performance' && (
       <div className="panel">
         <h2>media.db Caching</h2>
-        {(() => {
-          const fallback = DEFAULTS.cache_snapshot_payloads_to_media_db as boolean;
-          const current = values.cache_snapshot_payloads_to_media_db;
-          const effective = current === undefined ? fallback : current;
-          const isCustom = current !== undefined && current !== fallback;
-          return (
-            <label className="switch" style={{ marginTop: 8 }}>
-              <input
-                type="checkbox"
-                checked={effective}
-                onChange={(e) => setOne('cache_snapshot_payloads_to_media_db', e.target.checked)}
-              />
-              <span>
-                Cache snapshot payloads to media.db
-                {isCustom && (
-                  <span className="tag" style={{ marginLeft: 6, fontSize: 10 }}>custom</span>
-                )}
-                <span style={{ color: 'var(--text-dim)', marginLeft: 6, fontSize: 11 }}>
-                  (default {fallback ? 'on' : 'off'})
-                </span>
-              </span>
-              <span className="help">
-                When <strong>off</strong> (default), snapshot + direct-transfer runs do <strong>not</strong> ingest
-                payloads into <code>media.db</code>. The snapshot <code>.db</code> file and JSON
-                sidecar are unaffected - they're built directly from the live payloads (Rule 1).
-                A <strong>one-shot auto-seed</strong> still ingests the first run for any unseeded
-                server so the resolver Tier 0 GUID cache gets populated; subsequent runs skip the
-                write until you flip this on. Turn on to keep <code>media.db</code> in sync on
-                every run (useful for cross-run dedup, faster restore/direct resolution on
-                changing libraries, and future sync features). Turn off when you want media.db
-                to stay a one-time cache rather than a continuously-updated store.
-              </span>
-            </label>
-          );
-        })()}
+        <BooleanTunableSwitch
+          tunable="cache_snapshot_payloads_to_media_db"
+          label="Cache snapshot payloads to media.db"
+        >
+          When <strong>off</strong> (default), snapshot + direct-transfer runs do <strong>not</strong> ingest
+          payloads into <code>media.db</code>. The snapshot <code>.db</code> file and JSON
+          sidecar are unaffected - they're built directly from the live payloads (Rule 1).
+          A <strong>one-shot auto-seed</strong> still ingests the first run for any unseeded
+          server so the resolver Tier 0 GUID cache gets populated; subsequent runs skip the
+          write until you flip this on. Turn on to keep <code>media.db</code> in sync on
+          every run (useful for cross-run dedup, faster restore/direct resolution on
+          changing libraries, and future sync features). Turn off when you want media.db
+          to stay a one-time cache rather than a continuously-updated store.
+        </BooleanTunableSwitch>
       </div>
       )}
 

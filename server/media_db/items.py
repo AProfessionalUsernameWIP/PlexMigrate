@@ -31,24 +31,37 @@ def lookup_item_by_guids(guids: List[str]) -> Optional[int]:
     canon = normalize_guids(guids)
     if not canon:
         return None
+    # Bucket the canonical GUIDs by their target column so the lookup
+    # becomes a single OR-joined query instead of one query per scheme.
+    # On a restore that loops 10k items through here, this collapses
+    # 50k SQL round-trips to 10k. _DB_LOCK still serializes them, but
+    # each is one statement instead of five.
+    _PREFIX_TO_COL = {
+        "imdb": "imdb_id",
+        "tmdb": "tmdb_id",
+        "tvdb": "tvdb_id",
+        "musicbrainz": "musicbrainz_id",
+        "plex": "plex_guid",
+    }
+    where_parts: List[str] = []
+    params: List[str] = []
     for g in canon:
         prefix, _, payload = g.partition("://")
         if not payload:
             continue
-        col = {
-            "imdb": "imdb_id",
-            "tmdb": "tmdb_id",
-            "tvdb": "tvdb_id",
-            "musicbrainz": "musicbrainz_id",
-            "plex": "plex_guid",
-        }.get(prefix)
+        col = _PREFIX_TO_COL.get(prefix)
         if col is None:
             continue
-        row = conn.execute(
-            f"SELECT id FROM items WHERE {col} = ? LIMIT 1", (payload,)
-        ).fetchone()
-        if row is not None:
-            return int(row["id"])
+        where_parts.append(f"{col} = ?")
+        params.append(payload)
+    if not where_parts:
+        return None
+    row = conn.execute(
+        "SELECT id FROM items WHERE " + " OR ".join(where_parts) + " LIMIT 1",
+        params,
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
     return None
 
 
